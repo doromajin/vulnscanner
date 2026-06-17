@@ -1,0 +1,27 @@
+import json
+from dataclasses import asdict
+
+from vulnscanner.models import ScanResult
+
+
+def to_dict(result: ScanResult) -> dict:
+    return {
+        "repo_url": result.repo_url,
+        "summary": {
+            "total_findings": result.finding_count,
+            "scanned_files": result.scanned_files,
+            "scanned_lines": result.scanned_lines,
+            "by_severity": {
+                s.value: len(result.by_severity(s))
+                for s in __import__("vulnscanner.models", fromlist=["Severity"]).Severity
+            },
+        },
+        "findings": [asdict(f) for f in result.findings],
+        "errors": result.errors,
+    }
+
+
+def write_json(result: ScanResult, output_path: str) -> None:
+    data = to_dict(result)
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
