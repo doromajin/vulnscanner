@@ -56,7 +56,8 @@ _RULES = [
 
 
 class CommandInjectionAnalyzer(BaseAnalyzer):
-    supported_extensions = (".py", ".php", ".js", ".ts", ".java", ".rb", ".sh")
+    # .py is handled by PythonASTAnalyzer with higher precision
+    supported_extensions = (".php", ".js", ".ts", ".java", ".rb", ".sh")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         findings: list[Finding] = []

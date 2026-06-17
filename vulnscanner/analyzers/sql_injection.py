@@ -44,7 +44,8 @@ _RULES = [
 
 
 class SQLInjectionAnalyzer(BaseAnalyzer):
-    supported_extensions = (".py", ".php", ".js", ".ts", ".java", ".rb")
+    # .py is handled by PythonASTAnalyzer with higher precision
+    supported_extensions = (".php", ".js", ".ts", ".java", ".rb")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         findings: list[Finding] = []

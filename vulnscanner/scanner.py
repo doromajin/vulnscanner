@@ -72,11 +72,27 @@ class VulnScanner:
         result.scanned_files += 1
         result.scanned_lines += content.count("\n") + 1
 
+        raw: list = []
         for analyzer in self._analyzers:
             if not analyzer.supports(file_path):
                 continue
             try:
-                findings = analyzer.analyze(file_path, content, source)
-                result.findings.extend(findings)
+                raw.extend(analyzer.analyze(file_path, content, source))
             except Exception as exc:
                 result.errors.append(f"{file_path}: {exc}")
+
+        result.findings.extend(_deduplicate(raw))
+
+
+def _deduplicate(findings: list) -> list:
+    """When AST and regex both report the same (file, line, vuln_type),
+    keep the AST finding — it is more precise and context-aware."""
+    seen: dict[tuple, object] = {}
+    for f in findings:
+        key = (f.file_path, f.line_number, f.vuln_type)
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = f
+        elif f.rule_id.startswith("AST-") and not existing.rule_id.startswith("AST-"):
+            seen[key] = f  # prefer AST finding over regex finding
+    return list(seen.values())
