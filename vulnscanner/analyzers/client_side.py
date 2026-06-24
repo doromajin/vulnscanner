@@ -118,7 +118,7 @@ class ClientSideAnalyzer(BaseAnalyzer):
                     line_number=i + 1,
                     line_content=line.strip(),
                     description=(
-                        "Sensitive credential stored in localStorage/sessionStorage — "
+                        "Sensitive credential stored in localStorage/sessionStorage - "
                         "accessible to any same-origin JavaScript; XSS can exfiltrate it"
                     ),
                     rule_id="CLIENT-CRED-001",
@@ -155,7 +155,7 @@ class ClientSideAnalyzer(BaseAnalyzer):
                     line_number=i + 1,
                     line_content=line.strip(),
                     description=(
-                        "CDN resource loaded without Subresource Integrity (SRI) — "
+                        "CDN resource loaded without Subresource Integrity (SRI) - "
                         "add integrity= and crossorigin= to guard against supply-chain injection"
                     ),
                     rule_id="CLIENT-SRI-001",
@@ -182,7 +182,7 @@ class ClientSideAnalyzer(BaseAnalyzer):
                     line_number=i + 1,
                     line_content=line.strip(),
                     description=(
-                        "ESM import from external CDN URL — no SRI integrity check possible "
+                        "ESM import from external CDN URL - no SRI integrity check possible "
                         "without an import map; consider vendoring or using import maps with "
                         "integrity hashes"
                     ),
@@ -238,7 +238,7 @@ class ClientSideAnalyzer(BaseAnalyzer):
             line_number=i + 1,
             line_content=lines[i].strip(),
             description=(
-                "fetch()/axios() URL is derived from browser storage or URL parameters — "
+                "fetch()/axios() URL is derived from browser storage or URL parameters - "
                 "if XSS is present an attacker can redirect API calls to an arbitrary server"
             ),
             rule_id="CLIENT-FETCH-001",
@@ -266,7 +266,7 @@ class ClientSideAnalyzer(BaseAnalyzer):
                     line_number=i + 1,
                     line_content=line.strip(),
                     description=(
-                        "postMessage listener without event.origin validation — "
+                        "postMessage listener without event.origin validation - "
                         "any window can send arbitrary messages; always check event.origin"
                     ),
                     rule_id="CLIENT-MSG-001",

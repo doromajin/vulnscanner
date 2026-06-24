@@ -33,7 +33,7 @@ _SIMPLE_RULES = [
     (
         "XSS-006",
         r'insertAdjacentHTML\s*\(',
-        "insertAdjacentHTML() — verify content is sanitized",
+        "insertAdjacentHTML() - verify content is sanitized",
         Severity.MEDIUM,
     ),
     (
@@ -87,11 +87,11 @@ def _is_safe_interpolation(expr: str) -> bool:
         if expr.startswith(func + '('):
             return True
 
-    # Any function call at all — the developer is applying some transformation
+    # Any function call at all - the developer is applying some transformation
     if re.search(r'\w\s*\(', expr):
         return True
 
-    # Bare identifier (``varName``) or property access (``obj.prop``) — flag
+    # Bare identifier (``varName``) or property access (``obj.prop``) - flag
     return False
 
 
@@ -138,7 +138,7 @@ def _innerhtml_is_unsafe(block: str) -> bool:
         # Bare variable assignment or other non-literal expression
         return True
 
-    # Has ${} but rhs doesn't open with a backtick — flag conservatively
+    # Has ${} but rhs doesn't open with a backtick - flag conservatively
     return True
 
 
@@ -192,7 +192,7 @@ class XSSAnalyzer(BaseAnalyzer):
                         line_number=lineno,
                         line_content=line.strip(),
                         description=(
-                            "Direct innerHTML assignment — user data written without sanitization"
+                            "Direct innerHTML assignment - user data written without sanitization"
                         ),
                         rule_id="XSS-001",
                         repo_url=repo_url,

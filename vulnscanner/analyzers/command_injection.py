@@ -7,25 +7,25 @@ _RULES = [
     (
         "CMD-001",
         r'(?<![\w.])os\.system\s*\(',
-        "os.system() executes a shell command — avoid with user input",
+        "os.system() executes a shell command - avoid with user input",
         Severity.HIGH,
     ),
     (
         "CMD-002",
         # subprocess with shell=True
         r'subprocess\.\w+\s*\(.*shell\s*=\s*True',
-        "subprocess called with shell=True — susceptible to injection",
+        "subprocess called with shell=True - susceptible to injection",
         Severity.HIGH,
     ),
     (
         "CMD-003",
         r'(?<![\w.])os\.popen\s*\(',
-        "os.popen() — prefer subprocess with a list of args",
+        "os.popen() - prefer subprocess with a list of args",
         Severity.HIGH,
     ),
     (
         "CMD-004",
-        # Standalone eval()/exec() — NOT preceded by a dot (excludes JS .exec(), Java .exec())
+        # Standalone eval()/exec() - NOT preceded by a dot (excludes JS .exec(), Java .exec())
         # and NOT called on a literal string argument
         r'(?<![\w.])eval\s*\(\s*(?![\'\"]\s*[\'\"]\s*\))|'
         r'(?<![\w.])exec\s*\(\s*(?![\'\"#])',
@@ -49,7 +49,7 @@ _RULES = [
     (
         "CMD-007",
         r'Runtime\.getRuntime\(\)\.exec\s*\(',
-        "Java Runtime.exec() — verify arguments are not user-controlled",
+        "Java Runtime.exec() - verify arguments are not user-controlled",
         Severity.HIGH,
     ),
 ]

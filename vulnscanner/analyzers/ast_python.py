@@ -169,7 +169,7 @@ class _VulnVisitor(ast.NodeVisitor):
     # ── SQL injection ──────────────────────────────────────────────────────────
 
     def _check_sql(self, node: ast.Call) -> None:
-        # Match obj.execute(...) / obj.query(...) — not standalone execute()
+        # Match obj.execute(...) / obj.query(...) - not standalone execute()
         if not isinstance(node.func, ast.Attribute):
             return
         if node.func.attr not in _SQL_CALL_NAMES:
@@ -186,31 +186,31 @@ class _VulnVisitor(ast.NodeVisitor):
                 or any(kw.arg in ("parameters", "params") for kw in node.keywords)
             )
             if has_params:
-                return  # parameterized query — safe
+                return  # parameterized query - safe
             # Literal with no params: could still be safe (no user data injected)
             return
 
         func = node.func.attr
         if isinstance(first, ast.JoinedStr):
             self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-001",
-                      f"{func}() receives an f-string — user data may be interpolated directly")
+                      f"{func}() receives an f-string - user data may be interpolated directly")
         elif isinstance(first, ast.BinOp) and isinstance(first.op, ast.Add):
             self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-002",
-                      f"{func}() receives a + concatenation — use parameterized queries")
+                      f"{func}() receives a + concatenation - use parameterized queries")
         elif isinstance(first, ast.BinOp) and isinstance(first.op, ast.Mod):
             self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-003",
-                      f"{func}() receives a %%-formatted string — use parameterized queries")
+                      f"{func}() receives a %%-formatted string - use parameterized queries")
         elif _is_format_call(first):
             self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-004",
-                      f"{func}() receives a .format() string — use parameterized queries")
+                      f"{func}() receives a .format() string - use parameterized queries")
         elif isinstance(first, ast.Name):
             if _touches_user_input(first, self._assignments):
                 self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-005",
-                          f"{func}() receives a variable derived from user input — "
+                          f"{func}() receives a variable derived from user input - "
                           "SQL injection via tainted variable")
             else:
                 self._add(node, VulnType.SQL_INJECTION, Severity.MEDIUM, "AST-SQL-005",
-                          f"{func}() receives a variable — verify it is not user-controlled")
+                          f"{func}() receives a variable - verify it is not user-controlled")
 
     # ── command injection ──────────────────────────────────────────────────────
 
@@ -218,11 +218,11 @@ class _VulnVisitor(ast.NodeVisitor):
         full = _full_name(node.func)
         attr = _attr_name(node.func)
 
-        # os.system / os.popen — only flag when argument is not a literal
+        # os.system / os.popen - only flag when argument is not a literal
         if full in ("os.system", "os.popen"):
             if node.args and not _is_const(node.args[0]):
                 self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-001",
-                          f"{full}() called with non-literal argument — prefer subprocess list form")
+                          f"{full}() called with non-literal argument - prefer subprocess list form")
 
         # subprocess.* with shell=True
         elif full in _SUBPROCESS_NAMES:
@@ -234,7 +234,7 @@ class _VulnVisitor(ast.NodeVisitor):
                     pass  # literal command with shell=True: lower risk, still note it
                 elif isinstance(cmd, ast.List) and all(_is_const(e) for e in cmd.elts):
                     self._add(node, VulnType.COMMAND_INJECTION, Severity.LOW, "AST-CMD-002",
-                              f"{full}() uses shell=True with a literal list — remove shell=True")
+                              f"{full}() uses shell=True with a literal list - remove shell=True")
                 else:
                     # Constant propagation: cmd = 'literal'; subprocess.*(cmd, shell=True) → safe
                     if (isinstance(cmd, ast.Name) and cmd.id in self._assignments
@@ -242,19 +242,19 @@ class _VulnVisitor(ast.NodeVisitor):
                         pass
                     else:
                         self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-002",
-                                  f"{full}() uses shell=True with a non-literal command — injection risk")
+                                  f"{full}() uses shell=True with a non-literal command - injection risk")
 
-        # standalone eval(expr) — NOT a method call (attr check would be None for builtins)
+        # standalone eval(expr) - NOT a method call (attr check would be None for builtins)
         elif attr == "eval" and not isinstance(node.func, ast.Attribute):
             if node.args and not _is_const(node.args[0]):
                 self._add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "AST-CMD-003",
-                          "eval() called with non-literal — arbitrary code execution risk")
+                          "eval() called with non-literal - arbitrary code execution risk")
 
         # standalone exec(expr)
         elif attr == "exec" and not isinstance(node.func, ast.Attribute):
             if node.args and not _is_const(node.args[0]):
                 self._add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "AST-CMD-004",
-                          "exec() called with non-literal — arbitrary code execution risk")
+                          "exec() called with non-literal - arbitrary code execution risk")
 
     # ── path traversal ─────────────────────────────────────────────────────────
 
@@ -268,20 +268,20 @@ class _VulnVisitor(ast.NodeVisitor):
         path = node.args[0]
 
         if _is_const(path):
-            return  # literal path — safe
+            return  # literal path - safe
 
         if _touches_user_input(path, self._assignments):
             self._add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, "AST-PATH-001",
-                      "open() receives a path derived from user input — path traversal risk")
+                      "open() receives a path derived from user input - path traversal risk")
         elif isinstance(path, ast.JoinedStr):
             self._add(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "AST-PATH-002",
-                      "open() receives an f-string path — verify it cannot escape the intended directory")
+                      "open() receives an f-string path - verify it cannot escape the intended directory")
         elif isinstance(path, ast.BinOp) and isinstance(path.op, ast.Add):
             self._add(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "AST-PATH-002",
-                      "open() receives a concatenated path — verify it cannot escape the intended directory")
+                      "open() receives a concatenated path - verify it cannot escape the intended directory")
         elif isinstance(path, ast.Name):
             self._add(node, VulnType.PATH_TRAVERSAL, Severity.LOW, "AST-PATH-003",
-                      "open() receives a variable path — verify the value is validated and sanitized")
+                      "open() receives a variable path - verify the value is validated and sanitized")
             # Note: tainted Name nodes are already caught above via _touches_user_input
 
     # ── XSS (Python template helpers) ─────────────────────────────────────────
@@ -294,7 +294,7 @@ class _VulnVisitor(ast.NodeVisitor):
             return
         if not _is_const(node.args[0]):
             self._add(node, VulnType.XSS, Severity.MEDIUM, "AST-XSS-001",
-                      f"{name}() called with a non-literal value — verify no user input reaches this")
+                      f"{name}() called with a non-literal value - verify no user input reaches this")
 
     # ── insecure deserialization ───────────────────────────────────────────────
 
@@ -304,7 +304,7 @@ class _VulnVisitor(ast.NodeVisitor):
         if full in _PICKLE_FUNCS:
             self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
                       "AST-DESER-001",
-                      f"{full}() deserializes arbitrary Python objects — never use on "
+                      f"{full}() deserializes arbitrary Python objects - never use on "
                       "untrusted data; an attacker can achieve RCE via a crafted payload")
 
         elif full in _MARSHAL_FUNCS:
@@ -315,7 +315,7 @@ class _VulnVisitor(ast.NodeVisitor):
         elif full in _YAML_UNSAFE_FUNCS:
             self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
                       "AST-DESER-003",
-                      "yaml.unsafe_load() allows execution of arbitrary Python — use yaml.safe_load()")
+                      "yaml.unsafe_load() allows execution of arbitrary Python - use yaml.safe_load()")
 
         elif full in _YAML_LOAD_FUNCS:
             # Safe only when Loader= is explicitly set to a safe loader
@@ -323,14 +323,14 @@ class _VulnVisitor(ast.NodeVisitor):
             if loader_kw is None:
                 self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH,
                           "AST-DESER-004",
-                          f"{full}() without Loader= is unsafe — use yaml.safe_load() "
+                          f"{full}() without Loader= is unsafe - use yaml.safe_load() "
                           "or pass Loader=yaml.SafeLoader")
             else:
                 loader_name = _full_name(loader_kw.value) or _attr_name(loader_kw.value) or ""
                 if loader_name not in _YAML_SAFE_LOADERS:
                     self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH,
                               "AST-DESER-004",
-                              f"{full}() with Loader={loader_name} is not fully safe — "
+                              f"{full}() with Loader={loader_name} is not fully safe - "
                               "use Loader=yaml.SafeLoader")
 
     # ── SSRF ───────────────────────────────────────────────────────────────────
@@ -347,15 +347,15 @@ class _VulnVisitor(ast.NodeVisitor):
                 (kw.value for kw in node.keywords if kw.arg == "url"), None
             )
         if url_arg is None or _is_const(url_arg):
-            return  # no URL or hardcoded URL — safe
+            return  # no URL or hardcoded URL - safe
 
         if _touches_user_input(url_arg, self._assignments):
             self._add(node, VulnType.SSRF, Severity.HIGH, "AST-SSRF-001",
-                      f"{full}() called with URL derived from user input — "
+                      f"{full}() called with URL derived from user input - "
                       "SSRF allows requests to internal services or cloud metadata endpoints")
         elif isinstance(url_arg, (ast.Name, ast.JoinedStr, ast.BinOp)):
             self._add(node, VulnType.SSRF, Severity.MEDIUM, "AST-SSRF-002",
-                      f"{full}() called with a dynamic URL — verify the value cannot "
+                      f"{full}() called with a dynamic URL - verify the value cannot "
                       "be influenced by user-supplied data")
 
     # ── open redirect ──────────────────────────────────────────────────────────
@@ -369,15 +369,15 @@ class _VulnVisitor(ast.NodeVisitor):
 
         url_arg = node.args[0]
         if _is_const(url_arg):
-            return  # literal destination — safe
+            return  # literal destination - safe
 
         if _touches_user_input(url_arg, self._assignments):
             self._add(node, VulnType.OPEN_REDIRECT, Severity.HIGH, "AST-REDIR-001",
-                      f"{name}() redirects to a URL from user input — "
+                      f"{name}() redirects to a URL from user input - "
                       "attackers can redirect victims to malicious sites (phishing)")
         elif isinstance(url_arg, (ast.Name, ast.JoinedStr, ast.BinOp, ast.Subscript)):
             self._add(node, VulnType.OPEN_REDIRECT, Severity.MEDIUM, "AST-REDIR-002",
-                      f"{name}() redirects to a dynamic URL — "
+                      f"{name}() redirects to a dynamic URL - "
                       "validate the destination against an allowlist before redirecting")
 
     # ── server-side template injection (SSTI) ─────────────────────────────────
@@ -389,7 +389,7 @@ class _VulnVisitor(ast.NodeVisitor):
             if not node.args or _is_const(node.args[0]):
                 return
             self._add(node, VulnType.SSTI, Severity.CRITICAL, "AST-SSTI-001",
-                      f"{name}() renders a non-literal template string — "
+                      f"{name}() renders a non-literal template string - "
                       "user-controlled template content leads to RCE via SSTI")
 
         # Jinja2 Environment().from_string(template) with non-literal
@@ -397,7 +397,7 @@ class _VulnVisitor(ast.NodeVisitor):
             if not node.args or _is_const(node.args[0]):
                 return
             self._add(node, VulnType.SSTI, Severity.HIGH, "AST-SSTI-002",
-                      "Environment.from_string() with non-literal template — "
+                      "Environment.from_string() with non-literal template - "
                       "verify the template source is not user-controlled")
 
     # ── hardcoded secrets ──────────────────────────────────────────────────────
@@ -423,7 +423,7 @@ class _VulnVisitor(ast.NodeVisitor):
 
         self._add(
             node, VulnType.HARDCODED_SECRET, Severity.HIGH, "AST-SEC-001",
-            f"Hardcoded string assigned to '{name}' — use environment variables or a secrets manager",
+            f"Hardcoded string assigned to '{name}' - use environment variables or a secrets manager",
         )
 
     # ── helper ─────────────────────────────────────────────────────────────────

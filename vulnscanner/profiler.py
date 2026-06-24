@@ -2,7 +2,7 @@
 Vulnerability risk profiler.
 
 Converts a ScanResult into a RiskProfile with a normalized 0-100 score,
-grade, and recommendation — used by the `rank` command and the per-scan
+grade, and recommendation - used by the `rank` command and the per-scan
 summary line.
 """
 from __future__ import annotations
@@ -57,7 +57,7 @@ def profile(result: ScanResult) -> RiskProfile:
     """Build a RiskProfile from a completed scan result."""
     findings = result.findings
 
-    # Raw score — cap at 100
+    # Raw score - cap at 100
     raw = sum(_SEVERITY_WEIGHTS.get(f.severity, 0) for f in findings)
     score = min(raw, 100)
 
@@ -76,7 +76,7 @@ def profile(result: ScanResult) -> RiskProfile:
         if counts.get(s.value, 0) > 0
     }
 
-    # Top vulnerability categories — weighted by severity, not raw count
+    # Top vulnerability categories - weighted by severity, not raw count
     type_scores: Counter[str] = Counter()
     for f in findings:
         type_scores[f.vuln_type.value] += _SEVERITY_WEIGHTS.get(f.severity, 0)

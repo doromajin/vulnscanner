@@ -18,7 +18,7 @@ _SEVERITY_CHOICES = click.Choice(
 
 @click.group()
 def main() -> None:
-    """VulnScanner — static vulnerability scanner for OSS repositories."""
+    """VulnScanner - static vulnerability scanner for OSS repositories."""
 
 
 # ── scan ──────────────────────────────────────────────────────────────────────
@@ -72,10 +72,17 @@ def scan(
         if severity_order.index(f.severity) <= cutoff
     ]
 
+    # Load confirmed pattern keys from knowledge base for annotation
+    try:
+        from vulnscanner.knowledge import KnowledgeStore
+        confirmed_keys = KnowledgeStore().get_confirmed_pattern_keys()
+    except Exception:
+        confirmed_keys = set()
+
     if detail:
         print_finding_detail(result)
     else:
-        print_results(result)
+        print_results(result, confirmed_keys=confirmed_keys)
 
     if output:
         write_json(result, output)
@@ -173,3 +180,252 @@ def rank(
         profiles = sorted(profiles, key=lambda p: p.score, reverse=True)[:top]
 
     print_rank_table(profiles)
+
+
+# ── confirm ───────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.argument("repo")
+@click.argument("location", metavar="FILE:LINE")
+@click.argument("rule_id")
+@click.option("--note", default="", help="Notes about the vulnerability and why it is real")
+def confirm(repo: str, location: str, rule_id: str, note: str) -> None:
+    """Record a confirmed true-positive vulnerability finding.
+
+    REPO is the repository path or slug.\n
+    FILE:LINE is e.g. worker/worker.py:103\n
+    RULE_ID is e.g. AST-CMD-002
+
+    Example:\n
+      vulnscan confirm repos/ytdlp2STRM worker/worker.py:103 AST-CMD-002
+        --note "self.command flows from user config, shell=True enables injection"
+    """
+    from vulnscanner.knowledge import KnowledgeStore
+
+    # Parse FILE:LINE
+    if ":" not in location:
+        console.print("[red]Error: LOCATION must be FILE:LINE, e.g. worker/worker.py:103[/red]")
+        sys.exit(1)
+    parts = location.rsplit(":", 1)
+    file_path, line_str = parts[0], parts[1]
+    try:
+        line = int(line_str)
+    except ValueError:
+        console.print(f"[red]Error: LINE must be an integer, got {line_str!r}[/red]")
+        sys.exit(1)
+
+    # Try to read the code snippet from a local path
+    snippet = ""
+    import os
+    candidate = os.path.join(repo, file_path)
+    if os.path.isfile(candidate):
+        try:
+            lines = open(candidate, encoding="utf-8", errors="replace").readlines()
+            start = max(0, line - 3)
+            end = min(len(lines), line + 2)
+            snippet = "".join(lines[start:end]).strip()
+        except Exception:
+            pass
+
+    store = KnowledgeStore()
+    entry_id = store.add_confirmed(
+        repo=repo,
+        file=file_path,
+        line=line,
+        rule_id=rule_id,
+        code_snippet=snippet,
+        notes=note,
+    )
+
+    hist = store.lookup_rule_history(rule_id)
+    suggestion = store.suggest_rule_improvement(rule_id)
+
+    console.print(f"\n[green]Confirmed vulnerability recorded as {entry_id}[/green]")
+    console.print(f"  Rule    : {rule_id}")
+    console.print(f"  Location: {repo} / {file_path}:{line}")
+    if note:
+        console.print(f"  Notes   : {note}")
+    console.print(
+        f"\n[dim]Rule {rule_id} history: "
+        f"{hist['confirmed']} confirmed, {hist['false_positives']} FP  "
+        f"(precision {hist['precision']:.0%})[/dim]"
+    )
+    if suggestion:
+        console.print(f"\n[yellow]Learning suggestion:[/yellow] {suggestion}")
+    console.print(
+        f"\n[dim]Knowledge base: {store.path}[/dim]"
+    )
+
+
+# ── false-positive ────────────────────────────────────────────────────────────
+
+@main.command("fp")
+@click.argument("repo")
+@click.argument("location", metavar="FILE:LINE")
+@click.argument("rule_id")
+@click.option("--reason", required=True, help="Why this is a false positive")
+@click.option("--fix", "fix_applied", default="", help="Rule fix that was applied")
+def false_positive(repo: str, location: str, rule_id: str, reason: str, fix_applied: str) -> None:
+    """Record a confirmed false-positive finding.
+
+    Example:\n
+      vulnscan fp repos/ytdlp2STRM ui/ui.py:104 AST-PATH-001
+        --reason "config_file is server-constructed, not user input"
+        --fix "Removed data from _USER_INPUT_NAMES"
+    """
+    from vulnscanner.knowledge import KnowledgeStore
+
+    if ":" not in location:
+        console.print("[red]Error: LOCATION must be FILE:LINE[/red]")
+        sys.exit(1)
+    parts = location.rsplit(":", 1)
+    file_path, line_str = parts[0], parts[1]
+    try:
+        line = int(line_str)
+    except ValueError:
+        console.print(f"[red]Error: LINE must be an integer, got {line_str!r}[/red]")
+        sys.exit(1)
+
+    store = KnowledgeStore()
+    entry_id = store.add_false_positive(
+        repo=repo, file=file_path, line=line, rule_id=rule_id,
+        reason=reason, fix_applied=fix_applied,
+    )
+
+    suggestion = store.suggest_rule_improvement(rule_id)
+    console.print(f"\n[cyan]False positive recorded as {entry_id}[/cyan]")
+    console.print(f"  Rule   : {rule_id}")
+    console.print(f"  Reason : {reason}")
+    if fix_applied:
+        console.print(f"  Fix    : {fix_applied}")
+    if suggestion:
+        console.print(f"\n[yellow]Learning suggestion:[/yellow] {suggestion}")
+
+
+# ── knowledge ─────────────────────────────────────────────────────────────────
+
+@main.group()
+def knowledge() -> None:
+    """Inspect the confirmed vulnerability knowledge base."""
+
+
+@knowledge.command("list")
+@click.option("--type", "kind",
+              type=click.Choice(["all", "confirmed", "fp", "improvements"]),
+              default="all")
+def knowledge_list(kind: str) -> None:
+    """List knowledge base entries."""
+    from vulnscanner.knowledge import KnowledgeStore
+    from rich.table import Table
+    from rich import box
+    from rich.console import Console as RC
+
+    rc = RC()
+    store = KnowledgeStore()
+
+    if kind in ("all", "confirmed"):
+        entries = store.list_confirmed()
+        if entries:
+            t = Table(title="Confirmed Vulnerabilities", box=box.ROUNDED, show_lines=True)
+            t.add_column("ID", width=10)
+            t.add_column("Repo", overflow="fold")
+            t.add_column("File:Line", overflow="fold")
+            t.add_column("Rule", width=14)
+            t.add_column("Severity", width=9)
+            t.add_column("Confirmed", width=12)
+            for e in entries:
+                t.add_row(
+                    e["id"], e["repo"],
+                    f"{e['file']}:{e['line']}",
+                    e["rule_id"], e["severity"], e["confirmed_at"],
+                )
+            rc.print(t)
+
+    if kind in ("all", "fp"):
+        entries = store.list_false_positives()
+        if entries:
+            t = Table(title="False Positives", box=box.ROUNDED, show_lines=True)
+            t.add_column("ID", width=8)
+            t.add_column("Rule", width=14)
+            t.add_column("File:Line", overflow="fold")
+            t.add_column("Reason", overflow="fold")
+            for e in entries:
+                t.add_row(
+                    e["id"], e["rule_id"],
+                    f"{e['file']}:{e['line']}",
+                    e["reason"],
+                )
+            rc.print(t)
+
+    if kind in ("all", "improvements"):
+        entries = store.list_rule_improvements()
+        if entries:
+            t = Table(title="Rule Improvements", box=box.ROUNDED, show_lines=True)
+            t.add_column("Rule", width=14)
+            t.add_column("Change", overflow="fold")
+            t.add_column("Triggered By", width=12)
+            t.add_column("Date")
+            for e in entries:
+                t.add_row(
+                    e["rule_id"], e["change"],
+                    e.get("triggered_by", ""), e["implemented_at"],
+                )
+            rc.print(t)
+
+    if not store.list_confirmed() and not store.list_false_positives():
+        rc.print("[dim]Knowledge base is empty. Use `vulnscan confirm` to add entries.[/dim]")
+
+
+@knowledge.command("stats")
+def knowledge_stats() -> None:
+    """Show knowledge base statistics and rule effectiveness."""
+    from vulnscanner.knowledge import KnowledgeStore
+    from rich.console import Console as RC
+    from rich.table import Table
+    from rich import box
+
+    rc = RC()
+    store = KnowledgeStore()
+    s = store.stats()
+
+    rc.print()
+    rc.print(f"[bold]Knowledge Base Stats[/bold]  ({store.path})")
+    rc.print(f"  Confirmed vulns   : [green]{s['confirmed_count']}[/green]")
+    rc.print(f"  False positives   : [yellow]{s['false_positive_count']}[/yellow]")
+    rc.print(f"  Rule improvements : [cyan]{s['rule_improvement_count']}[/cyan]")
+    if s["confirmed_count"] + s["false_positive_count"] > 0:
+        rc.print(f"  Overall precision : [bold]{s['precision']:.0%}[/bold]")
+
+    if s["by_severity"]:
+        rc.print()
+        rc.print("[bold]Confirmed by severity:[/bold]")
+        for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+            n = s["by_severity"].get(sev, 0)
+            if n:
+                rc.print(f"  {sev:<10} {n}")
+
+    if s["by_rule"]:
+        rc.print()
+        t = Table(title="Rule Effectiveness", box=box.SIMPLE)
+        t.add_column("Rule ID", width=18)
+        t.add_column("TP", justify="right", width=5)
+        t.add_column("FP", justify="right", width=5)
+        t.add_column("Precision", justify="right", width=10)
+        t.add_column("Suggestion", overflow="fold")
+
+        all_rule_ids = set(s["by_rule"]) | {
+            fp["rule_id"] for fp in store.list_false_positives()
+        }
+        for rule_id in sorted(all_rule_ids):
+            hist = store.lookup_rule_history(rule_id)
+            prec = f"{hist['precision']:.0%}"
+            sugg = store.suggest_rule_improvement(rule_id) or ""
+            t.add_row(
+                rule_id,
+                str(hist["confirmed"]),
+                str(hist["false_positives"]),
+                prec,
+                sugg[:60] + "..." if len(sugg) > 60 else sugg,
+            )
+        rc.print(t)
+    rc.print()

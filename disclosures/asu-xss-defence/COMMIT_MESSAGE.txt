@@ -1,0 +1,29 @@
+stats: replace innerHTML with DOM API in loadPackages()
+
+Package names displayed in the Top Packages table are fetched from
+/api/v1/top-packages and inserted into the DOM via an innerHTML
+template-literal assignment:
+
+  tbody.innerHTML = data.packages.map(p =>
+      `<tr><td>${p.name}</td><td>${p.count}</td></tr>`
+  ).join("");
+
+innerHTML parses its argument as HTML, so any data containing '<', '>'
+or '"' would be interpreted as markup. The current server-side validation
+(STRING_PATTERN = r"^[\w.,-]*$" in BuildRequest) excludes those characters,
+making the page safe in practice. The pattern is nevertheless fragile: a
+future change to package-name rules, a direct Redis write, or a migration
+script could introduce HTML-unsafe values without any visible change in
+stats.html.
+
+Replace the assignment with insertRow() / insertCell() / textContent, which
+treats all values as plain text regardless of content:
+
+  tbody.replaceChildren();
+  for (const { name, count } of data.packages) {
+      const tr = tbody.insertRow();
+      tr.insertCell().textContent = name;
+      tr.insertCell().textContent = count;
+  }
+
+No functional change; rendered output is identical.

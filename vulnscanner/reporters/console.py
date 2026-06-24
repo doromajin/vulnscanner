@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from pathlib import Path
+
 from rich.console import Console
 from rich.table import Table
 from rich import box
@@ -6,7 +10,7 @@ from rich.text import Text
 
 from vulnscanner.models import ScanResult, Severity
 
-console = Console(legacy_windows=False)
+console = Console(width=120)
 
 _GRADE_BADGE = {
     "HIGH":    "[bold red][HIGH][/bold red]",
@@ -25,7 +29,10 @@ _SEVERITY_COLORS = {
 }
 
 
-def print_results(result: ScanResult) -> None:
+def print_results(
+    result: ScanResult,
+    confirmed_keys: set[tuple[str, str]] | None = None,
+) -> None:
     console.print()
     console.rule(f"[bold]Scan results: {result.repo_url}")
 
@@ -47,19 +54,22 @@ def print_results(result: ScanResult) -> None:
             show_lines=True,
             header_style="bold",
         )
-        table.add_column("Rule", style="dim", width=9)
+        table.add_column("Rule", style="dim", width=14)
         table.add_column("Type", width=24)
         table.add_column("File", overflow="fold")
         table.add_column("Line", justify="right", width=6)
         table.add_column("Description")
 
         for f in group:
+            desc = f.description
+            if confirmed_keys and (f.rule_id, Path(f.file_path).name) in confirmed_keys:
+                desc = "[bold green][CONFIRMED PATTERN][/bold green] " + desc
             table.add_row(
                 f.rule_id,
                 f.vuln_type.value,
                 f.file_path,
                 str(f.line_number),
-                f.description,
+                desc,
             )
 
         console.print(table)
@@ -75,7 +85,7 @@ def print_finding_detail(result: ScanResult) -> None:
         header = Text()
         header.append(f"[{finding.rule_id}] ", style="dim")
         header.append(f"{finding.severity.value} ", style=color)
-        header.append(f"— {finding.vuln_type.value}")
+        header.append(f"- {finding.vuln_type.value}")
 
         body = f"{finding.description}\n\n"
         body += f"File: {finding.file_path}:{finding.line_number}\n\n"
@@ -152,10 +162,10 @@ def print_rank_table(profiles: list) -> None:
             n = p.by_severity.get(label, 0)
             if n:
                 sev_parts.append(f"{n}{short}")
-        sev_str = " ".join(sev_parts) if sev_parts else "—"
+        sev_str = " ".join(sev_parts) if sev_parts else "-"
 
         bar = _score_bar(p.score, width=10)
-        top = ", ".join(p.top_vuln_types[:2]) if p.top_vuln_types else "—"
+        top = ", ".join(p.top_vuln_types[:2]) if p.top_vuln_types else "-"
         short_repo = p.repo.rstrip("/").split("/")[-1]
 
         table.add_row(

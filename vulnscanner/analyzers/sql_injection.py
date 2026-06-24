@@ -9,7 +9,7 @@ _RULES = [
         # String concatenation into SQL (Python)
         r'(?:execute|query|cursor\.execute)\s*\(\s*["\'].*["\'\s]*\+|'
         r'(?:execute|query|cursor\.execute)\s*\(\s*f["\'].*\{',
-        "SQL query built with string concatenation — susceptible to injection",
+        "SQL query built with string concatenation - susceptible to injection",
         Severity.HIGH,
     ),
     (
@@ -23,7 +23,7 @@ _RULES = [
         "SQL-003",
         # .format() inside execute
         r'(?:execute|query)\s*\(.*\.format\s*\(',
-        "SQL query uses .format() — prefer parameterized queries",
+        "SQL query uses .format() - prefer parameterized queries",
         Severity.HIGH,
     ),
     (
@@ -37,7 +37,7 @@ _RULES = [
         "SQL-005",
         # Generic ORM raw() / extra()
         r'\.raw\s*\(|\.extra\s*\(.*where',
-        "Django ORM raw()/extra() — ensure no unsanitized input",
+        "Django ORM raw()/extra() - ensure no unsanitized input",
         Severity.MEDIUM,
     ),
 ]

@@ -27,7 +27,7 @@ _SCAN_FILENAMES = frozenset({
 # Skip directories that are rarely production code
 _SKIP_DIRS = {"node_modules", ".git", "vendor", "dist", "build", "__pycache__"}
 
-# Max file size to fetch (bytes) — avoid huge generated files
+# Max file size to fetch (bytes) - avoid huge generated files
 _MAX_FILE_BYTES = 500_000
 
 

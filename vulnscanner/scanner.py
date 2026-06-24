@@ -19,7 +19,7 @@ _SUPPRESS_RE = re.compile(
 
 
 def _parse_ignore_file(content: str) -> list[str]:
-    """Parse a .vulnscannerignore file — one glob pattern per line, # for comments."""
+    """Parse a .vulnscannerignore file - one glob pattern per line, # for comments."""
     patterns = []
     for line in content.splitlines():
         line = line.strip()
@@ -160,7 +160,7 @@ def _is_suppressed(finding: Finding, lines: list[str]) -> bool:
             if m:
                 rule_ids_str = m.group(1)
                 if rule_ids_str is None:
-                    return True  # bare ignore — suppress all rules
+                    return True  # bare ignore - suppress all rules
                 rules = {r.strip() for r in re.split(r"[,\s]+", rule_ids_str) if r.strip()}
                 if finding.rule_id in rules:
                     return True
@@ -169,7 +169,7 @@ def _is_suppressed(finding: Finding, lines: list[str]) -> bool:
 
 def _deduplicate(findings: list) -> list:
     """When AST and regex both report the same (file, line, vuln_type),
-    keep the AST finding — it is more precise and context-aware."""
+    keep the AST finding - it is more precise and context-aware."""
     seen: dict[tuple, object] = {}
     for f in findings:
         key = (f.file_path, f.line_number, f.vuln_type)

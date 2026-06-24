@@ -6,7 +6,7 @@ from vulnscanner.models import Finding, Severity, VulnType
 _RULES = [
     (
         "PATH-001",
-        # Python/Ruby open() with a request/param variable — language-specific
+        # Python/Ruby open() with a request/param variable - language-specific
         r'(?<![\w.])open\s*\(\s*(?:request|req|args|params|data|input)',
         "open() with potentially user-controlled path",
         Severity.HIGH,
@@ -14,17 +14,17 @@ _RULES = [
     ),
     (
         "PATH-002",
-        # open() with string concatenation — Python/PHP/Ruby only;
+        # open() with string concatenation - Python/PHP/Ruby only;
         # JS 'open()' means XHR or window.open, so we exclude .js/.ts
         r'(?<![\w.])open\s*\(.*\+|(?<![\w.])open\s*\(.*f["\'].*\{',
-        "open() with string concatenation — path may be user-controlled",
+        "open() with string concatenation - path may be user-controlled",
         Severity.MEDIUM,
         (".py", ".rb", ".php"),
     ),
     (
         "PATH-003",
         r'(?:send_file|send_from_directory|serve_file)\s*\(',
-        "File-serving function — verify path is within expected root",
+        "File-serving function - verify path is within expected root",
         Severity.MEDIUM,
         None,  # all supported extensions
     ),
@@ -38,7 +38,7 @@ _RULES = [
     ),
     (
         "PATH-005",
-        # Literal path traversal sequence — report as INFO, skip test files
+        # Literal path traversal sequence - report as INFO, skip test files
         r'\.\./|\.\.\\\\',
         "Literal path traversal sequence in source code",
         Severity.INFO,
@@ -46,7 +46,7 @@ _RULES = [
     ),
 ]
 
-# Path fragments that indicate test/fixture code — lower value, skip PATH-005 there
+# Path fragments that indicate test/fixture code - lower value, skip PATH-005 there
 _TEST_PATH_MARKERS = ("/test/", "/tests/", "/spec/", "/it/", "/fixture", "/mock")
 
 
@@ -64,7 +64,7 @@ class PathTraversalAnalyzer(BaseAnalyzer):
             if lang_filter and not any(file_path.endswith(ext) for ext in lang_filter):
                 continue
 
-            # PATH-005 in test files is almost always intentional — skip
+            # PATH-005 in test files is almost always intentional - skip
             if rule_id == "PATH-005" and any(m in fp_lower for m in _TEST_PATH_MARKERS):
                 continue
 

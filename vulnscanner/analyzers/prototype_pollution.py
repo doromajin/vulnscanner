@@ -7,34 +7,34 @@ _RULES: list[tuple[str, str, str, Severity]] = [
     (
         "PROTO-001",
         r'__proto__\s*[\[=]',
-        "Direct __proto__ assignment — prototype pollution can affect all objects in the process",
+        "Direct __proto__ assignment - prototype pollution can affect all objects in the process",
         Severity.HIGH,
     ),
     (
         "PROTO-002",
         r'constructor\s*\.\s*prototype\s*[\[.]',
-        "Modification via constructor.prototype — prototype pollution risk",
+        "Modification via constructor.prototype - prototype pollution risk",
         Severity.HIGH,
     ),
     (
         "PROTO-003",
         # Object.assign / merge into a target where the source comes from request data
         r'Object\.(?:assign|merge)\s*\(\s*\w+\s*,\s*(?:req\.(?:body|query|params)|JSON\.parse)',
-        "Object.assign/merge with request data as source — prototype pollution if keys include __proto__",
+        "Object.assign/merge with request data as source - prototype pollution if keys include __proto__",
         Severity.HIGH,
     ),
     (
         "PROTO-004",
         # Deep merge / extend libraries often used unsafely
         r'(?:_\.merge|_\.extend|jQuery\.extend|deepmerge|lodash\.merge)\s*\(\s*(?:true\s*,\s*)?\w+\s*,\s*(?:req\.|JSON\.parse)',
-        "Deep merge with user-controlled object — prototype pollution risk",
+        "Deep merge with user-controlled object - prototype pollution risk",
         Severity.HIGH,
     ),
     (
         "PROTO-005",
-        # React dangerouslySetInnerHTML — XSS risk
+        # React dangerouslySetInnerHTML - XSS risk
         r'dangerouslySetInnerHTML\s*=\s*\{\s*\{',
-        "dangerouslySetInnerHTML bypasses React's XSS protection — ensure content is sanitized",
+        "dangerouslySetInnerHTML bypasses React's XSS protection - ensure content is sanitized",
         Severity.HIGH,
     ),
 ]

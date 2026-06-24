@@ -9,14 +9,14 @@ _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     (
         "SSRF-001",
         r'curl_setopt\s*\(.*CURLOPT_URL.*\$_(?:GET|POST|REQUEST|COOKIE)',
-        "PHP cURL with user-controlled URL — SSRF allows requests to internal services",
+        "PHP cURL with user-controlled URL - SSRF allows requests to internal services",
         Severity.HIGH,
         (".php",),
     ),
     (
         "SSRF-002",
         r'file_get_contents\s*\(\s*\$_(?:GET|POST|REQUEST)',
-        "PHP file_get_contents with user URL — SSRF / path traversal risk",
+        "PHP file_get_contents with user URL - SSRF / path traversal risk",
         Severity.HIGH,
         (".php",),
     ),
@@ -24,14 +24,14 @@ _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     (
         "SSRF-003",
         r'new\s+URL\s*\(\s*(?![\'"]\s*[\'"]\s*\))',
-        "Java URL instantiation with non-literal — verify URL cannot be user-controlled",
+        "Java URL instantiation with non-literal - verify URL cannot be user-controlled",
         Severity.MEDIUM,
         (".java",),
     ),
     (
         "SSRF-004",
         r'(?:HttpURLConnection|CloseableHttpClient|HttpClient).*(?:getParameter|getAttribute)',
-        "Java HTTP client using request parameter as URL — SSRF risk",
+        "Java HTTP client using request parameter as URL - SSRF risk",
         Severity.HIGH,
         (".java",),
     ),
@@ -39,14 +39,14 @@ _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     (
         "SSRF-005",
         r'(?:fetch|axios\.(?:get|post|put|patch|delete|request)|(?:http|https)\.(?:get|request))\s*\(\s*req\.(?:query|body|params)',
-        "Node.js HTTP request with user-controlled URL — SSRF risk",
+        "Node.js HTTP request with user-controlled URL - SSRF risk",
         Severity.HIGH,
         (".js", ".ts"),
     ),
     (
         "SSRF-006",
         r'(?:fetch|axios\.(?:get|post|put|patch|delete|request))\s*\(\s*`[^`]*\$\{req\.',
-        "Node.js HTTP request with URL template containing request data — SSRF risk",
+        "Node.js HTTP request with URL template containing request data - SSRF risk",
         Severity.HIGH,
         (".js", ".ts"),
     ),
@@ -54,7 +54,7 @@ _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     (
         "SSRF-007",
         r'(?:Net::HTTP\.get|open-uri|URI\.open|RestClient\.(?:get|post))\s*\(\s*params\[',
-        "Ruby HTTP request with user-supplied URL — SSRF risk",
+        "Ruby HTTP request with user-supplied URL - SSRF risk",
         Severity.HIGH,
         (".rb",),
     ),
@@ -62,7 +62,7 @@ _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     (
         "SSRF-008",
         r'http\.(?:Get|Post|NewRequest)\s*\(\s*(?:r\.(?:FormValue|URL|Header)|fmt\.Sprintf)',
-        "Go HTTP request with dynamic URL — verify URL cannot be user-controlled",
+        "Go HTTP request with dynamic URL - verify URL cannot be user-controlled",
         Severity.MEDIUM,
         (".go",),
     ),

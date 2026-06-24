@@ -9,14 +9,14 @@ _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     (
         "REDIR-001",
         r"header\s*\(\s*['\"]Location:\s*['\"].*\.\s*\$_(?:GET|POST|REQUEST)",
-        "PHP Location header with user input — open redirect allows phishing attacks",
+        "PHP Location header with user input - open redirect allows phishing attacks",
         Severity.HIGH,
         (".php",),
     ),
     (
         "REDIR-002",
         r"header\s*\(\s*['\"]Location:\s*['\"]\s*\.\s*\$(?!_(?:GET|POST|REQUEST))",
-        "PHP Location header with variable — verify redirect destination is allowlisted",
+        "PHP Location header with variable - verify redirect destination is allowlisted",
         Severity.MEDIUM,
         (".php",),
     ),
@@ -24,14 +24,14 @@ _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     (
         "REDIR-003",
         r'(?:response\.)?sendRedirect\s*\(.*request\.getParameter\s*\(',
-        "Java sendRedirect with request parameter — open redirect risk",
+        "Java sendRedirect with request parameter - open redirect risk",
         Severity.HIGH,
         (".java",),
     ),
     (
         "REDIR-004",
         r'RedirectView\s*\(.*(?:getParameter|getAttribute)\s*\(',
-        "Spring RedirectView with request attribute — verify redirect target",
+        "Spring RedirectView with request attribute - verify redirect target",
         Severity.HIGH,
         (".java",),
     ),
@@ -39,14 +39,14 @@ _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     (
         "REDIR-005",
         r'res\.redirect\s*\(\s*(?:\d+\s*,\s*)?req\.(?:query|body|params)',
-        "Express redirect with user-controlled URL — open redirect risk",
+        "Express redirect with user-controlled URL - open redirect risk",
         Severity.HIGH,
         (".js", ".ts"),
     ),
     (
         "REDIR-006",
         r'res\.redirect\s*\(\s*(?:\d+\s*,\s*)?`[^`]*\$\{req\.',
-        "Express redirect with URL template containing request data — open redirect risk",
+        "Express redirect with URL template containing request data - open redirect risk",
         Severity.HIGH,
         (".js", ".ts"),
     ),
@@ -54,7 +54,7 @@ _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     (
         "REDIR-007",
         r'redirect_to\s+params\[',
-        "Rails redirect_to with params — open redirect; validate with allow_other_host: false",
+        "Rails redirect_to with params - open redirect; validate with allow_other_host: false",
         Severity.HIGH,
         (".rb",),
     ),
@@ -62,7 +62,7 @@ _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     (
         "REDIR-008",
         r'http\.Redirect\s*\(.*r\.(?:FormValue|URL\.Query|Header\.Get)',
-        "Go http.Redirect with request-derived URL — open redirect risk",
+        "Go http.Redirect with request-derived URL - open redirect risk",
         Severity.HIGH,
         (".go",),
     ),

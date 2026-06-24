@@ -34,7 +34,7 @@ _SKIP_PATH_SEGMENTS = {
     "lodash", "underscore", "backbone", "ember",
 }
 
-# Never scan minified bundles — they're unreadable and flood results
+# Never scan minified bundles - they're unreadable and flood results
 _SKIP_FILENAME_SUFFIXES = (".min.js", ".min.css", ".bundle.js", ".chunk.js")
 
 _MAX_FILE_BYTES = 500_000

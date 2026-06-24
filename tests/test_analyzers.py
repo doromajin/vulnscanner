@@ -164,6 +164,36 @@ class TestHardcodedSecrets:
         findings = HardcodedSecretsAnalyzer().analyze("deploy.py", code)
         assert any(f.rule_id == "SEC-004" for f in findings)
 
+    def test_prod_password_is_high(self):
+        code = 'password = "supersecret123"'
+        findings = HardcodedSecretsAnalyzer().analyze("src/main/Config.java", code)
+        assert findings[0].severity == Severity.HIGH
+
+    def test_test_file_password_downgraded_to_low(self):
+        # Learned from WebGoat: src/test/ passwords are expected test setup, not exploitable
+        code = 'password = "supersecret123"'
+        findings = HardcodedSecretsAnalyzer().analyze("src/test/java/UserServiceTest.java", code)
+        assert findings, "Should still detect it"
+        assert findings[0].severity == Severity.LOW
+
+    def test_test_file_critical_stays_critical(self):
+        # CRITICAL (e.g. embedded private key) stays critical even in test files
+        # Must be in a string literal so _is_comment() doesn't skip the '---' prefix
+        code = 'String key = "-----BEGIN RSA PRIVATE KEY-----";'
+        findings = HardcodedSecretsAnalyzer().analyze("src/test/CryptoTest.java", code)
+        crit = [f for f in findings if f.rule_id == "SEC-005"]
+        assert crit and crit[0].severity == Severity.CRITICAL
+
+    def test_spec_directory_downgraded(self):
+        code = 'password = "testpass"'
+        findings = HardcodedSecretsAnalyzer().analyze("spec/auth_spec.rb", code)
+        assert findings and findings[0].severity == Severity.LOW
+
+    def test_test_suffix_java_downgraded(self):
+        code = 'String password = "MyP@ssw0rd";'
+        findings = HardcodedSecretsAnalyzer().analyze("AuthControllerTest.java", code)
+        assert findings and findings[0].severity == Severity.LOW
+
 
 # ── AST-based Python analyzer ─────────────────────────────────────────────────
 
