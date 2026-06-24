@@ -10,6 +10,13 @@ _PHP_SAFE_UNSERIALIZE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Method-call/definition form of unserialize is a user-defined method, not PHP's built-in.
+# Confirmed FP: bludit dbjson.class.php has private method named unserialize() wrapping json_decode().
+_PHP_USER_UNSERIALIZE_RE = re.compile(
+    r'(?:->\s*unserialize\s*\(|function\s+unserialize\s*\()',
+    re.IGNORECASE,
+)
+
 # (rule_id, pattern, description, severity, extensions)
 _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     # ── Python (regex fallback for files the AST analyzer cannot parse) ────────
@@ -101,6 +108,11 @@ class DeserializationAnalyzer(BaseAnalyzer):
                     # Check current line and up to 3 following lines for the safe arg
                     window = "\n".join(lines[lineno - 1: lineno + 3])
                     if _PHP_SAFE_UNSERIALIZE_RE.search(window):
+                        continue
+                    # Skip method-call/definition forms: $this->unserialize() / function unserialize()
+                    # These are user-defined methods, not PHP's built-in unserialize().
+                    # Confirmed FP: bludit dbjson.class.php private method wrapping json_decode()
+                    if _PHP_USER_UNSERIALIZE_RE.search(line):
                         continue
 
                 findings.append(Finding(
