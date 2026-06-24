@@ -3,6 +3,13 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
+# PHP 7.0+ safe unserialize: second arg contains ['allowed_classes' => false]
+# Confirmed FP in snipe-it: unserialize($x, ['allowed_classes' => false]) blocks object injection
+_PHP_SAFE_UNSERIALIZE_RE = re.compile(
+    r"unserialize\s*\([^,)]+,\s*\[.*'allowed_classes'\s*=>\s*false",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # (rule_id, pattern, description, severity, extensions)
 _RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
     # ── Python (regex fallback for files the AST analyzer cannot parse) ────────
@@ -84,17 +91,28 @@ class DeserializationAnalyzer(BaseAnalyzer):
             for lineno, line in enumerate(lines, start=1):
                 if self._is_comment(line):
                     continue
-                if re.search(pattern, line, re.IGNORECASE):
-                    findings.append(Finding(
-                        vuln_type=VulnType.INSECURE_DESERIALIZATION,
-                        severity=severity,
-                        file_path=file_path,
-                        line_number=lineno,
-                        line_content=line.strip(),
-                        description=description,
-                        rule_id=rule_id,
-                        repo_url=repo_url,
-                        snippet=self._extract_snippet(lines, lineno),
-                    ))
+                if not re.search(pattern, line, re.IGNORECASE):
+                    continue
+
+                # DESER-004: skip PHP unserialize() with ['allowed_classes' => false]
+                # This is the PHP 7.0+ safe form that prevents object injection.
+                # Confirmed FP: snipe-it ActionlogsTransformer.php
+                if rule_id == "DESER-004":
+                    # Check current line and up to 3 following lines for the safe arg
+                    window = "\n".join(lines[lineno - 1: lineno + 3])
+                    if _PHP_SAFE_UNSERIALIZE_RE.search(window):
+                        continue
+
+                findings.append(Finding(
+                    vuln_type=VulnType.INSECURE_DESERIALIZATION,
+                    severity=severity,
+                    file_path=file_path,
+                    line_number=lineno,
+                    line_content=line.strip(),
+                    description=description,
+                    rule_id=rule_id,
+                    repo_url=repo_url,
+                    snippet=self._extract_snippet(lines, lineno),
+                ))
 
         return findings
