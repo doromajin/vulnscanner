@@ -11,6 +11,7 @@ def to_dict(result: ScanResult) -> dict:
         "summary": {
             "total_findings": result.finding_count,
             "suppressed_count": result.suppressed_count,
+            "suppression_breakdown": result.suppression_breakdown,
             "scanned_files": result.scanned_files,
             "scanned_lines": result.scanned_lines,
             "elapsed_seconds": round(result.elapsed_seconds, 2),

@@ -3,10 +3,10 @@ High-precision Python vulnerability analyzer using the built-in `ast` module.
 
 Advantages over regex:
   - Ignores string literals and comments containing dangerous-looking text
-  - Detects argument types (literal vs variable vs f-string vs concatenation)
-  - Recognizes safe parameterized queries (execute("...", (params,)))
-  - Distinguishes .exec() method calls from standalone exec()
-  - Validates subprocess shell=True with literal vs variable commands
+  - Three-state taint tracking: TAINTED / UNKNOWN / CLEAN
+  - Class-attribute tracking: self.placeholder = "?" → CLEAN
+  - Function-scope constant propagation
+  - Sink-specific sanitizer recognition
 """
 
 from __future__ import annotations
@@ -16,26 +16,23 @@ import re
 
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
+from vulnscanner.taint import (
+    TaintInfo, TaintStatus,
+    CLEAN_LITERAL, CLEAN_BUILTIN, UNKNOWN_UNRESOLVED,
+)
 
-# ── constants ──────────────────────────────────────────────────────────────────
+# ── SQL ────────────────────────────────────────────────────────────────────────
 
 _SQL_CALL_NAMES = frozenset({"execute", "executemany", "executescript", "query"})
+
+# ── Command ────────────────────────────────────────────────────────────────────
 
 _SUBPROCESS_NAMES = frozenset({
     "subprocess.run", "subprocess.call", "subprocess.Popen",
     "subprocess.check_output", "subprocess.check_call",
 })
 
-# Names that suggest a variable holds user-supplied data
-_USER_INPUT_NAMES = frozenset({
-    "request", "args", "form", "json", "params",
-    "query_params", "GET", "POST", "REQUEST", "COOKIE", "FILES",
-    "environ", "stdin", "input",
-    # additional common names
-    "values", "cookies", "headers", "body", "payload", "user_input",
-})
-
-# ── deserialization ────────────────────────────────────────────────────────────
+# ── Deserialization ────────────────────────────────────────────────────────────
 
 _PICKLE_FUNCS = frozenset({
     "pickle.loads", "pickle.load", "pickle.Unpickler",
@@ -43,12 +40,10 @@ _PICKLE_FUNCS = frozenset({
 })
 _MARSHAL_FUNCS = frozenset({"marshal.loads", "marshal.load"})
 
-# yaml.load() is safe only when Loader is one of these
 _YAML_SAFE_LOADERS = frozenset({
     "SafeLoader", "CSafeLoader",
     "yaml.SafeLoader", "yaml.CSafeLoader",
 })
-# yaml.safe_load() and yaml.load(..., Loader=SafeLoader) are excluded automatically
 _YAML_LOAD_FUNCS = frozenset({"yaml.load", "yaml.full_load"})
 _YAML_UNSAFE_FUNCS = frozenset({"yaml.unsafe_load"})
 
@@ -65,32 +60,84 @@ _HTTP_CLIENT_FUNCS = frozenset({
 # ── Open Redirect ─────────────────────────────────────────────────────────────
 
 _REDIRECT_FUNCS = frozenset({
-    "redirect",                      # Flask
-    "HttpResponseRedirect",          # Django
-    "HttpResponsePermanentRedirect", # Django
-    "RedirectResponse",              # FastAPI / Starlette
+    "redirect",
+    "HttpResponseRedirect",
+    "HttpResponsePermanentRedirect",
+    "RedirectResponse",
 })
 
 # ── SSTI ──────────────────────────────────────────────────────────────────────
 
-_TEMPLATE_RENDER_FUNCS = frozenset({
-    "render_template_string",        # Flask / Jinja2
-})
+_TEMPLATE_RENDER_FUNCS = frozenset({"render_template_string"})
+
+# ── Secrets ────────────────────────────────────────────────────────────────────
 
 _SECRET_NAME_RE = re.compile(
     r"password|passwd|pwd|secret|api_key|apikey|api_secret|"
     r"access_token|auth_token|private_key|secret_key|token",
     re.IGNORECASE,
 )
-
 _SECRET_SKIP_RE = re.compile(
     r"example|sample|placeholder|your[_\-]|<[^>]+>|\*{2,}|"
     r"xxx|dummy|fake|change[_\-]?me|todo|test|mock",
     re.IGNORECASE,
 )
 
-# Django / Jinja2 unsafe template helpers
+# ── XSS ───────────────────────────────────────────────────────────────────────
+
 _UNSAFE_TEMPLATE_FUNCS = frozenset({"mark_safe", "format_html"})
+
+# ── Taint sources and sinks ────────────────────────────────────────────────────
+
+# Variable names that are inherently user-controlled when used as standalone names.
+_TAINTED_NAME_SOURCES = frozenset({
+    "request",     # Flask / Django / FastAPI / WSGI request object
+    "user_input",  # explicit user input variable
+    "stdin",       # sys.stdin reading
+})
+
+# Attribute names that indicate user-supplied data, regardless of the object.
+_TAINTED_ATTR_NAMES = frozenset({
+    "args",         # request.args (GET params, Flask)
+    "form",         # request.form (POST params)
+    "json",         # request.json
+    "params",       # request.params (ASGI / SQLAlchemy)
+    "query_params", # ASGI request.query_params
+    "GET", "POST", "REQUEST", "COOKIE", "FILES",  # Django / PHP-style
+    "cookies",      # request.cookies
+    "headers",      # request.headers
+    "body",         # request.body (raw body)
+    "payload",      # webhook payload
+    "data",         # request.data (some frameworks)
+    "META",         # Django request.META
+    # "environ" intentionally excluded: os.environ is server-set, not user input.
+    # WSGI environ is covered via request object (request is in _TAINTED_NAME_SOURCES).
+})
+
+# Getter methods on a TAINTED object — result is also TAINTED.
+_GETTER_METHODS = frozenset({
+    "get", "getlist", "getall", "get_json",
+    "read", "readline", "readlines",
+    "decode",
+    "__getitem__", "pop", "values", "items", "keys",
+})
+
+# String template/format methods: taint is propagated from both object and args.
+_STRING_TEMPLATE_METHODS = frozenset({
+    "format", "format_map", "join", "replace",
+})
+
+# Sanitization methods: result is CLEAN regardless of input taint.
+_SANITIZER_METHODS = frozenset({
+    "escape", "html_escape", "quote", "quote_plus", "urlencode",
+    "sanitize", "bleach_clean",
+})
+_SANITIZER_FUNCS = frozenset({
+    "html.escape", "cgi.escape",
+    "urllib.parse.quote", "urllib.parse.quote_plus", "urllib.parse.urlencode",
+    "bleach.clean", "markupsafe.escape",
+    "int", "float", "bool",
+})
 
 
 # ── public analyzer ────────────────────────────────────────────────────────────
@@ -100,6 +147,8 @@ class PythonASTAnalyzer(BaseAnalyzer):
 
     Replaces regex-based SQL/CMD/PATH rules for Python, eliminating false
     positives that come from matching inside string literals and docstrings.
+    Uses three-state taint tracking (TAINTED / UNKNOWN / CLEAN) to distinguish
+    confirmed user-input flows from unresolvable and provably-safe ones.
     """
 
     supported_extensions = (".py",)
@@ -108,7 +157,7 @@ class PythonASTAnalyzer(BaseAnalyzer):
         try:
             tree = ast.parse(content, filename=file_path)
         except SyntaxError:
-            return []  # Let regex analyzers handle unparseable files
+            return []
 
         lines = content.splitlines()
         visitor = _VulnVisitor(file_path, lines, repo_url, self)
@@ -132,8 +181,15 @@ class _VulnVisitor(ast.NodeVisitor):
         self.analyzer = analyzer
         self.findings: list[Finding] = []
         self._assignments: dict[str, ast.expr] = {}
+        self._class_attrs: dict[str, ast.expr] = {}
 
-    # ── scope tracking for taint analysis ─────────────────────────────────────
+    # ── scope tracking ─────────────────────────────────────────────────────────
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        saved = self._class_attrs
+        self._class_attrs = _collect_class_attrs(node)
+        self.generic_visit(node)
+        self._class_attrs = saved
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         saved = self._assignments
@@ -169,7 +225,6 @@ class _VulnVisitor(ast.NodeVisitor):
     # ── SQL injection ──────────────────────────────────────────────────────────
 
     def _check_sql(self, node: ast.Call) -> None:
-        # Match obj.execute(...) / obj.query(...) - not standalone execute()
         if not isinstance(node.func, ast.Attribute):
             return
         if node.func.attr not in _SQL_CALL_NAMES:
@@ -178,39 +233,39 @@ class _VulnVisitor(ast.NodeVisitor):
             return
 
         first = node.args[0]
+        func = node.func.attr
 
-        # Safe: literal string  +  params as second positional or keyword arg
+        # Literal string: safe if parameterized, also safe even without params
         if _is_str_const(first):
-            has_params = (
-                len(node.args) > 1
-                or any(kw.arg in ("parameters", "params") for kw in node.keywords)
-            )
-            if has_params:
-                return  # parameterized query - safe
-            # Literal with no params: could still be safe (no user data injected)
             return
 
-        func = node.func.attr
+        # Determine rule_id and pattern label from AST structure
         if isinstance(first, ast.JoinedStr):
-            self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-001",
-                      f"{func}() receives an f-string - user data may be interpolated directly")
+            rule_id, label = "AST-SQL-001", "f-string"
         elif isinstance(first, ast.BinOp) and isinstance(first.op, ast.Add):
-            self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-002",
-                      f"{func}() receives a + concatenation - use parameterized queries")
+            rule_id, label = "AST-SQL-002", "concatenation"
         elif isinstance(first, ast.BinOp) and isinstance(first.op, ast.Mod):
-            self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-003",
-                      f"{func}() receives a %%-formatted string - use parameterized queries")
+            rule_id, label = "AST-SQL-003", "%-format"
         elif _is_format_call(first):
-            self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-004",
-                      f"{func}() receives a .format() string - use parameterized queries")
-        elif isinstance(first, ast.Name):
-            if _touches_user_input(first, self._assignments):
-                self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-005",
-                          f"{func}() receives a variable derived from user input - "
-                          "SQL injection via tainted variable")
-            else:
-                self._add(node, VulnType.SQL_INJECTION, Severity.MEDIUM, "AST-SQL-005",
-                          f"{func}() receives a variable - verify it is not user-controlled")
+            rule_id, label = "AST-SQL-004", ".format()"
+        else:
+            rule_id, label = "AST-SQL-005", "variable"
+
+        taint = _taint_of(first, self._assignments, self._class_attrs)
+
+        if taint.status == TaintStatus.CLEAN:
+            self._add_suppressed(node, VulnType.SQL_INJECTION, rule_id, "clean_taint_source", taint)
+            return
+
+        if taint.status == TaintStatus.TAINTED:
+            self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, rule_id,
+                      f"{func}() receives a tainted {label} - SQL injection risk: {taint.reason}",
+                      taint)
+        else:  # UNKNOWN
+            self._add(node, VulnType.SQL_INJECTION, Severity.MEDIUM, rule_id,
+                      f"[needs_review] {func}() receives a {label} - verify not user-controlled:"
+                      f" {taint.reason}",
+                      taint)
 
     # ── command injection ──────────────────────────────────────────────────────
 
@@ -218,33 +273,41 @@ class _VulnVisitor(ast.NodeVisitor):
         full = _full_name(node.func)
         attr = _attr_name(node.func)
 
-        # os.system / os.popen - only flag when argument is not a literal
+        # os.system / os.popen
         if full in ("os.system", "os.popen"):
-            if node.args and not _is_const(node.args[0]):
-                self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-001",
-                          f"{full}() called with non-literal argument - prefer subprocess list form")
+            if not node.args:
+                return
+            taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                return
+            qualifier = "tainted" if taint.status == TaintStatus.TAINTED else "non-literal"
+            self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-001",
+                      f"{full}() called with {qualifier} argument - prefer subprocess list form:"
+                      f" {taint.reason}",
+                      taint)
 
         # subprocess.* with shell=True
         elif full in _SUBPROCESS_NAMES:
-            if _kwarg_is_true(node, "shell"):
-                cmd = node.args[0] if node.args else None
-                if cmd is None:
-                    pass
-                elif _is_const(cmd):
-                    pass  # literal command with shell=True: lower risk, still note it
-                elif isinstance(cmd, ast.List) and all(_is_const(e) for e in cmd.elts):
+            if not _kwarg_is_true(node, "shell"):
+                return
+            cmd = node.args[0] if node.args else None
+            if cmd is None:
+                return
+            taint = _taint_of(cmd, self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                # Literal list with shell=True: still warn (remove shell=True)
+                if isinstance(cmd, ast.List) and all(_is_const(e) for e in cmd.elts):
                     self._add(node, VulnType.COMMAND_INJECTION, Severity.LOW, "AST-CMD-002",
-                              f"{full}() uses shell=True with a literal list - remove shell=True")
-                else:
-                    # Constant propagation: cmd = 'literal'; subprocess.*(cmd, shell=True) → safe
-                    if (isinstance(cmd, ast.Name) and cmd.id in self._assignments
-                            and _is_const(self._assignments[cmd.id])):
-                        pass
-                    else:
-                        self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-002",
-                                  f"{full}() uses shell=True with a non-literal command - injection risk")
+                              f"{full}() uses shell=True with literal list - remove shell=True",
+                              taint)
+                return
+            qualifier = "tainted" if taint.status == TaintStatus.TAINTED else "non-literal"
+            self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-002",
+                      f"{full}() uses shell=True with {qualifier} command - injection risk:"
+                      f" {taint.reason}",
+                      taint)
 
-        # standalone eval(expr) - NOT a method call (attr check would be None for builtins)
+        # standalone eval(expr) — NOT a method call
         elif attr == "eval" and not isinstance(node.func, ast.Attribute):
             if node.args and not _is_const(node.args[0]):
                 self._add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "AST-CMD-003",
@@ -259,30 +322,48 @@ class _VulnVisitor(ast.NodeVisitor):
     # ── path traversal ─────────────────────────────────────────────────────────
 
     def _check_path(self, node: ast.Call) -> None:
-        # Only match standalone open() (builtins), not obj.open()
         if not (isinstance(node.func, ast.Name) and node.func.id == "open"):
             return
         if not node.args:
             return
 
         path = node.args[0]
-
         if _is_const(path):
-            return  # literal path - safe
+            return
 
-        if _touches_user_input(path, self._assignments):
-            self._add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, "AST-PATH-001",
-                      "open() receives a path derived from user input - path traversal risk")
-        elif isinstance(path, ast.JoinedStr):
-            self._add(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "AST-PATH-002",
-                      "open() receives an f-string path - verify it cannot escape the intended directory")
-        elif isinstance(path, ast.BinOp) and isinstance(path.op, ast.Add):
-            self._add(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "AST-PATH-002",
-                      "open() receives a concatenated path - verify it cannot escape the intended directory")
-        elif isinstance(path, ast.Name):
-            self._add(node, VulnType.PATH_TRAVERSAL, Severity.LOW, "AST-PATH-003",
-                      "open() receives a variable path - verify the value is validated and sanitized")
-            # Note: tainted Name nodes are already caught above via _touches_user_input
+        taint = _taint_of(path, self._assignments, self._class_attrs)
+
+        if taint.status == TaintStatus.CLEAN:
+            self._add_suppressed(node, VulnType.PATH_TRAVERSAL, "AST-PATH-001",
+                                 "clean_taint_source", taint)
+            return
+
+        if taint.status == TaintStatus.TAINTED:
+            if isinstance(path, (ast.JoinedStr, ast.BinOp)):
+                self._add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, "AST-PATH-002",
+                          f"open() receives a tainted {'f-string' if isinstance(path, ast.JoinedStr) else 'concatenated'}"
+                          f" path - traversal risk: {taint.reason}",
+                          taint)
+            else:
+                self._add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, "AST-PATH-001",
+                          f"open() receives a tainted path - traversal risk: {taint.reason}",
+                          taint)
+        else:  # UNKNOWN
+            if isinstance(path, ast.JoinedStr):
+                self._add(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "AST-PATH-002",
+                          f"[needs_review] open() receives an f-string path - verify cannot escape"
+                          f" directory: {taint.reason}",
+                          taint)
+            elif isinstance(path, ast.BinOp) and isinstance(path.op, ast.Add):
+                self._add(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "AST-PATH-002",
+                          f"[needs_review] open() receives a concatenated path - verify cannot"
+                          f" escape directory: {taint.reason}",
+                          taint)
+            else:
+                self._add(node, VulnType.PATH_TRAVERSAL, Severity.LOW, "AST-PATH-003",
+                          f"[needs_review] open() receives a variable path - verify not"
+                          f" user-controlled: {taint.reason}",
+                          taint)
 
     # ── XSS (Python template helpers) ─────────────────────────────────────────
 
@@ -318,7 +399,6 @@ class _VulnVisitor(ast.NodeVisitor):
                       "yaml.unsafe_load() allows execution of arbitrary Python - use yaml.safe_load()")
 
         elif full in _YAML_LOAD_FUNCS:
-            # Safe only when Loader= is explicitly set to a safe loader
             loader_kw = next((kw for kw in node.keywords if kw.arg == "Loader"), None)
             if loader_kw is None:
                 self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH,
@@ -340,23 +420,29 @@ class _VulnVisitor(ast.NodeVisitor):
         if full not in _HTTP_CLIENT_FUNCS:
             return
 
-        # URL is the first positional argument or the keyword argument `url`
         url_arg: ast.expr | None = node.args[0] if node.args else None
         if url_arg is None:
             url_arg = next(
                 (kw.value for kw in node.keywords if kw.arg == "url"), None
             )
-        if url_arg is None or _is_const(url_arg):
-            return  # no URL or hardcoded URL - safe
+        if url_arg is None:
+            return
 
-        if _touches_user_input(url_arg, self._assignments):
+        taint = _taint_of(url_arg, self._assignments, self._class_attrs)
+
+        if taint.status == TaintStatus.CLEAN:
+            return
+
+        if taint.status == TaintStatus.TAINTED:
             self._add(node, VulnType.SSRF, Severity.HIGH, "AST-SSRF-001",
-                      f"{full}() called with URL derived from user input - "
-                      "SSRF allows requests to internal services or cloud metadata endpoints")
-        elif isinstance(url_arg, (ast.Name, ast.JoinedStr, ast.BinOp)):
+                      f"{full}() called with URL from user input - SSRF allows requests to "
+                      f"internal services or cloud metadata endpoints: {taint.reason}",
+                      taint)
+        else:  # UNKNOWN
             self._add(node, VulnType.SSRF, Severity.MEDIUM, "AST-SSRF-002",
-                      f"{full}() called with a dynamic URL - verify the value cannot "
-                      "be influenced by user-supplied data")
+                      f"[needs_review] {full}() called with dynamic URL - verify not "
+                      f"user-controlled: {taint.reason}",
+                      taint)
 
     # ── open redirect ──────────────────────────────────────────────────────────
 
@@ -369,16 +455,23 @@ class _VulnVisitor(ast.NodeVisitor):
 
         url_arg = node.args[0]
         if _is_const(url_arg):
-            return  # literal destination - safe
+            return
 
-        if _touches_user_input(url_arg, self._assignments):
+        taint = _taint_of(url_arg, self._assignments, self._class_attrs)
+
+        if taint.status == TaintStatus.CLEAN:
+            return
+
+        if taint.status == TaintStatus.TAINTED:
             self._add(node, VulnType.OPEN_REDIRECT, Severity.HIGH, "AST-REDIR-001",
-                      f"{name}() redirects to a URL from user input - "
-                      "attackers can redirect victims to malicious sites (phishing)")
-        elif isinstance(url_arg, (ast.Name, ast.JoinedStr, ast.BinOp, ast.Subscript)):
+                      f"{name}() redirects to URL from user input - attackers can redirect "
+                      f"victims to malicious sites (phishing): {taint.reason}",
+                      taint)
+        else:  # UNKNOWN
             self._add(node, VulnType.OPEN_REDIRECT, Severity.MEDIUM, "AST-REDIR-002",
-                      f"{name}() redirects to a dynamic URL - "
-                      "validate the destination against an allowlist before redirecting")
+                      f"[needs_review] {name}() redirects to dynamic URL - validate against "
+                      f"allowlist before redirecting: {taint.reason}",
+                      taint)
 
     # ── server-side template injection (SSTI) ─────────────────────────────────
 
@@ -392,7 +485,6 @@ class _VulnVisitor(ast.NodeVisitor):
                       f"{name}() renders a non-literal template string - "
                       "user-controlled template content leads to RCE via SSTI")
 
-        # Jinja2 Environment().from_string(template) with non-literal
         elif name == "from_string":
             if not node.args or _is_const(node.args[0]):
                 return
@@ -411,8 +503,6 @@ class _VulnVisitor(ast.NodeVisitor):
         name = _assign_name(target)
         if not name or not _SECRET_NAME_RE.search(name):
             return
-
-        # Value must be a non-empty string literal
         if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
             return
         secret = value.value
@@ -420,13 +510,12 @@ class _VulnVisitor(ast.NodeVisitor):
             return
         if _SECRET_SKIP_RE.search(secret):
             return
-
         self._add(
             node, VulnType.HARDCODED_SECRET, Severity.HIGH, "AST-SEC-001",
             f"Hardcoded string assigned to '{name}' - use environment variables or a secrets manager",
         )
 
-    # ── helper ─────────────────────────────────────────────────────────────────
+    # ── helpers ────────────────────────────────────────────────────────────────
 
     def _add(
         self,
@@ -435,6 +524,7 @@ class _VulnVisitor(ast.NodeVisitor):
         severity: Severity,
         rule_id: str,
         description: str,
+        taint_info: TaintInfo | None = None,
     ) -> None:
         lineno: int = getattr(node, "lineno", 0)
         self.findings.append(
@@ -445,13 +535,45 @@ class _VulnVisitor(ast.NodeVisitor):
                 line_number=lineno,
                 line_content=(
                     self.lines[lineno - 1].strip()
-                    if 0 < lineno <= len(self.lines)
-                    else ""
+                    if 0 < lineno <= len(self.lines) else ""
                 ),
                 description=description,
                 rule_id=rule_id,
                 repo_url=self.repo_url,
                 snippet=self.analyzer._extract_snippet(self.lines, lineno),
+                taint_status=taint_info.status.value if taint_info else None,
+                taint_reason=taint_info.reason if taint_info else None,
+                taint_source=taint_info.source if taint_info else None,
+                confidence=taint_info.confidence if taint_info else 1.0,
+            )
+        )
+
+    def _add_suppressed(
+        self,
+        node: ast.AST,
+        vuln_type: VulnType,
+        rule_id: str,
+        suppression_reason: str,
+        taint_info: TaintInfo | None = None,
+    ) -> None:
+        lineno: int = getattr(node, "lineno", 0)
+        self.findings.append(
+            Finding(
+                vuln_type=vuln_type,
+                severity=Severity.INFO,
+                file_path=self.file_path,
+                line_number=lineno,
+                line_content=(
+                    self.lines[lineno - 1].strip()
+                    if 0 < lineno <= len(self.lines) else ""
+                ),
+                description="",
+                rule_id=rule_id,
+                repo_url=self.repo_url,
+                suppression_reason=suppression_reason,
+                taint_status=taint_info.status.value if taint_info else "clean",
+                taint_reason=taint_info.reason if taint_info else "",
+                confidence=0.0,
             )
         )
 
@@ -532,30 +654,183 @@ def _collect_scope_assignments(
     return result
 
 
-def _touches_user_input(
+def _collect_class_attrs(cls: ast.ClassDef) -> dict[str, ast.expr]:
+    """Return {attr: rhs} for class-level assignments and self.xxx = ... in __init__."""
+    result: dict[str, ast.expr] = {}
+    for item in cls.body:
+        if isinstance(item, ast.Assign):
+            for target in item.targets:
+                if isinstance(target, ast.Name):
+                    result[target.id] = item.value
+        elif (isinstance(item, ast.AnnAssign)
+              and isinstance(item.target, ast.Name)
+              and item.value is not None):
+            result[item.target.id] = item.value
+        elif (isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and item.name == "__init__"):
+            for stmt in ast.walk(item):
+                if (isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Attribute)
+                        and isinstance(stmt.targets[0].value, ast.Name)
+                        and stmt.targets[0].value.id == "self"):
+                    result[stmt.targets[0].attr] = stmt.value
+    return result
+
+
+# ── 3-state taint analysis ─────────────────────────────────────────────────────
+
+def _taint_of(
     node: ast.expr,
     assignments: dict[str, ast.expr] | None = None,
+    class_attrs: dict[str, ast.expr] | None = None,
     _depth: int = 0,
-) -> bool:
+) -> TaintInfo:
     """
-    Heuristic taint check: True if the expression is derived from a known
-    user-input source.  When *assignments* is provided, variable references
-    are followed up to 3 hops so patterns like
-        url = request.args["url"]
-        requests.get(url)
-    are detected just as reliably as the direct form.
+    Determine the taint state of an AST expression node.
+
+    Returns TaintInfo with status TAINTED, UNKNOWN, or CLEAN:
+      TAINTED  — provably derived from user-controlled input
+      UNKNOWN  — cannot determine; emit finding at lower severity (needs_review)
+      CLEAN    — literal, constant, or provably sanitized; suppress the finding
     """
-    if _depth > 3:
-        return False
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name):
-            if child.id in _USER_INPUT_NAMES:
-                return True
-            if assignments and child.id in assignments:
-                val = assignments[child.id]
-                # Guard against trivial self-assignment cycles (url = url)
-                if val is not node and _touches_user_input(val, assignments, _depth + 1):
-                    return True
-        elif isinstance(child, ast.Attribute) and child.attr in _USER_INPUT_NAMES:
-            return True
-    return False
+    if _depth > 4:
+        return UNKNOWN_UNRESOLVED
+
+    # ── Literal constant ────────────────────────────────────────────────────────
+    if isinstance(node, ast.Constant):
+        return CLEAN_LITERAL
+
+    # ── Variable name ───────────────────────────────────────────────────────────
+    if isinstance(node, ast.Name):
+        name = node.id
+        if name in _TAINTED_NAME_SOURCES:
+            return TaintInfo(TaintStatus.TAINTED,
+                             f"known user-input source '{name}'", source=name)
+        if name in ("True", "False", "None"):
+            return CLEAN_BUILTIN
+        if assignments and name in assignments:
+            val = assignments[name]
+            if val is not node:
+                return _taint_of(val, assignments, class_attrs, _depth + 1)
+        return TaintInfo(TaintStatus.UNKNOWN,
+                         f"untracked variable '{name}'", source=name)
+
+    # ── Attribute access ────────────────────────────────────────────────────────
+    if isinstance(node, ast.Attribute):
+        attr = node.attr
+        if attr in _TAINTED_ATTR_NAMES:
+            return TaintInfo(TaintStatus.TAINTED,
+                             f"user-input attribute '.{attr}'", source=f"*.{attr}")
+        # self.attr → look up class attributes
+        if isinstance(node.value, ast.Name) and node.value.id == "self":
+            if class_attrs and attr in class_attrs:
+                return _taint_of(class_attrs[attr], assignments, class_attrs, _depth + 1)
+            return TaintInfo(TaintStatus.UNKNOWN,
+                             f"untracked class attr 'self.{attr}'", source=f"self.{attr}")
+        obj_taint = _taint_of(node.value, assignments, class_attrs, _depth + 1)
+        if obj_taint.status == TaintStatus.TAINTED:
+            return TaintInfo(TaintStatus.TAINTED,
+                             f"attribute of tainted object '.{attr}'",
+                             source=obj_taint.source)
+        return TaintInfo(TaintStatus.UNKNOWN,
+                         f"attribute '.{attr}' on {obj_taint.status.value} object",
+                         source=f"*.{attr}")
+
+    # ── Function/method call ────────────────────────────────────────────────────
+    if isinstance(node, ast.Call):
+        full = _full_name(node.func) or ""
+        attr = (node.func.attr
+                if isinstance(node.func, ast.Attribute) else "") or ""
+
+        # Built-in user-input sources
+        if full == "input":
+            return TaintInfo(TaintStatus.TAINTED, "Python input() function", source="input()")
+
+        # Sanitization → CLEAN
+        if attr in _SANITIZER_METHODS:
+            return TaintInfo(TaintStatus.CLEAN, f"sanitized by .{attr}()", sanitizers=[attr])
+        if full in _SANITIZER_FUNCS:
+            return TaintInfo(TaintStatus.CLEAN, f"sanitized by {full}()", sanitizers=[full])
+
+        if isinstance(node.func, ast.Attribute):
+            obj_taint = _taint_of(node.func.value, assignments, class_attrs, _depth + 1)
+
+            # Getter methods on tainted objects propagate taint
+            if obj_taint.status == TaintStatus.TAINTED and attr in _GETTER_METHODS:
+                return TaintInfo(TaintStatus.TAINTED,
+                                 f"tainted object getter .{attr}()",
+                                 source=obj_taint.source)
+
+            # String template methods: propagate worst taint from object + args
+            if attr in _STRING_TEMPLATE_METHODS:
+                arg_taints = [
+                    _taint_of(a, assignments, class_attrs, _depth + 1)
+                    for a in node.args
+                ]
+                return _taint_worst([obj_taint] + arg_taints)
+
+        return TaintInfo(TaintStatus.UNKNOWN,
+                         f"return of {full or attr or '<call>'}()",
+                         source=full or attr or "<call>")
+
+    # ── BinOp ───────────────────────────────────────────────────────────────────
+    if isinstance(node, ast.BinOp):
+        return _taint_merge(
+            _taint_of(node.left, assignments, class_attrs, _depth + 1),
+            _taint_of(node.right, assignments, class_attrs, _depth + 1),
+        )
+
+    # ── F-string ────────────────────────────────────────────────────────────────
+    if isinstance(node, ast.JoinedStr):
+        parts = [
+            _taint_of(v.value, assignments, class_attrs, _depth + 1)
+            for v in node.values
+            if isinstance(v, ast.FormattedValue)
+        ]
+        return _taint_worst(parts) if parts else CLEAN_LITERAL
+
+    # ── Subscript ───────────────────────────────────────────────────────────────
+    if isinstance(node, ast.Subscript):
+        obj_taint = _taint_of(node.value, assignments, class_attrs, _depth + 1)
+        if obj_taint.status == TaintStatus.TAINTED:
+            return TaintInfo(TaintStatus.TAINTED,
+                             "subscript of tainted value", source=obj_taint.source)
+        return TaintInfo(TaintStatus.UNKNOWN,
+                         f"subscript of {obj_taint.status.value} value",
+                         source=obj_taint.source)
+
+    # ── Container literals (tuple / list / set) ─────────────────────────────────
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        if not node.elts:
+            return CLEAN_LITERAL
+        return _taint_worst([
+            _taint_of(e, assignments, class_attrs, _depth + 1)
+            for e in node.elts
+        ])
+
+    # ── Conditional expression ───────────────────────────────────────────────────
+    if isinstance(node, ast.IfExp):
+        return _taint_merge(
+            _taint_of(node.body, assignments, class_attrs, _depth + 1),
+            _taint_of(node.orelse, assignments, class_attrs, _depth + 1),
+        )
+
+    return TaintInfo(TaintStatus.UNKNOWN,
+                     f"unanalyzed expr ({type(node).__name__})", source="<expr>")
+
+
+_TAINT_ORDER = {TaintStatus.TAINTED: 2, TaintStatus.UNKNOWN: 1, TaintStatus.CLEAN: 0}
+
+
+def _taint_merge(a: TaintInfo, b: TaintInfo) -> TaintInfo:
+    """Return the more severe of two TaintInfo values."""
+    return a if _TAINT_ORDER[a.status] >= _TAINT_ORDER[b.status] else b
+
+
+def _taint_worst(infos: list[TaintInfo]) -> TaintInfo:
+    """Return the most severe TaintInfo from a non-empty list."""
+    result = infos[0]
+    for t in infos[1:]:
+        result = _taint_merge(result, t)
+    return result

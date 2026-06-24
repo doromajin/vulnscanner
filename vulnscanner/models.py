@@ -35,8 +35,12 @@ class Finding:
     description: str
     rule_id: str
     repo_url: Optional[str] = None
-    snippet: Optional[str] = None  # surrounding lines for context
-    suppression_reason: Optional[str] = None  # set by scanner when file is test/vendor
+    snippet: Optional[str] = None
+    suppression_reason: Optional[str] = None  # set by scanner or AST analyzer
+    taint_status: Optional[str] = None        # "tainted" | "unknown" | "clean"
+    taint_reason: Optional[str] = None
+    taint_source: Optional[str] = None
+    confidence: float = 1.0
 
 
 @dataclass
@@ -48,6 +52,7 @@ class ScanResult:
     errors: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     suppressed_count: int = 0
+    suppression_breakdown: dict = field(default_factory=dict)
 
     @property
     def finding_count(self) -> int:

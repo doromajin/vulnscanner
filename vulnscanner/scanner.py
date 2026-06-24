@@ -150,20 +150,33 @@ class VulnScanner:
             except Exception as exc:
                 result.errors.append(f"{file_path}: {exc}")
 
-        # Inline-comment suppression (# vulnscanner: ignore)
+        # 1. Inline-comment suppression (# vulnscanner: ignore)
         inline_suppressed = [f for f in raw if _is_suppressed(f, lines)]
-        result.suppressed_count += len(inline_suppressed)
+        _add_breakdown(result, "inline_comment", len(inline_suppressed))
         raw = [f for f in raw if not _is_suppressed(f, lines)]
 
-        # File-context suppression (test / fixture / vendor paths)
+        # 2. CLEAN taint suppression (AST analyzer marked these as provably safe)
+        clean_taint = [f for f in raw if f.suppression_reason == "clean_taint_source"]
+        _add_breakdown(result, "clean_taint_source", len(clean_taint))
+        raw = [f for f in raw if f.suppression_reason != "clean_taint_source"]
+
+        # 3. File-context suppression (test / fixture / vendor paths)
         ctx_reason = _context_suppression_reason(file_path)
         if ctx_reason:
             for f in raw:
                 f.suppression_reason = ctx_reason
-            result.suppressed_count += len(raw)
+            _add_breakdown(result, ctx_reason, len(raw))
             return  # none of these findings reach result.findings
 
         result.findings.extend(_deduplicate(raw))
+
+
+def _add_breakdown(result: ScanResult, reason: str, count: int) -> None:
+    if count:
+        result.suppressed_count += count
+        result.suppression_breakdown[reason] = (
+            result.suppression_breakdown.get(reason, 0) + count
+        )
 
 
 def _context_suppression_reason(file_path: str) -> str | None:

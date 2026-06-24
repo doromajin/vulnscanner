@@ -114,9 +114,15 @@ def _print_summary(result: ScanResult) -> None:
         f"[bold]{result.scanned_lines:,}[/bold] lines in [bold]{elapsed_str}[/bold]"
     )
     if result.suppressed_count:
-        console.print(
-            f"[dim]         {result.suppressed_count} finding(s) suppressed by inline comments[/dim]"
-        )
+        msg = f"[dim]         {result.suppressed_count} finding(s) suppressed"
+        if result.suppression_breakdown:
+            bd = ", ".join(
+                f"{k.replace('_', ' ')}: {v}"
+                for k, v in sorted(result.suppression_breakdown.items())
+            )
+            msg += f" ({bd})"
+        msg += "[/dim]"
+        console.print(msg)
     if result.errors:
         console.print(f"[yellow]         {len(result.errors)} error(s) during scan[/yellow]")
 
