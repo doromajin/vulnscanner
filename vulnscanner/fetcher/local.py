@@ -10,6 +10,15 @@ _SCAN_EXTENSIONS = {
     ".env", ".yml", ".yaml", ".json", ".config",
 }
 
+# Specific filenames to scan regardless of extension (dependency manifests)
+_SCAN_FILENAMES = frozenset({
+    "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
+    "Pipfile", "Pipfile.lock",
+    "package.json",
+    "Gemfile.lock",
+    "go.mod",
+})
+
 # Directory names that are always skipped (exact match on any path component)
 _SKIP_DIRS = {
     "node_modules", ".git", "vendor", "dist", "build",
@@ -35,6 +44,10 @@ class LocalFetcher:
     def __init__(self, root: str) -> None:
         self._root = Path(root).resolve()
 
+    def ignore_file_path(self) -> Path:
+        """Return the path to .vulnscannerignore if it exists in the root."""
+        return self._root / ".vulnscannerignore"
+
     def iter_files(self) -> Iterator[tuple[str, str]]:
         """Yield (relative_path, content) for every scannable file under root."""
         for path in self._root.rglob("*"):
@@ -42,7 +55,7 @@ class LocalFetcher:
                 continue
             if self._should_skip(path):
                 continue
-            if path.suffix not in _SCAN_EXTENSIONS:
+            if path.suffix not in _SCAN_EXTENSIONS and path.name not in _SCAN_FILENAMES:
                 continue
             if path.stat().st_size > _MAX_FILE_BYTES:
                 continue

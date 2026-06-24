@@ -6,7 +6,7 @@ from rich.text import Text
 
 from vulnscanner.models import ScanResult, Severity
 
-console = Console()
+console = Console(legacy_windows=False)
 
 _SEVERITY_COLORS = {
     Severity.CRITICAL: "bold red",
@@ -88,10 +88,17 @@ def _print_summary(result: ScanResult) -> None:
         f"[dim]INFO: {counts[Severity.INFO]}[/dim]",
     ]
     console.print("Summary  " + "  ".join(parts))
+
+    elapsed = result.elapsed_seconds
+    elapsed_str = f"{elapsed:.1f}s" if elapsed < 60 else f"{int(elapsed // 60)}m {elapsed % 60:.0f}s"
     console.print(
         f"         Scanned [bold]{result.scanned_files}[/bold] files / "
-        f"[bold]{result.scanned_lines:,}[/bold] lines"
+        f"[bold]{result.scanned_lines:,}[/bold] lines in [bold]{elapsed_str}[/bold]"
     )
+    if result.suppressed_count:
+        console.print(
+            f"[dim]         {result.suppressed_count} finding(s) suppressed by inline comments[/dim]"
+        )
     if result.errors:
         console.print(f"[yellow]         {len(result.errors)} error(s) during scan[/yellow]")
     console.print()

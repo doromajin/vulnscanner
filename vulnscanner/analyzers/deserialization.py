@@ -1,0 +1,100 @@
+import re
+
+from vulnscanner.analyzers.base import BaseAnalyzer
+from vulnscanner.models import Finding, Severity, VulnType
+
+# (rule_id, pattern, description, severity, extensions)
+_RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
+    # ── Python (regex fallback for files the AST analyzer cannot parse) ────────
+    (
+        "DESER-001",
+        r'\bpickle\.(?:loads?|Unpickler)\s*\(',
+        "pickle deserialization — arbitrary code execution if data is attacker-controlled",
+        Severity.CRITICAL,
+        (".py",),
+    ),
+    (
+        "DESER-002",
+        r'\byaml\.(?:load|unsafe_load)\s*\(',
+        "yaml.load() without SafeLoader — use yaml.safe_load() to prevent code execution",
+        Severity.HIGH,
+        (".py",),
+    ),
+    (
+        "DESER-003",
+        r'\bmarshal\.loads?\s*\(',
+        "marshal deserialization — not safe against malicious data",
+        Severity.CRITICAL,
+        (".py",),
+    ),
+    # ── PHP ────────────────────────────────────────────────────────────────────
+    (
+        "DESER-004",
+        r'\bunserialize\s*\(',
+        "PHP unserialize() — object injection risk; prefer JSON for untrusted data",
+        Severity.CRITICAL,
+        (".php",),
+    ),
+    # ── Java ───────────────────────────────────────────────────────────────────
+    (
+        "DESER-005",
+        r'\bObjectInputStream\b|\breadObject\s*\(\s*\)',
+        "Java ObjectInputStream/readObject — deserialization of untrusted data leads to RCE",
+        Severity.HIGH,
+        (".java",),
+    ),
+    # ── Ruby ───────────────────────────────────────────────────────────────────
+    (
+        "DESER-006",
+        r'\bMarshal\.(?:load|restore)\s*\(',
+        "Ruby Marshal.load — arbitrary object creation from untrusted data",
+        Severity.CRITICAL,
+        (".rb",),
+    ),
+    (
+        "DESER-007",
+        r'\bYAML\.(?:unsafe_load|load)\s*\(',
+        "Ruby YAML.load / YAML.unsafe_load — code execution risk with untrusted input",
+        Severity.HIGH,
+        (".rb",),
+    ),
+    # ── Node.js ────────────────────────────────────────────────────────────────
+    (
+        "DESER-008",
+        r'require\s*\(\s*[\'"]node-serialize[\'"]',
+        "node-serialize — known RCE vulnerability; replace with a safe alternative",
+        Severity.CRITICAL,
+        (".js", ".ts"),
+    ),
+]
+
+
+class DeserializationAnalyzer(BaseAnalyzer):
+    # Python is primarily handled by PythonASTAnalyzer (higher precision).
+    # .py rules here serve as a fallback for files that cannot be AST-parsed.
+    supported_extensions = (".py", ".php", ".java", ".rb", ".js", ".ts")
+
+    def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
+        findings: list[Finding] = []
+        lines = content.splitlines()
+
+        for rule_id, pattern, description, severity, exts in _RULES:
+            if not file_path.endswith(exts):
+                continue
+            for lineno, line in enumerate(lines, start=1):
+                if self._is_comment(line):
+                    continue
+                if re.search(pattern, line, re.IGNORECASE):
+                    findings.append(Finding(
+                        vuln_type=VulnType.INSECURE_DESERIALIZATION,
+                        severity=severity,
+                        file_path=file_path,
+                        line_number=lineno,
+                        line_content=line.strip(),
+                        description=description,
+                        rule_id=rule_id,
+                        repo_url=repo_url,
+                        snippet=self._extract_snippet(lines, lineno),
+                    ))
+
+        return findings

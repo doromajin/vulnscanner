@@ -31,6 +31,50 @@ _USER_INPUT_NAMES = frozenset({
     "request", "args", "form", "json", "data", "params",
     "query_params", "GET", "POST", "REQUEST", "COOKIE", "FILES",
     "environ", "stdin", "input",
+    # additional common names
+    "values", "cookies", "headers", "body", "payload", "user_input",
+})
+
+# ── deserialization ────────────────────────────────────────────────────────────
+
+_PICKLE_FUNCS = frozenset({
+    "pickle.loads", "pickle.load", "pickle.Unpickler",
+    "cPickle.loads", "cPickle.load",
+})
+_MARSHAL_FUNCS = frozenset({"marshal.loads", "marshal.load"})
+
+# yaml.load() is safe only when Loader is one of these
+_YAML_SAFE_LOADERS = frozenset({
+    "SafeLoader", "CSafeLoader",
+    "yaml.SafeLoader", "yaml.CSafeLoader",
+})
+# yaml.safe_load() and yaml.load(..., Loader=SafeLoader) are excluded automatically
+_YAML_LOAD_FUNCS = frozenset({"yaml.load", "yaml.full_load"})
+_YAML_UNSAFE_FUNCS = frozenset({"yaml.unsafe_load"})
+
+# ── SSRF ──────────────────────────────────────────────────────────────────────
+
+_HTTP_CLIENT_FUNCS = frozenset({
+    "requests.get", "requests.post", "requests.put", "requests.patch",
+    "requests.delete", "requests.head", "requests.options", "requests.request",
+    "httpx.get", "httpx.post", "httpx.put", "httpx.patch",
+    "httpx.delete", "httpx.request",
+    "urllib.request.urlopen", "urlopen", "urllib2.urlopen",
+})
+
+# ── Open Redirect ─────────────────────────────────────────────────────────────
+
+_REDIRECT_FUNCS = frozenset({
+    "redirect",                      # Flask
+    "HttpResponseRedirect",          # Django
+    "HttpResponsePermanentRedirect", # Django
+    "RedirectResponse",              # FastAPI / Starlette
+})
+
+# ── SSTI ──────────────────────────────────────────────────────────────────────
+
+_TEMPLATE_RENDER_FUNCS = frozenset({
+    "render_template_string",        # Flask / Jinja2
 })
 
 _SECRET_NAME_RE = re.compile(
@@ -87,6 +131,17 @@ class _VulnVisitor(ast.NodeVisitor):
         self.repo_url = repo_url
         self.analyzer = analyzer
         self.findings: list[Finding] = []
+        self._assignments: dict[str, ast.expr] = {}
+
+    # ── scope tracking for taint analysis ─────────────────────────────────────
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        saved = self._assignments
+        self._assignments = _collect_scope_assignments(node)
+        self.generic_visit(node)
+        self._assignments = saved
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
     # ── dispatch ───────────────────────────────────────────────────────────────
 
@@ -95,6 +150,10 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_command(node)
         self._check_path(node)
         self._check_xss(node)
+        self._check_deserialization(node)
+        self._check_ssrf(node)
+        self._check_open_redirect(node)
+        self._check_ssti(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -145,8 +204,13 @@ class _VulnVisitor(ast.NodeVisitor):
             self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-004",
                       f"{func}() receives a .format() string — use parameterized queries")
         elif isinstance(first, ast.Name):
-            self._add(node, VulnType.SQL_INJECTION, Severity.MEDIUM, "AST-SQL-005",
-                      f"{func}() receives a variable — verify it is not user-controlled")
+            if _touches_user_input(first, self._assignments):
+                self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-005",
+                          f"{func}() receives a variable derived from user input — "
+                          "SQL injection via tainted variable")
+            else:
+                self._add(node, VulnType.SQL_INJECTION, Severity.MEDIUM, "AST-SQL-005",
+                          f"{func}() receives a variable — verify it is not user-controlled")
 
     # ── command injection ──────────────────────────────────────────────────────
 
@@ -201,7 +265,7 @@ class _VulnVisitor(ast.NodeVisitor):
         if _is_const(path):
             return  # literal path — safe
 
-        if _touches_user_input(path):
+        if _touches_user_input(path, self._assignments):
             self._add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, "AST-PATH-001",
                       "open() receives a path derived from user input — path traversal risk")
         elif isinstance(path, ast.JoinedStr):
@@ -213,6 +277,7 @@ class _VulnVisitor(ast.NodeVisitor):
         elif isinstance(path, ast.Name):
             self._add(node, VulnType.PATH_TRAVERSAL, Severity.LOW, "AST-PATH-003",
                       "open() receives a variable path — verify the value is validated and sanitized")
+            # Note: tainted Name nodes are already caught above via _touches_user_input
 
     # ── XSS (Python template helpers) ─────────────────────────────────────────
 
@@ -225,6 +290,110 @@ class _VulnVisitor(ast.NodeVisitor):
         if not _is_const(node.args[0]):
             self._add(node, VulnType.XSS, Severity.MEDIUM, "AST-XSS-001",
                       f"{name}() called with a non-literal value — verify no user input reaches this")
+
+    # ── insecure deserialization ───────────────────────────────────────────────
+
+    def _check_deserialization(self, node: ast.Call) -> None:
+        full = _full_name(node.func)
+
+        if full in _PICKLE_FUNCS:
+            self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
+                      "AST-DESER-001",
+                      f"{full}() deserializes arbitrary Python objects — never use on "
+                      "untrusted data; an attacker can achieve RCE via a crafted payload")
+
+        elif full in _MARSHAL_FUNCS:
+            self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
+                      "AST-DESER-002",
+                      f"{full}() is not designed to be safe against malicious data")
+
+        elif full in _YAML_UNSAFE_FUNCS:
+            self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
+                      "AST-DESER-003",
+                      "yaml.unsafe_load() allows execution of arbitrary Python — use yaml.safe_load()")
+
+        elif full in _YAML_LOAD_FUNCS:
+            # Safe only when Loader= is explicitly set to a safe loader
+            loader_kw = next((kw for kw in node.keywords if kw.arg == "Loader"), None)
+            if loader_kw is None:
+                self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH,
+                          "AST-DESER-004",
+                          f"{full}() without Loader= is unsafe — use yaml.safe_load() "
+                          "or pass Loader=yaml.SafeLoader")
+            else:
+                loader_name = _full_name(loader_kw.value) or _attr_name(loader_kw.value) or ""
+                if loader_name not in _YAML_SAFE_LOADERS:
+                    self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH,
+                              "AST-DESER-004",
+                              f"{full}() with Loader={loader_name} is not fully safe — "
+                              "use Loader=yaml.SafeLoader")
+
+    # ── SSRF ───────────────────────────────────────────────────────────────────
+
+    def _check_ssrf(self, node: ast.Call) -> None:
+        full = _full_name(node.func)
+        if full not in _HTTP_CLIENT_FUNCS:
+            return
+
+        # URL is the first positional argument or the keyword argument `url`
+        url_arg: ast.expr | None = node.args[0] if node.args else None
+        if url_arg is None:
+            url_arg = next(
+                (kw.value for kw in node.keywords if kw.arg == "url"), None
+            )
+        if url_arg is None or _is_const(url_arg):
+            return  # no URL or hardcoded URL — safe
+
+        if _touches_user_input(url_arg, self._assignments):
+            self._add(node, VulnType.SSRF, Severity.HIGH, "AST-SSRF-001",
+                      f"{full}() called with URL derived from user input — "
+                      "SSRF allows requests to internal services or cloud metadata endpoints")
+        elif isinstance(url_arg, (ast.Name, ast.JoinedStr, ast.BinOp)):
+            self._add(node, VulnType.SSRF, Severity.MEDIUM, "AST-SSRF-002",
+                      f"{full}() called with a dynamic URL — verify the value cannot "
+                      "be influenced by user-supplied data")
+
+    # ── open redirect ──────────────────────────────────────────────────────────
+
+    def _check_open_redirect(self, node: ast.Call) -> None:
+        name = _attr_name(node.func) or _full_name(node.func)
+        if name not in _REDIRECT_FUNCS:
+            return
+        if not node.args:
+            return
+
+        url_arg = node.args[0]
+        if _is_const(url_arg):
+            return  # literal destination — safe
+
+        if _touches_user_input(url_arg, self._assignments):
+            self._add(node, VulnType.OPEN_REDIRECT, Severity.HIGH, "AST-REDIR-001",
+                      f"{name}() redirects to a URL from user input — "
+                      "attackers can redirect victims to malicious sites (phishing)")
+        elif isinstance(url_arg, (ast.Name, ast.JoinedStr, ast.BinOp, ast.Subscript)):
+            self._add(node, VulnType.OPEN_REDIRECT, Severity.MEDIUM, "AST-REDIR-002",
+                      f"{name}() redirects to a dynamic URL — "
+                      "validate the destination against an allowlist before redirecting")
+
+    # ── server-side template injection (SSTI) ─────────────────────────────────
+
+    def _check_ssti(self, node: ast.Call) -> None:
+        name = _attr_name(node.func) or _full_name(node.func)
+
+        if name in _TEMPLATE_RENDER_FUNCS:
+            if not node.args or _is_const(node.args[0]):
+                return
+            self._add(node, VulnType.SSTI, Severity.CRITICAL, "AST-SSTI-001",
+                      f"{name}() renders a non-literal template string — "
+                      "user-controlled template content leads to RCE via SSTI")
+
+        # Jinja2 Environment().from_string(template) with non-literal
+        elif name == "from_string":
+            if not node.args or _is_const(node.args[0]):
+                return
+            self._add(node, VulnType.SSTI, Severity.HIGH, "AST-SSTI-002",
+                      "Environment.from_string() with non-literal template — "
+                      "verify the template source is not user-controlled")
 
     # ── hardcoded secrets ──────────────────────────────────────────────────────
 
@@ -339,14 +508,49 @@ def _kwarg_is_true(node: ast.Call, name: str) -> bool:
     return False
 
 
-def _touches_user_input(node: ast.expr) -> bool:
+def _collect_scope_assignments(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> dict[str, ast.expr]:
+    """Return {name: rhs} for simple name assignments inside a function body."""
+    result: dict[str, ast.expr] = {}
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    result[target.id] = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+        ):
+            result[node.target.id] = node.value
+    return result
+
+
+def _touches_user_input(
+    node: ast.expr,
+    assignments: dict[str, ast.expr] | None = None,
+    _depth: int = 0,
+) -> bool:
     """
-    Heuristic: walk the expression tree and check whether any Name or
-    Attribute node uses a name commonly associated with user-supplied data.
+    Heuristic taint check: True if the expression is derived from a known
+    user-input source.  When *assignments* is provided, variable references
+    are followed up to 3 hops so patterns like
+        url = request.args["url"]
+        requests.get(url)
+    are detected just as reliably as the direct form.
     """
+    if _depth > 3:
+        return False
     for child in ast.walk(node):
-        if isinstance(child, ast.Name) and child.id in _USER_INPUT_NAMES:
-            return True
-        if isinstance(child, ast.Attribute) and child.attr in _USER_INPUT_NAMES:
+        if isinstance(child, ast.Name):
+            if child.id in _USER_INPUT_NAMES:
+                return True
+            if assignments and child.id in assignments:
+                val = assignments[child.id]
+                # Guard against trivial self-assignment cycles (url = url)
+                if val is not node and _touches_user_input(val, assignments, _depth + 1):
+                    return True
+        elif isinstance(child, ast.Attribute) and child.attr in _USER_INPUT_NAMES:
             return True
     return False

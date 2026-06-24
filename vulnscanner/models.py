@@ -17,6 +17,12 @@ class VulnType(str, Enum):
     COMMAND_INJECTION = "Command Injection"
     PATH_TRAVERSAL = "Path Traversal"
     HARDCODED_SECRET = "Hardcoded Secret"
+    INSECURE_DESERIALIZATION = "Insecure Deserialization"
+    SSRF = "Server-Side Request Forgery (SSRF)"
+    OPEN_REDIRECT = "Open Redirect"
+    SSTI = "Server-Side Template Injection (SSTI)"
+    PROTOTYPE_POLLUTION = "Prototype Pollution"
+    VULNERABLE_DEPENDENCY = "Vulnerable Dependency"
 
 
 @dataclass
@@ -39,6 +45,8 @@ class ScanResult:
     scanned_files: int = 0
     scanned_lines: int = 0
     errors: list[str] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
+    suppressed_count: int = 0
 
     @property
     def finding_count(self) -> int:

@@ -50,6 +50,10 @@ def cmd_os_system_literal():
 def path_user_input(request):
     open(request.args.get("file"))          # AST-PATH-001 (direct user input)
 
+def path_indirect(request):
+    filename = request.args.get("file")
+    open(filename)                          # AST-PATH-001 (via taint tracking)
+
 def path_fstring(filename):
     open(f"uploads/{filename}")             # AST-PATH-002 (f-string)
 
@@ -64,6 +68,75 @@ def path_safe():
 SECRET_KEY = "s3cr3t-django-key-xyz"       # AST-SEC-001
 api_token = "Bearer eyJhbGciOiJIUzI1NiJ9"  # AST-SEC-001
 placeholder_password = "your-password-here" # safe — placeholder
+
+# ── insecure deserialization ──────────────────────────────────────────────────
+
+import pickle
+import marshal
+import yaml
+
+def deser_pickle(data):
+    return pickle.loads(data)            # AST-DESER-001
+
+def deser_marshal(data):
+    return marshal.loads(data)           # AST-DESER-002
+
+def deser_yaml_unsafe(stream):
+    return yaml.unsafe_load(stream)      # AST-DESER-003
+
+def deser_yaml_no_loader(stream):
+    return yaml.load(stream)             # AST-DESER-004
+
+def deser_yaml_safe(stream):
+    return yaml.safe_load(stream)        # safe
+
+def deser_yaml_with_safe_loader(stream):
+    return yaml.load(stream, Loader=yaml.SafeLoader)  # safe
+
+# ── SSRF ──────────────────────────────────────────────────────────────────────
+
+import requests
+
+def ssrf_user_url(request):
+    return requests.get(request.args.get("url"))  # AST-SSRF-001
+
+def ssrf_indirect(request):
+    url = request.args.get("url")
+    return requests.get(url)             # AST-SSRF-001 (via taint tracking)
+
+def ssrf_dynamic_url(endpoint):
+    return requests.post(endpoint)       # AST-SSRF-002
+
+def ssrf_safe():
+    return requests.get("https://api.internal/health")  # safe — literal
+
+# ── open redirect ─────────────────────────────────────────────────────────────
+
+from flask import redirect, request as flask_req
+
+def redir_user_input(request):
+    return redirect(request.args.get("next"))  # AST-REDIR-001
+
+def redir_indirect(request):
+    dest = request.args.get("next")
+    return redirect(dest)                # AST-REDIR-001 (via taint tracking)
+
+def redir_dynamic(dest):
+    return redirect(dest)                # AST-REDIR-002
+
+def redir_safe():
+    return redirect("/dashboard")        # safe — literal
+
+# ── server-side template injection ────────────────────────────────────────────
+
+from flask import render_template_string
+
+def ssti_user_template(request):
+    tmpl = request.args.get("template")
+    return render_template_string(tmpl)  # AST-SSTI-001
+
+def ssti_safe():
+    return render_template_string("<h1>Hello</h1>")  # safe — literal
 
 # ── false positive checks: these should NOT be detected ───────────────────────
 

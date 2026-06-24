@@ -5,15 +5,17 @@ from vulnscanner.models import ScanResult
 
 
 def to_dict(result: ScanResult) -> dict:
+    from vulnscanner.models import Severity
     return {
         "repo_url": result.repo_url,
         "summary": {
             "total_findings": result.finding_count,
+            "suppressed_count": result.suppressed_count,
             "scanned_files": result.scanned_files,
             "scanned_lines": result.scanned_lines,
+            "elapsed_seconds": round(result.elapsed_seconds, 2),
             "by_severity": {
-                s.value: len(result.by_severity(s))
-                for s in __import__("vulnscanner.models", fromlist=["Severity"]).Severity
+                s.value: len(result.by_severity(s)) for s in Severity
             },
         },
         "findings": [asdict(f) for f in result.findings],
