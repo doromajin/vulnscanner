@@ -3,25 +3,6 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
-# Path segments that indicate test/fixture code - secrets there are low-risk
-# Learned from WebGoat: 10 SEC-001 findings in src/test/ were expected test setup
-_TEST_PATH_SEGMENTS = frozenset({
-    "test", "tests", "spec", "specs", "__tests__",
-    "fixtures", "mocks", "stubs", "fakes",
-    "it",  # Java integration tests (src/it/)
-})
-
-_TEST_FILE_SUFFIXES = ("test.java", "tests.java", "spec.java", "test.py",
-                       "_test.py", "test.js", "spec.js", "spec.ts", "test.ts")
-
-
-def _is_test_path(file_path: str) -> bool:
-    parts = file_path.replace("\\", "/").lower().split("/")
-    if any(p in _TEST_PATH_SEGMENTS for p in parts):
-        return True
-    return file_path.lower().endswith(_TEST_FILE_SUFFIXES)
-
-
 _RULES = [
     (
         "SEC-001",
@@ -43,14 +24,12 @@ _RULES = [
     ),
     (
         "SEC-004",
-        # AWS access key pattern
         r'AKIA[0-9A-Z]{16}',
         "AWS access key ID pattern detected",
         Severity.CRITICAL,
     ),
     (
         "SEC-005",
-        # Private key header
         r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',
         "Private key material in source code",
         Severity.CRITICAL,
@@ -69,11 +48,10 @@ _RULES = [
     ),
 ]
 
-# Lines that are clearly test/example values - skip them
 _ALLOWLIST_PATTERNS = [
     r'example|sample|placeholder|your[_-]|<.*>|\*{3,}|xxx|dummy|fake',
-    r'#.*password',  # commented out
-    r'^\s*//',       # JS/Java comment line
+    r'#.*password',
+    r'^\s*//',
 ]
 
 
@@ -86,15 +64,8 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         findings: list[Finding] = []
         lines = content.splitlines()
-        in_test = _is_test_path(file_path)
 
         for rule_id, pattern, description, severity in _RULES:
-            # Downgrade non-CRITICAL findings in test/fixture code to LOW
-            # Confirmed via WebGoat: test passwords are expected and not exploitable
-            effective_severity = severity
-            if in_test and severity not in (Severity.CRITICAL,):
-                effective_severity = Severity.LOW
-
             for lineno, line in enumerate(lines, start=1):
                 if self._is_comment(line):
                     continue
@@ -102,17 +73,14 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                     continue
                 if any(re.search(a, line, re.IGNORECASE) for a in _ALLOWLIST_PATTERNS):
                     continue
-                desc = description
-                if in_test and effective_severity != severity:
-                    desc = f"{description} [test file - severity reduced]"
                 findings.append(
                     Finding(
                         vuln_type=VulnType.HARDCODED_SECRET,
-                        severity=effective_severity,
+                        severity=severity,
                         file_path=file_path,
                         line_number=lineno,
                         line_content=line.strip(),
-                        description=desc,
+                        description=description,
                         rule_id=rule_id,
                         repo_url=repo_url,
                         snippet=self._extract_snippet(lines, lineno),

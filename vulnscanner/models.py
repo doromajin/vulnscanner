@@ -36,6 +36,7 @@ class Finding:
     rule_id: str
     repo_url: Optional[str] = None
     snippet: Optional[str] = None  # surrounding lines for context
+    suppression_reason: Optional[str] = None  # set by scanner when file is test/vendor
 
 
 @dataclass

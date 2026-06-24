@@ -7,6 +7,11 @@ import time
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from vulnscanner.analyzers import ALL_ANALYZERS, BaseAnalyzer
+from vulnscanner.analyzers.file_context import (
+    INCLUDE_TEST_FILES,
+    INCLUDE_VENDOR_FILES,
+    classify_file_context,
+)
 from vulnscanner.fetcher.github import GitHubFetcher
 from vulnscanner.fetcher.local import LocalFetcher
 from vulnscanner.models import Finding, ScanResult
@@ -145,10 +150,30 @@ class VulnScanner:
             except Exception as exc:
                 result.errors.append(f"{file_path}: {exc}")
 
-        suppressed = [f for f in raw if _is_suppressed(f, lines)]
-        result.suppressed_count += len(suppressed)
+        # Inline-comment suppression (# vulnscanner: ignore)
+        inline_suppressed = [f for f in raw if _is_suppressed(f, lines)]
+        result.suppressed_count += len(inline_suppressed)
         raw = [f for f in raw if not _is_suppressed(f, lines)]
+
+        # File-context suppression (test / fixture / vendor paths)
+        ctx_reason = _context_suppression_reason(file_path)
+        if ctx_reason:
+            for f in raw:
+                f.suppression_reason = ctx_reason
+            result.suppressed_count += len(raw)
+            return  # none of these findings reach result.findings
+
         result.findings.extend(_deduplicate(raw))
+
+
+def _context_suppression_reason(file_path: str) -> str | None:
+    """Return the suppression reason for *file_path*, or None if not suppressed."""
+    ctx = classify_file_context(file_path)
+    if not INCLUDE_TEST_FILES and (ctx["is_test"] or ctx["is_fixture"]):
+        return ctx["reason"]
+    if not INCLUDE_VENDOR_FILES and ctx["is_vendor"]:
+        return ctx["reason"]
+    return None
 
 
 def _is_suppressed(finding: Finding, lines: list[str]) -> bool:

@@ -3,32 +3,6 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
-# Vendor/library filename patterns - innerHTML usage is intentional, not exploitable
-# Confirmed FP: snipe-it html5shiv.js is a browser polyfill, not app code
-_VENDOR_FILE_RE = re.compile(
-    r'(?:^|[\\/])(?:'
-    r'jquery[.-]|bootstrap[.-]|html5shiv|modernizr|respond|polyfill|'
-    r'lodash|underscore|backbone|ember|angular|react|vue|'
-    r'moment|chart\.js|d3\.js|leaflet|tinymce|ckeditor|codemirror|'
-    r'font-awesome|normalize|reset\.css'
-    r')',
-    re.IGNORECASE,
-)
-
-_VENDOR_PATH_SEGMENTS = frozenset({
-    "vendor", "node_modules", "bower_components",
-    "public/js/lib", "assets/js/lib", "static/js/lib",
-    "dist", "build",  # often contain pre-built third-party bundles
-})
-
-
-def _is_vendor_file(file_path: str) -> bool:
-    parts = file_path.replace("\\", "/").lower().split("/")
-    if any(p in _VENDOR_PATH_SEGMENTS for p in parts):
-        return True
-    return bool(_VENDOR_FILE_RE.search(file_path))
-
-
 # ── Simple per-line rules (XSS-002 to XSS-007) ────────────────────────────────
 
 _SIMPLE_RULES = [
@@ -174,11 +148,6 @@ class XSSAnalyzer(BaseAnalyzer):
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         findings: list[Finding] = []
         lines = content.splitlines()
-
-        # Skip vendor/library files entirely - innerHTML usage is intentional there.
-        # Confirmed FP: snipe-it html5shiv.js is a browser polyfill, not app code.
-        if _is_vendor_file(file_path):
-            return findings
 
         # XSS-001: smart innerHTML check (handles multiline template literals)
         findings.extend(self._check_innerhtml(file_path, lines, repo_url))

@@ -169,30 +169,32 @@ class TestHardcodedSecrets:
         findings = HardcodedSecretsAnalyzer().analyze("src/main/Config.java", code)
         assert findings[0].severity == Severity.HIGH
 
-    def test_test_file_password_downgraded_to_low(self):
-        # Learned from WebGoat: src/test/ passwords are expected test setup, not exploitable
+    def test_analyzer_reports_test_file_finding_at_full_severity(self):
+        # Analyzer itself no longer downgrades severity — scanner handles suppression.
+        # SEC-001 in a test file is reported at HIGH by the analyzer.
+        # The scanner would suppress it before it reaches result.findings.
         code = 'password = "supersecret123"'
         findings = HardcodedSecretsAnalyzer().analyze("src/test/java/UserServiceTest.java", code)
-        assert findings, "Should still detect it"
-        assert findings[0].severity == Severity.LOW
+        assert findings, "Analyzer should detect the pattern"
+        assert findings[0].severity == Severity.HIGH
 
-    def test_test_file_critical_stays_critical(self):
-        # CRITICAL (e.g. embedded private key) stays critical even in test files
-        # Must be in a string literal so _is_comment() doesn't skip the '---' prefix
+    def test_analyzer_reports_critical_in_test_file(self):
+        # Analyzer reports at CRITICAL regardless of path. Scanner suppresses.
         code = 'String key = "-----BEGIN RSA PRIVATE KEY-----";'
         findings = HardcodedSecretsAnalyzer().analyze("src/test/CryptoTest.java", code)
         crit = [f for f in findings if f.rule_id == "SEC-005"]
         assert crit and crit[0].severity == Severity.CRITICAL
 
-    def test_spec_directory_downgraded(self):
+    def test_analyzer_reports_spec_directory_at_full_severity(self):
+        # Severity downgrade removed — scanner suppresses test/spec findings instead.
         code = 'password = "testpass"'
         findings = HardcodedSecretsAnalyzer().analyze("spec/auth_spec.rb", code)
-        assert findings and findings[0].severity == Severity.LOW
+        assert findings and findings[0].severity == Severity.HIGH
 
-    def test_test_suffix_java_downgraded(self):
+    def test_analyzer_reports_test_suffix_at_full_severity(self):
         code = 'String password = "MyP@ssw0rd";'
         findings = HardcodedSecretsAnalyzer().analyze("AuthControllerTest.java", code)
-        assert findings and findings[0].severity == Severity.LOW
+        assert findings and findings[0].severity == Severity.HIGH
 
 
 # ── AST-based Python analyzer ─────────────────────────────────────────────────

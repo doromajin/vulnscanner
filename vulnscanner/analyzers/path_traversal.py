@@ -46,10 +46,6 @@ _RULES = [
     ),
 ]
 
-# Path fragments that indicate test/fixture code - lower value, skip PATH-005 there
-_TEST_PATH_MARKERS = ("/test/", "/tests/", "/spec/", "/it/", "/fixture", "/mock")
-
-
 class PathTraversalAnalyzer(BaseAnalyzer):
     # .py is handled by PythonASTAnalyzer with higher precision
     supported_extensions = (".php", ".js", ".ts", ".java", ".rb")
@@ -57,15 +53,10 @@ class PathTraversalAnalyzer(BaseAnalyzer):
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         findings: list[Finding] = []
         lines = content.splitlines()
-        fp_lower = file_path.replace("\\", "/").lower()
 
         for rule_id, pattern, description, severity, lang_filter in _RULES:
             # Respect per-rule language filter
             if lang_filter and not any(file_path.endswith(ext) for ext in lang_filter):
-                continue
-
-            # PATH-005 in test files is almost always intentional - skip
-            if rule_id == "PATH-005" and any(m in fp_lower for m in _TEST_PATH_MARKERS):
                 continue
 
             for lineno, line in enumerate(lines, start=1):
