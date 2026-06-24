@@ -1,5 +1,6 @@
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
 from vulnscanner.analyzers.base import BaseAnalyzer
+from vulnscanner.analyzers.client_side import ClientSideAnalyzer
 from vulnscanner.analyzers.command_injection import CommandInjectionAnalyzer
 from vulnscanner.analyzers.dependencies import DependencyAnalyzer
 from vulnscanner.analyzers.deserialization import DeserializationAnalyzer
@@ -25,6 +26,8 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     OpenRedirectAnalyzer(),
     SSTIAnalyzer(),
     PrototypePollutionAnalyzer(),
+    # Browser-specific patterns (localStorage, SRI, postMessage, client-side SSRF)
+    ClientSideAnalyzer(),
     # Runs on all languages including .py (for SEC-004/005/007 content patterns)
     HardcodedSecretsAnalyzer(),
     # Checks dependency manifests against OSV.dev CVE database

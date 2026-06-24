@@ -17,6 +17,7 @@ from vulnscanner.analyzers.deserialization import DeserializationAnalyzer
 from vulnscanner.analyzers.hardcoded_secrets import HardcodedSecretsAnalyzer
 from vulnscanner.analyzers.open_redirect import OpenRedirectAnalyzer
 from vulnscanner.analyzers.prototype_pollution import PrototypePollutionAnalyzer
+from vulnscanner.analyzers.client_side import ClientSideAnalyzer
 from vulnscanner.analyzers.sql_injection import SQLInjectionAnalyzer
 from vulnscanner.analyzers.ssrf import SSRFAnalyzer
 from vulnscanner.analyzers.ssti import SSTIAnalyzer
@@ -796,3 +797,94 @@ class TestScanResultMetadata:
         d = to_dict(r)
         assert d["summary"]["elapsed_seconds"] == 1.23
         assert d["summary"]["suppressed_count"] == 3
+
+
+# ── client-side security analyzer ────────────────────────────────────────────
+
+CS = ClientSideAnalyzer()
+
+
+class TestClientSideAnalyzer:
+    # CLIENT-CRED-001
+
+    def test_cred_api_key_in_localstorage(self):
+        code = "localStorage.setItem('fugu_api_key', key);"
+        findings = CS.analyze("t.html", code)
+        assert any(f.rule_id == "CLIENT-CRED-001" for f in findings)
+
+    def test_cred_password_in_sessionstorage(self):
+        code = "sessionStorage.setItem('user_password', pwd);"
+        findings = CS.analyze("t.js", code)
+        assert any(f.rule_id == "CLIENT-CRED-001" for f in findings)
+
+    def test_cred_non_sensitive_key_no_flag(self):
+        code = "localStorage.setItem('theme', 'dark');"
+        findings = CS.analyze("t.html", code)
+        assert not any(f.rule_id == "CLIENT-CRED-001" for f in findings)
+
+    # CLIENT-SRI-001
+
+    def test_sri_cdn_script_no_integrity(self):
+        code = '<script src="https://cdn.example.com/lib.js"></script>'
+        findings = CS.analyze("t.html", code)
+        assert any(f.rule_id == "CLIENT-SRI-001" for f in findings)
+
+    def test_sri_cdn_script_with_integrity_no_flag(self):
+        code = '<script src="https://cdn.example.com/lib.js" integrity="sha384-abc" crossorigin="anonymous"></script>'
+        findings = CS.analyze("t.html", code)
+        assert not any(f.rule_id == "CLIENT-SRI-001" for f in findings)
+
+    # CLIENT-SRI-002
+
+    def test_sri2_esm_import_from_cdn(self):
+        code = "import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';"
+        findings = CS.analyze("t.html", code)
+        assert any(f.rule_id == "CLIENT-SRI-002" for f in findings)
+
+    def test_sri2_local_import_no_flag(self):
+        code = "import { helper } from './utils.js';"
+        findings = CS.analyze("t.js", code)
+        assert not any(f.rule_id == "CLIENT-SRI-002" for f in findings)
+
+    # CLIENT-FETCH-001
+
+    def test_fetch_direct_localstorage_url(self):
+        code = "fetch(localStorage.getItem('endpoint'));"
+        findings = CS.analyze("t.js", code)
+        assert any(f.rule_id == "CLIENT-FETCH-001" for f in findings)
+
+    def test_fetch_variable_from_localstorage(self):
+        code = (
+            "const baseUrl = localStorage.getItem('fugu_base_url') || 'https://default.com';\n"
+            "const res = await fetch(`${baseUrl}/chat/completions`, { method: 'POST' });\n"
+        )
+        findings = CS.analyze("t.html", code)
+        assert any(f.rule_id == "CLIENT-FETCH-001" for f in findings)
+
+    def test_fetch_static_url_no_flag(self):
+        code = "const res = await fetch('https://api.example.com/v1/data');"
+        findings = CS.analyze("t.js", code)
+        assert not any(f.rule_id == "CLIENT-FETCH-001" for f in findings)
+
+    # CLIENT-MSG-001
+
+    def test_postmessage_no_origin_check(self):
+        code = (
+            "window.addEventListener('message', function(event) {\n"
+            "    const data = event.data;\n"
+            "    processData(data);\n"
+            "});\n"
+        )
+        findings = CS.analyze("t.js", code)
+        assert any(f.rule_id == "CLIENT-MSG-001" for f in findings)
+
+    def test_postmessage_with_origin_check_no_flag(self):
+        code = (
+            "window.addEventListener('message', function(event) {\n"
+            "    if (event.origin !== 'https://trusted.com') return;\n"
+            "    const data = event.data;\n"
+            "    processData(data);\n"
+            "});\n"
+        )
+        findings = CS.analyze("t.js", code)
+        assert not any(f.rule_id == "CLIENT-MSG-001" for f in findings)
