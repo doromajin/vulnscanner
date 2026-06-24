@@ -8,6 +8,14 @@ from vulnscanner.models import ScanResult, Severity
 
 console = Console(legacy_windows=False)
 
+_GRADE_BADGE = {
+    "HIGH":    "[bold red][HIGH][/bold red]",
+    "MEDIUM":  "[yellow][MEDIUM][/yellow]",
+    "LOW":     "[cyan][LOW][/cyan]",
+    "MINIMAL": "[dim][MINIMAL][/dim]",
+    "CLEAN":   "[green][CLEAN][/green]",
+}
+
 _SEVERITY_COLORS = {
     Severity.CRITICAL: "bold red",
     Severity.HIGH: "red",
@@ -101,4 +109,63 @@ def _print_summary(result: ScanResult) -> None:
         )
     if result.errors:
         console.print(f"[yellow]         {len(result.errors)} error(s) during scan[/yellow]")
+
+    # Risk profile badge
+    from vulnscanner.profiler import profile as build_profile
+    p = build_profile(result)
+    badge = _GRADE_BADGE[p.grade]
+    bar = _score_bar(p.score)
+    console.print(f"Risk     {badge}  Score {p.score}/100  {bar}")
+    console.print()
+
+
+def _score_bar(score: int, width: int = 20) -> str:
+    filled = round(score / 100 * width)
+    return "[green]" + "#" * filled + "[/green][dim]" + "-" * (width - filled) + "[/dim]"
+
+
+def print_rank_table(profiles: list) -> None:
+    """Display a ranked table of RiskProfile objects."""
+    from vulnscanner.profiler import RiskProfile
+    ranked = sorted(profiles, key=lambda p: p.score, reverse=True)
+
+    console.print()
+    console.rule("[bold]Vulnerability Risk Ranking")
+    console.print()
+
+    table = Table(
+        box=box.ROUNDED,
+        show_lines=True,
+        header_style="bold",
+    )
+    table.add_column("#", width=3, justify="right")
+    table.add_column("Repository", overflow="fold")
+    table.add_column("Score", width=7, justify="center")
+    table.add_column("Level", width=10)
+    table.add_column("Findings", width=18)
+    table.add_column("Top Risk Categories")
+
+    for rank, p in enumerate(ranked, start=1):
+        # Severity breakdown string: "6H 4M 34L"
+        sev_parts = []
+        for label, short in [("CRITICAL","C"), ("HIGH","H"), ("MEDIUM","M"), ("LOW","L")]:
+            n = p.by_severity.get(label, 0)
+            if n:
+                sev_parts.append(f"{n}{short}")
+        sev_str = " ".join(sev_parts) if sev_parts else "—"
+
+        bar = _score_bar(p.score, width=10)
+        top = ", ".join(p.top_vuln_types[:2]) if p.top_vuln_types else "—"
+        short_repo = p.repo.rstrip("/").split("/")[-1]
+
+        table.add_row(
+            str(rank),
+            short_repo,
+            f"{p.score}/100",
+            _GRADE_BADGE[p.grade],
+            sev_str,
+            top,
+        )
+
+    console.print(table)
     console.print()
