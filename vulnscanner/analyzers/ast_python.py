@@ -28,7 +28,7 @@ _SUBPROCESS_NAMES = frozenset({
 
 # Names that suggest a variable holds user-supplied data
 _USER_INPUT_NAMES = frozenset({
-    "request", "args", "form", "json", "data", "params",
+    "request", "args", "form", "json", "params",
     "query_params", "GET", "POST", "REQUEST", "COOKIE", "FILES",
     "environ", "stdin", "input",
     # additional common names
@@ -236,8 +236,13 @@ class _VulnVisitor(ast.NodeVisitor):
                     self._add(node, VulnType.COMMAND_INJECTION, Severity.LOW, "AST-CMD-002",
                               f"{full}() uses shell=True with a literal list — remove shell=True")
                 else:
-                    self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-002",
-                              f"{full}() uses shell=True with a non-literal command — injection risk")
+                    # Constant propagation: cmd = 'literal'; subprocess.*(cmd, shell=True) → safe
+                    if (isinstance(cmd, ast.Name) and cmd.id in self._assignments
+                            and _is_const(self._assignments[cmd.id])):
+                        pass
+                    else:
+                        self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-002",
+                                  f"{full}() uses shell=True with a non-literal command — injection risk")
 
         # standalone eval(expr) — NOT a method call (attr check would be None for builtins)
         elif attr == "eval" and not isinstance(node.func, ast.Attribute):

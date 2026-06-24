@@ -3,13 +3,9 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
-_RULES = [
-    (
-        "XSS-001",
-        r'innerHTML\s*=\s*(?![\'"]\s*[\'"])',
-        "Direct innerHTML assignment — user data written without sanitization",
-        Severity.HIGH,
-    ),
+# ── Simple per-line rules (XSS-002 to XSS-007) ────────────────────────────────
+
+_SIMPLE_RULES = [
     (
         "XSS-002",
         r'document\.write\s*\(',
@@ -24,14 +20,12 @@ _RULES = [
     ),
     (
         "XSS-004",
-        # Python: render without escape in Jinja2/Django templates
         r'\|\s*safe\b|mark_safe\s*\(|format_html\s*\(.*\+',
         "Template value marked safe without explicit sanitization",
         Severity.MEDIUM,
     ),
     (
         "XSS-005",
-        # PHP echo with $_GET/$_POST/$_REQUEST
         r'echo\s+\$_(?:GET|POST|REQUEST|COOKIE)',
         "PHP direct echo of user-supplied input",
         Severity.HIGH,
@@ -50,6 +44,103 @@ _RULES = [
     ),
 ]
 
+# ── XSS-001: innerHTML smart analysis ─────────────────────────────────────────
+
+# Functions whose return value is safe to assign to innerHTML.
+_SAFE_FUNCS = frozenset({
+    "escHtml", "escapeHtml", "htmlEscape", "sanitize", "sanitizeHtml", "escape",
+    "encodeURIComponent", "encodeURI",
+    "DOMPurify.sanitize",
+    "Number", "parseInt", "parseFloat",
+    "JSON.stringify",
+})
+
+# Regex to extract all ${...} interpolations from a template literal.
+_INTERP_RE = re.compile(r'\$\{([^}]+)\}')
+
+
+def _is_safe_interpolation(expr: str) -> bool:
+    """
+    Return True when a ${expr} value cannot introduce XSS.
+
+    Conservative rule: any function call is treated as safer than a bare
+    identifier/property access.  Only bare references (e.g. ``${c.id}``,
+    ``${title}``) are considered unsafe.
+    """
+    expr = expr.strip()
+
+    # Numeric / boolean constant
+    if re.match(r'^[\d.]+$', expr) or expr in ('true', 'false', 'null', 'undefined'):
+        return True
+
+    # .length is always a number
+    if re.match(r'^[\w$.]+\.length$', expr):
+        return True
+
+    # Arithmetic / comparison / conditional operators mean the value is not
+    # a direct variable reference
+    if any(op in expr for op in (' + ', ' - ', ' * ', ' / ', ' ? ', ' : ', ' === ', ' !== ', ' == ', ' != ')):
+        return True
+
+    # Known-safe sanitization function
+    for func in _SAFE_FUNCS:
+        if expr.startswith(func + '('):
+            return True
+
+    # Any function call at all — the developer is applying some transformation
+    if re.search(r'\w\s*\(', expr):
+        return True
+
+    # Bare identifier (``varName``) or property access (``obj.prop``) — flag
+    return False
+
+
+def _innerhtml_is_unsafe(block: str) -> bool:
+    """
+    Analyse a (possibly multiline) ``innerHTML = ...`` assignment block.
+
+    Returns True only when there is evidence of unsanitized data interpolation.
+
+    Safe patterns (return False):
+    - Quoted string literals  e.g.  innerHTML = '<div>static</div>'
+    - Template literals with no ${}  e.g.  innerHTML = `<svg>...</svg>`
+    - Template literals where every ${} uses a known-safe or any function call
+    - Ternary expressions where no ${} appears anywhere
+    """
+    m = re.search(r'innerHTML\s*=\s*([\s\S]*)', block)
+    if not m:
+        return False
+    rhs = m.group(1).strip().rstrip(';').strip()
+    if not rhs:
+        return False
+
+    # ── quoted string literal ─────────────────────────────────────────────────
+    # JS string literals ('' or "") cannot contain variable interpolation.
+    # Only flag if there is a concatenation operator after a closing quote.
+    if rhs[0] in ("'", '"'):
+        return bool(re.search(r"['\"]\s*\+", rhs))
+
+    # ── template literal ──────────────────────────────────────────────────────
+    if rhs[0] == '`':
+        if '${' not in rhs:
+            return False
+        return any(
+            not _is_safe_interpolation(e)
+            for e in _INTERP_RE.findall(rhs)
+        )
+
+    # ── no template interpolation anywhere in the block ───────────────────────
+    # Handles ternary/conditional expressions whose branches are all literals,
+    # e.g.  innerHTML = model === 'x' ? '⚡ Ultra' : `<svg>...</svg>`
+    if '${' not in block:
+        if '?' in rhs:
+            return False  # ternary with literal branches
+        # Bare variable assignment or other non-literal expression
+        return True
+
+    # Has ${} but rhs doesn't open with a backtick — flag conservatively
+    return True
+
 
 class XSSAnalyzer(BaseAnalyzer):
     supported_extensions = (".js", ".ts", ".jsx", ".tsx", ".html", ".php", ".py")
@@ -58,7 +149,11 @@ class XSSAnalyzer(BaseAnalyzer):
         findings: list[Finding] = []
         lines = content.splitlines()
 
-        for rule_id, pattern, description, severity in _RULES:
+        # XSS-001: smart innerHTML check (handles multiline template literals)
+        findings.extend(self._check_innerhtml(file_path, lines, repo_url))
+
+        # XSS-002 to XSS-007: simple per-line regex rules
+        for rule_id, pattern, description, severity in _SIMPLE_RULES:
             for lineno, line in enumerate(lines, start=1):
                 if self._is_comment(line):
                     continue
@@ -78,3 +173,52 @@ class XSSAnalyzer(BaseAnalyzer):
                     )
 
         return findings
+
+    def _check_innerhtml(
+        self, file_path: str, lines: list[str], repo_url: str
+    ) -> list[Finding]:
+        findings: list[Finding] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if not self._is_comment(line) and 'innerHTML' in line and re.search(r'innerHTML\s*=', line):
+                lineno = i + 1
+                block = self._collect_block(lines, i)
+                if _innerhtml_is_unsafe(block):
+                    findings.append(Finding(
+                        vuln_type=VulnType.XSS,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=lineno,
+                        line_content=line.strip(),
+                        description=(
+                            "Direct innerHTML assignment — user data written without sanitization"
+                        ),
+                        rule_id="XSS-001",
+                        repo_url=repo_url,
+                        snippet=self._extract_snippet(lines, lineno),
+                    ))
+            i += 1
+        return findings
+
+    def _collect_block(self, lines: list[str], start: int) -> str:
+        """
+        Return the full assignment text for the innerHTML on ``lines[start]``.
+
+        If the RHS opens an unclosed template literal (multiline template),
+        collect subsequent lines until the closing backtick.
+        """
+        line = lines[start]
+        parts = re.split(r'innerHTML\s*=\s*', line, maxsplit=1)
+        rhs_start = parts[1].lstrip() if len(parts) > 1 else ''
+
+        # Multiline template: exactly one backtick on this line (the opening one)
+        if rhs_start.startswith('`') and rhs_start.count('`') == 1:
+            block = line
+            for j in range(start + 1, len(lines)):
+                block += '\n' + lines[j]
+                if '`' in lines[j]:
+                    break
+            return block
+
+        return line

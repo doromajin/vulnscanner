@@ -490,6 +490,51 @@ class TestTaintTracking:
         assert "AST-REDIR-001" in rule_ids
         assert "AST-PATH-001" in rule_ids
 
+    def test_no_false_positive_generic_data_param(self):
+        """A function param named 'data' must not auto-taint its subscript keys."""
+        code = (
+            "import json\n"
+            "def save_plugin(self, data):\n"
+            "    config_file = data['config_file']\n"
+            "    with open(config_file, 'w') as f:\n"
+            "        json.dump(data, f)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert not any(f.rule_id == "AST-PATH-001" for f in findings)
+
+    def test_data_from_request_still_tainted(self):
+        """When 'data' is explicitly assigned from request, subscripts remain tainted."""
+        code = (
+            "def view(request):\n"
+            "    data = request.get_json()\n"
+            "    path = data['filename']\n"
+            "    open(path)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert any(f.rule_id == "AST-PATH-001" for f in findings)
+
+    def test_subprocess_constant_variable_no_flag(self):
+        """cmd = 'literal'; Popen(cmd, shell=True) must not be flagged — constant propagation."""
+        code = (
+            "import subprocess\n"
+            "def run_restart():\n"
+            "    cmd = 'schtasks /End /TN \"MyTask\" && schtasks /Run /TN \"MyTask\"'\n"
+            "    subprocess.Popen(cmd, shell=True)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert not any(f.rule_id == "AST-CMD-002" for f in findings)
+
+    def test_subprocess_variable_command_still_flagged(self):
+        """cmd derived from user input with shell=True must still be flagged HIGH."""
+        code = (
+            "import subprocess\n"
+            "def view(request):\n"
+            "    cmd = request.args.get('cmd')\n"
+            "    subprocess.Popen(cmd, shell=True)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert any(f.rule_id == "AST-CMD-002" for f in findings)
+
 
 # ── suppression comments ──────────────────────────────────────────────────────
 
