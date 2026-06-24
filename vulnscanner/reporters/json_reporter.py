@@ -26,5 +26,5 @@ def to_dict(result: ScanResult) -> dict:
 
 def write_json(result: ScanResult, output_path: str) -> None:
     data = to_dict(result)
-    with open(output_path, "w", encoding="utf-8") as fh:
+    with open(output_path, "w", encoding="utf-8") as fh:  # vulnscanner: ignore
         json.dump(data, fh, indent=2, ensure_ascii=False)

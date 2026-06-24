@@ -182,14 +182,25 @@ class _VulnVisitor(ast.NodeVisitor):
         self.findings: list[Finding] = []
         self._assignments: dict[str, ast.expr] = {}
         self._class_attrs: dict[str, ast.expr] = {}
+        self._in_enum_class: bool = False
 
     # ── scope tracking ─────────────────────────────────────────────────────────
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        saved = self._class_attrs
+        saved_attrs = self._class_attrs
+        saved_enum = self._in_enum_class
         self._class_attrs = _collect_class_attrs(node)
+        # Enum member assignments look like secrets (HARDCODED_SECRET = "Hardcoded Secret")
+        # but are type labels, not credentials.  Suppress AST-SEC-001 inside Enum subclasses.
+        _ENUM_BASES = {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"}
+        self._in_enum_class = any(
+            (isinstance(b, ast.Name) and b.id in _ENUM_BASES)
+            or (isinstance(b, ast.Attribute) and b.attr in _ENUM_BASES)
+            for b in node.bases
+        )
         self.generic_visit(node)
-        self._class_attrs = saved
+        self._class_attrs = saved_attrs
+        self._in_enum_class = saved_enum
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         saved = self._assignments
@@ -500,6 +511,8 @@ class _VulnVisitor(ast.NodeVisitor):
         value: ast.expr,
         node: ast.AST,
     ) -> None:
+        if self._in_enum_class:
+            return
         name = _assign_name(target)
         if not name or not _SECRET_NAME_RE.search(name):
             return

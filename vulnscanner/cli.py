@@ -220,7 +220,7 @@ def confirm(repo: str, location: str, rule_id: str, note: str) -> None:
     candidate = os.path.join(repo, file_path)
     if os.path.isfile(candidate):
         try:
-            lines = open(candidate, encoding="utf-8", errors="replace").readlines()
+            lines = open(candidate, encoding="utf-8", errors="replace").readlines()  # vulnscanner: ignore
             start = max(0, line - 3)
             end = min(len(lines), line + 2)
             snippet = "".join(lines[start:end]).strip()

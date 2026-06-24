@@ -91,14 +91,21 @@ class DeserializationAnalyzer(BaseAnalyzer):
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         findings: list[Finding] = []
         lines = content.splitlines()
+        # For Python files: mask string literal interiors so rule description
+        # strings (e.g. "yaml.load() without SafeLoader...") don't match themselves.
+        match_lines = (
+            self._mask_python_strings(content).splitlines()
+            if file_path.endswith(".py")
+            else lines
+        )
 
         for rule_id, pattern, description, severity, exts in _RULES:
             if not file_path.endswith(exts):
                 continue
-            for lineno, line in enumerate(lines, start=1):
+            for lineno, (line, mline) in enumerate(zip(lines, match_lines), start=1):
                 if self._is_comment(line):
                     continue
-                if not re.search(pattern, line, re.IGNORECASE):
+                if not re.search(pattern, mline, re.IGNORECASE):
                     continue
 
                 # DESER-004: skip PHP unserialize() with ['allowed_classes' => false]

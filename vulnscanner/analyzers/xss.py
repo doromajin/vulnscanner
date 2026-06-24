@@ -5,6 +5,13 @@ from vulnscanner.models import Finding, Severity, VulnType
 
 # ── Simple per-line rules (XSS-002 to XSS-007) ────────────────────────────────
 
+# DOM manipulation APIs that only exist in JavaScript/HTML contexts.
+# Restricting their rules to these extensions prevents self-reference FPs
+# when their pattern strings appear inside Python source files.
+_JS_HTML_EXTS = (".js", ".ts", ".jsx", ".tsx", ".html")
+# Rule IDs restricted to JS/HTML only (DOM APIs absent from Python)
+_JS_HTML_ONLY = frozenset({"XSS-002", "XSS-006"})
+
 _SIMPLE_RULES = [
     (
         "XSS-002",
@@ -154,6 +161,8 @@ class XSSAnalyzer(BaseAnalyzer):
 
         # XSS-002 to XSS-007: simple per-line regex rules
         for rule_id, pattern, description, severity in _SIMPLE_RULES:
+            if rule_id in _JS_HTML_ONLY and not file_path.endswith(_JS_HTML_EXTS):
+                continue
             for lineno, line in enumerate(lines, start=1):
                 if self._is_comment(line):
                     continue
@@ -177,6 +186,10 @@ class XSSAnalyzer(BaseAnalyzer):
     def _check_innerhtml(
         self, file_path: str, lines: list[str], repo_url: str
     ) -> list[Finding]:
+        # innerHTML is a DOM API — not applicable to Python source files.
+        # Guarding here prevents false positives from docstrings that mention innerHTML.
+        if not file_path.endswith(_JS_HTML_EXTS + (".php",)):
+            return []
         findings: list[Finding] = []
         i = 0
         while i < len(lines):
