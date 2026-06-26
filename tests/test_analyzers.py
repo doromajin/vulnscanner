@@ -155,6 +155,54 @@ class TestXSS:
         # with the template-literal branch policy)
         assert XSSAnalyzer().analyze("app.js", "el.innerHTML = escapeHtml(content);") == []
 
+    # ── PHP XSS-008 precision ─────────────────────────────────────────────────
+
+    def test_no_fp_php_2hop_sanitization(self):
+        # Tainted var ($raw) is sanitized into $esc; echo outputs $esc, not $raw.
+        code = (
+            '$raw = $_GET["name"];\n'
+            '$esc = htmlspecialchars($raw, ENT_QUOTES, "UTF-8");\n'
+            'echo $esc;\n'
+        )
+        rule_ids = {f.rule_id for f in XSSAnalyzer().analyze("page.php", code)}
+        assert "XSS-008" not in rule_ids
+
+    def test_no_fp_php_inline_htmlspecialchars(self):
+        # echo wraps the tainted var in htmlspecialchars inline — sanitized at echo point.
+        code = '$name = $_GET["name"];\necho htmlspecialchars($name, ENT_QUOTES, "UTF-8");\n'
+        rule_ids = {f.rule_id for f in XSSAnalyzer().analyze("page.php", code)}
+        assert "XSS-008" not in rule_ids
+
+    def test_no_fp_php_inline_intval(self):
+        # intval() at echo point: numeric output cannot introduce HTML.
+        code = '$id = $_GET["id"];\necho intval($id);\n'
+        rule_ids = {f.rule_id for f in XSSAnalyzer().analyze("page.php", code)}
+        assert "XSS-008" not in rule_ids
+
+    def test_no_fp_php_wp_sanitize_text_field(self):
+        # WordPress sanitize_text_field strips tags/whitespace — now in _PHP_XSS_CLEAN_RE.
+        code = (
+            '$title = sanitize_text_field($_POST["title"]);\n'
+            'echo "<h1>" . $title . "</h1>";\n'
+        )
+        rule_ids = {f.rule_id for f in XSSAnalyzer().analyze("template.php", code)}
+        assert "XSS-008" not in rule_ids
+
+    def test_no_fp_php_esc_url(self):
+        # esc_url (WordPress) is now in _PHP_XSS_CLEAN_RE.
+        code = (
+            '$link = esc_url($_GET["redirect"]);\n'
+            'echo \'<a href="\' . $link . \'">Go</a>\';\n'
+        )
+        rule_ids = {f.rule_id for f in XSSAnalyzer().analyze("template.php", code)}
+        assert "XSS-008" not in rule_ids
+
+    def test_still_fires_php_bare_echo_tainted(self):
+        # Regression: unescaped echo of tainted variable must still fire XSS-008.
+        code = '$name = $_GET["name"];\necho "<h1>Hello " . $name . "</h1>";\n'
+        rule_ids = {f.rule_id for f in XSSAnalyzer().analyze("page.php", code)}
+        assert "XSS-008" in rule_ids
+
 
 class TestHardcodedSecrets:
     def test_detects_password(self):

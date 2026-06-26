@@ -76,8 +76,10 @@ _PHP_SUPERGLOBALS_RE = re.compile(
 # Functions that sanitize a value for HTML output — wrapping a superglobal
 # in one of these makes the variable safe to echo.
 _PHP_XSS_CLEAN_RE = re.compile(
-    r"^\s*(?:htmlspecialchars|htmlentities|strip_tags|esc_html|esc_attr"
-    r"|wp_kses|wp_kses_post|intval|floatval|abs)\s*\(",
+    r"^\s*(?:htmlspecialchars|htmlentities|strip_tags"
+    r"|esc_html|esc_attr|esc_textarea|esc_url"
+    r"|wp_kses|wp_kses_post|sanitize_text_field|wp_strip_all_tags"
+    r"|intval|floatval|abs)\s*\(",
     re.IGNORECASE,
 )
 
@@ -319,6 +321,11 @@ class XSSAnalyzer(BaseAnalyzer):
             for var_name, src_line in tainted.items():
                 # Match $varname as a standalone token (not part of a longer name)
                 if re.search(r"\$" + re.escape(var_name) + r"\b", expr):
+                    # If the whole echo expression is wrapped in a sanitizing
+                    # function the tainted value is sanitized at the echo point.
+                    # e.g. echo htmlspecialchars($raw) — safe even if $raw is tainted.
+                    if _PHP_XSS_CLEAN_RE.match(expr.strip()):
+                        break
                     findings.append(Finding(
                         vuln_type=VulnType.XSS,
                         severity=Severity.HIGH,
