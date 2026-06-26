@@ -768,10 +768,13 @@ def _taint_of(
         if full in _UNIVERSAL_SANITIZER_FUNCS:
             return TaintInfo(TaintStatus.CLEAN, f"sanitized by {full}()", sanitizers=[full])
 
-        # Context-specific sanitizers: propagate argument taint rather than
-        # unconditionally returning CLEAN.  If the argument is TAINTED, return
-        # UNKNOWN so callers emit a [needs_review] finding instead of silently
-        # suppressing a potential SQL/CMD/PATH vulnerability.
+        # Context-specific sanitizers: record the sanitizer in metadata but
+        # preserve the argument's taint status unchanged.
+        # html.escape / bleach.clean protect HTML/XSS sinks only.
+        # urllib.parse.quote protects URL encoding only.
+        # Neither prevents SQL/CMD/PATH/SSRF injection — do NOT downgrade a
+        # TAINTED argument to UNKNOWN or CLEAN; that would suppress HIGH findings
+        # at those sinks.  CLEAN arguments stay CLEAN (sanitizer is a no-op here).
         _is_ctx = (
             full in _HTML_SANITIZER_FUNCS | _URL_SANITIZER_FUNCS
             or attr in _HTML_SANITIZER_METHODS | _URL_SANITIZER_METHODS
@@ -782,17 +785,17 @@ def _taint_of(
                 if node.args
                 else TaintInfo(TaintStatus.UNKNOWN, "no argument")
             )
-            if arg_taint.status != TaintStatus.TAINTED:
-                # CLEAN or UNKNOWN argument → propagate as-is
+            if arg_taint.status == TaintStatus.CLEAN:
                 return arg_taint
-            # Tainted argument through a context-specific sanitizer: safe only
-            # for its own sink (HTML/URL), not for SQL/CMD/PATH.
+            # TAINTED or UNKNOWN: propagate status, record sanitizer as metadata.
+            # The sink-side checker (e.g. _check_sql) will determine severity.
+            sanitizer_name = full or f".{attr}"
             return TaintInfo(
-                TaintStatus.UNKNOWN,
-                f"{full or '.' + attr}() protects HTML/URL context only;"
-                f" verify safe for this sink: {arg_taint.reason}",
+                arg_taint.status,
+                f"{sanitizer_name}() applied but protects HTML/URL context only;"
+                f" ineffective at this sink: {arg_taint.reason}",
                 source=arg_taint.source,
-                sanitizers=[full or attr],
+                sanitizers=[sanitizer_name] + (arg_taint.sanitizers or []),
             )
 
         if isinstance(node.func, ast.Attribute):

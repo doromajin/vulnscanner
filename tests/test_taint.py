@@ -108,9 +108,9 @@ class TestTaintClean:
         assert _taint_of(node).status == TaintStatus.UNKNOWN
 
     def test_html_escape_on_unknown_arg_is_unknown(self):
-        # html.escape(user_input) where user_input is unresolvable → propagate UNKNOWN,
-        # NOT CLEAN: html.escape only protects HTML/XSS sinks, not SQL/CMD/PATH
-        node = _expr("html.escape(user_input)")
+        # html.escape(val) where val is unresolvable (not a known taint source) → UNKNOWN.
+        # "user_input" is in _TAINTED_NAME_SOURCES, so use a generic name here.
+        node = _expr("html.escape(some_val)")
         assert _taint_of(node).status == TaintStatus.UNKNOWN
 
     def test_html_escape_on_literal_is_clean(self):
@@ -118,13 +118,15 @@ class TestTaintClean:
         node = _expr('html.escape("safe_string")')
         assert _taint_of(node).status == TaintStatus.CLEAN
 
-    def test_html_escape_on_tainted_is_unknown(self):
-        # html.escape wrapping a request value: tainted arg → UNKNOWN (not CLEAN)
-        # so SQL/CMD/PATH checks still emit a finding
+    def test_html_escape_on_tainted_preserves_tainted(self):
+        # html.escape wrapping a request value: taint status MUST stay TAINTED.
+        # html.escape is ineffective against SQL/CMD/SSRF — downgrading to UNKNOWN
+        # would hide HIGH findings at those sinks.
         assignments = _stmt_assignments("x = request.args.get('q')")
         node = _expr("html.escape(x)")
         result = _taint_of(node, assignments)
-        assert result.status == TaintStatus.UNKNOWN
+        assert result.status == TaintStatus.TAINTED
+        assert "html.escape" in result.sanitizers
         assert "HTML/URL context only" in result.reason
 
     def test_int_coercion_returns_clean(self):
@@ -136,12 +138,14 @@ class TestTaintClean:
         node = _expr("float(user_val)")
         assert _taint_of(node).status == TaintStatus.CLEAN
 
-    def test_url_sanitizer_on_tainted_is_unknown(self):
-        # urllib.parse.quote on a tainted value: safe for URLs, not for SQL
+    def test_url_sanitizer_on_tainted_preserves_tainted(self):
+        # urllib.parse.quote on a tainted value: taint must propagate as TAINTED.
+        # URL encoding is ineffective against SQL/CMD injection.
         assignments = _stmt_assignments("v = request.form.get('path')")
         node = _expr("urllib.parse.quote(v)")
         result = _taint_of(node, assignments)
-        assert result.status == TaintStatus.UNKNOWN
+        assert result.status == TaintStatus.TAINTED
+        assert any("quote" in s for s in result.sanitizers)
 
     def test_empty_list_is_clean(self):
         node = _expr("[]")
@@ -528,3 +532,70 @@ class TestASTAnalyzerTaintIntegration:
             result = VulnScanner().scan(tmp)
 
         assert result.suppression_breakdown.get("clean_taint_source", 0) >= 1
+
+
+# ── Sink-aware sanitizer propagation (FuguAI validation scenarios) ─────────────
+
+class TestSanitizerSinkAwareness:
+    """Verify that context-specific sanitizers preserve taint for non-HTML sinks."""
+
+    def test_sql_html_escape_emits_high(self):
+        # html.escape() does NOT protect against SQL injection → HIGH finding
+        code = (
+            "def view(request, cursor):\n"
+            "    x = html.escape(request.args.get('id'))\n"
+            "    cursor.execute('SELECT * FROM users WHERE id=' + x)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        sql = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert sql, "html.escape() in SQL context must not suppress the finding"
+        assert sql[0].severity == Severity.HIGH
+
+    def test_cmd_html_escape_emits_high(self):
+        # html.escape() does NOT protect against command injection → HIGH finding
+        code = (
+            "import os\n"
+            "def view(request):\n"
+            "    cmd = html.escape(request.args.get('cmd'))\n"
+            "    os.system(cmd)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        cmd = [f for f in findings if "CMD" in f.rule_id and f.suppression_reason is None]
+        assert cmd, "html.escape() in CMD context must not suppress the finding"
+        assert cmd[0].severity == Severity.HIGH
+
+    def test_ssrf_url_quote_active_finding(self):
+        # urllib.parse.quote() does NOT protect against SSRF → active finding
+        code = (
+            "import requests, urllib.parse\n"
+            "def view(request):\n"
+            "    url = urllib.parse.quote(request.args.get('url'))\n"
+            "    requests.get(url)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        ssrf = [f for f in findings if "SSRF" in f.rule_id and f.suppression_reason is None]
+        assert ssrf, "urllib.parse.quote() in SSRF context must not suppress the finding"
+
+    def test_sql_int_coercion_suppressed(self):
+        # int() is a universal sanitizer → CLEAN → finding suppressed.
+        # Use user_id directly in f-string (str() is not a tracked sanitizer and
+        # would lose the CLEAN status through the generic call handler).
+        code = (
+            "def view(request, cursor):\n"
+            "    user_id = int(request.args.get('id'))\n"
+            "    cursor.execute(f'SELECT * FROM users WHERE id={user_id}')\n"
+        )
+        findings = AST.analyze("t.py", code)
+        sql_active = [f for f in findings
+                      if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert not sql_active, "int() coercion makes the value universally safe; SQL finding should be suppressed"
+
+    def test_sanitizer_name_recorded_in_taint_metadata(self):
+        # The sanitizer name must be stored in TaintInfo.sanitizers for audit trails
+        assignments = _stmt_assignments("x = request.args.get('q')")
+        node = _expr("html.escape(x)")
+        result = _taint_of(node, assignments)
+        assert result.status == TaintStatus.TAINTED
+        assert "html.escape" in result.sanitizers, (
+            "sanitizer name must be recorded in metadata even when taint is preserved"
+        )
