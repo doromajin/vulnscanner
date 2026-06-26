@@ -102,17 +102,46 @@ class TestTaintClean:
         result = _taint_of(node, class_attrs=attrs)
         assert result.status == TaintStatus.CLEAN
 
-    def test_sanitizer_method_returns_clean(self):
+    def test_sanitizer_method_no_args_is_unknown(self):
+        # .escape() with no args: no argument to inspect → UNKNOWN
         node = _expr("value.escape()")
+        assert _taint_of(node).status == TaintStatus.UNKNOWN
+
+    def test_html_escape_on_unknown_arg_is_unknown(self):
+        # html.escape(user_input) where user_input is unresolvable → propagate UNKNOWN,
+        # NOT CLEAN: html.escape only protects HTML/XSS sinks, not SQL/CMD/PATH
+        node = _expr("html.escape(user_input)")
+        assert _taint_of(node).status == TaintStatus.UNKNOWN
+
+    def test_html_escape_on_literal_is_clean(self):
+        # html.escape("safe_string"): argument is CLEAN → result is CLEAN
+        node = _expr('html.escape("safe_string")')
         assert _taint_of(node).status == TaintStatus.CLEAN
 
-    def test_sanitizer_func_returns_clean(self):
-        node = _expr('html.escape(user_input)')
-        assert _taint_of(node).status == TaintStatus.CLEAN
+    def test_html_escape_on_tainted_is_unknown(self):
+        # html.escape wrapping a request value: tainted arg → UNKNOWN (not CLEAN)
+        # so SQL/CMD/PATH checks still emit a finding
+        assignments = _stmt_assignments("x = request.args.get('q')")
+        node = _expr("html.escape(x)")
+        result = _taint_of(node, assignments)
+        assert result.status == TaintStatus.UNKNOWN
+        assert "HTML/URL context only" in result.reason
 
     def test_int_coercion_returns_clean(self):
+        # int() is a universal sanitizer: non-string output can't carry injection
         node = _expr("int(user_id)")
         assert _taint_of(node).status == TaintStatus.CLEAN
+
+    def test_float_coercion_returns_clean(self):
+        node = _expr("float(user_val)")
+        assert _taint_of(node).status == TaintStatus.CLEAN
+
+    def test_url_sanitizer_on_tainted_is_unknown(self):
+        # urllib.parse.quote on a tainted value: safe for URLs, not for SQL
+        assignments = _stmt_assignments("v = request.form.get('path')")
+        node = _expr("urllib.parse.quote(v)")
+        result = _taint_of(node, assignments)
+        assert result.status == TaintStatus.UNKNOWN
 
     def test_empty_list_is_clean(self):
         node = _expr("[]")

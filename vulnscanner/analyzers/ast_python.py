@@ -127,17 +127,21 @@ _STRING_TEMPLATE_METHODS = frozenset({
     "format", "format_map", "join", "replace",
 })
 
-# Sanitization methods: result is CLEAN regardless of input taint.
-_SANITIZER_METHODS = frozenset({
-    "escape", "html_escape", "quote", "quote_plus", "urlencode",
-    "sanitize", "bleach_clean",
+# Type-coercion sanitizers: safe against ALL sink types (SQL, CMD, PATH, XSS).
+# int/float/bool produce non-string values that cannot carry injection payloads.
+_UNIVERSAL_SANITIZER_FUNCS = frozenset({"int", "float", "bool"})
+
+# Context-specific sanitizers: protect ONLY their own sink context.
+# Using these in an unrelated sink (e.g. html.escape in a SQL query) does NOT
+# prevent injection — they must NOT mark the result CLEAN for every sink type.
+_HTML_SANITIZER_FUNCS = frozenset({
+    "html.escape", "cgi.escape", "bleach.clean", "markupsafe.escape",
 })
-_SANITIZER_FUNCS = frozenset({
-    "html.escape", "cgi.escape",
+_HTML_SANITIZER_METHODS = frozenset({"escape", "html_escape", "sanitize", "bleach_clean"})
+_URL_SANITIZER_FUNCS = frozenset({
     "urllib.parse.quote", "urllib.parse.quote_plus", "urllib.parse.urlencode",
-    "bleach.clean", "markupsafe.escape",
-    "int", "float", "bool",
 })
+_URL_SANITIZER_METHODS = frozenset({"quote", "quote_plus", "urlencode"})
 
 
 # ── public analyzer ────────────────────────────────────────────────────────────
@@ -760,11 +764,36 @@ def _taint_of(
         if full == "input":
             return TaintInfo(TaintStatus.TAINTED, "Python input() function", source="input()")
 
-        # Sanitization → CLEAN
-        if attr in _SANITIZER_METHODS:
-            return TaintInfo(TaintStatus.CLEAN, f"sanitized by .{attr}()", sanitizers=[attr])
-        if full in _SANITIZER_FUNCS:
+        # Universal sanitizers (type coercion): safe for every sink
+        if full in _UNIVERSAL_SANITIZER_FUNCS:
             return TaintInfo(TaintStatus.CLEAN, f"sanitized by {full}()", sanitizers=[full])
+
+        # Context-specific sanitizers: propagate argument taint rather than
+        # unconditionally returning CLEAN.  If the argument is TAINTED, return
+        # UNKNOWN so callers emit a [needs_review] finding instead of silently
+        # suppressing a potential SQL/CMD/PATH vulnerability.
+        _is_ctx = (
+            full in _HTML_SANITIZER_FUNCS | _URL_SANITIZER_FUNCS
+            or attr in _HTML_SANITIZER_METHODS | _URL_SANITIZER_METHODS
+        )
+        if _is_ctx:
+            arg_taint = (
+                _taint_of(node.args[0], assignments, class_attrs, _depth + 1)
+                if node.args
+                else TaintInfo(TaintStatus.UNKNOWN, "no argument")
+            )
+            if arg_taint.status != TaintStatus.TAINTED:
+                # CLEAN or UNKNOWN argument → propagate as-is
+                return arg_taint
+            # Tainted argument through a context-specific sanitizer: safe only
+            # for its own sink (HTML/URL), not for SQL/CMD/PATH.
+            return TaintInfo(
+                TaintStatus.UNKNOWN,
+                f"{full or '.' + attr}() protects HTML/URL context only;"
+                f" verify safe for this sink: {arg_taint.reason}",
+                source=arg_taint.source,
+                sanitizers=[full or attr],
+            )
 
         if isinstance(node.func, ast.Attribute):
             obj_taint = _taint_of(node.func.value, assignments, class_attrs, _depth + 1)
