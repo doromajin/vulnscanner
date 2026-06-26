@@ -146,6 +146,15 @@ class TestXSS:
         code = "name.innerHTML = model === 'ultra' ? '⚡ Ultra' : `<svg></svg>`;"
         assert XSSAnalyzer().analyze("app.js", code) == []
 
+    def test_no_fp_direct_function_call(self):
+        # innerHTML = func(x) — function application treated as safer than bare var ref
+        assert XSSAnalyzer().analyze("app.js", "el.innerHTML = DOMPurify.sanitize(userInput);") == []
+
+    def test_no_fp_direct_any_function(self):
+        # Unknown function: developer is at least transforming the value (consistent
+        # with the template-literal branch policy)
+        assert XSSAnalyzer().analyze("app.js", "el.innerHTML = escapeHtml(content);") == []
+
 
 class TestHardcodedSecrets:
     def test_detects_password(self):

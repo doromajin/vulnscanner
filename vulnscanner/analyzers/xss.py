@@ -164,7 +164,12 @@ def _innerhtml_is_unsafe(block: str) -> bool:
     if '${' not in block:
         if '?' in rhs:
             return False  # ternary with literal branches
-        # Bare variable assignment or other non-literal expression
+        # Any function call — developer is applying some transformation (same
+        # policy as the template-literal branch: function call = not a bare ref).
+        # e.g. innerHTML = DOMPurify.sanitize(x)  or  innerHTML = escapeHtml(x)
+        if re.search(r'\w\s*\(', rhs):
+            return False
+        # Bare variable or property access — flag
         return True
 
     # Has ${} but rhs doesn't open with a backtick - flag conservatively
