@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
@@ -21,6 +24,17 @@ _SUPPRESS_RE = re.compile(
     r"(?:#|//|<!--)\s*vulnscanner\s*:\s*ignore(?:\[([A-Z0-9,\s_-]+)\])?",
     re.IGNORECASE,
 )
+
+DEFAULT_WORKERS = min((os.cpu_count() or 1) * 2, 16)
+
+
+@dataclass
+class _FileResult:
+    """Accumulated analysis output for a single file (no shared-state mutation)."""
+    findings: list[Finding] = field(default_factory=list)
+    suppression_breakdown: dict[str, int] = field(default_factory=dict)
+    scanned_lines: int = 0
+    errors: list[str] = field(default_factory=list)
 
 
 def _parse_ignore_file(content: str) -> list[str]:
@@ -58,14 +72,15 @@ class VulnScanner:
         github_token: str | None = None,
         analyzers: list[BaseAnalyzer] | None = None,
         exclude: tuple[str, ...] | list[str] = (),
+        workers: int = 0,
     ) -> None:
         self._github_token = github_token
         self._analyzers = analyzers or ALL_ANALYZERS
         self._cli_excludes = tuple(exclude)
+        self._workers = workers if workers > 0 else DEFAULT_WORKERS
 
     def scan(self, target: str) -> ScanResult:
         """Scan a GitHub repo URL/slug or a local directory path."""
-        import os
         if os.path.isdir(target):
             return self._scan_local(target)
         return self._scan_github(target)
@@ -95,11 +110,28 @@ class VulnScanner:
             redirect_stderr=False,
         ) as progress:
             task = progress.add_task(f"Scanning {repo.full_name}...", total=None)
-            for file_path, content in fetcher.iter_files(repo):
-                if _is_excluded(file_path, excludes):
-                    continue
-                progress.update(task, description=f"[cyan]{file_path}")
-                self._analyze_file(file_path, content, repo_url, result)
+
+            with ThreadPoolExecutor(max_workers=self._workers) as pool:
+                futures: dict = {}
+                # Submit analysis jobs while fetching - overlaps network I/O with CPU work
+                for file_path, content in fetcher.iter_files(repo):
+                    if _is_excluded(file_path, excludes):
+                        continue
+                    progress.update(task, description=f"[cyan]{file_path}")
+                    f = pool.submit(self._analyze_file_pure, file_path, content, repo_url)
+                    futures[f] = file_path
+
+                # Collect results as workers complete
+                progress.update(task, total=len(futures), completed=0)
+                for future in as_completed(futures):
+                    fp = futures[future]
+                    progress.update(task, description=f"[cyan]{fp}", advance=1)
+                    try:
+                        partial = future.result()
+                    except Exception as exc:
+                        result.errors.append(f"{fp}: {exc}")
+                        continue
+                    _merge_into(result, partial)
 
         result.elapsed_seconds = time.perf_counter() - start
         return result
@@ -116,6 +148,13 @@ class VulnScanner:
         else:
             excludes = list(self._cli_excludes)
 
+        # Collect all files upfront so the progress bar knows the total
+        files = [
+            (fp, content)
+            for fp, content in fetcher.iter_files()
+            if not _is_excluded(fp, excludes)
+        ]
+
         start = time.perf_counter()
         with Progress(
             SpinnerColumn("line"),
@@ -124,40 +163,52 @@ class VulnScanner:
             TaskProgressColumn(),
             redirect_stderr=False,
         ) as progress:
-            task = progress.add_task(f"Scanning {directory}...", total=None)
-            for file_path, content in fetcher.iter_files():
-                if _is_excluded(file_path, excludes):
-                    continue
-                progress.update(task, description=f"[cyan]{file_path}")
-                self._analyze_file(file_path, content, directory, result)
+            task = progress.add_task(f"Scanning {directory}...", total=len(files))
+
+            with ThreadPoolExecutor(max_workers=self._workers) as pool:
+                futures = {
+                    pool.submit(self._analyze_file_pure, fp, content, directory): fp
+                    for fp, content in files
+                }
+                for future in as_completed(futures):
+                    fp = futures[future]
+                    progress.update(task, description=f"[cyan]{fp}", advance=1)
+                    try:
+                        partial = future.result()
+                    except Exception as exc:
+                        result.errors.append(f"{fp}: {exc}")
+                        continue
+                    _merge_into(result, partial)
 
         result.elapsed_seconds = time.perf_counter() - start
         return result
 
-    def _analyze_file(
-        self, file_path: str, content: str, source: str, result: ScanResult
-    ) -> None:
-        result.scanned_files += 1
-        result.scanned_lines += content.count("\n") + 1
+    def _analyze_file_pure(
+        self, file_path: str, content: str, source: str
+    ) -> _FileResult:
+        """Analyze a single file; returns results without mutating shared state."""
+        partial = _FileResult(scanned_lines=content.count("\n") + 1)
         lines = content.splitlines()
 
-        raw: list = []
+        raw: list[Finding] = []
         for analyzer in self._analyzers:
             if not analyzer.supports(file_path):
                 continue
             try:
                 raw.extend(analyzer.analyze(file_path, content, source))
             except Exception as exc:
-                result.errors.append(f"{file_path}: {exc}")
+                partial.errors.append(f"{file_path}: {exc}")
 
         # 1. Inline-comment suppression (# vulnscanner: ignore)
         inline_suppressed = [f for f in raw if _is_suppressed(f, lines)]
-        _add_breakdown(result, "inline_comment", len(inline_suppressed))
+        if inline_suppressed:
+            partial.suppression_breakdown["inline_comment"] = len(inline_suppressed)
         raw = [f for f in raw if not _is_suppressed(f, lines)]
 
         # 2. CLEAN taint suppression (AST analyzer marked these as provably safe)
         clean_taint = [f for f in raw if f.suppression_reason == "clean_taint_source"]
-        _add_breakdown(result, "clean_taint_source", len(clean_taint))
+        if clean_taint:
+            partial.suppression_breakdown["clean_taint_source"] = len(clean_taint)
         raw = [f for f in raw if f.suppression_reason != "clean_taint_source"]
 
         # 3. File-context suppression (test / fixture / vendor paths)
@@ -165,10 +216,22 @@ class VulnScanner:
         if ctx_reason:
             for f in raw:
                 f.suppression_reason = ctx_reason
-            _add_breakdown(result, ctx_reason, len(raw))
-            return  # none of these findings reach result.findings
+            if raw:
+                partial.suppression_breakdown[ctx_reason] = len(raw)
+            return partial  # none of these findings reach result.findings
 
-        result.findings.extend(_deduplicate(raw))
+        partial.findings = _deduplicate(raw)
+        return partial
+
+
+def _merge_into(result: ScanResult, partial: _FileResult) -> None:
+    """Merge a per-file result into the shared accumulator (called from the main thread only)."""
+    result.scanned_files += 1
+    result.scanned_lines += partial.scanned_lines
+    result.findings.extend(partial.findings)
+    result.errors.extend(partial.errors)
+    for reason, count in partial.suppression_breakdown.items():
+        _add_breakdown(result, reason, count)
 
 
 def _add_breakdown(result: ScanResult, reason: str, count: int) -> None:

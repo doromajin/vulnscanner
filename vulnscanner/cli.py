@@ -35,6 +35,8 @@ def main() -> None:
               help="Exit 1 only when a finding at or above this severity exists")
 @click.option("--exclude", "-e", multiple=True, metavar="GLOB",
               help="Glob pattern to skip (can be repeated)")
+@click.option("--workers", "-w", default=0, type=int, metavar="N",
+              help="Parallel worker threads (0 = auto-detect)")
 def scan(
     target: str,
     token: str | None,
@@ -44,6 +46,7 @@ def scan(
     min_severity: str,
     fail_on: str | None,
     exclude: tuple[str, ...],
+    workers: int,
 ) -> None:
     """Scan a single GitHub repository or local directory.
 
@@ -58,7 +61,7 @@ def scan(
     min_sev = Severity(min_severity.upper())
     cutoff = severity_order.index(min_sev)
 
-    scanner = VulnScanner(github_token=token, exclude=exclude)
+    scanner = VulnScanner(github_token=token, exclude=exclude, workers=workers)
 
     try:
         result = scanner.scan(target)
@@ -116,6 +119,8 @@ def scan(
               help="Write full JSON results to this directory (one file per repo)")
 @click.option("--quick", is_flag=True,
               help="Skip dependency CVE lookups for faster ranking")
+@click.option("--workers", "-w", default=0, type=int, metavar="N",
+              help="Parallel worker threads per repo (0 = auto-detect)")
 def rank(
     repos: tuple[str, ...],
     token: str | None,
@@ -123,6 +128,7 @@ def rank(
     min_score: int,
     output: str | None,
     quick: bool,
+    workers: int,
 ) -> None:
     """Scan multiple repositories and rank them by vulnerability risk.
 
@@ -150,7 +156,7 @@ def rank(
             end="",
         )
         try:
-            result = VulnScanner(github_token=token, analyzers=analyzers).scan(repo)
+            result = VulnScanner(github_token=token, analyzers=analyzers, workers=workers).scan(repo)
             p = build_profile(result)
             profiles.append(p)
             console.print(
