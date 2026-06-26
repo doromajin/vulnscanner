@@ -66,6 +66,10 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     # html.escape() wraps tainted SQL input; taint must stay TAINTED so that
     # the SQL injection finding is NOT suppressed (FuguAI fix: commit 5b4815a).
     ("AST-SQL-002",   "python/sanitizer_bypass.py",      "HIGH",     "html.escape() does NOT suppress SQL injection"),
+
+    # ── PHP: 1-hop taint (XSS-008) ────────────────────────────────────────────
+    # $_GET/$_POST assigned to variable, then echoed without htmlspecialchars().
+    ("XSS-008",       "php/xss_1hop.php",                "HIGH",     "PHP XSS 1-hop ($_GET → $var → echo)"),
 ]
 
 

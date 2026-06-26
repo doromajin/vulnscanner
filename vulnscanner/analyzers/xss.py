@@ -65,6 +65,28 @@ _SAFE_FUNCS = frozenset({
 # Regex to extract all ${...} interpolations from a template literal.
 _INTERP_RE = re.compile(r'\$\{([^}]+)\}')
 
+# ── PHP XSS 1-hop taint analysis (XSS-008) ────────────────────────────────────
+
+# PHP superglobals that carry user-controlled input
+_PHP_SUPERGLOBALS_RE = re.compile(
+    r'\$_(?:GET|POST|REQUEST|COOKIE|FILES)\s*\[',
+    re.IGNORECASE,
+)
+
+# Functions that sanitize a value for HTML output — wrapping a superglobal
+# in one of these makes the variable safe to echo.
+_PHP_XSS_CLEAN_RE = re.compile(
+    r"^\s*(?:htmlspecialchars|htmlentities|strip_tags|esc_html|esc_attr"
+    r"|wp_kses|wp_kses_post|intval|floatval|abs)\s*\(",
+    re.IGNORECASE,
+)
+
+# Single-line PHP assignment: $varname = expr;
+_PHP_ASSIGN_RE = re.compile(r"^\s*\$(\w+)\s*=\s*(.+?);\s*$", re.IGNORECASE)
+
+# echo / print sink (captures the full expression, greedy)
+_PHP_ECHO_RE = re.compile(r"^\s*(?:echo|print)\b\s+(.+)", re.IGNORECASE)
+
 
 def _is_safe_interpolation(expr: str) -> bool:
     """
@@ -181,6 +203,10 @@ class XSSAnalyzer(BaseAnalyzer):
                         )
                     )
 
+        # XSS-008: PHP 1-hop taint analysis ($_GET/$_POST → $var → echo)
+        if file_path.endswith(".php"):
+            findings.extend(self._check_php_taint(file_path, lines, repo_url))
+
         return findings
 
     def _check_innerhtml(
@@ -235,3 +261,74 @@ class XSSAnalyzer(BaseAnalyzer):
             return block
 
         return line
+
+    def _check_php_taint(
+        self, file_path: str, lines: list[str], repo_url: str
+    ) -> list[Finding]:
+        """PHP XSS 1-hop taint: detect $_GET/$_POST → $var → echo $var.
+
+        Pass 1: collect variables assigned directly from superglobals and not
+                immediately wrapped in an HTML-sanitizing function.
+        Pass 2: report echo/print statements that output a tainted variable
+                without going through a sanitizer (XSS-005 already covers
+                direct superglobal echoes; we skip those here).
+        """
+        # ── Pass 1: build tainted variable map ──────────────────────────────
+        tainted: dict[str, int] = {}   # var_name → assignment line number
+
+        for lineno, line in enumerate(lines, start=1):
+            if self._is_comment(line):
+                continue
+            m = _PHP_ASSIGN_RE.match(line)
+            if not m:
+                continue
+            var_name, rhs = m.group(1), m.group(2).strip()
+
+            if _PHP_SUPERGLOBALS_RE.search(rhs):
+                if _PHP_XSS_CLEAN_RE.match(rhs):
+                    # e.g. $safe = htmlspecialchars($_GET['x']) — not tainted
+                    tainted.pop(var_name, None)
+                else:
+                    tainted[var_name] = lineno
+            elif var_name in tainted and _PHP_XSS_CLEAN_RE.match(rhs):
+                # Variable re-sanitized after being tainted: $v = htmlentities($v)
+                tainted.pop(var_name, None)
+
+        if not tainted:
+            return []
+
+        # ── Pass 2: find echo/print that outputs a tainted variable ──────────
+        findings: list[Finding] = []
+        for lineno, line in enumerate(lines, start=1):
+            if self._is_comment(line):
+                continue
+            m = _PHP_ECHO_RE.match(line)
+            if not m:
+                continue
+            expr = m.group(1).rstrip("; \t")
+
+            # Skip direct superglobal echo — already caught by XSS-005
+            if _PHP_SUPERGLOBALS_RE.search(expr):
+                continue
+
+            for var_name, src_line in tainted.items():
+                # Match $varname as a standalone token (not part of a longer name)
+                if re.search(r"\$" + re.escape(var_name) + r"\b", expr):
+                    findings.append(Finding(
+                        vuln_type=VulnType.XSS,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=lineno,
+                        line_content=line.strip(),
+                        description=(
+                            f"${var_name} was assigned from user input "
+                            f"($_GET/$_POST) on line {src_line} and echoed "
+                            f"without HTML encoding — use htmlspecialchars()"
+                        ),
+                        rule_id="XSS-008",
+                        repo_url=repo_url,
+                        snippet=self._extract_snippet(lines, lineno),
+                    ))
+                    break  # one finding per sink line is enough
+
+        return findings
