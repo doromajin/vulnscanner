@@ -3,78 +3,60 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
+_PT = VulnType.PATH_TRAVERSAL
+
+# exts=None means the rule applies to all supported extensions
+# (rule_id, compiled_re, description, severity, vuln_type, exts_or_None)
 _RULES = [
     (
         "PATH-001",
-        # Python/Ruby open() with a request/param variable - language-specific
-        r'(?<![\w.])open\s*\(\s*(?:request|req|args|params|data|input)',
+        re.compile(r'(?<![\w.])open\s*\(\s*(?:request|req|args|params|data|input)', re.IGNORECASE),
         "open() with potentially user-controlled path",
-        Severity.HIGH,
-        (".py", ".rb"),
+        Severity.HIGH, _PT, (".py", ".rb"),
     ),
     (
         "PATH-002",
-        # open() with string concatenation - Python/PHP/Ruby only;
-        # JS 'open()' means XHR or window.open, so we exclude .js/.ts
-        r'(?<![\w.])open\s*\(.*\+|(?<![\w.])open\s*\(.*f["\'].*\{',
+        re.compile(r'(?<![\w.])open\s*\(.*\+|(?<![\w.])open\s*\(.*f["\'].*\{', re.IGNORECASE),
         "open() with string concatenation - path may be user-controlled",
-        Severity.MEDIUM,
-        (".py", ".rb", ".php"),
+        Severity.MEDIUM, _PT, (".py", ".rb", ".php"),
     ),
     (
         "PATH-003",
-        r'(?:send_file|send_from_directory|serve_file)\s*\(',
+        re.compile(r'(?:send_file|send_from_directory|serve_file)\s*\(', re.IGNORECASE),
         "File-serving function - verify path is within expected root",
-        Severity.MEDIUM,
-        None,  # all supported extensions
+        Severity.MEDIUM, _PT, None,
     ),
     (
         "PATH-004",
-        # PHP file functions with user input
-        r'\b(?:file_get_contents|include|require|fopen)\s*\(\s*\$_(?:GET|POST|REQUEST)',
+        re.compile(r'\b(?:file_get_contents|include|require|fopen)\s*\(\s*\$_(?:GET|POST|REQUEST)', re.IGNORECASE),
         "PHP file function called with direct user input",
-        Severity.CRITICAL,
-        (".php",),
+        Severity.CRITICAL, _PT, (".php",),
     ),
     (
         "PATH-005",
-        # Literal path traversal sequence - report as INFO, skip test files
-        r'\.\./|\.\.\\\\',
+        re.compile(r'\.\./|\.\.\\\\', re.IGNORECASE),
         "Literal path traversal sequence in source code",
-        Severity.INFO,
-        None,
+        Severity.INFO, _PT, None,
     ),
 ]
+
+_GUARD = re.compile(
+    r'open\s*\(|send_file|send_from_directory|serve_file|file_get_contents'
+    r'|include\s*\(|require\s*\(|fopen\s*\(|\.\./|\.\.\\\\'
+    , re.IGNORECASE,
+)
+
 
 class PathTraversalAnalyzer(BaseAnalyzer):
     # .py is handled by PythonASTAnalyzer with higher precision
     supported_extensions = (".php", ".js", ".ts", ".java", ".rb")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        findings: list[Finding] = []
-        lines = content.splitlines()
-
-        for rule_id, pattern, description, severity, lang_filter in _RULES:
-            # Respect per-rule language filter
-            if lang_filter and not any(file_path.endswith(ext) for ext in lang_filter):
-                continue
-
-            for lineno, line in enumerate(lines, start=1):
-                if self._is_comment(line):
-                    continue
-                if re.search(pattern, line, re.IGNORECASE):
-                    findings.append(
-                        Finding(
-                            vuln_type=VulnType.PATH_TRAVERSAL,
-                            severity=severity,
-                            file_path=file_path,
-                            line_number=lineno,
-                            line_content=line.strip(),
-                            description=description,
-                            rule_id=rule_id,
-                            repo_url=repo_url,
-                            snippet=self._extract_snippet(lines, lineno),
-                        )
-                    )
-
-        return findings
+        applicable = [
+            (rid, re_obj, desc, sev, vt)
+            for rid, re_obj, desc, sev, vt, exts in _RULES
+            if exts is None or file_path.endswith(exts)
+        ]
+        if not applicable:
+            return []
+        return self._scan_lines(file_path, content, repo_url, applicable, guard=_GUARD)

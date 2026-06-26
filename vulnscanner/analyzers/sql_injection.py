@@ -3,44 +3,50 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
+_SI = VulnType.SQL_INJECTION
+
+# (rule_id, compiled_re, description, severity, vuln_type)
 _RULES = [
     (
         "SQL-001",
-        # String concatenation into SQL (Python)
-        r'(?:execute|query|cursor\.execute)\s*\(\s*["\'].*["\'\s]*\+|'
-        r'(?:execute|query|cursor\.execute)\s*\(\s*f["\'].*\{',
+        re.compile(
+            r'(?:execute|query|cursor\.execute)\s*\(\s*["\'].*["\'\s]*\+'
+            r'|(?:execute|query|cursor\.execute)\s*\(\s*f["\'].*\{',
+            re.IGNORECASE,
+        ),
         "SQL query built with string concatenation - susceptible to injection",
-        Severity.HIGH,
+        Severity.HIGH, _SI,
     ),
     (
         "SQL-002",
-        # Raw % formatting into SQL
-        r'(?:execute|query)\s*\(\s*["\'].*%[sd].*["\'].*%',
+        re.compile(r'(?:execute|query)\s*\(\s*["\'].*%[sd].*["\'].*%', re.IGNORECASE),
         "SQL query uses %-formatting with user-controlled data",
-        Severity.HIGH,
+        Severity.HIGH, _SI,
     ),
     (
         "SQL-003",
-        # .format() inside execute
-        r'(?:execute|query)\s*\(.*\.format\s*\(',
+        re.compile(r'(?:execute|query)\s*\(.*\.format\s*\(', re.IGNORECASE),
         "SQL query uses .format() - prefer parameterized queries",
-        Severity.HIGH,
+        Severity.HIGH, _SI,
     ),
     (
         "SQL-004",
-        # PHP mysqli/PDO string concat
-        r'\$(?:sql|query|stmt)\s*=\s*["\']SELECT.*["\'\s]*\.\s*\$',
+        re.compile(r'\$(?:sql|query|stmt)\s*=\s*["\']SELECT.*["\'\s]*\.\s*\$', re.IGNORECASE),
         "PHP SQL query built with string concatenation",
-        Severity.HIGH,
+        Severity.HIGH, _SI,
     ),
     (
         "SQL-005",
-        # Generic ORM raw() / extra()
-        r'\.raw\s*\(|\.extra\s*\(.*where',
+        re.compile(r'\.raw\s*\(|\.extra\s*\(.*where', re.IGNORECASE),
         "Django ORM raw()/extra() - ensure no unsanitized input",
-        Severity.MEDIUM,
+        Severity.MEDIUM, _SI,
     ),
 ]
+
+_GUARD = re.compile(
+    r'execute\s*\(|query\s*\(|cursor\.|\.raw\s*\(|\.extra\s*\(|\$sql|\$query|\$stmt',
+    re.IGNORECASE,
+)
 
 
 class SQLInjectionAnalyzer(BaseAnalyzer):
@@ -48,26 +54,4 @@ class SQLInjectionAnalyzer(BaseAnalyzer):
     supported_extensions = (".php", ".js", ".ts", ".java", ".rb")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        findings: list[Finding] = []
-        lines = content.splitlines()
-
-        for rule_id, pattern, description, severity in _RULES:
-            for lineno, line in enumerate(lines, start=1):
-                if self._is_comment(line):
-                    continue
-                if re.search(pattern, line, re.IGNORECASE):
-                    findings.append(
-                        Finding(
-                            vuln_type=VulnType.SQL_INJECTION,
-                            severity=severity,
-                            file_path=file_path,
-                            line_number=lineno,
-                            line_content=line.strip(),
-                            description=description,
-                            rule_id=rule_id,
-                            repo_url=repo_url,
-                            snippet=self._extract_snippet(lines, lineno),
-                        )
-                    )
-
-        return findings
+        return self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)

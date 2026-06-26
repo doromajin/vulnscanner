@@ -3,70 +3,64 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
-# (rule_id, pattern, description, severity, extensions)
-_RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
-    # ── PHP ────────────────────────────────────────────────────────────────────
+_OR = VulnType.OPEN_REDIRECT
+
+# (rule_id, compiled_re, description, severity, vuln_type, exts)
+_RULES = [
     (
         "REDIR-001",
-        r"header\s*\(\s*['\"]Location:\s*['\"].*\.\s*\$_(?:GET|POST|REQUEST)",
+        re.compile(r"header\s*\(\s*['\"]Location:\s*['\"].*\.\s*\$_(?:GET|POST|REQUEST)", re.IGNORECASE),
         "PHP Location header with user input - open redirect allows phishing attacks",
-        Severity.HIGH,
-        (".php",),
+        Severity.HIGH, _OR, (".php",),
     ),
     (
         "REDIR-002",
-        r"header\s*\(\s*['\"]Location:\s*['\"]\s*\.\s*\$(?!_(?:GET|POST|REQUEST))",
+        re.compile(r"header\s*\(\s*['\"]Location:\s*['\"]\s*\.\s*\$(?!_(?:GET|POST|REQUEST))", re.IGNORECASE),
         "PHP Location header with variable - verify redirect destination is allowlisted",
-        Severity.MEDIUM,
-        (".php",),
+        Severity.MEDIUM, _OR, (".php",),
     ),
-    # ── Java / Spring ──────────────────────────────────────────────────────────
     (
         "REDIR-003",
-        r'(?:response\.)?sendRedirect\s*\(.*request\.getParameter\s*\(',
+        re.compile(r'(?:response\.)?sendRedirect\s*\(.*request\.getParameter\s*\(', re.IGNORECASE),
         "Java sendRedirect with request parameter - open redirect risk",
-        Severity.HIGH,
-        (".java",),
+        Severity.HIGH, _OR, (".java",),
     ),
     (
         "REDIR-004",
-        r'RedirectView\s*\(.*(?:getParameter|getAttribute)\s*\(',
+        re.compile(r'RedirectView\s*\(.*(?:getParameter|getAttribute)\s*\(', re.IGNORECASE),
         "Spring RedirectView with request attribute - verify redirect target",
-        Severity.HIGH,
-        (".java",),
+        Severity.HIGH, _OR, (".java",),
     ),
-    # ── Node.js / Express ──────────────────────────────────────────────────────
     (
         "REDIR-005",
-        r'res\.redirect\s*\(\s*(?:\d+\s*,\s*)?req\.(?:query|body|params)',
+        re.compile(r'res\.redirect\s*\(\s*(?:\d+\s*,\s*)?req\.(?:query|body|params)', re.IGNORECASE),
         "Express redirect with user-controlled URL - open redirect risk",
-        Severity.HIGH,
-        (".js", ".ts"),
+        Severity.HIGH, _OR, (".js", ".ts"),
     ),
     (
         "REDIR-006",
-        r'res\.redirect\s*\(\s*(?:\d+\s*,\s*)?`[^`]*\$\{req\.',
+        re.compile(r'res\.redirect\s*\(\s*(?:\d+\s*,\s*)?`[^`]*\$\{req\.', re.IGNORECASE),
         "Express redirect with URL template containing request data - open redirect risk",
-        Severity.HIGH,
-        (".js", ".ts"),
+        Severity.HIGH, _OR, (".js", ".ts"),
     ),
-    # ── Ruby / Rails ───────────────────────────────────────────────────────────
     (
         "REDIR-007",
-        r'redirect_to\s+params\[',
+        re.compile(r'redirect_to\s+params\[', re.IGNORECASE),
         "Rails redirect_to with params - open redirect; validate with allow_other_host: false",
-        Severity.HIGH,
-        (".rb",),
+        Severity.HIGH, _OR, (".rb",),
     ),
-    # ── Go ─────────────────────────────────────────────────────────────────────
     (
         "REDIR-008",
-        r'http\.Redirect\s*\(.*r\.(?:FormValue|URL\.Query|Header\.Get)',
+        re.compile(r'http\.Redirect\s*\(.*r\.(?:FormValue|URL\.Query|Header\.Get)', re.IGNORECASE),
         "Go http.Redirect with request-derived URL - open redirect risk",
-        Severity.HIGH,
-        (".go",),
+        Severity.HIGH, _OR, (".go",),
     ),
 ]
+
+_GUARD = re.compile(
+    r'Location:|sendRedirect|RedirectView|res\.redirect|redirect_to|http\.Redirect',
+    re.IGNORECASE,
+)
 
 
 class OpenRedirectAnalyzer(BaseAnalyzer):
@@ -74,26 +68,11 @@ class OpenRedirectAnalyzer(BaseAnalyzer):
     supported_extensions = (".php", ".java", ".js", ".ts", ".rb", ".go")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        findings: list[Finding] = []
-        lines = content.splitlines()
-
-        for rule_id, pattern, description, severity, exts in _RULES:
-            if not file_path.endswith(exts):
-                continue
-            for lineno, line in enumerate(lines, start=1):
-                if self._is_comment(line):
-                    continue
-                if re.search(pattern, line, re.IGNORECASE):
-                    findings.append(Finding(
-                        vuln_type=VulnType.OPEN_REDIRECT,
-                        severity=severity,
-                        file_path=file_path,
-                        line_number=lineno,
-                        line_content=line.strip(),
-                        description=description,
-                        rule_id=rule_id,
-                        repo_url=repo_url,
-                        snippet=self._extract_snippet(lines, lineno),
-                    ))
-
-        return findings
+        applicable = [
+            (rid, re_obj, desc, sev, vt)
+            for rid, re_obj, desc, sev, vt, exts in _RULES
+            if file_path.endswith(exts)
+        ]
+        if not applicable:
+            return []
+        return self._scan_lines(file_path, content, repo_url, applicable, guard=_GUARD)

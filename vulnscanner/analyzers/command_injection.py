@@ -3,56 +3,63 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
+_CI = VulnType.COMMAND_INJECTION
+
+# (rule_id, compiled_re, description, severity, vuln_type)
 _RULES = [
     (
         "CMD-001",
-        r'(?<![\w.])os\.system\s*\(',
+        re.compile(r'(?<![\w.])os\.system\s*\(', re.IGNORECASE),
         "os.system() executes a shell command - avoid with user input",
-        Severity.HIGH,
+        Severity.HIGH, _CI,
     ),
     (
         "CMD-002",
-        # subprocess with shell=True
-        r'subprocess\.\w+\s*\(.*shell\s*=\s*True',
+        re.compile(r'subprocess\.\w+\s*\(.*shell\s*=\s*True', re.IGNORECASE),
         "subprocess called with shell=True - susceptible to injection",
-        Severity.HIGH,
+        Severity.HIGH, _CI,
     ),
     (
         "CMD-003",
-        r'(?<![\w.])os\.popen\s*\(',
+        re.compile(r'(?<![\w.])os\.popen\s*\(', re.IGNORECASE),
         "os.popen() - prefer subprocess with a list of args",
-        Severity.HIGH,
+        Severity.HIGH, _CI,
     ),
     (
         "CMD-004",
-        # Standalone eval()/exec() - NOT preceded by a dot (excludes JS .exec(), Java .exec())
-        # and NOT called on a literal string argument
-        r'(?<![\w.])eval\s*\(\s*(?![\'\"]\s*[\'\"]\s*\))|'
-        r'(?<![\w.])exec\s*\(\s*(?![\'\"#])',
+        re.compile(
+            r'(?<![\w.])eval\s*\(\s*(?![\'\"]\s*[\'\"]\s*\))'
+            r'|(?<![\w.])exec\s*\(\s*(?![\'\"#])',
+            re.IGNORECASE,
+        ),
         "eval()/exec() with non-literal argument",
-        Severity.CRITICAL,
+        Severity.CRITICAL, _CI,
     ),
     (
         "CMD-005",
-        # PHP shell execution functions
-        r'\b(?:shell_exec|passthru|proc_open|popen|system)\s*\(\s*\$',
+        re.compile(r'\b(?:shell_exec|passthru|proc_open|popen|system)\s*\(\s*\$', re.IGNORECASE),
         "PHP shell execution function with variable argument",
-        Severity.CRITICAL,
+        Severity.CRITICAL, _CI,
     ),
     (
         "CMD-006",
-        # PHP backtick operator
-        r'`\s*\$(?:_GET|_POST|_REQUEST|_COOKIE)',
+        re.compile(r'`\s*\$(?:_GET|_POST|_REQUEST|_COOKIE)', re.IGNORECASE),
         "PHP backtick operator with user-supplied input",
-        Severity.CRITICAL,
+        Severity.CRITICAL, _CI,
     ),
     (
         "CMD-007",
-        r'Runtime\.getRuntime\(\)\.exec\s*\(',
+        re.compile(r'Runtime\.getRuntime\(\)\.exec\s*\(', re.IGNORECASE),
         "Java Runtime.exec() - verify arguments are not user-controlled",
-        Severity.HIGH,
+        Severity.HIGH, _CI,
     ),
 ]
+
+_GUARD = re.compile(
+    r'os\.system|os\.popen|subprocess\.|shell_exec|passthru|proc_open'
+    r'|eval\s*\(|exec\s*\(|Runtime\.getRuntime',
+    re.IGNORECASE,
+)
 
 
 class CommandInjectionAnalyzer(BaseAnalyzer):
@@ -60,26 +67,4 @@ class CommandInjectionAnalyzer(BaseAnalyzer):
     supported_extensions = (".php", ".js", ".ts", ".java", ".rb", ".sh")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        findings: list[Finding] = []
-        lines = content.splitlines()
-
-        for rule_id, pattern, description, severity in _RULES:
-            for lineno, line in enumerate(lines, start=1):
-                if self._is_comment(line):
-                    continue
-                if re.search(pattern, line, re.IGNORECASE):
-                    findings.append(
-                        Finding(
-                            vuln_type=VulnType.COMMAND_INJECTION,
-                            severity=severity,
-                            file_path=file_path,
-                            line_number=lineno,
-                            line_content=line.strip(),
-                            description=description,
-                            rule_id=rule_id,
-                            repo_url=repo_url,
-                            snippet=self._extract_snippet(lines, lineno),
-                        )
-                    )
-
-        return findings
+        return self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)

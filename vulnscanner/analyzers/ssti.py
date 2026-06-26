@@ -3,102 +3,82 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
-# (rule_id, pattern, description, severity, extensions)
-_RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
-    # ── Python / Jinja2 (regex fallback; AST handles .py with higher precision) ─
+_ST = VulnType.SSTI
+
+# (rule_id, compiled_re, description, severity, vuln_type, exts)
+_RULES = [
     (
         "SSTI-001",
-        r'render_template_string\s*\(\s*(?![\'"`])',
+        re.compile(r'render_template_string\s*\(\s*(?![\'"`])', re.IGNORECASE),
         "Jinja2 render_template_string with non-literal template - SSTI leads to RCE",
-        Severity.CRITICAL,
-        (".py",),
+        Severity.CRITICAL, _ST, (".py",),
     ),
     (
         "SSTI-002",
-        r'(?:Environment|jinja2\.Environment)\s*\(\s*\)\.from_string\s*\(\s*(?![\'"`])',
+        re.compile(r'(?:Environment|jinja2\.Environment)\s*\(\s*\)\.from_string\s*\(\s*(?![\'"`])', re.IGNORECASE),
         "Jinja2 Environment.from_string with non-literal template - SSTI risk",
-        Severity.HIGH,
-        (".py",),
+        Severity.HIGH, _ST, (".py",),
     ),
-    # ── PHP / Twig ─────────────────────────────────────────────────────────────
     (
         "SSTI-003",
-        r'\$twig->(?:render|display)\s*\(\s*\$(?!_)',
+        re.compile(r'\$twig->(?:render|display)\s*\(\s*\$(?!_)', re.IGNORECASE),
         "Twig render/display with variable template name - verify template is not user-controlled",
-        Severity.HIGH,
-        (".php",),
+        Severity.HIGH, _ST, (".php",),
     ),
     (
         "SSTI-004",
-        r'\$smarty->(?:display|fetch)\s*\(\s*\$(?!_)',
+        re.compile(r'\$smarty->(?:display|fetch)\s*\(\s*\$(?!_)', re.IGNORECASE),
         "Smarty display/fetch with variable template - SSTI risk",
-        Severity.HIGH,
-        (".php",),
+        Severity.HIGH, _ST, (".php",),
     ),
-    # ── Ruby / ERB ─────────────────────────────────────────────────────────────
     (
         "SSTI-005",
-        r'ERB\.new\s*\(\s*(?![\'"])',
+        re.compile(r'ERB\.new\s*\(\s*(?![\'"])', re.IGNORECASE),
         "Ruby ERB.new with non-literal template - SSTI risk if template is user-controlled",
-        Severity.CRITICAL,
-        (".rb",),
+        Severity.CRITICAL, _ST, (".rb",),
     ),
-    # ── Node.js template engines ───────────────────────────────────────────────
     (
         "SSTI-006",
-        r'\bejs\.render(?:File)?\s*\(\s*(?![\'"`])',
+        re.compile(r'\bejs\.render(?:File)?\s*\(\s*(?![\'"`])', re.IGNORECASE),
         "EJS render with non-literal template - SSTI risk",
-        Severity.CRITICAL,
-        (".js", ".ts"),
+        Severity.CRITICAL, _ST, (".js", ".ts"),
     ),
     (
         "SSTI-007",
-        r'\bHandlebars\.compile\s*\(\s*(?![\'"`])',
+        re.compile(r'\bHandlebars\.compile\s*\(\s*(?![\'"`])', re.IGNORECASE),
         "Handlebars compile with non-literal template - SSTI risk",
-        Severity.CRITICAL,
-        (".js", ".ts"),
+        Severity.CRITICAL, _ST, (".js", ".ts"),
     ),
     (
         "SSTI-008",
-        r'\bnunjucks\.renderString\s*\(\s*(?![\'"`])',
+        re.compile(r'\bnunjucks\.renderString\s*\(\s*(?![\'"`])', re.IGNORECASE),
         "Nunjucks renderString with non-literal template - SSTI risk",
-        Severity.CRITICAL,
-        (".js", ".ts"),
+        Severity.CRITICAL, _ST, (".js", ".ts"),
     ),
     (
         "SSTI-009",
-        r'\bpug\.(?:compile|render)\s*\(\s*(?![\'"`])',
+        re.compile(r'\bpug\.(?:compile|render)\s*\(\s*(?![\'"`])', re.IGNORECASE),
         "Pug compile/render with non-literal template - SSTI risk",
-        Severity.CRITICAL,
-        (".js", ".ts"),
+        Severity.CRITICAL, _ST, (".js", ".ts"),
     ),
 ]
+
+_GUARD = re.compile(
+    r'render_template_string|from_string|twig->|smarty->|ERB\.new|ejs\.render|Handlebars\.compile'
+    r'|nunjucks\.renderString|pug\.(?:compile|render)',
+    re.IGNORECASE,
+)
 
 
 class SSTIAnalyzer(BaseAnalyzer):
     supported_extensions = (".py", ".php", ".rb", ".js", ".ts")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        findings: list[Finding] = []
-        lines = content.splitlines()
-
-        for rule_id, pattern, description, severity, exts in _RULES:
-            if not file_path.endswith(exts):
-                continue
-            for lineno, line in enumerate(lines, start=1):
-                if self._is_comment(line):
-                    continue
-                if re.search(pattern, line, re.IGNORECASE):
-                    findings.append(Finding(
-                        vuln_type=VulnType.SSTI,
-                        severity=severity,
-                        file_path=file_path,
-                        line_number=lineno,
-                        line_content=line.strip(),
-                        description=description,
-                        rule_id=rule_id,
-                        repo_url=repo_url,
-                        snippet=self._extract_snippet(lines, lineno),
-                    ))
-
-        return findings
+        applicable = [
+            (rid, re_obj, desc, sev, vt)
+            for rid, re_obj, desc, sev, vt, exts in _RULES
+            if file_path.endswith(exts)
+        ]
+        if not applicable:
+            return []
+        return self._scan_lines(file_path, content, repo_url, applicable, guard=_GUARD)

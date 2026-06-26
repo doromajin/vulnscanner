@@ -3,70 +3,72 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
-# (rule_id, pattern, description, severity, extensions)
-_RULES: list[tuple[str, str, str, Severity, tuple[str, ...]]] = [
-    # ── PHP ────────────────────────────────────────────────────────────────────
+_SR = VulnType.SSRF
+
+# (rule_id, compiled_re, description, severity, vuln_type, exts)
+_RULES = [
     (
         "SSRF-001",
-        r'curl_setopt\s*\(.*CURLOPT_URL.*\$_(?:GET|POST|REQUEST|COOKIE)',
+        re.compile(r'curl_setopt\s*\(.*CURLOPT_URL.*\$_(?:GET|POST|REQUEST|COOKIE)', re.IGNORECASE),
         "PHP cURL with user-controlled URL - SSRF allows requests to internal services",
-        Severity.HIGH,
-        (".php",),
+        Severity.HIGH, _SR, (".php",),
     ),
     (
         "SSRF-002",
-        r'file_get_contents\s*\(\s*\$_(?:GET|POST|REQUEST)',
+        re.compile(r'file_get_contents\s*\(\s*\$_(?:GET|POST|REQUEST)', re.IGNORECASE),
         "PHP file_get_contents with user URL - SSRF / path traversal risk",
-        Severity.HIGH,
-        (".php",),
+        Severity.HIGH, _SR, (".php",),
     ),
-    # ── Java ───────────────────────────────────────────────────────────────────
     (
         "SSRF-003",
-        r'new\s+URL\s*\(\s*(?![\'"]\s*[\'"]\s*\))',
+        re.compile(r'new\s+URL\s*\(\s*(?![\'"]\s*[\'"]\s*\))', re.IGNORECASE),
         "Java URL instantiation with non-literal - verify URL cannot be user-controlled",
-        Severity.MEDIUM,
-        (".java",),
+        Severity.MEDIUM, _SR, (".java",),
     ),
     (
         "SSRF-004",
-        r'(?:HttpURLConnection|CloseableHttpClient|HttpClient).*(?:getParameter|getAttribute)',
+        re.compile(r'(?:HttpURLConnection|CloseableHttpClient|HttpClient).*(?:getParameter|getAttribute)', re.IGNORECASE),
         "Java HTTP client using request parameter as URL - SSRF risk",
-        Severity.HIGH,
-        (".java",),
+        Severity.HIGH, _SR, (".java",),
     ),
-    # ── Node.js / TypeScript ───────────────────────────────────────────────────
     (
         "SSRF-005",
-        r'(?:fetch|axios\.(?:get|post|put|patch|delete|request)|(?:http|https)\.(?:get|request))\s*\(\s*req\.(?:query|body|params)',
+        re.compile(
+            r'(?:fetch|axios\.(?:get|post|put|patch|delete|request)|(?:http|https)\.(?:get|request))\s*\(\s*req\.(?:query|body|params)',
+            re.IGNORECASE,
+        ),
         "Node.js HTTP request with user-controlled URL - SSRF risk",
-        Severity.HIGH,
-        (".js", ".ts"),
+        Severity.HIGH, _SR, (".js", ".ts"),
     ),
     (
         "SSRF-006",
-        r'(?:fetch|axios\.(?:get|post|put|patch|delete|request))\s*\(\s*`[^`]*\$\{req\.',
+        re.compile(
+            r'(?:fetch|axios\.(?:get|post|put|patch|delete|request))\s*\(\s*`[^`]*\$\{req\.',
+            re.IGNORECASE,
+        ),
         "Node.js HTTP request with URL template containing request data - SSRF risk",
-        Severity.HIGH,
-        (".js", ".ts"),
+        Severity.HIGH, _SR, (".js", ".ts"),
     ),
-    # ── Ruby ───────────────────────────────────────────────────────────────────
     (
         "SSRF-007",
-        r'(?:Net::HTTP\.get|open-uri|URI\.open|RestClient\.(?:get|post))\s*\(\s*params\[',
+        re.compile(r'(?:Net::HTTP\.get|open-uri|URI\.open|RestClient\.(?:get|post))\s*\(\s*params\[', re.IGNORECASE),
         "Ruby HTTP request with user-supplied URL - SSRF risk",
-        Severity.HIGH,
-        (".rb",),
+        Severity.HIGH, _SR, (".rb",),
     ),
-    # ── Go ─────────────────────────────────────────────────────────────────────
     (
         "SSRF-008",
-        r'http\.(?:Get|Post|NewRequest)\s*\(\s*(?:r\.(?:FormValue|URL|Header)|fmt\.Sprintf)',
+        re.compile(r'http\.(?:Get|Post|NewRequest)\s*\(\s*(?:r\.(?:FormValue|URL|Header)|fmt\.Sprintf)', re.IGNORECASE),
         "Go HTTP request with dynamic URL - verify URL cannot be user-controlled",
-        Severity.MEDIUM,
-        (".go",),
+        Severity.MEDIUM, _SR, (".go",),
     ),
 ]
+
+_GUARD = re.compile(
+    r'curl_setopt|file_get_contents|new\s+URL\s*\(|HttpURLConnection|CloseableHttpClient'
+    r'|fetch\s*\(|axios\.|http\.get|http\.request|https\.get|https\.request'
+    r'|Net::HTTP|open-uri|URI\.open|RestClient\.|http\.Get|http\.Post|http\.NewRequest',
+    re.IGNORECASE,
+)
 
 
 class SSRFAnalyzer(BaseAnalyzer):
@@ -74,26 +76,11 @@ class SSRFAnalyzer(BaseAnalyzer):
     supported_extensions = (".php", ".java", ".js", ".ts", ".rb", ".go")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        findings: list[Finding] = []
-        lines = content.splitlines()
-
-        for rule_id, pattern, description, severity, exts in _RULES:
-            if not file_path.endswith(exts):
-                continue
-            for lineno, line in enumerate(lines, start=1):
-                if self._is_comment(line):
-                    continue
-                if re.search(pattern, line, re.IGNORECASE):
-                    findings.append(Finding(
-                        vuln_type=VulnType.SSRF,
-                        severity=severity,
-                        file_path=file_path,
-                        line_number=lineno,
-                        line_content=line.strip(),
-                        description=description,
-                        rule_id=rule_id,
-                        repo_url=repo_url,
-                        snippet=self._extract_snippet(lines, lineno),
-                    ))
-
-        return findings
+        applicable = [
+            (rid, re_obj, desc, sev, vt)
+            for rid, re_obj, desc, sev, vt, exts in _RULES
+            if file_path.endswith(exts)
+        ]
+        if not applicable:
+            return []
+        return self._scan_lines(file_path, content, repo_url, applicable, guard=_GUARD)

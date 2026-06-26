@@ -3,69 +3,58 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
-_RULES: list[tuple[str, str, str, Severity]] = [
+_PP = VulnType.PROTOTYPE_POLLUTION
+_XS = VulnType.XSS
+
+# (rule_id, compiled_re, description, severity, vuln_type)
+_RULES = [
     (
         "PROTO-001",
-        r'__proto__\s*[\[=]',
+        re.compile(r'__proto__\s*[\[=]', re.IGNORECASE),
         "Direct __proto__ assignment - prototype pollution can affect all objects in the process",
-        Severity.HIGH,
+        Severity.HIGH, _PP,
     ),
     (
         "PROTO-002",
-        r'constructor\s*\.\s*prototype\s*[\[.]',
+        re.compile(r'constructor\s*\.\s*prototype\s*[\[.]', re.IGNORECASE),
         "Modification via constructor.prototype - prototype pollution risk",
-        Severity.HIGH,
+        Severity.HIGH, _PP,
     ),
     (
         "PROTO-003",
-        # Object.assign / merge into a target where the source comes from request data
-        r'Object\.(?:assign|merge)\s*\(\s*\w+\s*,\s*(?:req\.(?:body|query|params)|JSON\.parse)',
+        re.compile(
+            r'Object\.(?:assign|merge)\s*\(\s*\w+\s*,\s*(?:req\.(?:body|query|params)|JSON\.parse)',
+            re.IGNORECASE,
+        ),
         "Object.assign/merge with request data as source - prototype pollution if keys include __proto__",
-        Severity.HIGH,
+        Severity.HIGH, _PP,
     ),
     (
         "PROTO-004",
-        # Deep merge / extend libraries often used unsafely
-        r'(?:_\.merge|_\.extend|jQuery\.extend|deepmerge|lodash\.merge)\s*\(\s*(?:true\s*,\s*)?\w+\s*,\s*(?:req\.|JSON\.parse)',
+        re.compile(
+            r'(?:_\.merge|_\.extend|jQuery\.extend|deepmerge|lodash\.merge)\s*\(\s*(?:true\s*,\s*)?\w+\s*,\s*(?:req\.|JSON\.parse)',
+            re.IGNORECASE,
+        ),
         "Deep merge with user-controlled object - prototype pollution risk",
-        Severity.HIGH,
+        Severity.HIGH, _PP,
     ),
     (
         "PROTO-005",
-        # React dangerouslySetInnerHTML - XSS risk
-        r'dangerouslySetInnerHTML\s*=\s*\{\s*\{',
+        re.compile(r'dangerouslySetInnerHTML\s*=\s*\{\s*\{', re.IGNORECASE),
         "dangerouslySetInnerHTML bypasses React's XSS protection - ensure content is sanitized",
-        Severity.HIGH,
+        Severity.HIGH, _XS,
     ),
 ]
+
+_GUARD = re.compile(
+    r'__proto__|constructor\.prototype|Object\.(?:assign|merge)|'
+    r'_\.(?:merge|extend)|jQuery\.extend|deepmerge|lodash\.merge|dangerouslySetInnerHTML',
+    re.IGNORECASE,
+)
 
 
 class PrototypePollutionAnalyzer(BaseAnalyzer):
     supported_extensions = (".js", ".ts", ".jsx", ".tsx")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        findings: list[Finding] = []
-        lines = content.splitlines()
-
-        for rule_id, pattern, description, severity in _RULES:
-            for lineno, line in enumerate(lines, start=1):
-                if self._is_comment(line):
-                    continue
-                if re.search(pattern, line, re.IGNORECASE):
-                    vuln = (
-                        VulnType.XSS if rule_id == "PROTO-005"
-                        else VulnType.PROTOTYPE_POLLUTION
-                    )
-                    findings.append(Finding(
-                        vuln_type=vuln,
-                        severity=severity,
-                        file_path=file_path,
-                        line_number=lineno,
-                        line_content=line.strip(),
-                        description=description,
-                        rule_id=rule_id,
-                        repo_url=repo_url,
-                        snippet=self._extract_snippet(lines, lineno),
-                    ))
-
-        return findings
+        return self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)

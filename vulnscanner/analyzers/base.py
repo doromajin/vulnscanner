@@ -1,4 +1,5 @@
 import io
+import re
 import tokenize
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -27,6 +28,51 @@ class BaseAnalyzer(ABC):
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         """Analyze file content and return a list of findings."""
         ...
+
+    def _scan_lines(
+        self,
+        file_path: str,
+        content: str,
+        repo_url: str,
+        rules: list[tuple],
+        *,
+        guard: re.Pattern | None = None,
+    ) -> list[Finding]:
+        """Single-pass optimized line scanner.
+
+        *rules* is a list of ``(rule_id, compiled_re, description, severity, vuln_type)``
+        tuples where ``compiled_re`` is a pre-compiled :class:`re.Pattern`.
+
+        The outer loop iterates lines once; every rule is tested per line so
+        ``_is_comment`` is called exactly once per line (not once per rule per line)
+        and the compiled-pattern cache-lookup overhead is paid once per match, not
+        per rule×line.
+
+        If *guard* is provided and does not match *content*, returns [] immediately —
+        fast path for files that contain no keyword relevant to any rule in the set.
+        """
+        if guard is not None and not guard.search(content):
+            return []
+        lines = content.splitlines()
+        findings: list[Finding] = []
+        for lineno, line in enumerate(lines, 1):
+            if self._is_comment(line):
+                continue
+            stripped = line.strip()
+            for rule_id, pattern_re, description, severity, vuln_type in rules:
+                if pattern_re.search(line):
+                    findings.append(Finding(
+                        vuln_type=vuln_type,
+                        severity=severity,
+                        file_path=file_path,
+                        line_number=lineno,
+                        line_content=stripped,
+                        description=description,
+                        rule_id=rule_id,
+                        repo_url=repo_url,
+                        snippet=self._extract_snippet(lines, lineno),
+                    ))
+        return findings
 
     def _extract_snippet(self, lines: list[str], line_number: int, context: int = 2) -> str:
         start = max(0, line_number - context - 1)

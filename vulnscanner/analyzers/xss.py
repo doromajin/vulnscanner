@@ -15,41 +15,49 @@ _JS_HTML_ONLY = frozenset({"XSS-002", "XSS-006"})
 _SIMPLE_RULES = [
     (
         "XSS-002",
-        r'document\.write\s*\(',
+        re.compile(r'document\.write\s*\(', re.IGNORECASE),
         "document.write() with potentially unsanitized input",
         Severity.HIGH,
     ),
     (
         "XSS-003",
-        r'outerHTML\s*=\s*(?![\'"]\s*[\'"])',
+        re.compile(r'outerHTML\s*=\s*(?![\'"]\s*[\'"])', re.IGNORECASE),
         "Direct outerHTML assignment",
         Severity.HIGH,
     ),
     (
         "XSS-004",
-        r'\|\s*safe\b|mark_safe\s*\(|format_html\s*\(.*\+',
+        re.compile(r'\|\s*safe\b|mark_safe\s*\(|format_html\s*\(.*\+', re.IGNORECASE),
         "Template value marked safe without explicit sanitization",
         Severity.MEDIUM,
     ),
     (
         "XSS-005",
-        r'echo\s+\$_(?:GET|POST|REQUEST|COOKIE)',
+        re.compile(r'echo\s+\$_(?:GET|POST|REQUEST|COOKIE)', re.IGNORECASE),
         "PHP direct echo of user-supplied input",
         Severity.HIGH,
     ),
     (
         "XSS-006",
-        r'insertAdjacentHTML\s*\(',
+        re.compile(r'insertAdjacentHTML\s*\(', re.IGNORECASE),
         "insertAdjacentHTML() - verify content is sanitized",
         Severity.MEDIUM,
     ),
     (
         "XSS-007",
-        r'eval\s*\(\s*(?:location|document\.|window\.)',
+        re.compile(r'eval\s*\(\s*(?:location|document\.|window\.)', re.IGNORECASE),
         "eval() with browser-controlled input",
         Severity.CRITICAL,
     ),
 ]
+
+# Content guard for the simple XSS rules (XSS-002 to XSS-007)
+_SIMPLE_GUARD = re.compile(
+    r'document\.write|outerHTML\s*=|\|\s*safe\b|mark_safe\s*\('
+    r'|format_html\s*\(|echo\s+\$_|insertAdjacentHTML\s*\('
+    r'|eval\s*\(\s*(?:location|document\.|window\.)',
+    re.IGNORECASE,
+)
 
 # ── XSS-001: innerHTML smart analysis ─────────────────────────────────────────
 
@@ -188,27 +196,31 @@ class XSSAnalyzer(BaseAnalyzer):
         # XSS-001: smart innerHTML check (handles multiline template literals)
         findings.extend(self._check_innerhtml(file_path, lines, repo_url))
 
-        # XSS-002 to XSS-007: simple per-line regex rules
-        for rule_id, pattern, description, severity in _SIMPLE_RULES:
-            if rule_id in _JS_HTML_ONLY and not file_path.endswith(_JS_HTML_EXTS):
-                continue
-            for lineno, line in enumerate(lines, start=1):
+        # XSS-002 to XSS-007: simple per-line regex rules (single-pass, pre-compiled)
+        if _SIMPLE_GUARD.search(content):
+            is_js_html = file_path.endswith(_JS_HTML_EXTS)
+            simple_rules = [
+                (rid, pat, desc, sev)
+                for rid, pat, desc, sev in _SIMPLE_RULES
+                if rid not in _JS_HTML_ONLY or is_js_html
+            ]
+            for lineno, line in enumerate(lines, 1):
                 if self._is_comment(line):
                     continue
-                if re.search(pattern, line, re.IGNORECASE):
-                    findings.append(
-                        Finding(
+                stripped = line.strip()
+                for rule_id, pattern_re, description, severity in simple_rules:
+                    if pattern_re.search(line):
+                        findings.append(Finding(
                             vuln_type=VulnType.XSS,
                             severity=severity,
                             file_path=file_path,
                             line_number=lineno,
-                            line_content=line.strip(),
+                            line_content=stripped,
                             description=description,
                             rule_id=rule_id,
                             repo_url=repo_url,
                             snippet=self._extract_snippet(lines, lineno),
-                        )
-                    )
+                        ))
 
         # XSS-008: PHP 1-hop taint analysis ($_GET/$_POST → $var → echo)
         if file_path.endswith(".php"):
