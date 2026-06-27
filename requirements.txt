@@ -19,6 +19,7 @@ Jinja2==3.1.4
 
 # Nightly auto-improvement (FuguAI evaluation; Claude Code CLI used for generation)
 openai==2.44.0
+python-dotenv==1.0.1
 
 # Testing
 pytest==8.2.2

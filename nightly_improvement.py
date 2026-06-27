@@ -19,10 +19,13 @@ ANTHROPIC_API_KEY は不要（Claude Code のログイン認証を使用）。
 """
 
 import argparse
+import ast
 import json
 import os
 import re
+import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -31,11 +34,19 @@ from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# プロジェクトルートの .env を環境変数へ反映（既にセットされた値は上書きしない）
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
+except ImportError:
+    pass  # python-dotenv 未インストール時はシステム環境変数のみ使用
+
 # ── 設定定数 ──────────────────────────────────────────────────────────────────
 MAX_WINDOW_SECONDS  = 4 * 3600   # 実行ウィンドウ上限
 FUGU_TOKEN_BUDGET   = 50_000     # FuguAI 1晩上限トークン
 CLAUDE_HALF_WINDOW  = 2 * 3600   # 朝の作業用に 50% (2h) を残す
 MIN_FUGU_RESERVE    = 2_000      # ループ1回残せない場合は中断
+MAX_RETRIES         = 3          # 一時的エラー時の最大リトライ回数
 
 PROPOSALS_DIR      = Path("improvement_proposals")
 BEST_PROPOSAL_FILE = Path("proposal_best.py")
@@ -48,7 +59,6 @@ FUGU_MODEL        = os.environ.get("FUGU_MODEL", "fugu-chat")
 
 BASELINE = {"precision": 100.0, "recall": 100.0, "f1": 100.0, "passed": 36}
 
-# ローテーション対象のアナライザー（改善余地が大きい順）
 ANALYZER_FILES = [
     "vulnscanner/analyzers/ssrf.py",
     "vulnscanner/analyzers/open_redirect.py",
@@ -63,26 +73,79 @@ ANALYZER_FILES = [
 ]
 
 
+# ── 例外 ───────────────────────────────────────────────────────────────────────
+
+class FatalError(Exception):
+    """継続不可能なエラー。main() でキャッチしてフォアグラウンドに報告・停止する。"""
+
+
 # ── ユーティリティ ─────────────────────────────────────────────────────────────
 
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    # \r 進捗表示中の行を確定させてから新しい行を出力する
+    print(f"\r[{ts}] {msg}                    ", flush=True)
 
 
 def strip_ansi(text: str) -> str:
     return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
 
 
+# ── フォアグラウンド進捗表示付きサブプロセス実行 ─────────────────────────────
+
+def _run_with_ticker(
+    cmd: list[str],
+    input_text: str,
+    encoding: str,
+    timeout: float,
+    label: str,
+) -> subprocess.CompletedProcess:
+    """subprocess を別スレッドで実行しながら \r で経過秒を表示する。
+
+    完了後に空白付き改行を出力するので後続の log() と干渉しない。
+    例外は呼び出し元へそのままバブルアップする。
+    """
+    holder: dict = {"result": None, "exc": None}
+
+    def _worker() -> None:
+        try:
+            holder["result"] = subprocess.run(
+                cmd,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                encoding=encoding,
+                timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            holder["exc"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    t_start = time.monotonic()
+
+    while thread.is_alive():
+        elapsed = int(time.monotonic() - t_start)
+        print(f"\r  [{label}] 待機中... {elapsed}s", end="", flush=True)
+        thread.join(timeout=1.0)
+
+    elapsed_final = int(time.monotonic() - t_start)
+    print(f"\r  [{label}] 完了 ({elapsed_final}s)                    ", flush=True)
+
+    if holder["exc"] is not None:
+        raise holder["exc"]
+    return holder["result"]  # type: ignore[return-value]
+
+
 # ── recall_check 実行 & パース ─────────────────────────────────────────────────
 
 def run_recall_check() -> dict:
-    """recall_check.py を実行してメトリクス dict を返す。
-
-    Returns:
-        precision, recall, f1 (float), passed (int), total (int), ok (bool)
-    """
-    import subprocess
+    """recall_check.py を実行してメトリクス dict を返す。"""
+    if not Path("recall_check.py").exists():
+        raise FatalError(
+            "recall_check.py が見つかりません。\n"
+            "  作業ディレクトリが VulnScanner のルートか確認してください。"
+        )
     result = subprocess.run(
         [sys.executable, "recall_check.py"],
         capture_output=True, text=True, timeout=120,
@@ -93,7 +156,6 @@ def run_recall_check() -> dict:
         "precision": 0.0, "recall": 0.0, "f1": 0.0,
         "passed": 0, "total": 36, "ok": False,
     }
-
     for key, pat in [
         ("precision", r'Precision:\s+([\d.]+)%'),
         ("recall",    r'Recall:\s+([\d.]+)%'),
@@ -109,8 +171,7 @@ def run_recall_check() -> dict:
     else:
         m = re.search(r'(\d+) check\(s\) FAILED', raw)
         if m:
-            failed = int(m.group(1))
-            metrics["passed"] = 36 - failed
+            metrics["passed"] = 36 - int(m.group(1))
 
     return metrics
 
@@ -129,14 +190,12 @@ def _existing_rule_ids() -> list[str]:
 def build_claude_prompt(target_file: str, previous_attempts: list[str]) -> str:
     content = Path(target_file).read_text(encoding="utf-8")
     existing = ", ".join(_existing_rule_ids())
-
     prev_note = ""
     if previous_attempts:
         prev_note = (
             "\n\nPrevious attempts this session (do NOT repeat rule IDs or the same approach):\n"
             + "\n".join(f"  - {a}" for a in previous_attempts[-5:])
         )
-
     return f"""You are a security engineer improving VulnScanner, a whitebox static analysis tool.
 
 Current benchmark: Precision 100% / Recall 100% / F1 100% (36/36 checks passing).
@@ -207,74 +266,197 @@ Output ONLY a valid JSON object — no other text:
 
 # ── API 呼び出し ───────────────────────────────────────────────────────────────
 
-def call_claude(prompt: str) -> str | None:
-    """claude CLI (Claude Code 自身) を subprocess で呼び出す。
-    stdin にプロンプトを渡し、--output-format json の result フィールドを返す。
+def _find_claude_cmd() -> list[str]:
+    """OS に依存せず claude CLI の呼び出しコマンドリストを返す。
+
+    Windows では shutil.which が .cmd を返す場合があり、
+    .cmd/.bat は shell=False では直接実行できないため cmd /c 経由にする。
+    見つからない場合は FatalError を送出する。
     """
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["claude", "-p", "--output-format", "json"],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=300,
-        )
-        if result.returncode != 0:
-            log(f"claude CLI エラー (rc={result.returncode}): {result.stderr[:300]}")
+    import shutil
+    path = shutil.which("claude")
+    if path:
+        if sys.platform == "win32" and Path(path).suffix.lower() in (".cmd", ".bat"):
+            return ["cmd", "/c", path]
+        return [path]
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        for suffix in (".cmd", ".ps1"):
+            candidate = Path(appdata) / "npm" / f"claude{suffix}"
+            if candidate.exists():
+                if suffix == ".ps1":
+                    return ["powershell", "-NonInteractive", "-File", str(candidate)]
+                return ["cmd", "/c", str(candidate)]
+    raise FatalError(
+        "claude コマンドが見つかりません。\n"
+        "  Claude Code がインストール済みか、PATH が通っているか確認してください。\n"
+        "  インストール: npm install -g @anthropic-ai/claude-code"
+    )
+
+
+# エラー分類パターン
+_RETRYABLE_RE = re.compile(
+    r'rate.?limit|too many requests|overloaded|503|502|529'
+    r'|timed? ?out|network|connection|ECONNRESET|ETIMEDOUT',
+    re.IGNORECASE,
+)
+_AUTH_RE = re.compile(
+    r'not logged in|unauthorized|unauthenticated|authentication'
+    r'|401|invalid.{0,10}key|api.?key',
+    re.IGNORECASE,
+)
+
+
+def _classify_claude_error(returncode: int, stderr: str) -> str:
+    """'retryable' / 'fatal' のいずれかを返す。"""
+    if _AUTH_RE.search(stderr):
+        return "fatal"
+    if _RETRYABLE_RE.search(stderr):
+        return "retryable"
+    return "fatal"
+
+
+def call_claude(prompt: str) -> str | None:
+    """claude CLI を呼び出す（進捗表示・自動リトライ付き）。
+
+    Returns:
+        Claude の応答テキスト。取得できなければ None。
+    Raises:
+        FatalError: 認証エラーなど継続不可能な場合。
+    """
+    cmd = _find_claude_cmd() + ["-p", "--output-format", "json"]
+    retry_delays = [30, 60, 120]
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = _run_with_ticker(cmd, prompt, "utf-8", 300, "Claude")
+        except FileNotFoundError as exc:
+            raise FatalError(f"claude CLI が見つかりません: {exc}") from exc
+        except subprocess.TimeoutExpired:
+            log(f"  claude CLI タイムアウト (300s) [試行 {attempt + 1}/{MAX_RETRIES}]")
+            if attempt < MAX_RETRIES - 1:
+                delay = retry_delays[attempt]
+                log(f"  {delay}秒待機後リトライ...")
+                time.sleep(delay)
+                continue
+            log("  最大リトライに達しました — スキップ")
             return None
-        data = json.loads(result.stdout)
-        text = data.get("result", "")
-        return text if text else None
-    except subprocess.TimeoutExpired:
-        log("claude CLI タイムアウト (300s)")
-        return None
-    except Exception as exc:
-        log(f"claude CLI 呼び出しエラー: {exc}")
-        return None
+
+        if result.returncode == 0:
+            try:
+                data = json.loads(result.stdout)
+                text = data.get("result", "")
+                return text if text else None
+            except json.JSONDecodeError as exc:
+                log(f"  claude CLI JSON パースエラー: {exc}")
+                log(f"  生出力 (先頭200文字): {result.stdout[:200]}")
+                return None
+
+        # エラー診断
+        severity = _classify_claude_error(result.returncode, result.stderr)
+        snippet = result.stderr[:300].strip()
+        log(f"  [診断] claude CLI エラー (rc={result.returncode}): {snippet}")
+
+        if severity == "fatal":
+            raise FatalError(
+                f"claude CLI 致命的エラー (rc={result.returncode}):\n{result.stderr[:600]}\n"
+                "  ヒント: `claude auth login` でログイン状態を確認してください。"
+            )
+
+        # retryable: 待機してリトライ
+        if attempt < MAX_RETRIES - 1:
+            delay = retry_delays[attempt]
+            log(f"  [診断] 一時的エラー → {delay}秒待機後リトライ ({attempt + 1}/{MAX_RETRIES})")
+            time.sleep(delay)
+        else:
+            log("  最大リトライに達しました — スキップ")
+            return None
+
+    return None
+
+
+def _ensure_openai() -> None:
+    """openai パッケージを確認し、未インストールなら自動インストールする。
+
+    インストール失敗は FatalError を送出する。
+    """
+    try:
+        import openai  # noqa: F401
+        return
+    except ImportError:
+        pass
+    pkg = "openai==2.44.0"
+    log(f"  [自動修正] openai 未インストール — pip install {pkg} を実行します")
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", pkg],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise FatalError(
+            f"openai パッケージのインストールに失敗しました:\n{r.stderr[:400]}\n"
+            f"  手動で実行してください: pip install {pkg}"
+        )
+    log("  [自動修正] openai インストール完了")
 
 
 def call_fugu(prompt: str) -> tuple[str | None, int]:
-    """FuguAI を呼び出す。戻り値: (response_text, total_tokens_used)"""
+    """FuguAI を呼び出す（進捗表示付き）。戻り値: (response_text, total_tokens_used)"""
+    _ensure_openai()
     try:
         from openai import OpenAI
         client = OpenAI(api_key=FUGU_API_KEY, base_url=FUGU_API_BASE)
-        response = client.chat.completions.create(
-            model=FUGU_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=512,
-            temperature=0.2,
-        )
+        holder: dict = {"resp": None, "exc": None}
+
+        def _worker() -> None:
+            try:
+                holder["resp"] = client.chat.completions.create(
+                    model=FUGU_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=512,
+                    temperature=0.2,
+                )
+            except Exception as exc:  # noqa: BLE001
+                holder["exc"] = exc
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        t_start = time.monotonic()
+        while thread.is_alive():
+            elapsed = int(time.monotonic() - t_start)
+            print(f"\r  [FuguAI] 待機中... {elapsed}s", end="", flush=True)
+            thread.join(timeout=1.0)
+        elapsed_final = int(time.monotonic() - t_start)
+        print(f"\r  [FuguAI] 完了 ({elapsed_final}s)                    ", flush=True)
+
+        if holder["exc"] is not None:
+            raise holder["exc"]
+
+        response = holder["resp"]
         tokens = response.usage.total_tokens if response.usage else 0
         return response.choices[0].message.content, tokens
+
     except Exception as exc:
-        log(f"FuguAI エラー: {exc}")
+        log(f"  FuguAI エラー: {exc}")
         return None, 0
 
 
 # ── JSON パース ────────────────────────────────────────────────────────────────
 
 def parse_claude_json(raw: str) -> dict | None:
-    """Claude 出力から JSON を抽出する。new_content に改行・特殊文字を含む場合も対応。"""
-    # ```json ... ``` フェンスを除去
+    """Claude 出力から JSON を抽出する。"""
     cleaned = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
     cleaned = re.sub(r'\s*```$', '', cleaned, flags=re.MULTILINE)
     cleaned = cleaned.strip()
-
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-
-    # 部分的な JSON: {" から } までを貪欲に抽出して試みる
     m = re.search(r'\{.*\}', cleaned, re.DOTALL)
     if m:
         try:
             return json.loads(m.group(0))
         except json.JSONDecodeError:
             pass
-
     return None
 
 
@@ -292,20 +474,27 @@ def parse_fugu_json(raw: str | None) -> dict | None:
 
 # ── ファイル操作 ───────────────────────────────────────────────────────────────
 
+def validate_python_syntax(code: str, label: str) -> bool:
+    """Python ソースの構文を検証する。エラー内容はログに出力する。"""
+    try:
+        ast.parse(code)
+        return True
+    except SyntaxError as exc:
+        log(f"  [診断] 構文エラー ({label}): {exc}")
+        return False
+
+
 def apply_proposal(target_file: str, new_content: str) -> str | None:
-    """
-    target_file を new_content で上書きし、バックアップ内容を返す。
-    失敗時は None を返す（ファイルは変更しない）。
-    """
+    """target_file を new_content で上書きしバックアップ内容を返す。失敗時は None。"""
     p = Path(target_file)
     if not p.exists():
-        log(f"対象ファイルが見つかりません: {target_file}")
+        log(f"  対象ファイルが見つかりません: {target_file}")
         return None
     backup = p.read_text(encoding="utf-8")
     try:
         p.write_text(new_content, encoding="utf-8")
     except Exception as exc:
-        log(f"ファイル書き込みエラー: {exc}")
+        log(f"  ファイル書き込みエラー: {exc}")
         return None
     return backup
 
@@ -332,7 +521,6 @@ def write_report(
 ) -> None:
     date_str = datetime.now().strftime("%Y-%m-%d")
     mins = elapsed_sec / 60
-
     header = [
         "# VulnScanner 夜間自動改善レポート",
         "",
@@ -343,8 +531,8 @@ def write_report(
         "",
         "## ベースライン",
         "",
-        f"| 指標 | 値 |",
-        f"|---|---|",
+        "| 指標 | 値 |",
+        "|---|---|",
         f"| Precision | {BASELINE['precision']:.1f}% |",
         f"| Recall    | {BASELINE['recall']:.1f}% |",
         f"| F1        | {BASELINE['f1']:.1f}% |",
@@ -355,7 +543,6 @@ def write_report(
         "| # | ルールID | 概要 | P | R | F1 | 品質 | 経過(s) | 採用 |",
         "|---|---|---|---|---|---|---|---|---|",
     ]
-
     rows = []
     for r in loop_results:
         m  = r["metrics"]
@@ -366,13 +553,12 @@ def write_report(
             f"| {m['precision']:.1f}% | {m['recall']:.1f}% | {m['f1']:.1f}% "
             f"| {r.get('quality_score', '-')} | {r.get('loop_sec', 0):.0f} | {ok} |"
         )
-
     footer: list[str] = []
     if best_idx >= 0:
         best = loop_results[best_idx]
         footer += [
             "",
-            f"## 最良改善案",
+            "## 最良改善案",
             "",
             f"- イテレーション: {best['iteration']}",
             f"- ルールID: {best.get('rule_id','?')}",
@@ -392,36 +578,23 @@ def write_report(
 
 # ── メインループ ───────────────────────────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="VulnScanner 夜間自動改善ループ")
-    parser.add_argument("--max-hours", type=float, default=4.0,
-                        help="実行ウィンドウ上限（時間, デフォルト 4.0）")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="API を呼ばず動作確認のみ (recall_check は実行)")
-    args = parser.parse_args()
-
+def _run_loop(args: argparse.Namespace) -> int:
+    """改善ループ本体。終了コード (0/1) を返す。FatalError はバブルアップ。"""
     max_seconds = args.max_hours * 3600
     start_time  = time.monotonic()
-
-    # 必須環境変数チェック (claude CLI を使うため ANTHROPIC_API_KEY は不要)
-    missing = [k for k in ("FUGU_API_KEY",) if not os.environ.get(k)]
-    if missing and not args.dry_run:
-        log(f"ERROR: 環境変数未設定: {', '.join(missing)}")
-        sys.exit(1)
 
     PROPOSALS_DIR.mkdir(exist_ok=True)
     log(f"夜間改善ループ開始 | 最大 {args.max_hours}h | FuguAI 上限 {FUGU_TOKEN_BUDGET:,} tokens")
     if args.dry_run:
         log("[DRY RUN モード] Claude / FuguAI API 呼び出しはスキップします")
 
-    # ── 状態変数 ────────────────────────────────────────────────────────────────
-    fugu_tokens_used: int          = 0
-    iteration:        int          = 0
-    best_idx:         int          = -1
-    best_score:       float        = 0.0
-    loop_results:     list[dict]   = []
-    previous_attempts: list[str]   = []
-    loop_times:       list[float]  = []
+    fugu_tokens_used: int         = 0
+    iteration:        int         = 0
+    best_idx:         int         = -1
+    best_score:       float       = 0.0
+    loop_results:     list[dict]  = []
+    previous_attempts: list[str]  = []
+    loop_times:       list[float] = []
 
     token_record: dict = {
         "date": datetime.now().strftime("%Y-%m-%d"),
@@ -429,38 +602,29 @@ def main() -> None:
         "total_tokens": 0,
     }
 
-    # ── メインループ ─────────────────────────────────────────────────────────────
     while True:
         elapsed = time.monotonic() - start_time
 
-        # 時間バジェット: 平均ループ時間の 1.5 倍が残っているか確認
         avg_loop = sum(loop_times) / len(loop_times) if loop_times else 120.0
         if elapsed + avg_loop * 1.5 >= max_seconds:
             log(f"タイムバジェット残量不足 (経過 {elapsed/60:.1f}min, 平均ループ {avg_loop:.0f}s) → 終了")
             break
 
-        # FuguAI トークンバジェット確認
         if fugu_tokens_used >= FUGU_TOKEN_BUDGET - MIN_FUGU_RESERVE:
             log(f"FuguAI トークン上限に到達 ({fugu_tokens_used:,}/{FUGU_TOKEN_BUDGET:,}) → 終了")
             break
 
-        # Claude 呼び出し半ウィンドウ制限 (朝のために 50% を残す)
         if elapsed >= CLAUDE_HALF_WINDOW and not args.dry_run:
             log(f"Claude 半ウィンドウ上限 ({CLAUDE_HALF_WINDOW/3600:.1f}h) に到達 → 終了")
             break
 
-        loop_start   = time.monotonic()
-        target_file  = ANALYZER_FILES[iteration % len(ANALYZER_FILES)]
+        loop_start  = time.monotonic()
+        target_file = ANALYZER_FILES[iteration % len(ANALYZER_FILES)]
         log(f"── イテレーション {iteration + 1} | 対象: {target_file} | 経過 {elapsed/60:.1f}min ──")
 
         # ── 1. Claude に提案を生成させる ────────────────────────────────────────
-        rule_id      = "UNKNOWN"
-        change_summ  = ""
-        new_content  = ""
-
         if args.dry_run:
             log("[DRY RUN] Claude 呼び出しをスキップ -- 1 イテレーション実施して終了")
-            # dry-run では recall_check だけ実行して終了
             log("recall_check.py 実行中 (dry-run)...")
             m = run_recall_check()
             log(f"  P={m['precision']:.1f}% R={m['recall']:.1f}% F1={m['f1']:.1f}% ({m['passed']}/36)")
@@ -468,7 +632,7 @@ def main() -> None:
 
         log("Claude: 提案生成中...")
         prompt   = build_claude_prompt(target_file, previous_attempts)
-        raw_resp = call_claude(prompt)
+        raw_resp = call_claude(prompt)  # FatalError はバブルアップ
 
         if not raw_resp:
             log("Claude 応答なし — スキップ")
@@ -479,7 +643,7 @@ def main() -> None:
         proposal = parse_claude_json(raw_resp)
         if not proposal:
             log("JSON パース失敗 — スキップ")
-            previous_attempts.append(f"(json parse error on iteration {iteration+1})")
+            previous_attempts.append(f"(json parse error on iteration {iteration + 1})")
             iteration += 1
             loop_times.append(time.monotonic() - loop_start)
             continue
@@ -497,6 +661,14 @@ def main() -> None:
             loop_times.append(time.monotonic() - loop_start)
             continue
 
+        # Python 構文検証（ファイル書き込み前に弾く）
+        if not validate_python_syntax(new_content, rule_id):
+            log("  [自動診断] 構文エラーのためスキップ（ロールバック不要）")
+            previous_attempts.append(f"{rule_id}: syntax error in proposal")
+            iteration += 1
+            loop_times.append(time.monotonic() - loop_start)
+            continue
+
         # 提案ファイルを保存
         proposal_path = PROPOSALS_DIR / f"proposal_{iteration + 1:03d}.py"
         proposal_path.write_text(new_content, encoding="utf-8")
@@ -510,7 +682,7 @@ def main() -> None:
             continue
 
         log("  recall_check.py 実行中...")
-        metrics = run_recall_check()
+        metrics = run_recall_check()  # FatalError はバブルアップ
         log(f"  → P={metrics['precision']:.1f}% R={metrics['recall']:.1f}% "
             f"F1={metrics['f1']:.1f}% ({metrics['passed']}/36) {'OK' if metrics['ok'] else 'FAILED'}")
 
@@ -520,41 +692,33 @@ def main() -> None:
         fugu_tokens  = 0
 
         log("  FuguAI: 品質評価中...")
-        fugu_prompt = build_fugu_eval_prompt(
-            rule_id, change_summ, metrics, new_content
-        )
+        fugu_prompt = build_fugu_eval_prompt(rule_id, change_summ, metrics, new_content)
         fugu_raw, fugu_tokens = call_fugu(fugu_prompt)
         fugu_tokens_used += fugu_tokens
 
-        fugu_result  = parse_fugu_json(fugu_raw)
+        fugu_result = parse_fugu_json(fugu_raw)
         if fugu_result:
             quality      = int(fugu_result.get("quality_score", 0))
             fugu_comment = fugu_result.get("comments", "")
         log(f"  → 品質スコア: {quality}/10  ({fugu_comment[:70]})")
 
-        # トークン記録を更新・保存
         token_record["sessions"].append({
-            "iteration": iteration + 1,
-            "rule_id":   rule_id,
-            "tokens":    fugu_tokens,
-            "cumulative": fugu_tokens_used,
+            "iteration":   iteration + 1,
+            "rule_id":     rule_id,
+            "tokens":      fugu_tokens,
+            "cumulative":  fugu_tokens_used,
             "quality_score": quality,
         })
         token_record["total_tokens"] = fugu_tokens_used
         save_token_usage(token_record)
 
         # ── 4. 採用判定 ───────────────────────────────────────────────────────────
-        # composite = 品質スコア × (F1/100)  — ベンチ失敗は 0 固定
         composite = quality * (metrics["f1"] / 100.0) if metrics["ok"] else 0.0
-        adopted   = (
-            metrics["ok"]
-            and composite > best_score
-            and quality >= 5
-        )
+        adopted   = metrics["ok"] and composite > best_score and quality >= 5
 
         if adopted:
             best_score = composite
-            best_idx   = len(loop_results)   # 追加前のインデックス
+            best_idx   = len(loop_results)
             BEST_PROPOSAL_FILE.write_text(new_content, encoding="utf-8")
             log(f"  → ★ 採用 (composite={composite:.2f}) — 新ベスト!")
         else:
@@ -565,7 +729,6 @@ def main() -> None:
             )
             log(f"  → 棄却 ({reason})")
 
-        # 採用されなかった提案は元のファイルへロールバック
         if not adopted:
             rollback(target_file, backup)
             log("  ロールバック完了")
@@ -575,15 +738,15 @@ def main() -> None:
         log(f"  ループ時間: {loop_sec:.0f}s")
 
         loop_results.append({
-            "iteration":    iteration + 1,
-            "rule_id":      rule_id,
+            "iteration":      iteration + 1,
+            "rule_id":        rule_id,
             "change_summary": change_summ,
-            "target_file":  target_file,
-            "metrics":      metrics,
-            "quality_score": quality,
-            "fugu_comment": fugu_comment,
-            "adopted":      adopted,
-            "loop_sec":     loop_sec,
+            "target_file":    target_file,
+            "metrics":        metrics,
+            "quality_score":  quality,
+            "fugu_comment":   fugu_comment,
+            "adopted":        adopted,
+            "loop_sec":       loop_sec,
         })
 
         previous_attempts.append(f"{rule_id}: {change_summ[:60]}")
@@ -605,15 +768,43 @@ def main() -> None:
     else:
         log("最良提案: なし — すべての提案が棄却されました")
 
-    # 最終 recall スコアを確認して出力
     log("最終ベンチマーク確認...")
     final = run_recall_check()
     log(
         f"最終スコア: P={final['precision']:.1f}% R={final['recall']:.1f}% "
         f"F1={final['f1']:.1f}% ({final['passed']}/36) {'OK' if final['ok'] else 'FAILED'}"
     )
+    return 0 if final["ok"] else 1
 
-    sys.exit(0 if final["ok"] else 1)
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="VulnScanner 夜間自動改善ループ")
+    parser.add_argument("--max-hours", type=float, default=4.0,
+                        help="実行ウィンドウ上限（時間, デフォルト 4.0）")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="API を呼ばず動作確認のみ (recall_check は実行)")
+    args = parser.parse_args()
+
+    missing = [k for k in ("FUGU_API_KEY",) if not os.environ.get(k)]
+    if missing and not args.dry_run:
+        log(f"ERROR: 環境変数未設定: {', '.join(missing)}")
+        sys.exit(1)
+
+    try:
+        exit_code = _run_loop(args)
+    except FatalError as exc:
+        print(flush=True)  # \r 進捗行を確定
+        print("=" * 60, flush=True)
+        print("[FATAL] 継続不可能なエラーが発生しました:", flush=True)
+        print(str(exc), flush=True)
+        print("=" * 60, flush=True)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print(flush=True)
+        log("中断 (Ctrl+C)")
+        sys.exit(130)
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
