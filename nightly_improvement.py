@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """VulnScanner 夜間自動改善ループ
 
+提案生成は claude CLI (Claude Code 自身) を subprocess で呼び出す。
+ANTHROPIC_API_KEY は不要（Claude Code のログイン認証を使用）。
+
 環境変数 (必須):
-  ANTHROPIC_API_KEY  Claude API キー
   FUGU_API_KEY       FuguAI API キー
 
 環境変数 (省略可):
@@ -17,7 +19,6 @@
 """
 
 import argparse
-import io
 import json
 import os
 import re
@@ -33,7 +34,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # ── 設定定数 ──────────────────────────────────────────────────────────────────
 MAX_WINDOW_SECONDS  = 4 * 3600   # 実行ウィンドウ上限
 FUGU_TOKEN_BUDGET   = 50_000     # FuguAI 1晩上限トークン
-CLAUDE_HALF_WINDOW  = 2 * 3600   # 2時間を超えたら Claude 新規呼び出しを止める
+CLAUDE_HALF_WINDOW  = 2 * 3600   # 朝の作業用に 50% (2h) を残す
 MIN_FUGU_RESERVE    = 2_000      # ループ1回残せない場合は中断
 
 PROPOSALS_DIR      = Path("improvement_proposals")
@@ -41,7 +42,6 @@ BEST_PROPOSAL_FILE = Path("proposal_best.py")
 REPORT_FILE        = Path("improvement_report.md")
 TOKEN_USAGE_FILE   = Path("token_usage.json")
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 FUGU_API_KEY      = os.environ.get("FUGU_API_KEY", "")
 FUGU_API_BASE     = os.environ.get("FUGU_API_BASE", "https://api.fugu.sakana.ai/v1")
 FUGU_MODEL        = os.environ.get("FUGU_MODEL", "fugu-chat")
@@ -208,17 +208,30 @@ Output ONLY a valid JSON object — no other text:
 # ── API 呼び出し ───────────────────────────────────────────────────────────────
 
 def call_claude(prompt: str) -> str | None:
+    """claude CLI (Claude Code 自身) を subprocess で呼び出す。
+    stdin にプロンプトを渡し、--output-format json の result フィールドを返す。
+    """
+    import subprocess
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
+        result = subprocess.run(
+            ["claude", "-p", "--output-format", "json"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=300,
         )
-        return response.content[0].text
+        if result.returncode != 0:
+            log(f"claude CLI エラー (rc={result.returncode}): {result.stderr[:300]}")
+            return None
+        data = json.loads(result.stdout)
+        text = data.get("result", "")
+        return text if text else None
+    except subprocess.TimeoutExpired:
+        log("claude CLI タイムアウト (300s)")
+        return None
     except Exception as exc:
-        log(f"Claude API エラー: {exc}")
+        log(f"claude CLI 呼び出しエラー: {exc}")
         return None
 
 
@@ -390,8 +403,8 @@ def main() -> None:
     max_seconds = args.max_hours * 3600
     start_time  = time.monotonic()
 
-    # 必須環境変数チェック
-    missing = [k for k in ("ANTHROPIC_API_KEY", "FUGU_API_KEY") if not os.environ.get(k)]
+    # 必須環境変数チェック (claude CLI を使うため ANTHROPIC_API_KEY は不要)
+    missing = [k for k in ("FUGU_API_KEY",) if not os.environ.get(k)]
     if missing and not args.dry_run:
         log(f"ERROR: 環境変数未設定: {', '.join(missing)}")
         sys.exit(1)
