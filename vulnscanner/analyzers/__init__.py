@@ -1,3 +1,4 @@
+from vulnscanner.analyzers.ast_php import PhpASTAnalyzer
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.analyzers.client_side import ClientSideAnalyzer
@@ -19,6 +20,8 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     # Multi-language: regex-based
     SQLInjectionAnalyzer(),
     XSSAnalyzer(),
+    # PHP: AST-based multi-hop XSS taint (2-hop, null-coalescing, function propagation)
+    PhpASTAnalyzer(),
     CommandInjectionAnalyzer(),
     PathTraversalAnalyzer(),
     DeserializationAnalyzer(),

@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 from vulnscanner.models import Finding, Severity
 from vulnscanner.scanner import VulnScanner
@@ -59,6 +60,10 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     ("SQL-004",       "php/sqli.php",                 "HIGH",     "PHP SQL string concatenation"),
     ("XSS-005",       "php/xss.php",                  "HIGH",     "PHP echo $_GET / $_POST"),
     ("XSS-008",       "php/xss_1hop.php",             "HIGH",     "PHP XSS 1-hop"),
+    # PHP AST: multi-hop taint patterns (tree-sitter-php)
+    ("PHP-XSS-010",   "php/xss_2hop.php",             "HIGH",     "PHP XSS 2-hop taint propagation"),
+    ("PHP-XSS-011",   "php/xss_nullcoalesce.php",     "HIGH",     "PHP XSS null-coalescing taint propagation"),
+    ("PHP-XSS-012",   "php/xss_func.php",             "HIGH",     "PHP XSS function return taint"),
 
     # -- Python: command injection ------------------------------------------------
     ("AST-CMD-001",   "python/command_injection.py",  "HIGH",     "os.system() with tainted arg"),
@@ -152,14 +157,13 @@ def run(verbose: bool = False) -> int:
         print(f"[ERROR] recall/ not found at {RECALL_DIR}", file=sys.stderr)
         return 1
 
-    print("Scanning recall/positive/ ...", file=sys.stderr)
-    pos_active = _scan_active(POSITIVE_DIR)
-
-    print("Scanning recall/negative/ ...", file=sys.stderr)
-    neg_active = _scan_active(NEGATIVE_DIR)
-
-    print("Scanning recall/real_fp/ ...", file=sys.stderr)
-    rfp_active = _scan_active(REAL_FP_DIR)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        pos_f = pool.submit(_scan_active, POSITIVE_DIR)
+        neg_f = pool.submit(_scan_active, NEGATIVE_DIR)
+        rfp_f = pool.submit(_scan_active, REAL_FP_DIR)
+        pos_active = pos_f.result()
+        neg_active = neg_f.result()
+        rfp_active = rfp_f.result()
 
     if verbose:
         all_findings = pos_active + neg_active + rfp_active

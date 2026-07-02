@@ -30,6 +30,14 @@ repos/
 # Secrets
 .env
 
+# Nightly improvement output (proposals and patches are reviewed manually before commit)
+temp_eval/
+nightly_runs/
+improvement_proposals/
+proposal_best.py
+proposal_best.patch
+token_usage.json
+
 # OS
 .DS_Store
 Thumbs.db

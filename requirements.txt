@@ -21,6 +21,10 @@ Jinja2==3.1.4
 openai==2.44.0
 python-dotenv==1.0.1
 
+# PHP AST analysis (multi-hop taint detection)
+tree-sitter==0.26.0
+tree-sitter-php==0.24.1
+
 # Testing
 pytest==8.2.2
 pytest-cov==5.0.0

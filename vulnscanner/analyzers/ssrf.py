@@ -61,12 +61,19 @@ _RULES = [
         "Go HTTP request with dynamic URL - verify URL cannot be user-controlled",
         Severity.MEDIUM, _SR, (".go",),
     ),
+    (
+        "SSRF-009",
+        re.compile(r'p?fsockopen\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)', re.IGNORECASE),
+        "PHP fsockopen/pfsockopen with user-controlled host - SSRF enables internal port scanning and network probing",
+        Severity.HIGH, _SR, (".php",),
+    ),
 ]
 
 _GUARD = re.compile(
     r'curl_setopt|file_get_contents|new\s+URL\s*\(|HttpURLConnection|CloseableHttpClient'
     r'|fetch\s*\(|axios\.|http\.get|http\.request|https\.get|https\.request'
-    r'|Net::HTTP|open-uri|URI\.open|RestClient\.|http\.Get|http\.Post|http\.NewRequest',
+    r'|Net::HTTP|open-uri|URI\.open|RestClient\.|http\.Get|http\.Post|http\.NewRequest'
+    r'|p?fsockopen',
     re.IGNORECASE,
 )
 
