@@ -55,17 +55,35 @@ _RULES = [
         "Go http.Redirect with request-derived URL - open redirect risk",
         Severity.HIGH, _OR, (".go",),
     ),
+    (
+        "REDIR-009",
+        re.compile(
+            r'Response\.Redirect(?:Permanent)?\s*\(.*(?:HttpContext\.Current\.)?Request\.(?:QueryString|Form|Params)\s*\[',
+            re.IGNORECASE,
+        ),
+        "ASP.NET Response.Redirect with Request.QueryString/Form/Params value - open redirect allows phishing attacks",
+        Severity.HIGH, _OR, (".cs",),
+    ),
+    (
+        "REDIR-010",
+        re.compile(
+            r'redirect\s*\(\s*request\.(?:args|form|values|GET|POST)\s*(?:\.get\s*\(|\[)',
+            re.IGNORECASE,
+        ),
+        "Python redirect() with user-controlled request parameter - open redirect allows phishing attacks",
+        Severity.HIGH, _OR, (".py",),
+    ),
 ]
 
 _GUARD = re.compile(
-    r'Location:|sendRedirect|RedirectView|res\.redirect|redirect_to|http\.Redirect',
+    r'Location:|sendRedirect|RedirectView|res\.redirect|redirect_to|http\.Redirect|Response\.Redirect|\bredirect\s*\(',
     re.IGNORECASE,
 )
 
 
 class OpenRedirectAnalyzer(BaseAnalyzer):
     # Python open redirects are detected by PythonASTAnalyzer.
-    supported_extensions = (".php", ".java", ".js", ".ts", ".rb", ".go")
+    supported_extensions = (".php", ".java", ".js", ".ts", ".rb", ".go", ".cs", ".py")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         applicable = [
