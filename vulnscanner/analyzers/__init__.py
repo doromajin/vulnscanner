@@ -5,7 +5,9 @@ from vulnscanner.analyzers.client_side import ClientSideAnalyzer
 from vulnscanner.analyzers.command_injection import CommandInjectionAnalyzer
 from vulnscanner.analyzers.dependencies import DependencyAnalyzer
 from vulnscanner.analyzers.deserialization import DeserializationAnalyzer
+from vulnscanner.analyzers.go_analyzer import GoAnalyzer
 from vulnscanner.analyzers.hardcoded_secrets import HardcodedSecretsAnalyzer
+from vulnscanner.analyzers.java_analyzer import JavaAnalyzer
 from vulnscanner.analyzers.open_redirect import OpenRedirectAnalyzer
 from vulnscanner.analyzers.path_traversal import PathTraversalAnalyzer
 from vulnscanner.analyzers.prototype_pollution import PrototypePollutionAnalyzer
@@ -35,4 +37,7 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     HardcodedSecretsAnalyzer(),
     # Checks dependency manifests against OSV.dev CVE database
     DependencyAnalyzer(),
+    # Language-specific analyzers
+    JavaAnalyzer(),
+    GoAnalyzer(),
 ]

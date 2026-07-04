@@ -23,6 +23,9 @@ class VulnType(str, Enum):
     SSTI = "Server-Side Template Injection (SSTI)"
     PROTOTYPE_POLLUTION = "Prototype Pollution"
     VULNERABLE_DEPENDENCY = "Vulnerable Dependency"
+    XXE = "XML External Entity (XXE)"
+    JNDI_INJECTION = "JNDI Injection"
+    RACE_CONDITION = "Race Condition"
 
 
 @dataclass
