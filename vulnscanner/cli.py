@@ -308,6 +308,139 @@ def false_positive(repo: str, location: str, rule_id: str, reason: str, fix_appl
         console.print(f"\n[yellow]Learning suggestion:[/yellow] {suggestion}")
 
 
+# ── fuzz ──────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.argument("target")
+@click.option("--payloads-only", is_flag=True,
+              help="Generate payloads without executing any code")
+@click.option("--max-seconds", default=30, type=int, show_default=True,
+              help="Per-function execution time limit (seconds)")
+@click.option("--max-examples", default=300, type=int, show_default=True,
+              help="Hypothesis max_examples per function")
+@click.option("--output", "-o", default=None,
+              help="Write JSON report to this file")
+@click.option("--yes", "-y", is_flag=True,
+              help="Skip the legal confirmation prompt")
+def fuzz(
+    target: str,
+    payloads_only: bool,
+    max_seconds: int,
+    max_examples: int,
+    output: str | None,
+    yes: bool,
+) -> None:
+    """Fuzz a LOCAL repository using static-analysis-guided payload generation.
+
+    TARGET must be a local directory path.
+    Network URLs are rejected — clone the repo first.
+
+    Two-layer approach:\n
+      Layer 1 (always) -- generate concrete payloads from static findings\n
+      Layer 2 (Python) -- run Hypothesis against importable functions
+
+    Example:\n
+      vulnscan fuzz ./repos/my-app\n
+      vulnscan fuzz ./repos/my-app --payloads-only\n
+      vulnscan fuzz ./repos/my-app --max-seconds 60 --output fuzz_report.json
+    """
+    from vulnscanner.fuzzer import run_fuzz, FuzzTarget, LEGAL_NOTICE
+    from vulnscanner.models import VulnType
+    import json
+
+    # Validate target (also enforces local-only)
+    try:
+        FuzzTarget(target)
+    except (ValueError, FileNotFoundError) as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    execute = not payloads_only
+
+    # Legal confirmation before any execution
+    if execute and not yes:
+        console.print(LEGAL_NOTICE)
+        if not click.confirm("Proceed with dynamic execution?"):
+            console.print("[yellow]Switching to --payloads-only mode.[/yellow]")
+            execute = False
+
+    console.print(f"\n[bold]VulnScanner Fuzz[/bold] — target: [cyan]{target}[/cyan]")
+    console.print("[dim]Step 1/3: Static analysis...[/dim]")
+
+    result = run_fuzz(
+        target,
+        execute=execute,
+        max_seconds=max_seconds,
+        max_examples=max_examples,
+    )
+
+    # ── Report ─────────────────────────────────────────────────────────────────
+
+    console.print(f"[dim]Step 2/3: Payload generation... {len(result.payloads)} payloads generated[/dim]")
+    if execute:
+        console.print(f"[dim]Step 3/3: Dynamic execution complete[/dim]")
+
+    console.print()
+    console.print(f"[bold]Static findings:[/bold] {len(result.static_findings)} total, "
+                  f"{sum(1 for f in result.static_findings if f.severity.value in ('CRITICAL','HIGH'))} critical/high")
+    console.print()
+
+    # Group payloads by vuln_type
+    by_type: dict = {}
+    for p in result.payloads:
+        by_type.setdefault(p.vuln_type, []).append(p)
+
+    if by_type:
+        console.print("[bold]Generated Payloads (for manual testing):[/bold]")
+        for vt, payloads in by_type.items():
+            console.print(f"\n  [yellow]{vt.value}[/yellow] ({len(payloads)} payloads)")
+            for p in payloads[:5]:
+                console.print(f"    {p.value!r:<50}  [dim]{p.description}[/dim]")
+            if len(payloads) > 5:
+                console.print(f"    [dim]... and {len(payloads)-5} more[/dim]")
+
+    if result.fuzz_findings:
+        console.print()
+        console.print(f"[bold red]Dynamic Fuzz Findings: {len(result.fuzz_findings)}[/bold red]")
+        for ff in result.fuzz_findings:
+            console.print(ff.to_display())
+    elif execute:
+        console.print()
+        console.print("[green]Dynamic fuzzing: no unexpected exceptions found.[/green]")
+
+    if result.skipped_functions:
+        console.print()
+        console.print(f"[dim]Skipped ({len(result.skipped_functions)}):[/dim]")
+        for s in result.skipped_functions[:5]:
+            console.print(f"  [dim]{s}[/dim]")
+
+    if output:
+        report = {
+            "target": str(result.target_path),
+            "static_findings": len(result.static_findings),
+            "payloads": [
+                {"value": p.value, "type": p.vuln_type.value, "description": p.description}
+                for p in result.payloads
+            ],
+            "fuzz_findings": [
+                {
+                    "payload": ff.payload,
+                    "exception": ff.exception_type,
+                    "message": ff.exception_msg,
+                    "file": ff.file_path,
+                    "function": ff.function_name,
+                    "confirmed": ff.confirmed,
+                }
+                for ff in result.fuzz_findings
+            ],
+            "skipped": result.skipped_functions,
+        }
+        Path(output).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        console.print(f"\n[green]JSON report written to {output}[/green]")
+
+    sys.exit(0)
+
+
 # ── knowledge ─────────────────────────────────────────────────────────────────
 
 @main.group()
