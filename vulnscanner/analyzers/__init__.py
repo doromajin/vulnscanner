@@ -1,3 +1,4 @@
+from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
 from vulnscanner.analyzers.ast_php import PhpASTAnalyzer
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
 from vulnscanner.analyzers.base import BaseAnalyzer
@@ -38,6 +39,7 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     # Checks dependency manifests against OSV.dev CVE database
     DependencyAnalyzer(),
     # Language-specific analyzers
+    JavaASTAnalyzer(),
     JavaAnalyzer(),
     GoAnalyzer(),
 ]
