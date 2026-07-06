@@ -92,7 +92,7 @@ FUGU_MODEL    = os.environ.get("FUGU_MODEL", "fugu")
 _TASK_MODEL_MAP: dict[str, str] = {
     "proposal":  "claude-sonnet-5",            # draft 生成（創造性・セキュリティ知識が必要）
     "report":    "claude-sonnet-5",            # レポート作成
-    "revise":    "claude-haiku-4-5-20251001",  # FuguAI 指示に従うだけの実装タスク
+    "revise":    "claude-sonnet-5",             # FuguAI 指示に従って複雑な改訂を行う
     "log":       "claude-haiku-4-5-20251001",  # ログ整理
     "diagnosis": "claude-haiku-4-5-20251001",  # エラー診断
 }
@@ -101,7 +101,7 @@ _TASK_MODEL_MAP: dict[str, str] = {
 _API_MODEL_MAP: dict[str, str] = {
     "proposal":  "claude-sonnet-4-6",          # Sonnet — 高精度タスク
     "report":    "claude-sonnet-4-6",
-    "revise":    "claude-haiku-4-5-20251001",   # Haiku — 軽量タスク
+    "revise":    "claude-sonnet-4-6",            # Sonnet — revise は複雑なので軽量モデル不可
     "log":       "claude-haiku-4-5-20251001",
     "diagnosis": "claude-haiku-4-5-20251001",
 }
@@ -109,9 +109,11 @@ _API_MODEL_MAP: dict[str, str] = {
 BASELINE = {"precision": 100.0, "recall": 100.0, "f1": 100.0, "passed": 39}
 
 ANALYZER_FILES = [
-    # New language support (prioritized — expand coverage toward Java/Go)
-    "vulnscanner/analyzers/java_analyzer.py",
+    # AST-based analyzers (highest value — taint-aware, FuguAI scores 7+)
+    "vulnscanner/analyzers/ast_java.py",
     "vulnscanner/analyzers/go_analyzer.py",
+    # Regex-based language support
+    "vulnscanner/analyzers/java_analyzer.py",
     # Existing analyzers (ordered by improvement potential)
     "vulnscanner/analyzers/ssrf.py",
     "vulnscanner/analyzers/open_redirect.py",
@@ -590,15 +592,27 @@ def _existing_rule_ids() -> list[str]:
     return _rule_ids_cache
 
 
-def _format_previous_attempts(previous_attempts: list[dict]) -> str:
+def _format_previous_attempts(previous_attempts: list[dict], target_file: str = "") -> str:
     if not previous_attempts:
         return ""
+
+    # ファイル固有の試行を優先して見せる（最大7件）、残りは直近グローバル（最大3件）
+    file_attempts  = [a for a in previous_attempts if a.get("target_file") == target_file][-7:]
+    other_attempts = [a for a in previous_attempts if a.get("target_file") != target_file][-3:]
+    combined = file_attempts + other_attempts
+
+    if not combined:
+        return ""
+
     lines = ["\n\nPrevious attempts this session (learn from these — do NOT repeat same approach):"]
-    for a in previous_attempts[-5:]:
+    if file_attempts:
+        lines.append(f"  [Same file: {target_file}]")
+    for a in combined:
         dm = a.get("draft_metrics", {})
         fm = a.get("final_metrics", {})
+        tag = f"[{a.get('target_file','?').split('/')[-1]}]" if a.get("target_file") != target_file else ""
         lines.append(
-            f"\n  [{a['iteration']}] {a['rule_id']} — {a['change_summary'][:60]}"
+            f"\n  [{a['iteration']}]{tag} {a['rule_id']} — {a['change_summary'][:60]}"
         )
         lines.append(
             f"    Draft eval:  P={dm.get('P','?')}% R={dm.get('R','?')}% "
@@ -623,35 +637,68 @@ def _format_previous_attempts(previous_attempts: list[dict]) -> str:
 def build_draft_prompt(target_file: str, previous_attempts: list[dict], baseline: dict | None = None) -> str:
     content  = Path(target_file).read_text(encoding="utf-8")
     existing = ", ".join(_existing_rule_ids())
-    prev     = _format_previous_attempts(previous_attempts)
+    prev     = _format_previous_attempts(previous_attempts, target_file)
     checks   = f"{baseline['passed']}/{baseline['total']}" if baseline and baseline.get("total") else "100%"
 
+    is_ast_java = "ast_java" in target_file
+    is_go       = "go_analyzer" in target_file
+
     lang_hint = ""
-    if "java_analyzer" in target_file:
+    if is_ast_java:
         lang_hint = """
-Language focus: Java / Spring / JEE
-Priority patterns (real CVEs / bug-bounty findings):
-  - JNDI injection: Spring JNDI, LDAP lookups, Log4j-style ${jndi:} in logged user input
-  - SpEL injection: @Value with user data, ExpressionParser.parseExpression(userInput)
-  - XXE: XMLStreamReader, TransformerFactory, SchemaFactory, Validator without feature disabling
-  - Deserialization: XStream.fromXML, Jackson polymorphic @JsonTypeInfo, Kryo without whitelist
-  - Path traversal: Files.readAllBytes(Paths.get(req.param)), getResourceAsStream(userPath)
-  - SSRF: HttpURLConnection/Apache HttpClient/OkHttp with URL from request parameter
-  - SQL: Spring JdbcTemplate.query(String.format/+), QueryDSL raw predicates
-  - SSTI: Freemarker Template.getTemplate(userInput), Velocity context.evaluate(userInput)
+File type: Java AST analyzer (javalang-based taint tracking — NOT regex).
+Architecture: _collect_tainted() builds a set of tainted variable names by scanning
+LocalVariableDeclaration nodes. _is_tainted() recurses into MemberReference/MethodInvocation.
+Detection rules check tainted variables reaching sink MethodInvocations.
+
+Priority additions (AST-level, real CVEs):
+  - JAST-SSRF-002: Apache HttpClient/OkHttp execute() where URL arg is tainted
+    → detect ClassCreator(type="HttpGet"/"HttpPost") or MethodInvocation(member="execute")
+       with a tainted argument tracing to request.getParameter()
+  - JAST-SQL-003: Spring JdbcTemplate.query/update with String.format or + concat of tainted
+    → detect MethodInvocation(member="query"|"update") on qualifier "jdbcTemplate"
+       where argument is BinaryOperation(operator="+") with tainted left/right
+  - JAST-SSTI-001: Freemarker Template.process()/Velocity context.evaluate() with tainted vars
+    → detect MethodInvocation(member="process"|"evaluate"|"merge") where any arg is tainted
+  - JAST-PATH-003: ClassLoader.getResourceAsStream(tainted) / new File(tainted)
 """
-    elif "go_analyzer" in target_file:
+    elif is_go:
         lang_hint = """
 Language focus: Go (stdlib + Gin, Echo, Fiber, chi, GORM, sqlx)
-Priority patterns (real CVEs / bug-bounty findings):
-  - SQL: GORM.Raw/Exec, sqlx.Query with fmt.Sprintf or + concatenation
-  - SSRF: url.Parse + http.NewRequest where host comes from request param
-  - Path traversal: filepath.Join without filepath.Clean / strings.Contains ".."
-  - Open redirect: http.Redirect with user-controlled URL lacking scheme check
-  - Template injection: text/template (NOT html/template) .Execute with user data
-  - Race condition: unsynchronized global map write under concurrent requests
-  - Hardcoded creds in struct literals (password: "...", secret: "...")
+File architecture: Layer 1 = regex _scan_lines(), Layer 2 = taint-lite _taint_lite().
+To add a Layer-2 taint rule, extend _TAINT_SINKS with a new entry.
+To add a Layer-1 regex rule, add a tuple to _RULES.
+
+Priority patterns (real CVEs / bug-bounty findings NOT yet covered):
+  - SQL taint-lite: GORM.Raw/Exec/Where with fmt.Sprintf(tainted) — extend _TAINT_SINKS
+  - SSRF taint-lite: url.Parse + http.NewRequest where host variable comes from r.FormValue
+  - Path traversal regex: filepath.Join/filepath.Abs calls where any arg contains ".."
+  - Hardcoded creds: struct literal with field name "password"|"secret"|"token" = "..."
 """
+    elif "java_analyzer" in target_file:
+        lang_hint = """
+Language focus: Java / Spring / JEE (regex-based analyzer for patterns javalang can't cover)
+Priority patterns (real CVEs / bug-bounty findings):
+  - JNDI injection: Spring JNDI lookups, Log4j-style ${jndi:} in logged user input
+  - XXE: XMLStreamReader, TransformerFactory, SchemaFactory without feature disabling
+  - Deserialization: XStream.fromXML, Jackson @JsonTypeInfo with user-controlled type
+  - SSTI: Freemarker Template.getTemplate(userInput), Velocity context.evaluate(userInput)
+"""
+
+    if is_ast_java:
+        constraint4 = (
+            "4. IMPORTANT: This file uses javalang AST — do NOT add regex rules. "
+            "Add JAST-* rules by extending the existing AST analysis pattern "
+            "(javalang node filtering, _is_tainted checks on MethodInvocation arguments)."
+        )
+    elif is_go:
+        constraint4 = (
+            "4. For Layer-2 taint rules, extend _TAINT_SINKS dict. "
+            "For Layer-1 regex rules, add a tuple to _RULES with re.compile(). "
+            "Do NOT mix the two architectures in a single rule."
+        )
+    else:
+        constraint4 = "4. Use pre-compiled regex at module level: re.compile(r'...', flags)."
 
     return f"""You are a senior security researcher improving VulnScanner, targeting
 ENTERPRISE-GRADE detection quality (Google/Microsoft OSS audit level, comparable to CodeQL/Semgrep).
@@ -676,7 +723,7 @@ Hard constraints:
   1. Precision must stay at 100% (no new false positives on safe code).
   2. Recall must stay at 100% (no missed existing TP cases).
   3. Rule ID must not duplicate any existing ID above.
-  4. Use pre-compiled regex at module level: re.compile(r'...', flags).
+  {constraint4}
   5. Return the COMPLETE modified file — every line, nothing omitted.
   6. For Java/Go: ensure supported_extensions covers ONLY the target language.
 
@@ -688,7 +735,7 @@ Output ONLY a single JSON object (no markdown fences, no text outside JSON):
   "rule_id": "<RULE-NNN>",
   "change_summary": "<one sentence: what you added and the real-world vulnerability it catches>",
   "new_content": "<complete file content after your change>"
-}}
+}}"""
 
 
 def build_fugu_critique_prompt(
@@ -698,6 +745,10 @@ def build_fugu_critique_prompt(
     total  = metrics.get("total", 39)
     failed = total - metrics["passed"]
     status = "ALL PASS" if metrics["ok"] else f"FAILED ({failed} checks failed)"
+    prec   = str(round(metrics["precision"], 1))
+    rec    = str(round(metrics["recall"], 1))
+    f1v    = str(round(metrics["f1"], 1))
+    chk    = str(metrics["passed"]) + "/" + str(total)
     return f"""You are a security static-analysis expert performing a structured code review for VulnScanner.
 Goal: enterprise-grade detection quality targeting Java, Go, Python, PHP, JS/TS codebases
 at the level of Google/Microsoft OSS security audits (comparable to CodeQL/Semgrep precision).
@@ -709,25 +760,25 @@ A developer has proposed a new detection rule:
 
 Benchmark result ({total} existing checks, regression gate):
   Status    : {status}
-  Precision : {metrics['precision']:.1f}%
-  Recall    : {metrics['recall']:.1f}%
-  F1        : {metrics['f1']:.1f}%
-  Checks    : {metrics['passed']}/{metrics['total']}
+  Precision : {prec}%
+  Recall    : {rec}%
+  F1        : {f1v}%
+  Checks    : {chk}
 
 Modified file (up to 3000 chars):
 ```python
 {draft_content[:3000]}
 ```
 
-Perform a thorough structured review across 6 improvement axes. Score each 0–5 (HIGHER = BETTER for all axes):
-  - reliability    (確実性): accuracy and correctness — handles edge cases, no logic errors, deterministic
-  - speed_score    (速度): runtime efficiency — low-overhead patterns, avoids catastrophic backtracking
+Perform a thorough structured review across 6 improvement axes. Score each 0-5 (HIGHER = BETTER for all axes):
+  - reliability    (確実性): accuracy and correctness - handles edge cases, no logic errors, deterministic
+  - speed_score    (速度): runtime efficiency - low-overhead patterns, avoids catastrophic backtracking
   - coverage_score (検出範囲): breadth of real-world attack surface covered across vulnerability types and codebases
-  - fp_reduction   (FP削減): how well false positives are avoided — HIGHER means fewer FPs
-  - fn_reduction   (FN削減): how well false negatives are avoided — HIGHER means fewer FNs, better recall
+  - fp_reduction   (FP削減): how well false positives are avoided - HIGHER means fewer FPs
+  - fn_reduction   (FN削減): how well false negatives are avoided - HIGHER means fewer FNs, better recall
   - usability      (業務利用性): report clarity, explanation quality, CI/CD integration readiness, regression safety
 
-Output ONLY a valid JSON object — no other text, no markdown:
+Output ONLY a valid JSON object - no other text, no markdown:
 {{
   "quality_score": <integer 0-10>,
   "reliability": <integer 0-5>,
@@ -737,9 +788,9 @@ Output ONLY a valid JSON object — no other text, no markdown:
   "fn_reduction": <integer 0-5>,
   "usability": <integer 0-5>,
   "critical_fn_risk": <boolean: true only if the rule could suppress detection of real vulnerabilities>,
-  "implementation_issues": "<specific technical problems with the regex or logic, or 'none'>",
-  "missing_tests": "<vulnerability patterns this rule would miss that it should catch, or 'none'>",
-  "improvement_instructions": "<concrete, actionable revision instructions — specify exactly what regex/pattern to change, what edge cases to cover, and why>",
+  "implementation_issues": "<specific technical problems with the regex or logic, or none>",
+  "missing_tests": "<vulnerability patterns this rule would miss that it should catch, or none>",
+  "improvement_instructions": "<concrete revision instructions - specify exactly what regex/pattern to change, what edge cases to cover, and why>",
   "comments": "<one sentence overall assessment>"
 }}"""
 
@@ -749,7 +800,8 @@ def build_revise_prompt(
     fugu_review: dict, draft_metrics: dict,
     rule_id: str, change_summary: str,
 ) -> str:
-    bench    = "ALL PASS" if draft_metrics["ok"] else f"FAILED ({36 - draft_metrics['passed']} checks)"
+    total_chk = draft_metrics.get("total", 39)
+    bench     = "ALL PASS" if draft_metrics["ok"] else f"FAILED ({total_chk - draft_metrics['passed']} checks)"
     diff_text = generate_patch(original_content, draft_content, target_file)
     return f"""You are a security engineer improving VulnScanner. You previously proposed a new rule,
 and a security expert has reviewed it with specific critique. Revise your proposal to address all feedback.
@@ -771,7 +823,7 @@ Security Expert Review:
   Implementation issues : {fugu_review.get('implementation_issues', 'none')}
   Missing test coverage : {fugu_review.get('missing_tests', 'none')}
 
-IMPROVEMENT INSTRUCTIONS — address ALL of these in your revision:
+IMPROVEMENT INSTRUCTIONS - address ALL of these in your revision:
 {fugu_review.get('improvement_instructions', 'No specific instructions provided.')}
 
 Overall assessment: {fugu_review.get('comments', '')}
@@ -780,13 +832,13 @@ Overall assessment: {fugu_review.get('comments', '')}
 {diff_text}
 --- END DIFF ---
 
---- YOUR DRAFT (complete file — revise from this) ---
+--- YOUR DRAFT (complete file - revise from this) ---
 {draft_content}
 --- END DRAFT ---
 
 Revise the proposal to address every point in the improvement instructions.
 Keep rule ID {rule_id} unless the critique says to change the vulnerability type entirely.
-Return the COMPLETE revised file — every line, nothing omitted.
+Return the COMPLETE revised file - every line, nothing omitted.
 
 Output ONLY a single JSON object (no markdown fences, no text outside JSON):
 {{
@@ -1162,6 +1214,7 @@ def _run_loop(args: argparse.Namespace) -> int:
             previous_attempts.append({
                 "iteration": iteration + 1, "rule_id": iter_result["rule_id"],
                 "change_summary": iter_result["change_summary"],
+                "target_file": target_file,
                 "draft_metrics": {}, "fugu_status": "skipped",
                 "decision": "rejected", "rejection_reason": reason, "next_hint": hint,
             })
@@ -1227,6 +1280,7 @@ def _run_loop(args: argparse.Namespace) -> int:
             loop_results.append(iter_result)
             previous_attempts.append({
                 "iteration": iteration+1, "rule_id": rule_id, "change_summary": change_summ,
+                "target_file": target_file,
                 "draft_metrics": {"P": draft_metrics["precision"], "R": draft_metrics["recall"], "ok": False},
                 "fugu_status": "skipped_benchmark_failed",
                 "decision": "rejected", "rejection_reason": "benchmark_failed_on_draft", "next_hint": hint,
@@ -1268,6 +1322,7 @@ def _run_loop(args: argparse.Namespace) -> int:
             loop_results.append(iter_result)
             previous_attempts.append({
                 "iteration": iteration+1, "rule_id": rule_id, "change_summary": change_summ,
+                "target_file": target_file,
                 "draft_metrics": {"P": draft_metrics["precision"], "R": draft_metrics["recall"], "ok": True},
                 "fugu_status": "unavailable",
                 "decision": "candidate_no_fugu", "rejection_reason": "FuguAI unavailable",
@@ -1377,13 +1432,32 @@ def _run_loop(args: argparse.Namespace) -> int:
             log(f"  最終評価エラー: {exc} → draft metrics を流用")
             final_metrics = draft_metrics
 
-        iter_result["final_metrics"] = final_metrics
-        save_eval_result(run_dir, iteration+1, "final", final_metrics)
         log(
             f"  → P={final_metrics['precision']:.1f}% R={final_metrics['recall']:.1f}% "
             f"F1={final_metrics['f1']:.1f}% ({final_metrics['passed']}/{final_metrics['total']}) "
             f"{'OK' if final_metrics['ok'] else 'FAILED'}"
         )
+
+        # ── Revise がベンチマークを壊した場合は draft にフォールバック ──────────────
+        # Draft が合格 → Revise が破壊 → Draft を final として使い直す
+        # (REDIR-011 のような「質7なのにReviseで棄却」を防ぐ)
+        if not final_metrics["ok"] and draft_metrics["ok"]:
+            log("  ⚠ revise がベンチマークを破壊 → draft にフォールバック (draft は合格済み)")
+            final_content     = draft_content
+            final_metrics     = draft_metrics
+            revision_notes   += " [revise破損→draftフォールバック]"
+            # フォールバック後のパッチを上書き保存
+            fallback_patch = generate_patch(original_content, final_content, target_file)
+            final_py.write_text(final_content, encoding="utf-8")
+            final_patch.write_text(fallback_patch, encoding="utf-8")
+            final_patch_text = fallback_patch
+            log(
+                f"  → フォールバック後: P={final_metrics['precision']:.1f}% "
+                f"R={final_metrics['recall']:.1f}% OK"
+            )
+
+        iter_result["final_metrics"] = final_metrics
+        save_eval_result(run_dir, iteration+1, "final", final_metrics)
 
         # ────────────────────────────────────────────────────────────────────
         # 採用判定
@@ -1431,6 +1505,7 @@ def _run_loop(args: argparse.Namespace) -> int:
             "iteration":      iteration + 1,
             "rule_id":        rule_id,
             "change_summary": final_summ,
+            "target_file":    target_file,
             "draft_metrics":  {
                 "P": draft_metrics["precision"], "R": draft_metrics["recall"], "ok": draft_metrics["ok"],
             },
