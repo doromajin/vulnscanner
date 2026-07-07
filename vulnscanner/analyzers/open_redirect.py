@@ -73,10 +73,19 @@ _RULES = [
         "Python redirect() with user-controlled request parameter - open redirect allows phishing attacks",
         Severity.HIGH, _OR, (".py",),
     ),
+    (
+        "REDIR-011",
+        re.compile(
+            r'HttpResponseRedirect\s*\(\s*request\.(?:GET|POST|META|DATA|query_params)\s*(?:\.get\s*\(|\[)',
+            re.IGNORECASE,
+        ),
+        "Django HttpResponseRedirect with user-controlled request parameter - open redirect allows phishing attacks (cf. CVE-2017-7233)",
+        Severity.HIGH, _OR, (".py",),
+    ),
 ]
 
 _GUARD = re.compile(
-    r'Location:|sendRedirect|RedirectView|res\.redirect|redirect_to|http\.Redirect|Response\.Redirect|\bredirect\s*\(',
+    r'Location:|sendRedirect|RedirectView|res\.redirect|redirect_to|http\.Redirect|Response\.Redirect|\bredirect\s*\(|HttpResponseRedirect',
     re.IGNORECASE,
 )
 
