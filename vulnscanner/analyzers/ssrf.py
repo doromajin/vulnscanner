@@ -67,13 +67,25 @@ _RULES = [
         "PHP fsockopen/pfsockopen with user-controlled host - SSRF enables internal port scanning and network probing",
         Severity.HIGH, _SR, (".php",),
     ),
+    (
+        "SSRF-010",
+        re.compile(
+            r'\b(?:restTemplate\s*\.\s*(?:getForObject|getForEntity|postForObject|postForEntity'
+            r'|exchange|execute|put|delete|patchForObject)'
+            r'|WebClient\s*\.\s*create)\s*\('
+            r'(?=[^;\n]{0,300}(?:getParameter|getHeader|getQueryString|getAttribute|request\.))',
+            re.IGNORECASE,
+        ),
+        "Spring RestTemplate/WebClient called with request-derived URL — SSRF risk (attacker can probe internal services)",
+        Severity.HIGH, _SR, (".java",),
+    ),
 ]
 
 _GUARD = re.compile(
     r'curl_setopt|file_get_contents|new\s+URL\s*\(|HttpURLConnection|CloseableHttpClient'
     r'|fetch\s*\(|axios\.|http\.get|http\.request|https\.get|https\.request'
     r'|Net::HTTP|open-uri|URI\.open|RestClient\.|http\.Get|http\.Post|http\.NewRequest'
-    r'|p?fsockopen',
+    r'|p?fsockopen|restTemplate\.|WebClient\.create',
     re.IGNORECASE,
 )
 
