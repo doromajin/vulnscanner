@@ -52,6 +52,22 @@ _RULES = [
         "Database connection string with embedded credentials",
         Severity.HIGH, _HS,
     ),
+    (
+        "SEC-008",
+        re.compile(
+            # JS/Python/Ruby: jwt.sign(payload, "secret") / jwt.encode(data, "key") / JWT.encode(data, "key")
+            # PHP:            JWT::encode($data, "key")
+            # Go:             token.SignedString([]byte("key"))
+            r'(?:'
+            r'(?:jwt\.(?:sign|encode)|JWT\.encode|JWT::encode)\s*\([^)\n]{0,200},\s*'
+            r'|SignedString\s*\(\s*\[\]byte\s*\(\s*'
+            r')'
+            r'["\'][A-Za-z0-9._/+=!@#$%^&*()\-]{6,}["\']',
+            re.IGNORECASE,
+        ),
+        "Hardcoded JWT signing secret passed directly to library — use environment variable or secrets manager",
+        Severity.CRITICAL, _HS,
+    ),
 ]
 
 # Merged allowlist: a single compiled OR pattern replaces three separate re.search calls.
@@ -66,14 +82,15 @@ _ALLOWLIST_RE = re.compile(
 _GUARD = re.compile(
     r'password|passwd|pwd|api[_-]?key|api[_-]?secret|secret[_-]?key|SECRET_KEY'
     r'|AKIA[0-9A-Z]|PRIVATE KEY|token|auth_token|access_token'
-    r'|connection_string|conn_str|DATABASE_URL',
+    r'|connection_string|conn_str|DATABASE_URL'
+    r'|jwt\.(?:sign|encode)|JWT\.encode|JWT::encode|SignedString',
     re.IGNORECASE,
 )
 
 
 class HardcodedSecretsAnalyzer(BaseAnalyzer):
     supported_extensions = (
-        ".py", ".js", ".ts", ".java", ".rb", ".php",
+        ".py", ".js", ".ts", ".java", ".rb", ".php", ".go",
         ".env", ".yml", ".yaml", ".json", ".config",
     )
 
