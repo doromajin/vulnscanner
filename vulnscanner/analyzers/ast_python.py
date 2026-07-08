@@ -170,6 +170,49 @@ _PATH_CONSTRUCTION_FUNCS = frozenset({
     "pathlib.Path", "Path",
 })
 
+# CMD-specific sanitizer: shlex.quote() correctly escapes shell metacharacters.
+# Safe for subprocess shell=True but NOT for SQL/PATH/XSS — preserve taint, add metadata.
+_CMD_SANITIZER_FUNCS = frozenset({"shlex.quote", "pipes.quote"})
+
+# Dynamic import sinks: load arbitrary code from user-supplied module names.
+_DYNAMIC_IMPORT_FUNCS = frozenset({"__import__", "importlib.import_module"})
+
+# os.* path sinks with a single path argument.
+_OS_PATH_SINKS_SINGLE = frozenset({
+    "os.makedirs", "os.mkdir", "os.remove", "os.unlink",
+    "os.chmod", "os.stat", "os.listdir", "os.scandir",
+    "os.rmdir", "os.removedirs", "os.chown",
+})
+# os.* / shutil.* path sinks with (src, dst) — both arguments are checked.
+_OS_PATH_SINKS_DUAL = frozenset({
+    "os.rename", "os.replace",
+    "shutil.copy", "shutil.copy2", "shutil.move", "shutil.rmtree", "shutil.copytree",
+})
+# pathlib methods that perform IO on the path object — fire when receiver is TAINTED.
+_PATHLIB_IO_METHODS = frozenset({
+    "read_text", "read_bytes", "write_text", "write_bytes",
+    "iterdir", "glob", "rglob",
+})
+
+# Weak hash algorithms — fast enough for GPU brute-force; broken for cryptographic use.
+_WEAK_HASH_FUNCS = frozenset({
+    "hashlib.md5", "hashlib.sha1", "md5", "sha1",
+})
+# Python stdlib RNG — not cryptographically secure; predictable from seed.
+_INSECURE_RNG_FUNCS = frozenset({
+    "random.random", "random.randint", "random.choice", "random.choices",
+    "random.sample", "random.shuffle", "random.randrange", "random.uniform",
+})
+# Variable names that suggest security-sensitive random values.
+_SECURITY_SENSITIVE_RNG_RE = re.compile(
+    r"token|secret|key|nonce|salt|otp|csrf|session|password|passwd|pwd",
+    re.IGNORECASE,
+)
+
+# ── interprocedural taint (per-file, single-threaded) ─────────────────────────
+# Updated by PythonASTAnalyzer.analyze() before each file visit.
+_interprocedural_taint_sources: frozenset[str] = frozenset()
+
 
 # ── public analyzer ────────────────────────────────────────────────────────────
 
@@ -185,12 +228,14 @@ class PythonASTAnalyzer(BaseAnalyzer):
     supported_extensions = (".py",)
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
+        global _interprocedural_taint_sources
         try:
             tree = ast.parse(content, filename=file_path)
         except SyntaxError:
             return []
 
         lines = content.splitlines()
+        _interprocedural_taint_sources = _find_taint_source_funcs(tree)
         visitor = _VulnVisitor(file_path, lines, repo_url, self)
         visitor.visit(tree)
         return visitor.findings
@@ -236,7 +281,7 @@ class _VulnVisitor(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         saved = self._assignments
         self._assignments = _collect_scope_assignments(node)
-        self.generic_visit(node)
+        self._visit_stmts(node.body)
         self._assignments = saved
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
@@ -254,38 +299,36 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_ssrf(node)
         self._check_open_redirect(node)
         self._check_ssti(node)
+        self._check_weak_crypto(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         for target in node.targets:
             self._check_secret(target, node.value, node)
+            self._check_insecure_rng(target, node.value, node)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if node.value is not None:
             self._check_secret(node.target, node.value, node)
+            self._check_insecure_rng(node.target, node.value, node)
         self.generic_visit(node)
 
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
-        guarded_var = _extract_guard_var(node.test)
-        if guarded_var:
-            # Patch assignments so the guarded variable appears CLEAN inside the if-body.
-            # Outside the body (else-branch, subsequent code) taint is restored.
+        guarded_vars = _extract_guard_vars(node.test)
+        if guarded_vars:
             saved = self._assignments
             patched = dict(saved)
-            patched[guarded_var] = ast.Constant(value=0)
+            for v in guarded_vars:
+                patched[v] = ast.Constant(value=0)
             self._assignments = patched
-            for stmt in node.body:
-                self.visit(stmt)
+            self._visit_stmts(node.body)
             self._assignments = saved
-            for stmt in node.orelse:
-                self.visit(stmt)
+            self._visit_stmts(node.orelse)
         else:
-            for stmt in node.body:
-                self.visit(stmt)
-            for stmt in node.orelse:
-                self.visit(stmt)
+            self._visit_stmts(node.body)
+            self._visit_stmts(node.orelse)
 
     # ── SQL injection ──────────────────────────────────────────────────────────
 
@@ -419,6 +462,8 @@ class _VulnVisitor(ast.NodeVisitor):
             taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
             if taint.status == TaintStatus.CLEAN:
                 return
+            if any(s in _CMD_SANITIZER_FUNCS for s in taint.sanitizers):
+                return
             qualifier = "tainted" if taint.status == TaintStatus.TAINTED else "non-literal"
             self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-001",
                       f"{full}() called with {qualifier} argument - prefer subprocess list form:"
@@ -434,11 +479,12 @@ class _VulnVisitor(ast.NodeVisitor):
                 return
             taint = _taint_of(cmd, self._assignments, self._class_attrs)
             if taint.status == TaintStatus.CLEAN:
-                # Literal list with shell=True: still warn (remove shell=True)
                 if isinstance(cmd, ast.List) and all(_is_const(e) for e in cmd.elts):
                     self._add(node, VulnType.COMMAND_INJECTION, Severity.LOW, "AST-CMD-002",
                               f"{full}() uses shell=True with literal list - remove shell=True",
                               taint)
+                return
+            if any(s in _CMD_SANITIZER_FUNCS for s in taint.sanitizers):
                 return
             qualifier = "tainted" if taint.status == TaintStatus.TAINTED else "non-literal"
             self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-002",
@@ -449,60 +495,113 @@ class _VulnVisitor(ast.NodeVisitor):
         # standalone eval(expr) — NOT a method call
         elif attr == "eval" and not isinstance(node.func, ast.Attribute):
             if node.args and not _is_const(node.args[0]):
-                self._add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "AST-CMD-003",
-                          "eval() called with non-literal - arbitrary code execution risk")
+                taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+                if taint.status == TaintStatus.CLEAN:
+                    return
+                sev = Severity.CRITICAL if taint.status == TaintStatus.TAINTED else Severity.HIGH
+                label = "tainted" if taint.status == TaintStatus.TAINTED else "non-literal"
+                self._add(node, VulnType.COMMAND_INJECTION, sev, "AST-CMD-003",
+                          f"eval() called with {label} argument - arbitrary code execution risk:"
+                          f" {taint.reason}",
+                          taint)
 
         # standalone exec(expr)
         elif attr == "exec" and not isinstance(node.func, ast.Attribute):
             if node.args and not _is_const(node.args[0]):
-                self._add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "AST-CMD-004",
-                          "exec() called with non-literal - arbitrary code execution risk")
+                taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+                if taint.status == TaintStatus.CLEAN:
+                    return
+                sev = Severity.CRITICAL if taint.status == TaintStatus.TAINTED else Severity.HIGH
+                label = "tainted" if taint.status == TaintStatus.TAINTED else "non-literal"
+                self._add(node, VulnType.COMMAND_INJECTION, sev, "AST-CMD-004",
+                          f"exec() called with {label} argument - arbitrary code execution risk:"
+                          f" {taint.reason}",
+                          taint)
+
+        # dynamic import — arbitrary module loading from user input
+        elif full in _DYNAMIC_IMPORT_FUNCS:
+            if not node.args:
+                return
+            module_arg = node.args[0]
+            if _is_const(module_arg):
+                return
+            taint = _taint_of(module_arg, self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                return
+            sev = Severity.CRITICAL if taint.status == TaintStatus.TAINTED else Severity.HIGH
+            label = "tainted" if taint.status == TaintStatus.TAINTED else "dynamic"
+            self._add(node, VulnType.COMMAND_INJECTION, sev, "AST-CMD-005",
+                      f"{full}() with {label} module name — allows loading arbitrary code:"
+                      f" {taint.reason}",
+                      taint)
 
     # ── path traversal ─────────────────────────────────────────────────────────
 
     def _check_path(self, node: ast.Call) -> None:
-        if not (isinstance(node.func, ast.Name) and node.func.id == "open"):
-            return
-        if not node.args:
-            return
+        full = _full_name(node.func)
+        attr = _attr_name(node.func)
 
-        path = node.args[0]
-        if _is_const(path):
-            return
-
-        taint = _taint_of(path, self._assignments, self._class_attrs)
-
-        if taint.status == TaintStatus.CLEAN:
-            self._add_suppressed(node, VulnType.PATH_TRAVERSAL, "AST-PATH-001",
-                                 "clean_taint_source", taint)
-            return
-
-        if taint.status == TaintStatus.TAINTED:
-            if isinstance(path, (ast.JoinedStr, ast.BinOp)):
-                self._add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, "AST-PATH-002",
-                          f"open() receives a tainted {'f-string' if isinstance(path, ast.JoinedStr) else 'concatenated'}"
-                          f" path - traversal risk: {taint.reason}",
+        # open(path) — standalone built-in
+        if isinstance(node.func, ast.Name) and node.func.id == "open":
+            if not node.args:
+                return
+            path = node.args[0]
+            if _is_const(path):
+                return
+            taint = _taint_of(path, self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                self._add_suppressed(node, VulnType.PATH_TRAVERSAL, "AST-PATH-001",
+                                     "clean_taint_source", taint)
+                return
+            if taint.status == TaintStatus.TAINTED:
+                rule = "AST-PATH-002" if isinstance(path, (ast.JoinedStr, ast.BinOp)) else "AST-PATH-001"
+                label = ("f-string" if isinstance(path, ast.JoinedStr)
+                         else "concatenated" if isinstance(path, ast.BinOp) else "")
+                self._add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, rule,
+                          f"open() receives a tainted {label + ' ' if label else ''}path"
+                          f" - traversal risk: {taint.reason}",
                           taint)
             else:
-                self._add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, "AST-PATH-001",
-                          f"open() receives a tainted path - traversal risk: {taint.reason}",
-                          taint)
-        else:  # UNKNOWN
-            if isinstance(path, ast.JoinedStr):
-                self._add(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "AST-PATH-002",
-                          f"[needs_review] open() receives an f-string path - verify cannot escape"
+                rule = "AST-PATH-002" if isinstance(path, (ast.JoinedStr, ast.BinOp)) else "AST-PATH-003"
+                self._add(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, rule,
+                          f"[needs_review] open() receives a dynamic path - verify cannot escape"
                           f" directory: {taint.reason}",
                           taint)
-            elif isinstance(path, ast.BinOp) and isinstance(path.op, ast.Add):
-                self._add(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "AST-PATH-002",
-                          f"[needs_review] open() receives a concatenated path - verify cannot"
-                          f" escape directory: {taint.reason}",
-                          taint)
-            else:
-                self._add(node, VulnType.PATH_TRAVERSAL, Severity.LOW, "AST-PATH-003",
-                          f"[needs_review] open() receives a variable path - verify not"
-                          f" user-controlled: {taint.reason}",
-                          taint)
+
+        # os.makedirs / os.remove / os.stat / etc.
+        elif full in _OS_PATH_SINKS_SINGLE:
+            if node.args:
+                self._check_path_arg(node, node.args[0], full)
+
+        # os.rename / shutil.copy / shutil.move / etc. — check src and dst
+        elif full in _OS_PATH_SINKS_DUAL:
+            for path_arg in node.args[:2]:
+                self._check_path_arg(node, path_arg, full)
+
+        # pathlib IO methods on a potentially-tainted path object
+        elif attr in _PATHLIB_IO_METHODS and isinstance(node.func, ast.Attribute):
+            obj_taint = _taint_of(node.func.value, self._assignments, self._class_attrs)
+            if obj_taint.status == TaintStatus.CLEAN:
+                return
+            sev = Severity.HIGH if obj_taint.status == TaintStatus.TAINTED else Severity.MEDIUM
+            prefix = "" if obj_taint.status == TaintStatus.TAINTED else "[needs_review] "
+            self._add(node, VulnType.PATH_TRAVERSAL, sev, "AST-PATH-004",
+                      f"{prefix}.{attr}() on {'tainted' if obj_taint.status == TaintStatus.TAINTED else 'dynamic'}"
+                      f" path — traversal risk: {obj_taint.reason}",
+                      obj_taint)
+
+    def _check_path_arg(self, node: ast.Call, path: ast.expr, func_name: str) -> None:
+        if _is_const(path):
+            return
+        taint = _taint_of(path, self._assignments, self._class_attrs)
+        if taint.status == TaintStatus.CLEAN:
+            return
+        sev = Severity.HIGH if taint.status == TaintStatus.TAINTED else Severity.MEDIUM
+        prefix = "" if taint.status == TaintStatus.TAINTED else "[needs_review] "
+        self._add(node, VulnType.PATH_TRAVERSAL, sev, "AST-PATH-005",
+                  f"{prefix}{func_name}() receives {'tainted' if taint.status == TaintStatus.TAINTED else 'dynamic'}"
+                  f" path — traversal risk: {taint.reason}",
+                  taint)
 
     # ── XSS (Python template helpers) ─────────────────────────────────────────
 
@@ -631,6 +730,35 @@ class _VulnVisitor(ast.NodeVisitor):
                       "Environment.from_string() with non-literal template - "
                       "verify the template source is not user-controlled")
 
+    # ── weak cryptography ──────────────────────────────────────────────────────
+
+    def _check_weak_crypto(self, node: ast.Call) -> None:
+        full = _full_name(node.func)
+        if full in _WEAK_HASH_FUNCS:
+            self._add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.LOW, "AST-CRYPTO-001",
+                      f"{full}() uses a weak hash algorithm — MD5/SHA-1 are broken for "
+                      "cryptographic use; use hashlib.sha256() or stronger")
+
+    def _check_insecure_rng(
+        self,
+        target: ast.expr,
+        value: ast.expr,
+        node: ast.AST,
+    ) -> None:
+        if not isinstance(value, ast.Call):
+            return
+        full = _full_name(value.func)
+        if full not in _INSECURE_RNG_FUNCS:
+            return
+        name = _assign_name(target)
+        if not name or not _SECURITY_SENSITIVE_RNG_RE.search(name):
+            return
+        self._add(
+            node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "AST-CRYPTO-002",
+            f"Security-sensitive '{name}' generated with {full}() — "
+            "use secrets.token_bytes() or secrets.token_hex() for cryptographic randomness",
+        )
+
     # ── hardcoded secrets ──────────────────────────────────────────────────────
 
     def _check_secret(
@@ -717,6 +845,33 @@ class _VulnVisitor(ast.NodeVisitor):
                 confidence=0.0,
             )
         )
+
+    def _visit_stmts(self, stmts: list[ast.stmt]) -> None:
+        """Visit a statement list, detecting early-return guards for taint suppression.
+
+        When `if not guard(x): return/raise` is detected, subsequent statements in
+        the same block treat `x` as CLEAN — matching real-world input-validation patterns.
+        """
+        i = 0
+        while i < len(stmts):
+            stmt = stmts[i]
+            if (isinstance(stmt, ast.If)
+                    and not stmt.orelse
+                    and _is_always_exit(stmt.body)):
+                neg_vars = _extract_negated_guard_vars(stmt.test)
+                self.visit(stmt)
+                if neg_vars:
+                    saved = self._assignments
+                    patched = dict(saved)
+                    for v in neg_vars:
+                        patched[v] = ast.Constant(value=0)
+                    self._assignments = patched
+                    self._visit_stmts(stmts[i + 1:])
+                    self._assignments = saved
+                    return
+            else:
+                self.visit(stmt)
+            i += 1
 
 
 # ── module-level helpers ───────────────────────────────────────────────────────
@@ -892,15 +1047,18 @@ def _taint_of(
         if full in _UNIVERSAL_SANITIZER_FUNCS:
             return TaintInfo(TaintStatus.CLEAN, f"sanitized by {full}()", sanitizers=[full])
 
-        # Context-specific sanitizers: record the sanitizer in metadata but
-        # preserve the argument's taint status unchanged.
-        # html.escape / bleach.clean protect HTML/XSS sinks only.
-        # urllib.parse.quote protects URL encoding only.
-        # Neither prevents SQL/CMD/PATH/SSRF injection — do NOT downgrade a
-        # TAINTED argument to UNKNOWN or CLEAN; that would suppress HIGH findings
-        # at those sinks.  CLEAN arguments stay CLEAN (sanitizer is a no-op here).
+        # Interprocedural taint: call to a function identified as a taint source in pre-pass.
+        if full in _interprocedural_taint_sources:
+            return TaintInfo(TaintStatus.TAINTED,
+                             f"return of taint-source function '{full}'", source=full)
+
+        # Context-specific sanitizers: record sanitizer in metadata, preserve taint status.
+        # html.escape / bleach.clean  → protects HTML/XSS only
+        # urllib.parse.quote          → protects URL encoding only
+        # shlex.quote / pipes.quote   → protects CMD/shell only
+        # None of these prevent injection at other sink types — do NOT mark CLEAN globally.
         _is_ctx = (
-            full in _HTML_SANITIZER_FUNCS | _URL_SANITIZER_FUNCS
+            full in _HTML_SANITIZER_FUNCS | _URL_SANITIZER_FUNCS | _CMD_SANITIZER_FUNCS
             or attr in _HTML_SANITIZER_METHODS | _URL_SANITIZER_METHODS
         )
         if _is_ctx:
@@ -911,13 +1069,13 @@ def _taint_of(
             )
             if arg_taint.status == TaintStatus.CLEAN:
                 return arg_taint
-            # TAINTED or UNKNOWN: propagate status, record sanitizer as metadata.
-            # The sink-side checker (e.g. _check_sql) will determine severity.
             sanitizer_name = full or f".{attr}"
+            ctx_label = ("CMD" if full in _CMD_SANITIZER_FUNCS
+                         else "HTML/URL")
             return TaintInfo(
                 arg_taint.status,
-                f"{sanitizer_name}() applied but protects HTML/URL context only;"
-                f" ineffective at this sink: {arg_taint.reason}",
+                f"{sanitizer_name}() applied — protects {ctx_label} context only;"
+                f" ineffective at other sinks: {arg_taint.reason}",
                 source=arg_taint.source,
                 sanitizers=[sanitizer_name] + (arg_taint.sanitizers or []),
             )
@@ -1046,3 +1204,65 @@ def _is_safe_type_check(types_node: ast.expr) -> bool:
             for e in types_node.elts
         )
     return False
+
+
+def _extract_guard_vars(test: ast.expr) -> frozenset[str]:
+    """Return all variable names validated by the if-condition.
+
+    Handles single guards and `and`-chained guards:
+      if x.isdigit() and y.isalpha():  →  {'x', 'y'}
+    """
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        result: set[str] = set()
+        for value in test.values:
+            var = _extract_guard_var(value)
+            if var:
+                result.add(var)
+        return frozenset(result)
+    var = _extract_guard_var(test)
+    return frozenset({var}) if var else frozenset()
+
+
+def _extract_negated_guard_vars(test: ast.expr) -> frozenset[str]:
+    """Return guarded vars from a negated guard: `not x.isdigit()` → {'x'}."""
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return _extract_guard_vars(test.operand)
+    return frozenset()
+
+
+def _is_always_exit(stmts: list[ast.stmt]) -> bool:
+    """True if the last statement in the block always exits the current scope."""
+    return bool(stmts) and isinstance(
+        stmts[-1], (ast.Return, ast.Raise, ast.Continue, ast.Break)
+    )
+
+
+def _find_taint_source_funcs(tree: ast.AST) -> frozenset[str]:
+    """Pre-pass: find names of functions that always return a tainted value.
+
+    Handles simple wrappers like:
+      def get_user_id():
+          return request.GET.get("id")
+    """
+    sources: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        # Collect only non-docstring, non-pass statements
+        body = [s for s in node.body
+                if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+        assignments = _collect_scope_assignments(node)
+        # Single return statement
+        if (len(body) == 1
+                and isinstance(body[0], ast.Return)
+                and body[0].value is not None):
+            if _taint_of(body[0].value, assignments, {}).status == TaintStatus.TAINTED:
+                sources.add(node.name)
+        # Assignment then return
+        elif (len(body) == 2
+                and isinstance(body[0], ast.Assign)
+                and isinstance(body[1], ast.Return)
+                and body[1].value is not None):
+            if _taint_of(body[1].value, assignments, {}).status == TaintStatus.TAINTED:
+                sources.add(node.name)
+    return frozenset(sources)
