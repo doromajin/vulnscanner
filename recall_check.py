@@ -91,6 +91,12 @@ EXPECTED: list[tuple[str, str, str, str]] = [
 
     # -- Python: sanitizer bypass -------------------------------------------------
     ("AST-SQL-002",   "python/sanitizer_bypass.py",   "HIGH",     "html.escape() does NOT suppress SQL injection"),
+
+    # -- Java: deserialization ----------------------------------------------------
+    ("DESER-005",     "java/deserialization.java",     "CRITICAL", "Java ObjectInputStream.readObject() RCE"),
+    ("DESER-009",     "java/deserialization.java",     "CRITICAL", "Java XStream.fromXML() RCE"),
+    ("DESER-010",     "java/deserialization.java",     "CRITICAL", "Java XMLDecoder arbitrary object instantiation"),
+    ("JAST-DESER-001","java/deserialization.java",     "CRITICAL", "Java AST deserialization"),
 ]
 
 
@@ -157,7 +163,7 @@ def run(verbose: bool = False) -> int:
         print(f"[ERROR] recall/ not found at {RECALL_DIR}", file=sys.stderr)
         return 1
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         pos_f = pool.submit(_scan_active, POSITIVE_DIR)
         neg_f = pool.submit(_scan_active, NEGATIVE_DIR)
         rfp_f = pool.submit(_scan_active, REAL_FP_DIR)

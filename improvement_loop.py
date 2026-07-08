@@ -420,18 +420,43 @@ def call_fugu(prompt: str, max_tokens: int = 512) -> tuple[str | None, int]:
 # ── JSON パース ────────────────────────────────────────────────────────────────
 
 def parse_claude_json(raw: str) -> dict | None:
-    cleaned = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
-    cleaned = re.sub(r'\s*```$', '', cleaned, flags=re.MULTILINE).strip()
+    text = raw.strip()
+    # Try 1: direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Try 2: strip outer code fence only (first + last line) — handles ```json, ```python, etc.
+    m_outer = re.match(r'^```[a-zA-Z]*\s*\n(.*)\n```\s*$', text, re.DOTALL)
+    if m_outer:
+        inner = m_outer.group(1).strip()
+        try:
+            return json.loads(inner)
+        except json.JSONDecodeError:
+            pass
+    # Try 3: strip all fence lines (less precise but catches multi-fence responses)
+    cleaned = re.sub(r'^```[a-zA-Z]*\s*$', '', text, flags=re.MULTILINE).strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-    m = re.search(r'\{.*\}', cleaned, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
+    # Try 4: extract outermost JSON object by brace matching
+    start = text.find('{')
+    if start != -1:
+        depth, end = 0, -1
+        for i, ch in enumerate(text[start:], start):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end != -1:
+            try:
+                return json.loads(text[start:end])
+            except json.JSONDecodeError:
+                pass
     return None
 
 
