@@ -106,7 +106,7 @@ _API_MODEL_MAP: dict[str, str] = {
     "diagnosis": "claude-haiku-4-5-20251001",
 }
 
-BASELINE = {"precision": 100.0, "recall": 100.0, "f1": 100.0, "passed": 39}
+BASELINE = {"precision": 100.0, "recall": 100.0, "f1": 100.0, "passed": 44}
 
 ANALYZER_FILES = [
     # Python AST analyzer — highest improvement potential (#8 conditional taint, #6 framework models)
@@ -618,6 +618,10 @@ def validate_python_syntax(code: str, label: str) -> bool:
 _PROMPT_FILE_MAX_CHARS = 10_000
 
 _rule_ids_cache: list[str] | None = None
+
+# FuguAI review cache: (rule_id, target_file) → review dict
+# 同一ルールIDを同一ファイルで再提案した場合に FuguAI 呼び出しを節約する
+_fugu_review_cache: dict[tuple[str, str], dict] = {}
 # Rule IDs proposed in the current session — updated after each proposal to prevent
 # same-session duplicates (important because cache is built once from disk state).
 _proposed_this_session: set[str] = set()
@@ -1422,21 +1426,29 @@ def _run_loop(args: argparse.Namespace) -> int:
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
 
         # ────────────────────────────────────────────────────────────────────
-        # Step 3: FuguAI critique
+        # Step 3: FuguAI critique (キャッシュ優先)
+        # 同一 (rule_id, target_file) の2回目以降はキャッシュを再利用し
+        # FuguAI トークンと待ち時間を節約する
         # ────────────────────────────────────────────────────────────────────
-        log("  [Step 3/5] FuguAI — 構造化レビュー...")
-        fugu_prompt   = build_fugu_critique_prompt(rule_id, change_summ, target_file, draft_content, draft_metrics)
-        fugu_raw, ftok = call_fugu(fugu_prompt, max_tokens=FUGU_CRITIQUE_MAX_TOKENS)
-        fugu_tokens_used += ftok
+        _fugu_cache_key = (rule_id, target_file)
+        if _fugu_cache_key in _fugu_review_cache:
+            fugu_review = _fugu_review_cache[_fugu_cache_key]
+            ftok = 0
+            log(f"  [Step 3/5] FuguAI キャッシュ使用 (rule_id={rule_id} の前回レビューを再利用、トークン節約)")
+        else:
+            log("  [Step 3/5] FuguAI — 構造化レビュー...")
+            fugu_prompt   = build_fugu_critique_prompt(rule_id, change_summ, target_file, draft_content, draft_metrics)
+            fugu_raw, ftok = call_fugu(fugu_prompt, max_tokens=FUGU_CRITIQUE_MAX_TOKENS)
+            fugu_tokens_used += ftok
 
-        token_record["sessions"].append({
-            "iteration": iteration+1, "stage": "critique",
-            "rule_id": rule_id, "tokens": ftok, "cumulative": fugu_tokens_used,
-        })
-        token_record["total_tokens"] = fugu_tokens_used
-        save_token_usage(run_dir, token_record)
+            token_record["sessions"].append({
+                "iteration": iteration+1, "stage": "critique",
+                "rule_id": rule_id, "tokens": ftok, "cumulative": fugu_tokens_used,
+            })
+            token_record["total_tokens"] = fugu_tokens_used
+            save_token_usage(run_dir, token_record)
 
-        fugu_review = parse_fugu_critique(fugu_raw)
+            fugu_review = parse_fugu_critique(fugu_raw)
 
         if fugu_review is None:
             # パース失敗の原因を記録
@@ -1463,6 +1475,10 @@ def _run_loop(args: argparse.Namespace) -> int:
                 "next_hint": "FuguAI was down; retry when available for critique/revise",
             })
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
+
+        # キャッシュ未登録なら保存（パース成功時のみ）
+        if _fugu_cache_key not in _fugu_review_cache:
+            _fugu_review_cache[_fugu_cache_key] = fugu_review
 
         fugu_ever_available = True
         iter_result["fugu_status"]  = "available"
@@ -1498,14 +1514,14 @@ def _run_loop(args: argparse.Namespace) -> int:
         # Step 4: Claude → revise (FuguAI フィードバックを渡す)
         # 以下のいずれかの場合は revise をスキップ（Claude 呼び出し節約）:
         #   a) improvement_instructions が "none" / 空
-        #   b) quality >= 8 かつ implementation_issues が "none" / 空
-        #      → 品質が既に高く改善余地が小さいため、revise のコストに見合わない
+        #   b) quality >= 7 (採用閾値) かつ implementation_issues が "none" / 空
+        #      → 採用閾値に達しており revise による改善余地が小さい
         # ────────────────────────────────────────────────────────────────────
         _instr_text  = (fugu_review.get("improvement_instructions") or "").strip().lower()
         _issues_text = (fugu_review.get("implementation_issues")    or "none").strip().lower()
         _no_instructions = _instr_text in ("", "none")
         _no_issues       = _issues_text in ("", "none")
-        _quality_high    = (iter_result.get("fugu_quality") or 0) >= 8
+        _quality_high    = (iter_result.get("fugu_quality") or 0) >= 7
         _skip_revise     = _no_instructions or (_quality_high and _no_issues)
 
         revise_raw          = None
@@ -1514,8 +1530,8 @@ def _run_loop(args: argparse.Namespace) -> int:
 
         if _skip_revise:
             if _quality_high and _no_issues and not _no_instructions:
-                log(f"  [Step 4/5] 品質十分 (quality={iter_result.get('fugu_quality')}/10, 実装問題なし) → revise スキップ")
-                revision_notes = f"(quality={iter_result.get('fugu_quality')}/10 かつ実装問題なし — revise スキップ)"
+                log(f"  [Step 4/5] 採用閾値到達 (quality={iter_result.get('fugu_quality')}/10≥7, 実装問題なし) → revise スキップ")
+                revision_notes = f"(quality={iter_result.get('fugu_quality')}/10≥7 かつ実装問題なし — revise スキップ)"
             else:
                 log("  [Step 4/5] FuguAI 改善指示なし → revise スキップ")
         else:
