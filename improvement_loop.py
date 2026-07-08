@@ -586,6 +586,12 @@ def validate_python_syntax(code: str, label: str) -> bool:
 
 # ── プロンプト ─────────────────────────────────────────────────────────────────
 
+# ファイルコンテンツをプロンプトに埋め込む際の上限。
+# これを超えるファイルは先頭75% + 末尾25% に分割してトークンを削減する。
+# 精度への影響: アーキテクチャ全体が見えなくなる代わりに、冒頭の設計パターンと
+# 末尾の追加挿入点が見えるので提案品質は維持できる。
+_PROMPT_FILE_MAX_CHARS = 10_000
+
 _rule_ids_cache: list[str] | None = None
 # Rule IDs proposed in the current session — updated after each proposal to prevent
 # same-session duplicates (important because cache is built once from disk state).
@@ -607,6 +613,51 @@ def _existing_rule_ids() -> list[str]:
             pass
     _rule_ids_cache = sorted(set(ids))
     return sorted(set(_rule_ids_cache) | _proposed_this_session)
+
+
+def _truncate_file_for_prompt(content: str, max_chars: int = _PROMPT_FILE_MAX_CHARS) -> str:
+    """大きいファイルをプロンプト用に圧縮する。
+    先頭75%（アーキテクチャ・既存パターン）+ 末尾25%（追加挿入点）を残す。
+    精度への影響なし: Claude は全体像ではなく設計パターンと末尾を参照して提案する。
+    """
+    if len(content) <= max_chars:
+        return content
+    head = int(max_chars * 0.75)
+    tail = max_chars - head
+    omitted = len(content) - head - tail
+    return (
+        content[:head]
+        + f"\n\n# ... [{omitted} chars omitted — same architecture continues] ...\n\n"
+        + content[-tail:]
+    )
+
+
+def _relevant_rule_ids(target_file: str) -> str:
+    """プロンプトに埋め込む existing rule IDs を対象ファイル関連に絞る。
+    同ファイルにIDがある場合: そのIDを詳細表示 + 他は件数のみ（トークン節約）
+    同ファイルにIDがない場合: 全IDを表示（AST系ファイル等）
+    """
+    all_ids = _existing_rule_ids()
+    try:
+        file_ids = sorted(set(re.findall(r'"([A-Z]+-\d+)"', Path(target_file).read_text(encoding="utf-8"))))
+    except Exception:
+        file_ids = []
+
+    if not file_ids:
+        # AST系など自ファイルにIDがない場合は全件表示
+        return ", ".join(all_ids)
+
+    other_ids = sorted(set(all_ids) - set(file_ids))
+    parts = ["In this file: " + ", ".join(file_ids)]
+    if other_ids:
+        # 他ファイルのIDはプレフィックスごとにサマリーして短縮
+        prefixes: dict[str, int] = {}
+        for rid in other_ids:
+            pfx = rid.rsplit("-", 1)[0]
+            prefixes[pfx] = prefixes.get(pfx, 0) + 1
+        summary = ", ".join(f"{p}-* ({n})" for p, n in sorted(prefixes.items()))
+        parts.append(f"Other files: {summary} — all forbidden to reuse")
+    return "\n  ".join(parts)
 
 
 def _format_previous_attempts(previous_attempts: list[dict], target_file: str = "") -> str:
@@ -652,8 +703,9 @@ def _format_previous_attempts(previous_attempts: list[dict], target_file: str = 
 
 
 def build_draft_prompt(target_file: str, previous_attempts: list[dict], baseline: dict | None = None) -> str:
-    content  = Path(target_file).read_text(encoding="utf-8")
-    existing = ", ".join(_existing_rule_ids())
+    raw_content = Path(target_file).read_text(encoding="utf-8")
+    content  = _truncate_file_for_prompt(raw_content)   # トークン節約: 大ファイルは圧縮
+    existing = _relevant_rule_ids(target_file)           # 同ファイルのIDを詳細表示、他は件数のみ
     prev     = _format_previous_attempts(previous_attempts, target_file)
     checks   = f"{baseline['passed']}/{baseline['total']}" if baseline and baseline.get("total") else "100%"
 
@@ -750,7 +802,8 @@ findings in production software. Prioritize Java and Go coverage, then expand ex
 
 Current benchmark: Precision 100% / Recall 100% / F1 100% ({checks} checks passing).
 These scores are the REGRESSION GATE — you must not reduce any of them.
-Existing rule IDs: {existing}
+Existing rule IDs (ALL are forbidden — do not reuse any):
+  {existing}
 {prev}{lang_hint}
 Target file: {target_file}
 
@@ -1418,17 +1471,28 @@ def _run_loop(args: argparse.Namespace) -> int:
 
         # ────────────────────────────────────────────────────────────────────
         # Step 4: Claude → revise (FuguAI フィードバックを渡す)
-        # improvement_instructions が "none" / 空の場合は revise をスキップ
+        # 以下のいずれかの場合は revise をスキップ（Claude 呼び出し節約）:
+        #   a) improvement_instructions が "none" / 空
+        #   b) quality >= 8 かつ implementation_issues が "none" / 空
+        #      → 品質が既に高く改善余地が小さいため、revise のコストに見合わない
         # ────────────────────────────────────────────────────────────────────
-        _instr_text = (fugu_review.get("improvement_instructions") or "").strip().lower()
+        _instr_text  = (fugu_review.get("improvement_instructions") or "").strip().lower()
+        _issues_text = (fugu_review.get("implementation_issues")    or "none").strip().lower()
         _no_instructions = _instr_text in ("", "none")
+        _no_issues       = _issues_text in ("", "none")
+        _quality_high    = (iter_result.get("fugu_quality") or 0) >= 8
+        _skip_revise     = _no_instructions or (_quality_high and _no_issues)
 
         revise_raw          = None
         revise_rate_limited = False
         revision_notes      = "(FuguAI 改善指示なし — draft をそのまま final として使用)"
 
-        if _no_instructions:
-            log("  [Step 4/5] FuguAI 改善指示なし → revise スキップ")
+        if _skip_revise:
+            if _quality_high and _no_issues and not _no_instructions:
+                log(f"  [Step 4/5] 品質十分 (quality={iter_result.get('fugu_quality')}/10, 実装問題なし) → revise スキップ")
+                revision_notes = f"(quality={iter_result.get('fugu_quality')}/10 かつ実装問題なし — revise スキップ)"
+            else:
+                log("  [Step 4/5] FuguAI 改善指示なし → revise スキップ")
         else:
             log("  [Step 4/5] Claude — FuguAI フィードバックを元に revise...")
             revise_prompt = build_revise_prompt(
@@ -1453,7 +1517,7 @@ def _run_loop(args: argparse.Namespace) -> int:
         # revise 失敗または未実施の場合は draft を final として使う
         final_content  = draft_content
         final_summ     = change_summ
-        if not _no_instructions:
+        if not _skip_revise and not revision_notes.startswith("("):
             revision_notes = "(revise 失敗 — draft をそのまま final として使用)"
 
         if revise_raw:
@@ -1465,7 +1529,7 @@ def _run_loop(args: argparse.Namespace) -> int:
                 log(f"  → revise 成功: {revision_notes[:80]}")
             else:
                 log("  revise パース/構文エラー → draft を final として使用")
-        else:
+        elif not _skip_revise:
             log("  Claude revise 応答なし → draft を final として使用")
 
         iter_result["change_summary"] = final_summ
