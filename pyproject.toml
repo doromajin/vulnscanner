@@ -19,5 +19,9 @@ dependencies = [
 [project.scripts]
 vulnscan = "vulnscanner.cli:main"
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vulnscanner*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
