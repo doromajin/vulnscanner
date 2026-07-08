@@ -41,10 +41,32 @@ _RULES = [
         "Django ORM raw()/extra() - ensure no unsanitized input",
         Severity.MEDIUM, _SI,
     ),
+    (
+        "SQL-007",
+        re.compile(
+            r'\.(?:where|find_by_sql|having|from|joins|select)\s*\(\s*'
+            r'(?:"[^"]*#\{|\'[^\']*#\{)',
+            re.IGNORECASE,
+        ),
+        "Ruby ActiveRecord method with string interpolation #{} — SQL injection risk; use parameterized placeholders",
+        Severity.HIGH, _SI,
+    ),
+    (
+        "SQL-008",
+        re.compile(
+            r'(?:ActiveRecord::Base\.connection|connection)\.'
+            r'(?:execute|select_all|select_one|select_value)\s*\('
+            r'(?:"[^"]*#\{|\'[^\']*#\{)',
+            re.IGNORECASE,
+        ),
+        "Ruby raw ActiveRecord connection query with string interpolation — SQL injection risk",
+        Severity.CRITICAL, _SI,
+    ),
 ]
 
 _GUARD = re.compile(
-    r'execute\s*\(|query\s*\(|cursor\.|\.raw\s*\(|\.extra\s*\(|\$sql|\$query|\$stmt',
+    r'execute\s*\(|query\s*\(|cursor\.|\.raw\s*\(|\.extra\s*\(|\$sql|\$query|\$stmt'
+    r'|\.where\s*\(|find_by_sql|\.having\s*\(',
     re.IGNORECASE,
 )
 

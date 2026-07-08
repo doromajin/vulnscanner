@@ -53,11 +53,28 @@ _RULES = [
         "Java Runtime.exec() - verify arguments are not user-controlled",
         Severity.HIGH, _CI,
     ),
+    (
+        "CMD-009",
+        re.compile(
+            r'\b(?:system|exec|spawn|IO\.popen|Open3\.popen3?|Open3\.capture[23]?|Kernel\.system)\s*\('
+            r'[^)]*params\s*\[',
+            re.IGNORECASE,
+        ),
+        "Ruby shell execution with user-controlled params[] argument — command injection risk",
+        Severity.CRITICAL, _CI,
+    ),
+    (
+        "CMD-010",
+        re.compile(r'`[^`]*#\{[^`]*params\s*\[', re.IGNORECASE),
+        "Ruby backtick shell execution with params[] interpolation — command injection risk",
+        Severity.CRITICAL, _CI,
+    ),
 ]
 
 _GUARD = re.compile(
     r'os\.system|os\.popen|subprocess\.|shell_exec|passthru|proc_open'
-    r'|eval\s*\(|exec\s*\(|Runtime\.getRuntime',
+    r'|eval\s*\(|exec\s*\(|Runtime\.getRuntime'
+    r'|IO\.popen|Open3\.|spawn\s*\(|system\s*\(',
     re.IGNORECASE,
 )
 
