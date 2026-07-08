@@ -17,6 +17,7 @@ from vulnscanner.analyzers.file_context import (
 )
 from vulnscanner.fetcher.github import GitHubFetcher
 from vulnscanner.fetcher.local import LocalFetcher
+from vulnscanner.cwe_map import get_cwe_id
 from vulnscanner.models import Finding, ScanResult
 
 # Matches:  # vulnscanner: ignore  or  // vulnscanner: ignore[XSS-001,SQL-001]
@@ -79,10 +80,15 @@ class VulnScanner:
         self._cli_excludes = tuple(exclude)
         self._workers = workers if workers > 0 else DEFAULT_WORKERS
 
-    def scan(self, target: str) -> ScanResult:
-        """Scan a GitHub repo URL/slug or a local directory path."""
+    def scan(self, target: str, changed_files: set[str] | None = None) -> ScanResult:
+        """Scan a GitHub repo URL/slug or a local directory path.
+
+        *changed_files* — when provided (incremental mode), only files whose
+        relative path is in this set are analysed; other files are skipped.
+        Only honoured for local-directory scans; ignored for GitHub targets.
+        """
         if os.path.isdir(target):
-            return self._scan_local(target)
+            return self._scan_local(target, changed_files=changed_files)
         return self._scan_github(target)
 
     def _scan_github(self, repo_url: str) -> ScanResult:
@@ -136,7 +142,7 @@ class VulnScanner:
         result.elapsed_seconds = time.perf_counter() - start
         return result
 
-    def _scan_local(self, directory: str) -> ScanResult:
+    def _scan_local(self, directory: str, changed_files: set[str] | None = None) -> ScanResult:
         result = ScanResult(repo_url=directory)
         fetcher = LocalFetcher(directory)
 
@@ -153,6 +159,7 @@ class VulnScanner:
             (fp, content)
             for fp, content in fetcher.iter_files()
             if not _is_excluded(fp, excludes)
+            and (changed_files is None or fp in changed_files)
         ]
 
         start = time.perf_counter()
@@ -220,7 +227,11 @@ class VulnScanner:
                 partial.suppression_breakdown[ctx_reason] = len(raw)
             return partial  # none of these findings reach result.findings
 
-        partial.findings = _deduplicate(raw)
+        deduped = _deduplicate(raw)
+        for f in deduped:
+            if f.cwe_id is None:
+                f.cwe_id = get_cwe_id(f.rule_id)
+        partial.findings = deduped
         return partial
 
 

@@ -37,6 +37,8 @@ def main() -> None:
               help="Glob pattern to skip (can be repeated)")
 @click.option("--workers", "-w", default=0, type=int, metavar="N",
               help="Parallel worker threads (0 = auto-detect)")
+@click.option("--since", default=None, metavar="REF",
+              help="Incremental scan: only analyse files changed since this git ref (e.g. HEAD~1, main)")
 def scan(
     target: str,
     token: str | None,
@@ -47,6 +49,7 @@ def scan(
     fail_on: str | None,
     exclude: tuple[str, ...],
     workers: int,
+    since: str | None,
 ) -> None:
     """Scan a single GitHub repository or local directory.
 
@@ -55,16 +58,38 @@ def scan(
       owner/repo                     (short GitHub slug)\n
       C:\\path\\to\\cloned\\repo     (local directory)
     """
+    import subprocess
     from vulnscanner.models import Severity
 
     severity_order = list(Severity)
     min_sev = Severity(min_severity.upper())
     cutoff = severity_order.index(min_sev)
 
+    # Incremental scan: resolve changed files from git diff
+    changed_files: set[str] | None = None
+    if since:
+        if not os.path.isdir(target):
+            console.print("[yellow]--since requires a local directory target; ignoring.[/yellow]")
+        else:
+            try:
+                proc = subprocess.run(
+                    ["git", "diff", "--name-only", since, "--"],
+                    cwd=target, capture_output=True, text=True, check=True,
+                )
+                changed_files = {ln.strip() for ln in proc.stdout.splitlines() if ln.strip()}
+                console.print(
+                    f"[dim]Incremental scan: {len(changed_files)} file(s) changed since {since}[/dim]"
+                )
+                if not changed_files:
+                    console.print("[yellow]No changed files detected — nothing to scan.[/yellow]")
+                    sys.exit(0)
+            except subprocess.CalledProcessError as exc:
+                console.print(f"[yellow]--since failed ({exc.stderr.strip()}); scanning all files.[/yellow]")
+
     scanner = VulnScanner(github_token=token, exclude=exclude, workers=workers)
 
     try:
-        result = scanner.scan(target)
+        result = scanner.scan(target, changed_files=changed_files)
     except KeyboardInterrupt:
         console.print("\n[yellow]Scan interrupted.[/yellow]")
         sys.exit(1)

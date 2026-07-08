@@ -28,6 +28,9 @@ def write_sarif(result: ScanResult, output_path: str) -> None:
 
     for f in result.findings:
         if f.rule_id not in rule_registry:
+            tags = [f.vuln_type.value]
+            if f.cwe_id:
+                tags.append(f"external/cwe/cwe-{f.cwe_id}")
             rule_registry[f.rule_id] = {
                 "id": f.rule_id,
                 "name": _pascal(f.vuln_type.value),
@@ -36,7 +39,10 @@ def write_sarif(result: ScanResult, output_path: str) -> None:
                     "level": _LEVEL.get(f.severity, "warning")
                 },
                 "helpUri": "https://github.com/doromajin/VulnScanner",
-                "properties": {"tags": [f.vuln_type.value]},
+                "properties": {
+                    "tags": tags,
+                    **({"security-severity": _cvss(f.severity)} if f.severity in (Severity.CRITICAL, Severity.HIGH) else {}),
+                },
             }
 
         uri = f.file_path.replace("\\", "/").lstrip("/")
@@ -79,6 +85,11 @@ def write_sarif(result: ScanResult, output_path: str) -> None:
         json.dumps(doc, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _cvss(severity: Severity) -> str:
+    """Return a CVSS-like numeric string for GitHub's severity filter."""
+    return "9.0" if severity == Severity.CRITICAL else "7.5"
 
 
 def _pascal(text: str) -> str:

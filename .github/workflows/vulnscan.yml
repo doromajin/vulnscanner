@@ -1,0 +1,48 @@
+name: VulnScanner Security Scan
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  scan:
+    name: Static vulnerability scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install VulnScanner
+        run: pip install -e ".[dev]" --quiet
+
+      - name: Run VulnScanner (incremental on PR)
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            vulnscan scan . \
+              --sarif vulnscan.sarif \
+              --since origin/${{ github.base_ref }} \
+              --fail-on HIGH
+          else
+            vulnscan scan . \
+              --sarif vulnscan.sarif \
+              --fail-on HIGH
+          fi
+        continue-on-error: true
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: vulnscan.sarif
+          category: vulnscanner

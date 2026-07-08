@@ -7,7 +7,7 @@ _SCAN_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".php", ".java", ".rb", ".go",
     ".html", ".htm", ".sh",
-    ".env", ".yml", ".yaml", ".json", ".config",
+    ".env", ".yml", ".yaml", ".json", ".config", ".tf",
 }
 
 # Specific filenames to scan regardless of extension (dependency manifests)

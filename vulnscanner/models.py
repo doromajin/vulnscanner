@@ -29,6 +29,7 @@ class VulnType(str, Enum):
     CSRF = "Cross-Site Request Forgery (CSRF)"
     WEAK_CRYPTOGRAPHY = "Weak Cryptography"
     LDAP_INJECTION = "LDAP Injection"
+    IAC_MISCONFIGURATION = "IaC Misconfiguration"
 
 
 @dataclass
@@ -47,6 +48,7 @@ class Finding:
     taint_reason: Optional[str] = None
     taint_source: Optional[str] = None
     confidence: float = 1.0
+    cwe_id: Optional[int] = None
 
 
 @dataclass
