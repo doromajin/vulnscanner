@@ -17,6 +17,7 @@ from vulnscanner.analyzers.prototype_pollution import PrototypePollutionAnalyzer
 from vulnscanner.analyzers.sql_injection import SQLInjectionAnalyzer
 from vulnscanner.analyzers.ssrf import SSRFAnalyzer
 from vulnscanner.analyzers.ssti import SSTIAnalyzer
+from vulnscanner.analyzers.ldap_injection import LDAPInjectionAnalyzer
 from vulnscanner.analyzers.weak_crypto import WeakCryptoAnalyzer
 from vulnscanner.analyzers.xss import XSSAnalyzer
 
@@ -48,4 +49,5 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     CSRFAnalyzer(),
     NoSQLInjectionAnalyzer(),
     WeakCryptoAnalyzer(),
+    LDAPInjectionAnalyzer(),
 ]

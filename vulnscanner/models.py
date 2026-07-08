@@ -28,6 +28,7 @@ class VulnType(str, Enum):
     RACE_CONDITION = "Race Condition"
     CSRF = "Cross-Site Request Forgery (CSRF)"
     WEAK_CRYPTOGRAPHY = "Weak Cryptography"
+    LDAP_INJECTION = "LDAP Injection"
 
 
 @dataclass
