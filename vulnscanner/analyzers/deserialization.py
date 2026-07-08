@@ -17,6 +17,11 @@ _PHP_USER_UNSERIALIZE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Java XMLDecoder: exact class name match (case-sensitive — XMLDecoder is a Java class).
+# Used to deserialize XML into Java objects; equivalent in danger to ObjectInputStream.
+# CVE-2017-10271: Oracle WebLogic XMLDecoder RCE via crafted XML payload.
+_JAVA_XMLDECODER_RE = re.compile(r'\bXMLDecoder\b')
+
 # (rule_id, compiled_re, description, severity, vuln_type, exts)
 _RULES = [
     # ── Python (regex fallback for files the AST analyzer cannot parse) ────────
@@ -52,6 +57,12 @@ _RULES = [
         "Java ObjectInputStream/readObject - deserialization of untrusted data leads to RCE",
         Severity.CRITICAL, VulnType.INSECURE_DESERIALIZATION, (".java",),
     ),
+    (
+        "DESER-010",
+        _JAVA_XMLDECODER_RE,
+        "Java XMLDecoder - XML deserialization allows arbitrary object instantiation and RCE (CVE-2017-10271)",
+        Severity.CRITICAL, VulnType.INSECURE_DESERIALIZATION, (".java",),
+    ),
     # ── Ruby ───────────────────────────────────────────────────────────────────
     (
         "DESER-006",
@@ -77,9 +88,12 @@ _RULES = [
 _GUARD = re.compile(
     r'pickle\.|yaml\.(?:load|unsafe_load)|marshal\.load|unserialize\s*\('
     r'|ObjectInputStream|readObject\s*\(|Marshal\.(?:load|restore)|YAML\.(?:load|unsafe_load)'
-    r'|node-serialize',
+    r'|node-serialize|XMLDecoder',
     re.IGNORECASE,
 )
+
+# Separate guard for XMLDecoder that is case-sensitive (class name must match exactly)
+_XMLDECODER_GUARD = re.compile(r'\bXMLDecoder\b')
 
 
 class DeserializationAnalyzer(BaseAnalyzer):
@@ -89,7 +103,11 @@ class DeserializationAnalyzer(BaseAnalyzer):
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         if not _GUARD.search(content):
-            return []
+            # Also check case-sensitive XMLDecoder guard for Java files
+            if file_path.endswith(".java") and not _XMLDECODER_GUARD.search(content):
+                return []
+            elif not file_path.endswith(".java"):
+                return []
 
         # Filter rules to those applicable to this file extension
         applicable = [
