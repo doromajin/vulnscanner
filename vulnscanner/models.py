@@ -27,6 +27,7 @@ class VulnType(str, Enum):
     JNDI_INJECTION = "JNDI Injection"
     RACE_CONDITION = "Race Condition"
     CSRF = "Cross-Site Request Forgery (CSRF)"
+    WEAK_CRYPTOGRAPHY = "Weak Cryptography"
 
 
 @dataclass
