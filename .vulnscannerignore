@@ -1,0 +1,5 @@
+# CI環境でスキャン対象から除外するパス
+repos/
+temp_eval/
+improvement_runs/
+nightly_runs/

@@ -24,7 +24,7 @@ jobs:
           cache: pip
 
       - name: Install VulnScanner
-        run: pip install -e ".[dev]" --quiet
+        run: pip install -e "." --quiet
 
       - name: Run VulnScanner (incremental on PR)
         run: |
