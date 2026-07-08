@@ -109,22 +109,32 @@ _API_MODEL_MAP: dict[str, str] = {
 BASELINE = {"precision": 100.0, "recall": 100.0, "f1": 100.0, "passed": 39}
 
 ANALYZER_FILES = [
-    # AST-based analyzers (highest value — taint-aware, FuguAI scores 7+)
+    # Python AST analyzer — highest improvement potential (#8 conditional taint, #6 framework models)
+    "vulnscanner/analyzers/ast_python.py",
+    # Java AST-based (taint-aware, FuguAI scores 7+)
     "vulnscanner/analyzers/ast_java.py",
+    # Go (Layer-1 regex + Layer-2 taint-lite)
     "vulnscanner/analyzers/go_analyzer.py",
-    # Regex-based language support
+    # Java regex (JNDI, XXE, Spring patterns)
     "vulnscanner/analyzers/java_analyzer.py",
-    # Existing analyzers (ordered by improvement potential)
+    # Multi-language regex analyzers ordered by improvement potential
     "vulnscanner/analyzers/ssrf.py",
-    "vulnscanner/analyzers/open_redirect.py",
-    "vulnscanner/analyzers/ssti.py",
     "vulnscanner/analyzers/deserialization.py",
     "vulnscanner/analyzers/command_injection.py",
     "vulnscanner/analyzers/sql_injection.py",
+    "vulnscanner/analyzers/open_redirect.py",
     "vulnscanner/analyzers/path_traversal.py",
+    "vulnscanner/analyzers/ssti.py",
     "vulnscanner/analyzers/hardcoded_secrets.py",
     "vulnscanner/analyzers/prototype_pollution.py",
     "vulnscanner/analyzers/xss.py",
+    # Newer analyzers
+    "vulnscanner/analyzers/weak_crypto.py",
+    "vulnscanner/analyzers/ldap_injection.py",
+    "vulnscanner/analyzers/nosql_injection.py",
+    "vulnscanner/analyzers/csrf.py",
+    "vulnscanner/analyzers/ast_php.py",
+    "vulnscanner/analyzers/client_side.py",
 ]
 
 
@@ -577,19 +587,26 @@ def validate_python_syntax(code: str, label: str) -> bool:
 # ── プロンプト ─────────────────────────────────────────────────────────────────
 
 _rule_ids_cache: list[str] | None = None
+# Rule IDs proposed in the current session — updated after each proposal to prevent
+# same-session duplicates (important because cache is built once from disk state).
+_proposed_this_session: set[str] = set()
 
 
 def _existing_rule_ids() -> list[str]:
+    """Return all rule IDs found in ANY analyzer file under vulnscanner/analyzers/,
+    plus any IDs proposed earlier in the current session."""
     global _rule_ids_cache
     if _rule_ids_cache is not None:
-        return _rule_ids_cache
+        return sorted(set(_rule_ids_cache) | _proposed_this_session)
     ids: list[str] = []
-    for fp in ANALYZER_FILES:
-        p = Path(fp)
-        if p.exists():
+    analyzers_dir = BASE_DIR / "vulnscanner" / "analyzers"
+    for p in analyzers_dir.glob("*.py"):
+        try:
             ids.extend(re.findall(r'"([A-Z]+-\d+)"', p.read_text(encoding="utf-8")))
+        except Exception:
+            pass
     _rule_ids_cache = sorted(set(ids))
-    return _rule_ids_cache
+    return sorted(set(_rule_ids_cache) | _proposed_this_session)
 
 
 def _format_previous_attempts(previous_attempts: list[dict], target_file: str = "") -> str:
@@ -684,6 +701,24 @@ Priority patterns (real CVEs / bug-bounty findings):
   - Deserialization: XStream.fromXML, Jackson @JsonTypeInfo with user-controlled type
   - SSTI: Freemarker Template.getTemplate(userInput), Velocity context.evaluate(userInput)
 """
+    elif "ast_python" in target_file:
+        lang_hint = """
+File type: Python AST analyzer (ast module-based taint tracking).
+Architecture: _collect_tainted_names() builds taint set from function args / request.* calls.
+_is_tainted_node() checks AST nodes. Sinks are checked in visit_Call().
+
+STRATEGIC PRIORITIES for this file (backlog items):
+  #8 Conditional branch taint: Detect guard patterns like `if user_input.isdigit():` before
+     a sink call — when the guard uses .isdigit()/.isalpha()/re.match()/re.fullmatch() on
+     the tainted variable, the sink inside the if-body should NOT fire.
+     Implementation: in visit_If(), check if the test is a method call on a tainted var
+     with a sanitizing method name; if so, un-taint that var in the if-body scope.
+  #6 Framework-specific sink models: Django ORM `.filter(name=user_input)` is SAFE
+     (parameterized), but `.extra(where=[...])`, `.raw(sql)`, `RawSQL()` are UNSAFE.
+     Flask `render_template()` is SAFE, `render_template_string(user_input)` is UNSAFE.
+
+Propose ONE new rule addressing either #8 or #6, or any other high-value Python taint rule.
+"""
 
     if is_ast_java:
         constraint4 = (
@@ -696,6 +731,13 @@ Priority patterns (real CVEs / bug-bounty findings):
             "4. For Layer-2 taint rules, extend _TAINT_SINKS dict. "
             "For Layer-1 regex rules, add a tuple to _RULES with re.compile(). "
             "Do NOT mix the two architectures in a single rule."
+        )
+    elif "ast_python" in target_file:
+        constraint4 = (
+            "4. This file uses Python ast module — extend the visitor pattern. "
+            "For guard-based suppression (#8), modify visit_If() or _collect_tainted_names(). "
+            "For safe-sink models (#6), add to the _SAFE_SINKS / _SAFE_METHODS sets. "
+            "Do NOT add regex rules to this file."
         )
     else:
         constraint4 = "4. Use pre-compiled regex at module level: re.compile(r'...', flags)."
@@ -765,9 +807,9 @@ Benchmark result ({total} existing checks, regression gate):
   F1        : {f1v}%
   Checks    : {chk}
 
-Modified file (up to 3000 chars):
+Modified file (up to 5000 chars):
 ```python
-{draft_content[:3000]}
+{draft_content[:5000]}
 ```
 
 Perform a thorough structured review across 6 improvement axes. Score each 0-5 (HIGHER = BETTER for all axes):
@@ -1163,7 +1205,10 @@ def _run_loop(args: argparse.Namespace) -> int:
             break
 
         loop_start  = time.monotonic()
-        target_file = ANALYZER_FILES[iteration % len(ANALYZER_FILES)]
+        if args.target:
+            target_file = args.target
+        else:
+            target_file = ANALYZER_FILES[iteration % len(ANALYZER_FILES)]
         log(
             f"── イテレーション {iteration+1} | {target_file} | "
             f"経過 {elapsed/60:.1f}min | Claude {claude_call_count} calls ──"
@@ -1236,6 +1281,17 @@ def _run_loop(args: argparse.Namespace) -> int:
         iter_result["rule_id"]        = rule_id
         iter_result["change_summary"] = change_summ
         log(f"  提案: {rule_id} — {change_summ[:70]}")
+
+        # ── 重複ID チェック ──────────────────────────────────────────────────
+        # 既存ルールIDと同じIDが提案された場合はスキップ（セッション内提案分も含む）
+        if rule_id in set(_existing_rule_ids()):
+            hint = (
+                f"Rule ID {rule_id} already exists. Choose a NEW rule ID not in: "
+                + ", ".join(_existing_rule_ids()[-10:]) + " ..."
+            )
+            log(f"  ⚠ 重複ルールID {rule_id} — スキップ")
+            _skip("duplicate_rule_id", hint)
+            iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
 
         if not draft_content:
             _skip("draft_empty_content")
@@ -1494,6 +1550,9 @@ def _run_loop(args: argparse.Namespace) -> int:
             (run_dir / "proposal_best.py").write_text(final_content, encoding="utf-8")
             (run_dir / "proposal_best.patch").write_text(final_patch_text, encoding="utf-8")
             log(f"  → ★ 採用 (composite={composite:.1f}) — 新ベスト!")
+        # セッション内提案IDとして記録（採否に関わらず — 棄却案でもID重複を防ぐ）
+        if rule_id and rule_id != "UNKNOWN":
+            _proposed_this_session.add(rule_id)
         else:
             log(f"  → 棄却 ({reason})")
 
@@ -1574,6 +1633,10 @@ def main() -> None:
                         help="絶対終了時刻 例: --stop-at 05:00 (翌日をまたぐ場合も可)")
     parser.add_argument("--dry-run", action="store_true",
                         help="API を呼ばず動作確認のみ (recall_check は実行)")
+    parser.add_argument("--target", default=None, metavar="FILE",
+                        help="特定のアナライザーファイルに集中 "
+                             "例: vulnscanner/analyzers/ast_python.py  "
+                             "(指定すると全イテレーションでそのファイルのみ対象にする)")
     args = parser.parse_args()
 
     if not os.environ.get("FUGU_API_KEY") and not args.dry_run:
