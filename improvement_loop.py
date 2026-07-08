@@ -600,6 +600,68 @@ def generate_patch(original: str, modified: str, filepath: str) -> str:
     return "".join(diff)
 
 
+def apply_unified_diff(original: str, diff_text: str, fuzz: int = 3) -> str | None:
+    """unified diff を original に適用して新しいファイル内容を返す。
+    fuzz 行以内のずれはファジーマッチングで吸収する。失敗時は None。"""
+    if not diff_text or not diff_text.strip():
+        return None
+
+    # ── ハンク解析 ───────────────────────────────────────────────────────────────
+    hunks: list[tuple[int, list[str]]] = []  # (orig_start_0idx, hunk_lines)
+    current_hunk_lines: list[str] = []
+    current_orig_start: int = -1
+
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("--- ") or line.startswith("+++ "):
+            continue
+        m = re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", line)
+        if m:
+            if current_hunk_lines and current_orig_start >= 0:
+                hunks.append((current_orig_start - 1, current_hunk_lines))
+            current_orig_start = int(m.group(1))
+            current_hunk_lines = []
+        elif current_orig_start >= 0:
+            current_hunk_lines.append(line)
+
+    if current_hunk_lines and current_orig_start >= 0:
+        hunks.append((current_orig_start - 1, current_hunk_lines))
+
+    if not hunks:
+        return None
+
+    # ── ハンク適用（後ろから順に適用してインデックスずれを防ぐ） ──────────────────
+    result = list(original.splitlines(keepends=True))
+
+    for orig_start_0, hunk_lines in reversed(hunks):
+        # old = context lines + removed lines (the block that must exist in result)
+        # new = context lines + added lines  (what to replace it with)
+        old_lines = [l[1:] for l in hunk_lines if l and l[0] in (" ", "-")]
+        new_lines = [l[1:] for l in hunk_lines if l and l[0] in (" ", "+")]
+        n_old = len(old_lines)
+
+        # 先頭行がヒットする位置を fuzz ウィンドウで検索
+        search_start = max(0, orig_start_0 - fuzz)
+        search_end   = min(len(result), orig_start_0 + fuzz + 1)
+
+        match_pos = -1
+        for pos in range(search_start, search_end):
+            if pos + n_old > len(result):
+                break
+            if all(
+                result[pos + i].rstrip("\r\n") == old_lines[i].rstrip("\r\n")
+                for i in range(n_old)
+            ):
+                match_pos = pos
+                break
+
+        if match_pos == -1:
+            return None  # ハンク適用失敗
+
+        result[match_pos: match_pos + n_old] = new_lines
+
+    return "".join(result)
+
+
 def validate_python_syntax(code: str, label: str) -> bool:
     try:
         ast.parse(code)
@@ -848,17 +910,19 @@ Hard constraints:
   2. Recall must stay at 100% (no missed existing TP cases).
   3. Rule ID must not duplicate any existing ID above.
   {constraint4}
-  5. Return the COMPLETE modified file — every line, nothing omitted.
+  5. Output a unified diff of your change — do NOT return the full file.
   6. For Java/Go: ensure supported_extensions covers ONLY the target language.
 
 NOTE: This is a DRAFT. A security expert will critique it and you will revise it.
 
-Output ONLY a single JSON object (no markdown fences, no text outside JSON):
+Output ONLY a single JSON object (no markdown fences, no text outside JSON).
+The "diff" field must be a valid unified diff (--- a/file, +++ b/file, @@ hunks).
+Include 3 lines of context around each change so the hunk can be located precisely.
 {{
   "target_file": "{target_file}",
   "rule_id": "<RULE-NNN>",
   "change_summary": "<one sentence: what you added and the real-world vulnerability it catches>",
-  "new_content": "<complete file content after your change>"
+  "diff": "<unified diff of your change with --- a/{target_file} +++ b/{target_file} headers>"
 }}"""
 
 
@@ -952,25 +1016,27 @@ IMPROVEMENT INSTRUCTIONS - address ALL of these in your revision:
 
 Overall assessment: {fugu_review.get('comments', '')}
 
---- DIFF (what your draft changed from the original) ---
+--- YOUR DRAFT DIFF (what you changed from the original) ---
 {diff_text}
---- END DIFF ---
+--- END DRAFT DIFF ---
 
---- YOUR DRAFT (complete file - revise from this) ---
-{draft_content}
---- END DRAFT ---
+--- ORIGINAL FILE (revise against this) ---
+{_truncate_file_for_prompt(original_content)}
+--- END ORIGINAL ---
 
 Revise the proposal to address every point in the improvement instructions.
 Keep rule ID {rule_id} unless the critique says to change the vulnerability type entirely.
-Return the COMPLETE revised file - every line, nothing omitted.
+Output a unified diff against the ORIGINAL file (not the draft) — do NOT return the full file.
 
-Output ONLY a single JSON object (no markdown fences, no text outside JSON):
+Output ONLY a single JSON object (no markdown fences, no text outside JSON).
+The "diff" field must be a valid unified diff with --- a/file, +++ b/file headers and @@ hunks.
+Include 3 lines of context around each change.
 {{
   "target_file": "{target_file}",
   "rule_id": "{rule_id}",
   "change_summary": "<updated one-sentence summary reflecting your revision>",
   "revision_notes": "<brief note: what specifically you changed based on the critique>",
-  "new_content": "<complete revised file content>"
+  "diff": "<unified diff against the ORIGINAL file with --- a/{target_file} +++ b/{target_file} headers>"
 }}"""
 
 
@@ -1357,9 +1423,14 @@ def _run_loop(args: argparse.Namespace) -> int:
             _skip("draft_json_parse_error", "Return valid JSON only — no markdown fences")
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
 
-        rule_id       = draft_proposal.get("rule_id", "UNKNOWN")
-        change_summ   = draft_proposal.get("change_summary", "")
-        draft_content = draft_proposal.get("new_content", "")
+        rule_id     = draft_proposal.get("rule_id", "UNKNOWN")
+        change_summ = draft_proposal.get("change_summary", "")
+        # diff 形式で受け取り、original に適用して draft_content を得る
+        _raw_diff   = draft_proposal.get("diff", "")
+        if _raw_diff:
+            draft_content = apply_unified_diff(original_content, _raw_diff) or ""
+        else:
+            draft_content = draft_proposal.get("new_content", "")
         iter_result["rule_id"]        = rule_id
         iter_result["change_summary"] = change_summ
         log(f"  提案: {rule_id} — {change_summ[:70]}")
@@ -1375,6 +1446,10 @@ def _run_loop(args: argparse.Namespace) -> int:
             _skip("duplicate_rule_id", hint)
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
 
+        if _raw_diff and not draft_content:
+            log("  diff 適用失敗 → スキップ")
+            _skip("draft_diff_apply_error", "Diff failed to apply — check hunk context lines match the file exactly")
+            iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
         if not draft_content:
             _skip("draft_empty_content")
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
@@ -1563,11 +1638,19 @@ def _run_loop(args: argparse.Namespace) -> int:
 
         if revise_raw:
             rp = parse_claude_json(revise_raw)
-            if rp and rp.get("new_content") and validate_python_syntax(rp["new_content"], f"{rule_id} final"):
-                final_content  = rp["new_content"]
-                final_summ     = rp.get("change_summary", change_summ)
-                revision_notes = rp.get("revision_notes", "")
-                log(f"  → revise 成功: {revision_notes[:80]}")
+            if rp:
+                _rev_diff = rp.get("diff", "")
+                _rev_content = (
+                    apply_unified_diff(original_content, _rev_diff)
+                    if _rev_diff else rp.get("new_content", "")
+                )
+                if _rev_content and validate_python_syntax(_rev_content, f"{rule_id} final"):
+                    final_content  = _rev_content
+                    final_summ     = rp.get("change_summary", change_summ)
+                    revision_notes = rp.get("revision_notes", "")
+                    log(f"  → revise 成功: {revision_notes[:80]}")
+                else:
+                    log("  revise diff 適用/構文エラー → draft を final として使用")
             else:
                 log("  revise パース/構文エラー → draft を final として使用")
         elif not _skip_revise:
