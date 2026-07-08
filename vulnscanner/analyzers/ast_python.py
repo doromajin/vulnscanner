@@ -118,8 +118,13 @@ _TAINTED_ATTR_NAMES = frozenset({
 _GETTER_METHODS = frozenset({
     "get", "getlist", "getall", "get_json",
     "read", "readline", "readlines",
-    "decode",
+    "decode", "encode",
     "__getitem__", "pop", "values", "items", "keys",
+    # str transformations: taint passes through unchanged (digits/alpha still injectable)
+    "strip", "lstrip", "rstrip",
+    "lower", "upper", "title", "capitalize", "swapcase",
+    "split", "rsplit", "splitlines",
+    "zfill", "ljust", "rjust", "center",
 })
 
 # String template/format methods: taint is propagated from both object and args.
@@ -142,6 +147,28 @@ _URL_SANITIZER_FUNCS = frozenset({
     "urllib.parse.quote", "urllib.parse.quote_plus", "urllib.parse.urlencode",
 })
 _URL_SANITIZER_METHODS = frozenset({"quote", "quote_plus", "urlencode"})
+
+# if-condition guards: when these string methods return True, the receiver only
+# contains chars with no syntactic meaning in SQL/CMD/URL — injection-safe.
+_GUARD_VALIDATION_METHODS = frozenset({
+    "isdigit", "isnumeric", "isalpha", "isalnum", "isidentifier",
+})
+# isinstance() target types that produce non-string values — cannot carry injection payloads.
+_SAFE_ISINSTANCE_TYPES = frozenset({"int", "float", "bool", "Decimal"})
+
+# Django ORM raw-SQL sinks: methods that accept raw SQL fragments bypassing parameterisation.
+_DJANGO_RAW_SQL_METHODS = frozenset({"raw", "extra"})
+_DJANGO_ORM_RAW_FUNCS = frozenset({"RawSQL"})
+
+# SQLAlchemy raw-SQL wrapper: text() explicitly opts out of ORM parameterisation.
+_SQLALCHEMY_TEXT_FUNCS = frozenset({"text", "sqlalchemy.text"})
+
+# Path construction functions: taint from any argument flows to the result path.
+_PATH_CONSTRUCTION_FUNCS = frozenset({
+    "os.path.join", "os.path.abspath", "os.path.realpath",
+    "os.path.normpath", "os.path.expanduser",
+    "pathlib.Path", "Path",
+})
 
 
 # ── public analyzer ────────────────────────────────────────────────────────────
@@ -218,6 +245,8 @@ class _VulnVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         self._check_sql(node)
+        self._check_django_orm_sql(node)
+        self._check_sqlalchemy_text(node)
         self._check_command(node)
         self._check_path(node)
         self._check_xss(node)
@@ -236,6 +265,27 @@ class _VulnVisitor(ast.NodeVisitor):
         if node.value is not None:
             self._check_secret(node.target, node.value, node)
         self.generic_visit(node)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        guarded_var = _extract_guard_var(node.test)
+        if guarded_var:
+            # Patch assignments so the guarded variable appears CLEAN inside the if-body.
+            # Outside the body (else-branch, subsequent code) taint is restored.
+            saved = self._assignments
+            patched = dict(saved)
+            patched[guarded_var] = ast.Constant(value=0)
+            self._assignments = patched
+            for stmt in node.body:
+                self.visit(stmt)
+            self._assignments = saved
+            for stmt in node.orelse:
+                self.visit(stmt)
+        else:
+            for stmt in node.body:
+                self.visit(stmt)
+            for stmt in node.orelse:
+                self.visit(stmt)
 
     # ── SQL injection ──────────────────────────────────────────────────────────
 
@@ -280,6 +330,80 @@ class _VulnVisitor(ast.NodeVisitor):
             self._add(node, VulnType.SQL_INJECTION, Severity.MEDIUM, rule_id,
                       f"[needs_review] {func}() receives a {label} - verify not user-controlled:"
                       f" {taint.reason}",
+                      taint)
+
+    # ── Django ORM raw-SQL sinks ───────────────────────────────────────────────
+
+    def _check_django_orm_sql(self, node: ast.Call) -> None:
+        """Detect .raw(sql), .extra(where=[sql]), and RawSQL(sql) with tainted arguments."""
+        sql_arg: ast.expr | None = None
+        rule_label: str = ""
+
+        if isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+            if attr == "raw":
+                sql_arg = (node.args[0] if node.args else None) or next(
+                    (kw.value for kw in node.keywords if kw.arg in ("raw_query", "query")),
+                    None,
+                )
+                rule_label = ".raw()"
+            elif attr == "extra":
+                sql_arg = next(
+                    (kw.value for kw in node.keywords if kw.arg == "where"), None
+                )
+                if sql_arg is None and node.args:
+                    sql_arg = node.args[0]
+                rule_label = ".extra()"
+            elif attr == "RawSQL":
+                sql_arg = node.args[0] if node.args else None
+                rule_label = "RawSQL()"
+        elif isinstance(node.func, ast.Name) and node.func.id in _DJANGO_ORM_RAW_FUNCS:
+            sql_arg = node.args[0] if node.args else None
+            rule_label = f"{node.func.id}()"
+
+        if sql_arg is None or _is_const(sql_arg):
+            return
+
+        taint = _taint_of(sql_arg, self._assignments, self._class_attrs)
+        if taint.status == TaintStatus.CLEAN:
+            return
+
+        if taint.status == TaintStatus.TAINTED:
+            self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-006",
+                      f"{rule_label} receives tainted SQL — Django ORM raw SQL injection: {taint.reason}",
+                      taint)
+        else:
+            self._add(node, VulnType.SQL_INJECTION, Severity.MEDIUM, "AST-SQL-006",
+                      f"[needs_review] {rule_label} receives dynamic SQL — verify not user-controlled:"
+                      f" {taint.reason}",
+                      taint)
+
+    # ── SQLAlchemy text() sink ─────────────────────────────────────────────────
+
+    def _check_sqlalchemy_text(self, node: ast.Call) -> None:
+        """Detect sqlalchemy.text(tainted_sql) — the ORM raw-SQL escape hatch."""
+        full = _full_name(node.func)
+        if full not in _SQLALCHEMY_TEXT_FUNCS:
+            return
+        if not node.args:
+            return
+
+        sql_arg = node.args[0]
+        if _is_const(sql_arg):
+            return
+
+        taint = _taint_of(sql_arg, self._assignments, self._class_attrs)
+        if taint.status == TaintStatus.CLEAN:
+            return
+
+        if taint.status == TaintStatus.TAINTED:
+            self._add(node, VulnType.SQL_INJECTION, Severity.HIGH, "AST-SQL-007",
+                      f"sqlalchemy text() receives tainted SQL — raw SQL injection risk: {taint.reason}",
+                      taint)
+        else:
+            self._add(node, VulnType.SQL_INJECTION, Severity.MEDIUM, "AST-SQL-007",
+                      f"[needs_review] sqlalchemy text() receives dynamic SQL — verify not"
+                      f" user-controlled: {taint.reason}",
                       taint)
 
     # ── command injection ──────────────────────────────────────────────────────
@@ -711,7 +835,7 @@ def _taint_of(
       UNKNOWN  — cannot determine; emit finding at lower severity (needs_review)
       CLEAN    — literal, constant, or provably sanitized; suppress the finding
     """
-    if _depth > 4:
+    if _depth > 6:
         return UNKNOWN_UNRESOLVED
 
     # ── Literal constant ────────────────────────────────────────────────────────
@@ -798,6 +922,15 @@ def _taint_of(
                 sanitizers=[sanitizer_name] + (arg_taint.sanitizers or []),
             )
 
+        # Path construction: taint propagates from any argument to the resulting path.
+        # os.path.join(safe_base, user_input) must remain TAINTED for open() to fire HIGH.
+        if full in _PATH_CONSTRUCTION_FUNCS:
+            arg_taints = [
+                _taint_of(a, assignments, class_attrs, _depth + 1)
+                for a in node.args
+            ]
+            return _taint_worst(arg_taints) if arg_taints else CLEAN_LITERAL
+
         if isinstance(node.func, ast.Attribute):
             obj_taint = _taint_of(node.func.value, assignments, class_attrs, _depth + 1)
 
@@ -879,3 +1012,37 @@ def _taint_worst(infos: list[TaintInfo]) -> TaintInfo:
     for t in infos[1:]:
         result = _taint_merge(result, t)
     return result
+
+
+def _extract_guard_var(test: ast.expr) -> str | None:
+    """Return the name of the variable validated by a safe guard condition, or None.
+
+    Recognized patterns:
+      isinstance(var, int | float | bool | Decimal)   — numeric type check
+      var.isdigit() / var.isnumeric() / var.isalpha() / var.isalnum()
+    """
+    if (isinstance(test, ast.Call)
+            and isinstance(test.func, ast.Name)
+            and test.func.id == "isinstance"
+            and len(test.args) == 2
+            and isinstance(test.args[0], ast.Name)
+            and _is_safe_type_check(test.args[1])):
+        return test.args[0].id
+    if (isinstance(test, ast.Call)
+            and isinstance(test.func, ast.Attribute)
+            and test.func.attr in _GUARD_VALIDATION_METHODS
+            and isinstance(test.func.value, ast.Name)):
+        return test.func.value.id
+    return None
+
+
+def _is_safe_type_check(types_node: ast.expr) -> bool:
+    """True if types_node names a type that guarantees non-string, injection-safe values."""
+    if isinstance(types_node, ast.Name):
+        return types_node.id in _SAFE_ISINSTANCE_TYPES
+    if isinstance(types_node, ast.Tuple):
+        return any(
+            isinstance(e, ast.Name) and e.id in _SAFE_ISINSTANCE_TYPES
+            for e in types_node.elts
+        )
+    return False
