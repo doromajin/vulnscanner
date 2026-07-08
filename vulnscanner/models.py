@@ -26,6 +26,7 @@ class VulnType(str, Enum):
     XXE = "XML External Entity (XXE)"
     JNDI_INJECTION = "JNDI Injection"
     RACE_CONDITION = "Race Condition"
+    CSRF = "Cross-Site Request Forgery (CSRF)"
 
 
 @dataclass
