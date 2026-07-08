@@ -58,6 +58,12 @@ _RULES = [
         Severity.CRITICAL, VulnType.INSECURE_DESERIALIZATION, (".java",),
     ),
     (
+        "DESER-009",
+        re.compile(r'\bfromXML\s*\(', re.IGNORECASE),
+        "Java XStream.fromXML() - deserialization of untrusted XML can lead to RCE (CVE-2021-29505, CVE-2020-26217); use XStream security framework or a safe alternative",
+        Severity.CRITICAL, VulnType.INSECURE_DESERIALIZATION, (".java",),
+    ),
+    (
         "DESER-010",
         _JAVA_XMLDECODER_RE,
         "Java XMLDecoder - XML deserialization allows arbitrary object instantiation and RCE (CVE-2017-10271)",

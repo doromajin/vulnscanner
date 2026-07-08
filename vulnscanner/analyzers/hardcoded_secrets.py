@@ -124,6 +124,29 @@ _RULES = [
         "Hardcoded GCP/service-account private key embedded in source code or config (YAML block scalar) — rotate credential immediately",
         Severity.CRITICAL, _HS,
     ),
+    # SEC-010: Hardcoded VCS personal access tokens.
+    #
+    # GitHub classic PATs start with ghp_ followed by exactly 36 alphanumeric chars.
+    # GitHub fine-grained PATs start with github_pat_ followed by 82+ alphanumeric/underscore chars.
+    # GitLab PATs start with glpat- followed by exactly 20 alphanumeric/hyphen chars.
+    #
+    # These token formats are well-documented by the vendors and have a very low false-positive
+    # rate because the prefix anchors are unique and the body length constraints are tight.
+    # Real-world impact: thousands of leaked GitHub/GitLab tokens on public repos (e.g. Truffle
+    # Security research, GitGuardian reports), enabling full repo/org takeover.
+    (
+        "SEC-010",
+        re.compile(
+            r'\b(?:'
+            r'ghp_[A-Za-z0-9]{36}'            # GitHub classic PAT
+            r'|github_pat_[A-Za-z0-9_]{82,}'  # GitHub fine-grained PAT
+            r'|glpat-[A-Za-z0-9\-]{20}'       # GitLab PAT
+            r')\b',
+            re.IGNORECASE,
+        ),
+        "Hardcoded VCS personal access token (GitHub/GitLab PAT) detected — revoke and rotate immediately",
+        Severity.CRITICAL, _HS,
+    ),
 ]
 
 # Merged allowlist: a single compiled OR pattern replaces three separate re.search calls.
@@ -140,7 +163,8 @@ _GUARD = re.compile(
     r'|AKIA[0-9A-Z]|PRIVATE KEY|token|auth_token|access_token'
     r'|connection_string|conn_str|DATABASE_URL'
     r'|jwt\.(?:sign|encode)|JWT\.encode|JWT::encode|SignedString'
-    r'|private_key',
+    r'|private_key'
+    r'|ghp_|github_pat_|glpat-',
     re.IGNORECASE,
 )
 
@@ -167,7 +191,7 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
         # Pass 1: Pattern D is multiline — run it against the full content     #
         # first so its line numbers can seed the sec009_lines suppression set. #
         # ------------------------------------------------------------------ #
-        _pattern_d = _RULES[-1]  # last entry is Pattern D
+        _pattern_d = _RULES[-2]  # second-to-last entry is Pattern D (SEC-009 YAML)
         rule_id_d, re_d, desc_d, sev_d, vt_d = _pattern_d
         for m in re_d.finditer(content):
             # Determine the starting line number of the match.
@@ -194,9 +218,10 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
 
         # ------------------------------------------------------------------ #
         # Pass 2: Line-by-line scan for all other rules (Patterns A-C of      #
-        # SEC-009 plus SEC-001 through SEC-008, excluding Pattern D).         #
+        # SEC-009 plus SEC-001 through SEC-008 and SEC-010, excluding          #
+        # Pattern D which is the second-to-last entry).                        #
         # ------------------------------------------------------------------ #
-        rules_except_d = _RULES[:-1]
+        rules_except_d = [r for r in _RULES if not (r[0] == "SEC-009" and r[1].flags & re.MULTILINE and r[1].pattern.startswith(r'\bprivate_key\s*:\s*[|>]'))]
         for lineno, line in enumerate(lines, 1):
             if self._is_comment(line):
                 continue
