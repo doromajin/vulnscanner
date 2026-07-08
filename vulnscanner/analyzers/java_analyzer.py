@@ -101,12 +101,72 @@ _RULES = [
         "Java URL instantiation with request parameter — SSRF risk",
         Severity.HIGH, _SSRF,
     ),
+    # SQL-006: JDBC/JPA string concatenation (statement-bounded, requires SQL keyword)
+    (
+        "SQL-006",
+        re.compile(
+            r'\b(?:\w+\s*\.\s*)?(?:prepareStatement|prepareCall|createQuery|createNativeQuery'
+            r'|createSQLQuery|executeQuery|executeUpdate|execute|addBatch)\s*\('
+            r'(?=[^;\n]{0,300}\+)'          # concat operator present within statement
+            r'(?=[^;\n]{0,300}\b(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|INTO|SET)\b)',
+            re.IGNORECASE,
+        ),
+        "Java JDBC/JPA call with string concatenation containing SQL keyword — SQL injection risk",
+        Severity.HIGH, _SI,
+    ),
+    # CMD-008: ProcessBuilder / Runtime.exec with non-literal first argument
+    (
+        "CMD-008",
+        re.compile(
+            r'\bnew\s+ProcessBuilder\s*\([^;\n]{0,300}'
+            r'(?:getParam|getHeader|getQueryString|getAttribute|request\.|args\[|argv\[)',
+            re.IGNORECASE,
+        ),
+        "Java ProcessBuilder with request-derived argument — command injection risk",
+        Severity.CRITICAL, _CI,
+    ),
+    # PATH-006: File/Path construction with request-derived argument
+    (
+        "PATH-006",
+        re.compile(
+            r'\b(?:new\s+(?:java\.io\.)?(?:File|FileInputStream|FileReader|FileOutputStream|FileWriter)'
+            r'|(?:java\.nio\.file\.)?(?:Paths\.get|Path\.of))\s*\('
+            r'(?=[^;\n]{0,300}(?:getParam|getHeader|getQueryString|getAttribute|request\.))',
+            re.IGNORECASE,
+        ),
+        "Java File/Path construction with request-derived argument — path traversal risk",
+        Severity.HIGH, _PT,
+    ),
+    # DESER-009: XStream deserialization (CVE-2013-7285, CVE-2021-21351)
+    (
+        "DESER-009",
+        re.compile(
+            r'\bnew\s+(?:[\w$]+\.)*XStream\s*\('
+            r'|xstream\.(?:fromXML|unmarshal)\s*\(',
+            re.IGNORECASE,
+        ),
+        "Java XStream deserialization — RCE risk without allowlist (CVE-2021-21351)",
+        Severity.CRITICAL, _DESER,
+    ),
+    # JAVA-XXE-003: XMLInputFactory without disabling external entities
+    (
+        "JAVA-XXE-003",
+        re.compile(
+            r'\b(?:javax\.xml\.stream\.)?XMLInputFactory\s*\.\s*(?:newInstance|newFactory)\s*\(',
+            re.IGNORECASE,
+        ),
+        "Java XMLInputFactory (StAX) without disabling IS_SUPPORTING_EXTERNAL_ENTITIES — XXE risk",
+        Severity.HIGH, _XXE,
+    ),
 ]
 
 _GUARD = re.compile(
     r'ObjectInputStream|DocumentBuilderFactory|SAXParserFactory'
     r'|InitialContext|ProcessBuilder|Runtime\.getRuntime'
-    r'|createQuery|createNativeQuery|new\s+URL\s*\(',
+    r'|createQuery|createNativeQuery|new\s+URL\s*\('
+    r'|XStream|fromXML|unmarshal|XMLInputFactory'
+    r'|prepareStatement|prepareCall|executeQuery|executeUpdate'
+    r'|new\s+File|Paths\.get|Path\.of',
     re.IGNORECASE,
 )
 
