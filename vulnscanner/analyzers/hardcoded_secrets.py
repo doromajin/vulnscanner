@@ -33,7 +33,7 @@ _RULES = [
     ),
     (
         "SEC-005",
-        re.compile(r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----', re.IGNORECASE),
+        re.compile(r'-----BEGIN (?:RSA |EC |ENCRYPTED |OPENSSH )?PRIVATE KEY-----', re.IGNORECASE),
         "Private key material in source code",
         Severity.CRITICAL, _HS,
     ),
@@ -68,6 +68,62 @@ _RULES = [
         "Hardcoded JWT signing secret passed directly to library — use environment variable or secrets manager",
         Severity.CRITICAL, _HS,
     ),
+    # SEC-009: GCP / service-account private key embedded in source or config.
+    # Four sub-patterns are compiled separately and all share the same rule_id, description, severity.
+    #
+    # Pattern A — Standard quoted JSON / Python dict:
+    #   "private_key": "-----BEGIN RSA PRIVATE KEY-----"
+    #   'private_key': '-----BEGIN PRIVATE KEY-----'
+    (
+        "SEC-009",
+        re.compile(
+            r'(?P<keyquote>["\'])private_key(?P=keyquote)\s*:\s*'
+            r'(?P<valquote>["\'])-----BEGIN (?:RSA |EC |ENCRYPTED |OPENSSH )?PRIVATE KEY-----',
+            re.IGNORECASE,
+        ),
+        "Hardcoded GCP/service-account private key embedded in source code or config — rotate credential immediately",
+        Severity.CRITICAL, _HS,
+    ),
+    # Pattern B — Escaped JSON embedded inside a source string (e.g. a Go/Java string literal):
+    #   \"private_key\":\"-----BEGIN PRIVATE KEY-----
+    (
+        "SEC-009",
+        re.compile(
+            r'\\["\']private_key\\["\']\s*:\s*'
+            r'\\["\']-----BEGIN (?:RSA |EC |ENCRYPTED |OPENSSH )?PRIVATE KEY-----',
+            re.IGNORECASE,
+        ),
+        "Hardcoded GCP/service-account private key embedded in source code or config — rotate credential immediately",
+        Severity.CRITICAL, _HS,
+    ),
+    # Pattern C — Unquoted JS/TS/Python object key (word-boundary guarded):
+    #   private_key: "-----BEGIN PRIVATE KEY-----"
+    #   private_key: '-----BEGIN RSA PRIVATE KEY-----'
+    (
+        "SEC-009",
+        re.compile(
+            r'\bprivate_key\s*:\s*'
+            r'["\']-----BEGIN (?:RSA |EC |ENCRYPTED |OPENSSH )?PRIVATE KEY-----',
+            re.IGNORECASE,
+        ),
+        "Hardcoded GCP/service-account private key embedded in source code or config — rotate credential immediately",
+        Severity.CRITICAL, _HS,
+    ),
+    # Pattern D — YAML block scalar (multiline-aware, up to 200 chars lookahead):
+    #   private_key: |
+    #     -----BEGIN PRIVATE KEY-----
+    # Uses re.DOTALL so . matches newlines within the lookahead window.
+    (
+        "SEC-009",
+        re.compile(
+            r'\bprivate_key\s*:\s*[|>][+\-]?\s{0,10}[\r\n]'
+            r'(?:[ \t]*[^\r\n]*[\r\n]){0,5}'
+            r'[ \t]*-----BEGIN (?:RSA |EC |ENCRYPTED |OPENSSH )?PRIVATE KEY-----',
+            re.IGNORECASE | re.MULTILINE,
+        ),
+        "Hardcoded GCP/service-account private key embedded in source code or config (YAML block scalar) — rotate credential immediately",
+        Severity.CRITICAL, _HS,
+    ),
 ]
 
 # Merged allowlist: a single compiled OR pattern replaces three separate re.search calls.
@@ -83,7 +139,8 @@ _GUARD = re.compile(
     r'password|passwd|pwd|api[_-]?key|api[_-]?secret|secret[_-]?key|SECRET_KEY'
     r'|AKIA[0-9A-Z]|PRIVATE KEY|token|auth_token|access_token'
     r'|connection_string|conn_str|DATABASE_URL'
-    r'|jwt\.(?:sign|encode)|JWT\.encode|JWT::encode|SignedString',
+    r'|jwt\.(?:sign|encode)|JWT\.encode|JWT::encode|SignedString'
+    r'|private_key',
     re.IGNORECASE,
 )
 
@@ -91,7 +148,7 @@ _GUARD = re.compile(
 class HardcodedSecretsAnalyzer(BaseAnalyzer):
     supported_extensions = (
         ".py", ".js", ".ts", ".java", ".rb", ".php", ".go",
-        ".env", ".yml", ".yaml", ".json", ".config",
+        ".env", ".yml", ".yaml", ".json", ".config", ".tf",
     )
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
@@ -100,15 +157,65 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
 
         lines = content.splitlines()
         findings: list[Finding] = []
+
+        # De-duplication: track (rule_id, lineno) pairs already emitted, and track
+        # line numbers where SEC-009 fired so we can suppress SEC-005 on the same line.
+        seen: set[tuple[str, int]] = set()
+        sec009_lines: set[int] = set()
+
+        # ------------------------------------------------------------------ #
+        # Pass 1: Pattern D is multiline — run it against the full content     #
+        # first so its line numbers can seed the sec009_lines suppression set. #
+        # ------------------------------------------------------------------ #
+        _pattern_d = _RULES[-1]  # last entry is Pattern D
+        rule_id_d, re_d, desc_d, sev_d, vt_d = _pattern_d
+        for m in re_d.finditer(content):
+            # Determine the starting line number of the match.
+            lineno = content[: m.start()].count("\n") + 1
+            key = (rule_id_d, lineno)
+            if key in seen:
+                continue
+            if _ALLOWLIST_RE.search(m.group()):
+                continue
+            seen.add(key)
+            sec009_lines.add(lineno)
+            stripped = lines[lineno - 1].strip() if lineno <= len(lines) else m.group()[:120]
+            findings.append(Finding(
+                vuln_type=vt_d,
+                severity=sev_d,
+                file_path=file_path,
+                line_number=lineno,
+                line_content=stripped,
+                description=desc_d,
+                rule_id=rule_id_d,
+                repo_url=repo_url,
+                snippet=self._extract_snippet(lines, lineno),
+            ))
+
+        # ------------------------------------------------------------------ #
+        # Pass 2: Line-by-line scan for all other rules (Patterns A-C of      #
+        # SEC-009 plus SEC-001 through SEC-008, excluding Pattern D).         #
+        # ------------------------------------------------------------------ #
+        rules_except_d = _RULES[:-1]
         for lineno, line in enumerate(lines, 1):
             if self._is_comment(line):
                 continue
             stripped = line.strip()
-            for rule_id, pattern_re, description, severity, vuln_type in _RULES:
+            for rule_id, pattern_re, description, severity, vuln_type in rules_except_d:
+                # De-duplication: suppress SEC-005 if SEC-009 already fired on this line.
+                if rule_id == "SEC-005" and lineno in sec009_lines:
+                    continue
                 if not pattern_re.search(line):
                     continue
                 if _ALLOWLIST_RE.search(line):
                     continue
+                key = (rule_id, lineno)
+                if key in seen:
+                    continue
+                seen.add(key)
+                # If any SEC-009 pattern fires, record the line for SEC-005 suppression.
+                if rule_id == "SEC-009":
+                    sec009_lines.add(lineno)
                 findings.append(Finding(
                     vuln_type=vuln_type,
                     severity=severity,
