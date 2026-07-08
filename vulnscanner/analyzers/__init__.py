@@ -1,5 +1,6 @@
 from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
 from vulnscanner.analyzers.csrf import CSRFAnalyzer
+from vulnscanner.analyzers.nosql_injection import NoSQLInjectionAnalyzer
 from vulnscanner.analyzers.ast_php import PhpASTAnalyzer
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
 from vulnscanner.analyzers.base import BaseAnalyzer
@@ -44,4 +45,5 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     JavaAnalyzer(),
     GoAnalyzer(),
     CSRFAnalyzer(),
+    NoSQLInjectionAnalyzer(),
 ]
