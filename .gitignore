@@ -18,6 +18,7 @@ htmlcov/
 # Scan output
 *.json
 !tests/fixtures/**/*.json
+!custom_taint_sources.json
 
 # Cloned repos used for local scanning
 repos/
@@ -30,9 +31,9 @@ repos/
 # Secrets
 .env
 
-# Nightly improvement output (proposals and patches are reviewed manually before commit)
+# 改善ループ出力 (proposals and patches are reviewed manually before commit)
 temp_eval/
-nightly_runs/
+improvement_runs/
 improvement_proposals/
 proposal_best.py
 proposal_best.patch

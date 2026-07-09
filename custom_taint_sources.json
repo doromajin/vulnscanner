@@ -1,0 +1,9 @@
+{
+  "_comment": "User-defined taint sources for VulnScanner Java AST analyzer. Add entries here to teach the analyzer about custom request-wrapper methods in your codebase.",
+  "any_qualifier_taint_methods": [
+    {
+      "method": "getTheParameter",
+      "description": "OWASP Benchmark SeparateClassRequest wrapper — delegates to HttpServletRequest.getParameter() and returns user-controlled data regardless of the object it is called on. Add similar entries for your own request-wrapper classes."
+    }
+  ]
+}

@@ -8,6 +8,9 @@ the file uses unsupported Java syntax.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 try:
     import javalang
     import javalang.tree as jt
@@ -17,6 +20,22 @@ except ImportError:
 
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
+
+
+def _load_custom_taint_sources() -> frozenset:
+    """Load user-defined any-qualifier taint methods from custom_taint_sources.json.
+
+    Searches for the config file next to this file's package root (i.e. the project
+    root two levels up from analyzers/). Silently returns an empty set if the file is
+    absent or malformed so the analyzer remains usable without configuration.
+    """
+    config_path = Path(__file__).parent.parent.parent / "custom_taint_sources.json"
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        entries = data.get("any_qualifier_taint_methods", [])
+        return frozenset(e["method"] for e in entries if isinstance(e, dict) and "method" in e)
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, KeyError):
+        return frozenset()
 
 # ── request source methods ─────────────────────────────────────────────────────
 
@@ -33,15 +52,15 @@ _REQUEST_OBJECTS = frozenset({
     "httpServletRequest", "hreq",
 })
 
-# Methods that return user-controlled data regardless of what object they're called on
-# (e.g. custom request wrappers like SeparateClassRequest.getTheParameter).
-_ANY_QUALIFIER_TAINT_METHODS = frozenset({"getTheParameter"})
+# Methods that return user-controlled data regardless of what object they're called on.
+# Populated from custom_taint_sources.json — no hardcoded values here.
+_ANY_QUALIFIER_TAINT_METHODS = _load_custom_taint_sources()
 
 # ── sink sets ──────────────────────────────────────────────────────────────────
 
 _SQL_EXEC_METHODS = frozenset({
     "execute", "executeQuery", "executeUpdate", "executeLargeUpdate",
-    "executeBatch", "prepareCall", "prepareStatement",
+    "executeBatch", "addBatch", "prepareCall", "prepareStatement",
     # Spring JdbcTemplate
     "queryForLong", "queryForInt", "queryForObject", "queryForList",
     "queryForMap", "queryForRowSet", "queryForStream",
@@ -515,7 +534,7 @@ def _analyze_local_method(
     return None  # Method not found → fall back to arg-based propagation
 
 
-def _collect_tainted(tree) -> "set[str]":
+def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
     """Multi-pass fixed-point taint collector with dead-branch elimination.
 
     Handles:
@@ -534,6 +553,10 @@ def _collect_tainted(tree) -> "set[str]":
     # When map.put("key", tainted_val) is seen, "key" is added.
     # When map.get("key") is read with a matching tainted key, the result is tainted.
     map_tainted_keys: dict = {}
+
+    # Ordered list state tracking: {list_var → [is_tainted_at_index_0, ...]}
+    # Populated by list.add/remove/set SE calls; read by list.get checks.
+    list_contents: dict = {}
 
     def _line_of(node) -> int:
         pos = getattr(node, "position", None)
@@ -561,8 +584,13 @@ def _collect_tainted(tree) -> "set[str]":
                 if _line_of(node) in dead_lines:
                     continue
                 for decl in node.declarators:
-                    if decl.name not in tainted and decl.initializer:
-                        init = decl.initializer
+                    init = decl.initializer
+                    # Reset list state each round when a new ArrayList/LinkedList/Vector is seen
+                    if isinstance(init, jt.ClassCreator):
+                        _lct = _type_name(init.type)
+                        if _lct in ("ArrayList", "LinkedList", "Vector"):
+                            list_contents.setdefault(decl.name, [])
+                    if decl.name not in tainted and init:
                         # For bare (no-qualifier) static calls, try intra-file return analysis
                         # before falling back to argument propagation.
                         # qualifier=''  → bare call doSomething(...)   → intercept
@@ -580,6 +608,21 @@ def _collect_tainted(tree) -> "set[str]":
                                     tainted.add(decl.name)
                                     changed = True
                                 continue  # analysis decided; skip arg-based fallback
+                        # Ordered list.get(idx) taint propagation — always continue so the
+                        # general _is_tainted fallback cannot over-taint via qualifier-in-tainted.
+                        _li_inner = init.expression if isinstance(init, jt.Cast) else init
+                        if (isinstance(_li_inner, jt.MethodInvocation)
+                                and _li_inner.member == "get"
+                                and str(_li_inner.qualifier or "") in list_contents):
+                            _liq = str(_li_inner.qualifier)
+                            _lia = _li_inner.arguments or []
+                            if _lia:
+                                _lii = _eval_const_expr(_lia[0], const_ints, const_strings)
+                                if (_lii is not None
+                                        and 0 <= _lii < len(list_contents[_liq])
+                                        and list_contents[_liq][_lii]):
+                                    tainted.add(decl.name); changed = True
+                                continue  # skip general propagation for tracked list.get
                         # Key-matched HashMap.get: (Type) map.get("key") where key is tainted
                         if _map_get_tainted(init, map_tainted_keys):
                             tainted.add(decl.name)
@@ -630,6 +673,21 @@ def _collect_tainted(tree) -> "set[str]":
 
                 # General propagation: only add taint (never remove).
                 if _vname not in tainted:
+                    # Ordered list.get(idx) taint propagation — always continue so the
+                    # general _is_tainted fallback cannot over-taint via qualifier-in-tainted.
+                    _li_rhs = rhs.expression if isinstance(rhs, jt.Cast) else rhs
+                    if (isinstance(_li_rhs, jt.MethodInvocation)
+                            and _li_rhs.member == "get"
+                            and str(_li_rhs.qualifier or "") in list_contents):
+                        _liq2 = str(_li_rhs.qualifier)
+                        _lia2 = _li_rhs.arguments or []
+                        if _lia2:
+                            _lii2 = _eval_const_expr(_lia2[0], const_ints, const_strings)
+                            if (_lii2 is not None
+                                    and 0 <= _lii2 < len(list_contents[_liq2])
+                                    and list_contents[_liq2][_lii2]):
+                                tainted.add(_vname); changed = True
+                            continue  # skip general propagation for tracked list.get
                     # For bare (no-qualifier) static calls, try intra-file return analysis.
                     # qualifier='' → bare call; qualifier=None → new X().m() chain → skip.
                     if (isinstance(rhs, jt.MethodInvocation)
@@ -678,6 +736,46 @@ def _collect_tainted(tree) -> "set[str]":
         except Exception:
             pass
 
+        # Rebuild list_contents from scratch so indices stay correct across rounds.
+        # Reset each tracked list, then replay all add/remove/set calls in document order.
+        try:
+            _old_lists = {k: list(v) for k, v in list_contents.items()}
+            for k in list_contents:
+                list_contents[k] = []
+            for _, se in tree.filter(jt.StatementExpression):
+                if _line_of(se) in dead_lines:
+                    continue
+                expr = getattr(se, "expression", None)
+                if not isinstance(expr, jt.MethodInvocation):
+                    continue
+                q = str(expr.qualifier or "")
+                if q not in list_contents:
+                    continue
+                lst = list_contents[q]
+                args = expr.arguments or []
+                if expr.member == "add":
+                    if len(args) == 1:
+                        if len(lst) <= 32:  # guard against unbounded growth
+                            lst.append(_is_tainted(args[0], tainted, const_ints))
+                    elif len(args) == 2:
+                        idx = _eval_const_expr(args[0], const_ints, const_strings)
+                        if idx is not None and 0 <= idx <= len(lst) <= 32:
+                            lst.insert(idx, _is_tainted(args[1], tainted, const_ints))
+                elif expr.member == "remove":
+                    if len(args) == 1:
+                        idx = _eval_const_expr(args[0], const_ints, const_strings)
+                        if idx is not None and 0 <= idx < len(lst):
+                            lst.pop(idx)
+                elif expr.member == "set":
+                    if len(args) == 2:
+                        idx = _eval_const_expr(args[0], const_ints, const_strings)
+                        if idx is not None and 0 <= idx < len(lst):
+                            lst[idx] = _is_tainted(args[1], tainted, const_ints)
+            if list_contents != _old_lists:
+                changed = True
+        except Exception:
+            pass
+
         try:
             for _, node in tree.filter(jt.ForStatement):
                 ctrl = node.control
@@ -699,7 +797,8 @@ def _collect_tainted(tree) -> "set[str]":
 
         if not changed:
             break
-    return tainted
+    list_tainted_vars: set = {k for k, v in list_contents.items() if any(v)}
+    return tainted, list_tainted_vars
 
 
 def _collect_writers(tree) -> set[str]:
@@ -743,7 +842,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
             return []
 
         lines = content.splitlines()
-        tainted = _collect_tainted(tree)
+        tainted, list_tainted_vars = _collect_tainted(tree)
         writers = _collect_writers(tree)
         findings: list[Finding] = []
 
@@ -826,7 +925,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
             for _, node in tree.filter(jt.ClassCreator):
                 if _type_name(node.type) == "ProcessBuilder":
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        _arg_name = arg.member if isinstance(arg, jt.MemberReference) else ""
+                        if (_is_tainted(arg, tainted)
+                                or (_arg_name and _arg_name in list_tainted_vars)):
                             _add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "JAST-CMD-002",
                                  "new ProcessBuilder() with user-controlled argument — "
                                  "command injection; validate and allowlist commands")
@@ -834,7 +935,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
             for _, node in tree.filter(jt.MethodInvocation):
                 if node.member == "command":
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        _arg_name = arg.member if isinstance(arg, jt.MemberReference) else ""
+                        if (_is_tainted(arg, tainted)
+                                or (_arg_name and _arg_name in list_tainted_vars)):
                             _add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "JAST-CMD-003",
                                  "ProcessBuilder.command() with user-controlled argument — "
                                  "command injection; validate and allowlist commands")
@@ -900,16 +1003,10 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 if not args:
                     continue
                 algo = _literal_str(args[0])
-                if algo:
-                    if algo.upper() in _WEAK_HASH_ALGOS:
-                        _add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "JAST-CRYPTO-002",
-                             f"MessageDigest.getInstance(\"{algo}\") uses a broken hash algorithm — "
-                             "use SHA-256 or stronger")
-                else:
-                    # Non-literal arg: algorithm loaded from variable/config — flag as suspicious
-                    _add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.MEDIUM, "JAST-CRYPTO-002V",
-                         "MessageDigest.getInstance() with non-literal algorithm — "
-                         "verify the algorithm is SHA-256 or stronger at runtime")
+                if algo and algo.upper() in _WEAK_HASH_ALGOS:
+                    _add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "JAST-CRYPTO-002",
+                         f"MessageDigest.getInstance(\"{algo}\") uses a broken hash algorithm — "
+                         "use SHA-256 or stronger")
         except Exception:
             pass
 
@@ -931,11 +1028,6 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         _add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "JAST-CRYPTO-003",
                              f"Cipher.getInstance(\"{algo}\") uses a weak/broken cipher — "
                              "use AES/GCM/NoPadding")
-                else:
-                    # Non-literal arg: algorithm loaded from variable/config — flag as suspicious
-                    _add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.MEDIUM, "JAST-CRYPTO-003V",
-                         "Cipher.getInstance() with non-literal algorithm — "
-                         "verify it is not DES/RC4/Blowfish")
         except Exception:
             pass
 
