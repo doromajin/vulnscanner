@@ -136,6 +136,17 @@ _STRING_TEMPLATE_METHODS = frozenset({
 # int/float/bool produce non-string values that cannot carry injection payloads.
 _UNIVERSAL_SANITIZER_FUNCS = frozenset({"int", "float", "bool"})
 
+# Decode/transform functions that are NOT sanitizers — they propagate taint from
+# their first argument.  URL-decoding (unquote*) makes encoded input *more* raw,
+# not safer.  JSON parsing preserves any injection payload in the underlying string.
+_TAINT_PASSTHROUGH_FUNCS = frozenset({
+    "urllib.parse.unquote",
+    "urllib.parse.unquote_plus",
+    "urllib.parse.unquote_to_bytes",
+    "json.loads",
+    "json.load",
+})
+
 # Context-specific sanitizers: protect ONLY their own sink context.
 # Using these in an unrelated sink (e.g. html.escape in a SQL query) does NOT
 # prevent injection — they must NOT mark the result CLEAN for every sink type.
@@ -194,6 +205,56 @@ _PATHLIB_IO_METHODS = frozenset({
     "iterdir", "glob", "rglob",
 })
 
+
+def _find_canonicalized_paths(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> frozenset[str]:
+    """Return variable names that have been canonicalized via .resolve() + .startswith().
+
+    Detects the standard Python path-traversal mitigation pattern:
+        p = (base_dir / user_input).resolve()
+        if not str(p).startswith(str(base_dir)):
+            return ...
+
+    Variables satisfying both conditions are treated as safe to use in path sinks.
+    This pattern is recommended by the OWASP Python Cheat Sheet and widely used in
+    Flask/Django applications.
+    """
+    resolve_vars: set[str] = set()
+    startswith_vars: set[str] = set()
+
+    for node in ast.walk(func):
+        # Detect: p = expr.resolve()
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "resolve"
+        ):
+            resolve_vars.add(node.targets[0].id)
+
+        # Detect: str(p).startswith(...) or p.startswith(...)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "startswith"
+        ):
+            obj = node.func.value
+            if isinstance(obj, ast.Name):
+                startswith_vars.add(obj.id)
+            elif (
+                isinstance(obj, ast.Call)
+                and isinstance(obj.func, ast.Name)
+                and obj.func.id == "str"
+                and obj.args
+                and isinstance(obj.args[0], ast.Name)
+            ):
+                startswith_vars.add(obj.args[0].id)
+
+    return frozenset(resolve_vars & startswith_vars)
+
 # Weak hash algorithms — fast enough for GPU brute-force; broken for cryptographic use.
 _WEAK_HASH_FUNCS = frozenset({
     "hashlib.md5", "hashlib.sha1", "md5", "sha1",
@@ -203,11 +264,34 @@ _INSECURE_RNG_FUNCS = frozenset({
     "random.random", "random.randint", "random.choice", "random.choices",
     "random.sample", "random.shuffle", "random.randrange", "random.uniform",
 })
+# Direct random.xxx() method attrs — fire unconditionally (context-unaware, like Bandit B311).
+# Excludes random.SystemRandom which uses os.urandom() and IS cryptographically secure.
+_INSECURE_RNG_ATTRS = frozenset({
+    "random", "randint", "choice", "choices", "sample", "shuffle",
+    "randrange", "uniform", "normalvariate", "gauss", "lognormvariate",
+    "expovariate", "vonmisesvariate", "gammavariate", "betavariate",
+    "paretovariate", "weibullvariate", "triangular", "randbytes", "getrandbits",
+})
 # Variable names that suggest security-sensitive random values.
 _SECURITY_SENSITIVE_RNG_RE = re.compile(
     r"token|secret|key|nonce|salt|otp|csrf|session|password|passwd|pwd",
     re.IGNORECASE,
 )
+
+# ── XXE ───────────────────────────────────────────────────────────────────────
+# xml.dom.minidom / xml.etree.ElementTree parse functions that accept a custom
+# parser object.  XXE is only exploitable when external entity expansion is
+# explicitly enabled (feature_external_ges=True on the SAX parser).
+_XXE_PARSE_FUNCS = frozenset({
+    "xml.dom.minidom.parseString", "xml.dom.minidom.parse",
+    "minidom.parseString", "minidom.parse",
+    "parseString", "parse",
+})
+
+# ── LDAP injection ────────────────────────────────────────────────────────────
+# ldap3 conn.search() — first positional arg is base, second is the filter.
+# We detect taint in the variable used as the filter argument.
+_LDAP3_SEARCH_METHODS = frozenset({"search"})
 
 # ── interprocedural taint (per-file, single-threaded) ─────────────────────────
 # Updated by PythonASTAnalyzer.analyze() before each file visit.
@@ -236,7 +320,7 @@ class PythonASTAnalyzer(BaseAnalyzer):
 
         lines = content.splitlines()
         _interprocedural_taint_sources = _find_taint_source_funcs(tree)
-        visitor = _VulnVisitor(file_path, lines, repo_url, self)
+        visitor = _VulnVisitor(file_path, lines, repo_url, self, content)
         visitor.visit(tree)
         return visitor.findings
 
@@ -250,14 +334,17 @@ class _VulnVisitor(ast.NodeVisitor):
         lines: list[str],
         repo_url: str,
         analyzer: PythonASTAnalyzer,
+        content: str = "",
     ) -> None:
         self.file_path = file_path
         self.lines = lines
         self.repo_url = repo_url
         self.analyzer = analyzer
+        self.content = content
         self.findings: list[Finding] = []
         self._assignments: dict[str, ast.expr] = {}
         self._class_attrs: dict[str, ast.expr] = {}
+        self._canonicalized_paths: frozenset[str] = frozenset()
         self._in_enum_class: bool = False
 
     # ── scope tracking ─────────────────────────────────────────────────────────
@@ -280,9 +367,12 @@ class _VulnVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         saved = self._assignments
+        saved_canon = self._canonicalized_paths
         self._assignments = _collect_scope_assignments(node)
+        self._canonicalized_paths = _find_canonicalized_paths(node)
         self._visit_stmts(node.body)
         self._assignments = saved
+        self._canonicalized_paths = saved_canon
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
@@ -300,6 +390,9 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_open_redirect(node)
         self._check_ssti(node)
         self._check_weak_crypto(node)
+        self._check_insecure_rng_call(node)
+        self._check_xxe(node)
+        self._check_ldap_injection(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -312,6 +405,10 @@ class _VulnVisitor(ast.NodeVisitor):
         if node.value is not None:
             self._check_secret(node.target, node.value, node)
             self._check_insecure_rng(node.target, node.value, node)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self._check_xss_response(node)
         self.generic_visit(node)
 
     def visit_If(self, node: ast.If) -> None:
@@ -541,14 +638,19 @@ class _VulnVisitor(ast.NodeVisitor):
         full = _full_name(node.func)
         attr = _attr_name(node.func)
 
-        # open(path) — standalone built-in
-        if isinstance(node.func, ast.Name) and node.func.id == "open":
+        # open(path) / codecs.open(path, …) / io.open(path, …) — file-open sinks
+        _is_open = (
+            (isinstance(node.func, ast.Name) and node.func.id == "open")
+            or full in ("codecs.open", "io.open")
+        )
+        if _is_open:
             if not node.args:
                 return
             path = node.args[0]
             if _is_const(path):
                 return
             taint = _taint_of(path, self._assignments, self._class_attrs)
+            func_label = node.func.id if isinstance(node.func, ast.Name) else full
             if taint.status == TaintStatus.CLEAN:
                 self._add_suppressed(node, VulnType.PATH_TRAVERSAL, "AST-PATH-001",
                                      "clean_taint_source", taint)
@@ -558,14 +660,14 @@ class _VulnVisitor(ast.NodeVisitor):
                 label = ("f-string" if isinstance(path, ast.JoinedStr)
                          else "concatenated" if isinstance(path, ast.BinOp) else "")
                 self._add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, rule,
-                          f"open() receives a tainted {label + ' ' if label else ''}path"
+                          f"{func_label}() receives a tainted {label + ' ' if label else ''}path"
                           f" - traversal risk: {taint.reason}",
                           taint)
             else:
                 rule = "AST-PATH-002" if isinstance(path, (ast.JoinedStr, ast.BinOp)) else "AST-PATH-003"
                 self._add(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, rule,
-                          f"[needs_review] open() receives a dynamic path - verify cannot escape"
-                          f" directory: {taint.reason}",
+                          f"[needs_review] {func_label}() receives a dynamic path - verify cannot"
+                          f" escape directory: {taint.reason}",
                           taint)
 
         # os.makedirs / os.remove / os.stat / etc.
@@ -578,9 +680,15 @@ class _VulnVisitor(ast.NodeVisitor):
             for path_arg in node.args[:2]:
                 self._check_path_arg(node, path_arg, full)
 
-        # pathlib IO methods on a potentially-tainted path object
+        # pathlib IO methods on a potentially-tainted path object.
+        # If the path variable was produced by .resolve() and guarded by .startswith(),
+        # it is treated as canonicalized and therefore safe (OWASP recommended pattern).
         elif attr in _PATHLIB_IO_METHODS and isinstance(node.func, ast.Attribute):
-            obj_taint = _taint_of(node.func.value, self._assignments, self._class_attrs)
+            path_obj = node.func.value
+            if (isinstance(path_obj, ast.Name)
+                    and path_obj.id in self._canonicalized_paths):
+                return
+            obj_taint = _taint_of(path_obj, self._assignments, self._class_attrs)
             if obj_taint.status == TaintStatus.CLEAN:
                 return
             sev = Severity.HIGH if obj_taint.status == TaintStatus.TAINTED else Severity.MEDIUM
@@ -759,6 +867,112 @@ class _VulnVisitor(ast.NodeVisitor):
             "use secrets.token_bytes() or secrets.token_hex() for cryptographic randomness",
         )
 
+    def _check_insecure_rng_call(self, node: ast.Call) -> None:
+        """Detect random.xxx() direct calls (excludes random.SystemRandom() which is secure).
+
+        Fires unconditionally for any call to the standard random module's PRNG functions.
+        random.SystemRandom() uses os.urandom() and is NOT flagged.
+        """
+        if not isinstance(node.func, ast.Attribute):
+            return
+        attr = node.func.attr
+        if attr not in _INSECURE_RNG_ATTRS:
+            return
+        # Must be random.xxx() — qualifier must be the 'random' module Name, not a Call
+        # (random.SystemRandom().xxx() has a Call as qualifier, not a Name)
+        qualifier = node.func.value
+        if not isinstance(qualifier, ast.Name) or qualifier.id != "random":
+            return
+        self._add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "AST-CRYPTO-003",
+                  f"random.{attr}() is not cryptographically secure — "
+                  "use secrets.token_bytes() or secrets.token_hex() for session tokens and nonces")
+
+    # ── XXE ───────────────────────────────────────────────────────────────────
+
+    def _check_xxe(self, node: ast.Call) -> None:
+        """Detect XXE via xml.dom.minidom.parseString/parse with external entity expansion.
+
+        Only fires when xml.sax.handler.feature_external_ges is explicitly enabled in the
+        same file — that is the only way Python's xml.dom.minidom becomes vulnerable to XXE.
+        """
+        full = _full_name(node.func) or ""
+        attr = _attr_name(node.func) or ""
+        if full not in _XXE_PARSE_FUNCS and attr not in {"parseString", "parse"}:
+            return
+        if not node.args:
+            return
+        # Guard: only fire when external entity expansion is explicitly enabled.
+        if "feature_external_ges" not in self.content:
+            return
+        xml_arg = node.args[0]
+        if _is_const(xml_arg):
+            return
+        taint = _taint_of(xml_arg, self._assignments, self._class_attrs)
+        if taint.status == TaintStatus.CLEAN:
+            return
+        if taint.status == TaintStatus.TAINTED:
+            self._add(node, VulnType.XXE, Severity.HIGH, "AST-XXE-001",
+                      f"XML parsed with external entity expansion enabled and tainted input — "
+                      f"XXE allows reading local files and SSRF: {taint.reason}",
+                      taint)
+        else:
+            self._add(node, VulnType.XXE, Severity.MEDIUM, "AST-XXE-002",
+                      "[needs_review] XML parsed with external entity expansion enabled and "
+                      f"dynamic input — verify input is not user-controlled: {taint.reason}",
+                      taint)
+
+    # ── LDAP injection ─────────────────────────────────────────────────────────
+
+    def _check_ldap_injection(self, node: ast.Call) -> None:
+        """Detect ldap3 conn.search() with a tainted filter argument.
+
+        The filter is typically built as an f-string and passed as the second
+        positional argument: conn.search(base, filter, attributes=...).
+        """
+        if not isinstance(node.func, ast.Attribute):
+            return
+        if node.func.attr not in _LDAP3_SEARCH_METHODS:
+            return
+        # Need at least 2 positional args: base + filter
+        if len(node.args) < 2:
+            return
+        filter_arg = node.args[1]
+        if _is_const(filter_arg):
+            return
+        taint = _taint_of(filter_arg, self._assignments, self._class_attrs)
+        if taint.status == TaintStatus.CLEAN:
+            return
+        if taint.status == TaintStatus.TAINTED:
+            self._add(node, VulnType.LDAP_INJECTION, Severity.HIGH, "AST-LDAP-001",
+                      f"ldap3 conn.search() filter built with user input — "
+                      f"LDAP injection allows authentication bypass: {taint.reason}",
+                      taint)
+
+    # ── XSS: Flask/Django response body accumulation ───────────────────────────
+
+    def _check_xss_response(self, node: ast.AugAssign) -> None:
+        """Detect XSS via `RESPONSE += f'...{tainted_var}...'` in Flask route handlers.
+
+        Fires only when the augmented value is provably TAINTED (not merely UNKNOWN),
+        avoiding false positives on string accumulation patterns with unresolved variables.
+        """
+        if not isinstance(node.op, ast.Add):
+            return
+        if not isinstance(node.target, ast.Name):
+            return
+        # Check taint of the value being appended
+        taint = _taint_of(node.value, self._assignments, self._class_attrs)
+        if taint.status != TaintStatus.TAINTED:
+            return
+        # Suppress if an HTML-specific sanitizer (markupsafe.escape, html.escape, etc.) was applied
+        if any(s in _HTML_SANITIZER_FUNCS or s in _HTML_SANITIZER_METHODS
+               for s in (taint.sanitizers or [])):
+            return
+        self._add(node, VulnType.XSS, Severity.HIGH, "AST-XSS-002",
+                  f"Tainted user input appended to response string without HTML encoding — "
+                  f"reflected XSS risk: {taint.reason}",
+                  taint)
+
     # ── hardcoded secrets ──────────────────────────────────────────────────────
 
     def _check_secret(
@@ -934,13 +1148,51 @@ def _kwarg_is_true(node: ast.Call, name: str) -> bool:
 def _collect_scope_assignments(
     func: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> dict[str, ast.expr]:
-    """Return {name: rhs} for simple name assignments inside a function body."""
+    """Return {name: rhs} for simple name assignments inside a function body.
+
+    Also stores dict-subscript assignments as tuple keys ``(dict_name, key_str)``
+    so that ``_taint_of`` can resolve ``map['keyA']`` to its assigned value.
+
+    Null-guard default assignments (``if not X: X = <constant>``) are skipped so
+    that an original tainted assignment to X is not overwritten by the empty-string
+    default; e.g. ``param = request.form.get(...); if not param: param = ""``.
+    """
+    # First pass: identify null-guard assignment node ids to skip.
+    null_guard_ids: set[int] = set()
+    for node in ast.walk(func):
+        if not (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.UnaryOp)
+            and isinstance(node.test.op, ast.Not)
+            and isinstance(node.test.operand, ast.Name)
+            and not node.orelse
+        ):
+            continue
+        guarded = node.test.operand.id
+        for stmt in node.body:
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and stmt.targets[0].id == guarded
+                and _is_const(stmt.value)
+            ):
+                null_guard_ids.add(id(stmt))
+
     result: dict[str, ast.expr] = {}
     for node in ast.walk(func):
         if isinstance(node, ast.Assign):
+            if id(node) in null_guard_ids:
+                continue
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     result[target.id] = node.value
+                elif (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and isinstance(target.slice, ast.Constant)
+                ):
+                    result[(target.value.id, str(target.slice.value))] = node.value
         elif (
             isinstance(node, ast.AnnAssign)
             and isinstance(node.target, ast.Name)
@@ -1047,6 +1299,12 @@ def _taint_of(
         if full in _UNIVERSAL_SANITIZER_FUNCS:
             return TaintInfo(TaintStatus.CLEAN, f"sanitized by {full}()", sanitizers=[full])
 
+        # Decode/transform functions that propagate taint unchanged (not sanitizers).
+        if full in _TAINT_PASSTHROUGH_FUNCS:
+            if node.args:
+                return _taint_of(node.args[0], assignments, class_attrs, _depth + 1)
+            return UNKNOWN_UNRESOLVED
+
         # Interprocedural taint: call to a function identified as a taint source in pre-pass.
         if full in _interprocedural_taint_sources:
             return TaintInfo(TaintStatus.TAINTED,
@@ -1128,6 +1386,15 @@ def _taint_of(
 
     # ── Subscript ───────────────────────────────────────────────────────────────
     if isinstance(node, ast.Subscript):
+        # Dict key tracking: resolve map['key'] to its assigned value when known.
+        if (
+            assignments is not None
+            and isinstance(node.value, ast.Name)
+            and isinstance(node.slice, ast.Constant)
+        ):
+            lookup = (node.value.id, str(node.slice.value))
+            if lookup in assignments:
+                return _taint_of(assignments[lookup], assignments, class_attrs, _depth + 1)
         obj_taint = _taint_of(node.value, assignments, class_attrs, _depth + 1)
         if obj_taint.status == TaintStatus.TAINTED:
             return TaintInfo(TaintStatus.TAINTED,

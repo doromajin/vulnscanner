@@ -17,8 +17,9 @@ PyYAML==6.0.2
 Jinja2==3.1.4
 
 
-# Nightly auto-improvement (FuguAI evaluation; Claude Code CLI used for generation)
+# 改善ループ (FuguAI evaluation + Anthropic API for Claude calls)
 openai==2.44.0
+anthropic==0.112.0
 python-dotenv==1.0.1
 
 # PHP AST analysis (multi-hop taint detection)

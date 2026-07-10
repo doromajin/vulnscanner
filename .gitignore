@@ -38,6 +38,15 @@ improvement_proposals/
 proposal_best.py
 proposal_best.patch
 token_usage.json
+nightly_runs/
+
+# ベンチマークデータ (大容量のため追跡しない)
+benchmark_python/
+owasp_benchmark/
+
+# 一時デバッグスクリプト
+_*.py
+_*.txt
 
 # OS
 .DS_Store

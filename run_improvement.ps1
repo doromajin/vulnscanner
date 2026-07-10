@@ -1,5 +1,5 @@
 # VulnScanner 改善ループ 手動起動スクリプト
-# 使い方: .\run_nightly.ps1 [-MaxHours 4] [-StopAt "05:00"]
+# 使い方: .\run_improvement.ps1 [-MaxHours 4] [-StopAt "05:00"]
 
 param(
     [double]$MaxHours = 4.0,
@@ -7,7 +7,7 @@ param(
 )
 
 $VulnDir = "C:\VulnScanner"
-$LogDir  = "$VulnDir\nightly_runs\logs"
+$LogDir  = "$VulnDir\improvement_runs\logs"
 
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $LogFile = Join-Path $LogDir ("run_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")
@@ -15,7 +15,7 @@ $LogFile = Join-Path $LogDir ("run_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".
 $Stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 Add-Content -Path $LogFile -Value "=== 起動: $Stamp ==="
 
-$PyArgs = @("$VulnDir\nightly_improvement.py", "--max-hours", $MaxHours)
+$PyArgs = @("$VulnDir\improvement_loop.py", "--max-hours", $MaxHours)
 if ($StopAt -ne "") { $PyArgs += @("--stop-at", $StopAt) }
 
 Set-Location $VulnDir

@@ -9,13 +9,16 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
-_SI   = VulnType.SQL_INJECTION
-_CI   = VulnType.COMMAND_INJECTION
-_PT   = VulnType.PATH_TRAVERSAL
-_SSRF = VulnType.SSRF
+_SI    = VulnType.SQL_INJECTION
+_CI    = VulnType.COMMAND_INJECTION
+_PT    = VulnType.PATH_TRAVERSAL
+_SSRF  = VulnType.SSRF
 _DESER = VulnType.INSECURE_DESERIALIZATION
-_XXE  = VulnType.XXE
-_JNDI = VulnType.JNDI_INJECTION
+_XXE   = VulnType.XXE
+_JNDI  = VulnType.JNDI_INJECTION
+_XSS   = VulnType.XSS
+_WKCP  = VulnType.WEAK_CRYPTOGRAPHY
+_LDAP  = VulnType.LDAP_INJECTION
 
 # (rule_id, compiled_re, description, severity, vuln_type)
 _RULES = [
@@ -38,15 +41,8 @@ _RULES = [
         "JPA createQuery/createNativeQuery with string concatenation — SQL injection",
         Severity.HIGH, _SI,
     ),
-    (
-        "JAVA-CMD-001",
-        re.compile(
-            r'(?:Runtime\.getRuntime\(\)\.exec|new\s+ProcessBuilder)\s*\(',
-            re.IGNORECASE,
-        ),
-        "Java Runtime.exec / ProcessBuilder — verify arguments are not user-controlled",
-        Severity.HIGH, _CI,
-    ),
+    # JAVA-CMD-001 removed: unconditional Runtime.exec/ProcessBuilder flag caused high FPR.
+    # Taint-tracked detection is handled by ast_java.py JAST-CMD-001/002.
     (
         "JAVA-XXE-001",
         re.compile(
@@ -158,6 +154,49 @@ _RULES = [
         "Java XMLInputFactory (StAX) without disabling IS_SUPPORTING_EXTERNAL_ENTITIES — XXE risk",
         Severity.HIGH, _XXE,
     ),
+    # JAVA-XSS-001 removed: unconditional getWriter().print*() flag caused 96% FPR.
+    # Taint-tracked detection is handled by ast_java.py JAST-XSS-001.
+    # JAVA-WEAKRAND-001: new Random() — not cryptographically secure
+    (
+        "JAVA-WEAKRAND-001",
+        re.compile(
+            r'\bnew\s+(?:java\.util\.)?Random\s*\(\s*\)',
+            re.IGNORECASE,
+        ),
+        "new Random() is not cryptographically secure — use java.security.SecureRandom",
+        Severity.HIGH, _WKCP,
+    ),
+    # JAVA-HASH-001: MessageDigest with weak/broken hash algorithm
+    (
+        "JAVA-HASH-001",
+        re.compile(
+            r'\bMessageDigest\s*\.\s*getInstance\s*\(\s*"(?:MD5|SHA-?1|MD2|MD4)"',
+            re.IGNORECASE,
+        ),
+        "MessageDigest.getInstance() with broken hash algorithm (MD5/SHA-1) — use SHA-256 or stronger",
+        Severity.HIGH, _WKCP,
+    ),
+    # JAVA-CRYPTO-001: Cipher with weak/broken cipher algorithm
+    (
+        "JAVA-CRYPTO-001",
+        re.compile(
+            r'\bCipher\s*\.\s*getInstance\s*\(\s*"(?:DES|RC2|RC4|ARCFOUR|BLOWFISH)',
+            re.IGNORECASE,
+        ),
+        "Cipher.getInstance() with weak cipher (DES/RC4/RC2/Blowfish) — use AES/GCM/NoPadding",
+        Severity.HIGH, _WKCP,
+    ),
+    # JAVA-LDAP-001: LDAP search with potential user-controlled filter
+    (
+        "JAVA-LDAP-001",
+        re.compile(
+            r'(?:DirContext|InitialDirContext|LdapContext)\b[^;]{0,200}\.'
+            r'\s*search\s*\([^;]{0,300}\b(?:param|filter|input|query|search|value)\b',
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "LDAP DirContext.search() with potentially user-controlled filter — LDAP injection risk",
+        Severity.HIGH, _LDAP,
+    ),
 ]
 
 _GUARD = re.compile(
@@ -166,7 +205,9 @@ _GUARD = re.compile(
     r'|createQuery|createNativeQuery|new\s+URL\s*\('
     r'|XStream|fromXML|unmarshal|XMLInputFactory'
     r'|prepareStatement|prepareCall|executeQuery|executeUpdate'
-    r'|new\s+File|Paths\.get|Path\.of',
+    r'|new\s+File|Paths\.get|Path\.of'
+    r'|getWriter|new\s+Random|MessageDigest|Cipher\.getInstance'
+    r'|DirContext|InitialDirContext|LdapContext',
     re.IGNORECASE,
 )
 

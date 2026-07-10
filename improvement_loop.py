@@ -153,6 +153,33 @@ def strip_ansi(text: str) -> str:
     return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
 
 
+import sys as _sys
+
+def _ticker_print(label: str, t0: float, thread: "threading.Thread") -> None:
+    """Wait for thread with a progress ticker.
+
+    Terminal mode  (isatty): in-place \\r update every 1 s — no log growth.
+    Non-terminal   (file/pipe): one new line every 30 s to avoid file bloat.
+    """
+    _is_tty = _sys.stdout.isatty()
+    _interval = 1
+    _last_printed = -1
+    while thread.is_alive():
+        elapsed = int(time.monotonic() - t0)
+        if elapsed // _interval > _last_printed // _interval:
+            if _is_tty:
+                print(f"\r  [{label}] 思考中... {elapsed}s", end="", flush=True)
+            else:
+                print(f"  [{label}] 思考中... {elapsed}s", flush=True)
+            _last_printed = elapsed
+        thread.join(timeout=1.0)
+    elapsed = int(time.monotonic() - t0)
+    if _is_tty:
+        print(f"\r  [{label}] 完了 ({elapsed}s)          ", flush=True)
+    else:
+        print(f"  [{label}] 完了 ({elapsed}s)", flush=True)
+
+
 # ── 実行ディレクトリ ───────────────────────────────────────────────────────────
 
 def get_run_dir(started_at: datetime) -> Path:
@@ -182,10 +209,7 @@ def _run_with_ticker(
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
     t0 = time.monotonic()
-    while thread.is_alive():
-        print(f"\r  [{label}] 思考中... {int(time.monotonic()-t0)}s", end="", flush=True)
-        thread.join(timeout=1.0)
-    print(f"\r  [{label}] 完了 ({int(time.monotonic()-t0)}s)                    ", flush=True)
+    _ticker_print(label, t0, thread)
     if holder["exc"] is not None:
         raise holder["exc"]  # type: ignore[misc]
     return holder["result"]  # type: ignore[return-value]
@@ -287,10 +311,7 @@ def _call_claude_api(prompt: str, task_type: str = "proposal") -> tuple[str | No
         t0     = time.monotonic()
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
-        while thread.is_alive():
-            print(f"\r  [Claude API] 思考中... {int(time.monotonic()-t0)}s", end="", flush=True)
-            thread.join(timeout=1.0)
-        print(f"\r  [Claude API] 完了 ({int(time.monotonic()-t0)}s)                    ", flush=True)
+        _ticker_print("Claude API", t0, thread)
 
         exc = holder["exc"]
         if exc is None:
@@ -396,10 +417,7 @@ def call_fugu(prompt: str, max_tokens: int = 512) -> tuple[str | None, int]:
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
         t0 = time.monotonic()
-        while thread.is_alive():
-            print(f"\r  [FuguAI] 思考中... {int(time.monotonic()-t0)}s", end="", flush=True)
-            thread.join(timeout=1.0)
-        print(f"\r  [FuguAI] 完了 ({int(time.monotonic()-t0)}s)                    ", flush=True)
+        _ticker_print("FuguAI", t0, thread)
 
         if holder["exc"] is not None:
             if attempt < MAX_RETRIES - 1:
@@ -1428,6 +1446,26 @@ def _run_loop(args: argparse.Namespace) -> int:
         # diff 形式で受け取り、original に適用して draft_content を得る
         _raw_diff   = draft_proposal.get("diff", "")
         if _raw_diff:
+            # diff の対象ファイルが target_file と一致するか事前確認
+            _diff_file: str | None = None
+            for _dl in _raw_diff.splitlines()[:6]:
+                if _dl.startswith("--- a/"):
+                    _diff_file = _dl[6:].strip()
+                    break
+            if _diff_file and _diff_file != target_file:
+                rule_id     = draft_proposal.get("rule_id", "UNKNOWN")
+                change_summ = draft_proposal.get("change_summary", "")
+                iter_result["rule_id"]        = rule_id
+                iter_result["change_summary"] = change_summ
+                log(f"  提案: {rule_id} — {change_summ[:70]}")
+                log(f"  diff が誤ファイル対象 ({_diff_file}) → スキップ")
+                _skip(
+                    "draft_diff_wrong_target_file",
+                    f"Your diff targets '{_diff_file}' but MUST target '{target_file}'. "
+                    f"The '--- a/' and '+++ b/' headers must be exactly '{target_file}'. "
+                    f"Do NOT modify any other file.",
+                )
+                iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
             draft_content = apply_unified_diff(original_content, _raw_diff) or ""
         else:
             draft_content = draft_proposal.get("new_content", "")
@@ -1448,7 +1486,9 @@ def _run_loop(args: argparse.Namespace) -> int:
 
         if _raw_diff and not draft_content:
             log("  diff 適用失敗 → スキップ")
-            _skip("draft_diff_apply_error", "Diff failed to apply — check hunk context lines match the file exactly")
+            _skip("draft_diff_apply_error",
+                  f"Diff failed to apply against '{target_file}' — copy exact context lines "
+                  f"(including indentation) from the file shown in the prompt.")
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
         if not draft_content:
             _skip("draft_empty_content")

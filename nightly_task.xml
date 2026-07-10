@@ -1,40 +1,38 @@
 <?xml version="1.0" encoding="UTF-16"?>
 <!--
-  VulnScanner 夜間自動改善タスク — Windows タスクスケジューラ設定ファイル
+  VulnScanner 改善ループ — Windows タスクスケジューラ設定ファイル（参考用）
 
-  インポート手順:
+  ※ 現在は手動実行のみ。スケジューラ登録は不要。
+  ※ 手動実行: .\run_improvement.ps1 [-MaxHours 4] [-StopAt "05:00"]
+
+  スケジューラに登録したい場合のインポート手順:
     1. 環境変数を設定しておく:
-         ANTHROPIC_API_KEY=<your-key>
          FUGU_API_KEY=<your-key>
          FUGU_API_BASE=https://api.fugu.sakana.ai/v1   (省略可)
          FUGU_MODEL=fugu-chat                          (省略可)
     2. 管理者権限の PowerShell で実行:
-         Register-ScheduledTask -Xml (Get-Content nightly_task.xml -Raw) -TaskName "VulnScannerNightly" -Force
+         Register-ScheduledTask -Xml (Get-Content nightly_task.xml -Raw) -TaskName "VulnScannerImprovement" -Force
     3. 確認:
-         Get-ScheduledTask -TaskName "VulnScannerNightly"
-    4. 手動テスト実行:
-         Start-ScheduledTask -TaskName "VulnScannerNightly"
+         Get-ScheduledTask -TaskName "VulnScannerImprovement"
 
   削除:
-    Unregister-ScheduledTask -TaskName "VulnScannerNightly" -Confirm:$false
+    Unregister-ScheduledTask -TaskName "VulnScannerImprovement" -Confirm:$false
 
   注意: <Command> の python パスは環境に合わせて変更してください。
-        下記は Python が PATH に登録されていることを前提としています。
         フルパスを使う場合の例:
           C:\Users\dorom\AppData\Local\Programs\Python\Python314\python.exe
 -->
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>VulnScanner 夜間自動改善ループ — 毎日 02:00 に実行し、4時間以内に改善提案を生成・評価する。</Description>
+    <Description>VulnScanner 改善ループ — 改善提案を生成・評価する。</Description>
     <Author>VulnScanner</Author>
-    <URI>\VulnScannerNightly</URI>
+    <URI>\VulnScannerImprovement</URI>
   </RegistrationInfo>
 
   <Triggers>
     <CalendarTrigger>
-      <!-- 翌日 02:00 から毎日実行 -->
       <StartBoundary>2026-06-29T02:00:00</StartBoundary>
-      <Enabled>true</Enabled>
+      <Enabled>false</Enabled>
       <ScheduleByDay>
         <DaysInterval>1</DaysInterval>
       </ScheduleByDay>
@@ -43,14 +41,12 @@
 
   <Principals>
     <Principal id="Author">
-      <!-- ログオン中のユーザーとして実行 (環境変数を引き継ぐため) -->
       <LogonType>InteractiveToken</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
 
   <Settings>
-    <!-- 多重起動を防ぐ: 既に実行中なら新規インスタンスを無視 -->
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
@@ -62,11 +58,10 @@
       <RestartOnIdle>false</RestartOnIdle>
     </IdleSettings>
     <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
+    <Enabled>false</Enabled>
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
-    <!-- 安全マージンとして 5 時間で強制終了 (スクリプト自体は 4h で自己終了) -->
     <ExecutionTimeLimit>PT5H</ExecutionTimeLimit>
     <Priority>7</Priority>
   </Settings>
@@ -74,7 +69,7 @@
   <Actions Context="Author">
     <Exec>
       <Command>python</Command>
-      <Arguments>nightly_improvement.py --max-hours 4</Arguments>
+      <Arguments>improvement_loop.py --max-hours 4</Arguments>
       <WorkingDirectory>C:\VulnScanner</WorkingDirectory>
     </Exec>
   </Actions>
