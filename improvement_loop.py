@@ -88,7 +88,10 @@ FUGU_API_KEY  = os.environ.get("FUGU_API_KEY", "")
 FUGU_API_BASE = os.environ.get("FUGU_API_BASE", "https://api.sakana.ai/v1")
 FUGU_MODEL    = os.environ.get("FUGU_MODEL", "fugu")
 
-# task_type → Claude モデル対応表（CLI フォールバック用）
+# Claude バックエンド選択 ("api" | "cli") — main() で --claude-backend から上書きされる
+_CLAUDE_BACKEND: str = "api"
+
+# task_type → Claude モデル対応表（CLI 用）
 _TASK_MODEL_MAP: dict[str, str] = {
     "proposal":  "claude-sonnet-5",            # draft 生成（創造性・セキュリティ知識が必要）
     "report":    "claude-sonnet-5",            # レポート作成
@@ -273,13 +276,13 @@ def _classify_claude_error(returncode: int, stderr: str) -> str:
 # ── API 呼び出し ───────────────────────────────────────────────────────────────
 
 def call_claude(prompt: str, task_type: str = "proposal") -> tuple[str | None, float, bool]:
-    """Claude を呼び出す。ANTHROPIC_API_KEY があれば API、なければ CLI。
+    """Claude を呼び出す。_CLAUDE_BACKEND で api / cli を選択。
 
     戻り値: (text, elapsed_seconds, rate_limited)
     """
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return _call_claude_api(prompt, task_type)
-    return _call_claude_cli(prompt, task_type)
+    if _CLAUDE_BACKEND == "cli":
+        return _call_claude_cli(prompt, task_type)
+    return _call_claude_api(prompt, task_type)
 
 
 def _call_claude_api(prompt: str, task_type: str = "proposal") -> tuple[str | None, float, bool]:
@@ -1854,6 +1857,8 @@ def _run_loop(args: argparse.Namespace) -> int:
 # ── エントリポイント ───────────────────────────────────────────────────────────
 
 def main() -> None:
+    global _CLAUDE_BACKEND
+
     parser = argparse.ArgumentParser(description="VulnScanner 改善ループ")
     parser.add_argument("--max-hours", type=float, default=4.0,
                         help="実行ウィンドウ上限（時間, デフォルト 4.0）")
@@ -1865,10 +1870,27 @@ def main() -> None:
                         help="特定のアナライザーファイルに集中 "
                              "例: vulnscanner/analyzers/ast_python.py  "
                              "(指定すると全イテレーションでそのファイルのみ対象にする)")
+    parser.add_argument(
+        "--claude-backend", choices=["api", "cli"], default="api",
+        help=(
+            "Claude バックエンド: "
+            "api = Anthropic API (デフォルト, ANTHROPIC_API_KEY 必須) / "
+            "cli = claude CLI (claude auth login でログイン済みであること)"
+        ),
+    )
     args = parser.parse_args()
+
+    # バックエンドをグローバルに設定（call_claude() が参照する）
+    _CLAUDE_BACKEND = args.claude_backend
+    log(f"Claude バックエンド: {_CLAUDE_BACKEND.upper()}")
 
     if not os.environ.get("FUGU_API_KEY") and not args.dry_run:
         log("ERROR: FUGU_API_KEY が未設定です。.env ファイルを確認してください。")
+        sys.exit(1)
+
+    if args.claude_backend == "api" and not os.environ.get("ANTHROPIC_API_KEY") and not args.dry_run:
+        log("ERROR: ANTHROPIC_API_KEY が未設定です。"
+            ".env ファイルを設定するか --claude-backend cli を使ってください。")
         sys.exit(1)
 
     try:
