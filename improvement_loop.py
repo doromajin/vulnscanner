@@ -317,9 +317,11 @@ def _call_claude_api(prompt: str, task_type: str = "proposal") -> tuple[str | No
 
         def _worker() -> None:
             try:
+                # proposal/revise が散文＋JSONを書いても切れないよう 8192 に拡大
+                max_tok = 8192 if use_json_system else 4096
                 kwargs: dict = dict(
                     model=model,
-                    max_tokens=4096,
+                    max_tokens=max_tok,
                     messages=[{"role": "user", "content": prompt}],
                 )
                 if use_json_system:
@@ -506,6 +508,37 @@ def _escape_json_string_literals(segment: str) -> str:
     return ''.join(result)
 
 
+def _extract_json_object(text: str) -> str | None:
+    """Extract the first complete JSON object from text, string-context-aware.
+
+    Naive brace-counting fails when the "diff" field contains { or } inside
+    Python code.  This implementation tracks whether the current position is
+    inside a JSON string value, so only structural braces are counted.
+    """
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch == '\\' and in_string:
+            i += 2  # skip the escaped character
+            continue
+        if ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        i += 1
+    return None
+
+
 def parse_claude_json(raw: str) -> dict | None:
     text = raw.strip()
     # Try 1: direct parse
@@ -527,28 +560,14 @@ def parse_claude_json(raw: str) -> dict | None:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-    # Try 4: extract outermost JSON object by brace matching
-    brace_segment: str | None = None
-    start = text.find('{')
-    if start != -1:
-        depth, end = 0, -1
-        for i, ch in enumerate(text[start:], start):
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        if end != -1:
-            brace_segment = text[start:end]
-            try:
-                return json.loads(brace_segment)
-            except json.JSONDecodeError:
-                pass
-    # Try 5: escape literal control characters in string values (e.g. bare newlines
-    # in the "diff" field) and retry.  Apply to both the full text and the brace
-    # segment found above.
+    # Try 4: string-aware brace extraction (handles { and } inside diff string values)
+    brace_segment: str | None = _extract_json_object(text)
+    if brace_segment:
+        try:
+            return json.loads(brace_segment)
+        except json.JSONDecodeError:
+            pass
+    # Try 5: escape literal control characters (bare newlines in diff fields) and retry.
     for candidate in filter(None, [brace_segment, cleaned, text]):
         fixed = _escape_json_string_literals(candidate)
         if fixed == candidate:
@@ -556,23 +575,12 @@ def parse_claude_json(raw: str) -> dict | None:
         try:
             return json.loads(fixed)
         except json.JSONDecodeError:
-            # Brace-match again on the fixed text in case fence stripping changed it
-            s2 = fixed.find('{')
-            if s2 != -1:
-                d2, e2 = 0, -1
-                for j, c2 in enumerate(fixed[s2:], s2):
-                    if c2 == '{':
-                        d2 += 1
-                    elif c2 == '}':
-                        d2 -= 1
-                        if d2 == 0:
-                            e2 = j + 1
-                            break
-                if e2 != -1:
-                    try:
-                        return json.loads(fixed[s2:e2])
-                    except json.JSONDecodeError:
-                        pass
+            seg = _extract_json_object(fixed)
+            if seg:
+                try:
+                    return json.loads(seg)
+                except json.JSONDecodeError:
+                    pass
     return None
 
 
@@ -1001,7 +1009,16 @@ Propose ONE new rule addressing either #8 or #6, or any other high-value Python 
     else:
         constraint4 = "4. Use pre-compiled regex at module level: re.compile(r'...', flags)."
 
-    return f"""You are a senior security researcher improving VulnScanner, targeting
+    return f"""OUTPUT FORMAT (MANDATORY): Respond with ONLY the JSON object below — no prose, no markdown, no explanation before or after. Your entire response must be parseable by json.loads().
+{{
+  "target_file": "{target_file}",
+  "rule_id": "<RULE-NNN>",
+  "change_summary": "<one sentence>",
+  "diff": "<unified diff --- a/{target_file} +++ b/{target_file}>"
+}}
+
+---
+You are a senior security researcher improving VulnScanner, targeting
 ENTERPRISE-GRADE detection quality (Google/Microsoft OSS audit level, comparable to CodeQL/Semgrep).
 
 GOAL: Add detection for real vulnerability patterns that have caused actual CVEs or bug-bounty
@@ -1538,9 +1555,11 @@ def _run_loop(args: argparse.Namespace) -> int:
         draft_proposal = parse_claude_json(draft_raw)
         if not draft_proposal:
             consecutive_parse_failures += 1
-            preview = draft_raw[:600].replace('\n', '↵')
+            _head = draft_raw[:400].replace('\n', '↵')
+            _tail = draft_raw[-300:].replace('\n', '↵') if len(draft_raw) > 400 else ""
+            _tail_diag = f"\n  [診断] 末尾: {_tail!r}" if _tail else ""
             log(f"  draft JSON パース失敗 ({consecutive_parse_failures}回連続) → スキップ\n"
-                f"  [診断] 応答 {len(draft_raw)} 文字, 先頭: {preview!r}")
+                f"  [診断] 応答 {len(draft_raw)} 文字, 先頭: {_head!r}{_tail_diag}")
             if consecutive_parse_failures >= _MAX_CONSECUTIVE_PARSE_FAIL:
                 log(
                     f"\n  ⛔ JSON パース失敗が {_MAX_CONSECUTIVE_PARSE_FAIL} 回連続 — "
