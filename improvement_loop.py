@@ -285,12 +285,19 @@ def call_claude(prompt: str, task_type: str = "proposal") -> tuple[str | None, f
     return _call_claude_api(prompt, task_type)
 
 
+_JSON_SYSTEM_PROMPT = (
+    "You are a JSON API endpoint. Your response MUST be a single valid JSON object "
+    "and nothing else. Do not write any prose, explanation, markdown fences, or text "
+    "outside the JSON object. Start your response with { and end with }."
+)
+
+
 def _call_claude_api(prompt: str, task_type: str = "proposal") -> tuple[str | None, float, bool]:
     """Anthropic Python SDK で Claude API を直接呼び出す。
 
-    proposal / revise タスクは JSON を期待するので prefill テクニックを使う。
-    アシスタントメッセージを "{" で始めることで Claude が必ず JSON オブジェクトを
-    返すよう強制する（Anthropic API の assistant-prefill 機能）。
+    proposal / revise タスクは JSON を返す必要があるため、system プロンプトで
+    JSON のみを出力するよう強制する。
+    （claude-sonnet-4-6 は assistant-prefill 非対応のため system 方式を使用）
     """
     try:
         import anthropic as _anthropic
@@ -302,29 +309,23 @@ def _call_claude_api(prompt: str, task_type: str = "proposal") -> tuple[str | No
     t_start = time.monotonic()
     retry_delays = [30, 60, 120]
 
-    # proposal / revise は JSON を返す必要があるので prefill で強制する
-    use_prefill = task_type in ("proposal", "revise")
-    prefill_text = "{"
+    # proposal / revise は JSON を返す必要があるので system プロンプトで強制する
+    use_json_system = task_type in ("proposal", "revise")
 
     for attempt in range(MAX_RETRIES):
         holder: dict = {"text": None, "exc": None}
 
         def _worker() -> None:
             try:
-                messages: list[dict] = [{"role": "user", "content": prompt}]
-                if use_prefill:
-                    messages.append({"role": "assistant", "content": prefill_text})
-                msg = client.messages.create(
+                kwargs: dict = dict(
                     model=model,
                     max_tokens=4096,
-                    messages=messages,
+                    messages=[{"role": "user", "content": prompt}],
                 )
-                text = msg.content[0].text if msg.content else None
-                # prefill を使った場合、Claude の返答は "{" の続きから始まるので
-                # 先頭に "{" を戻す
-                if use_prefill and text is not None:
-                    text = prefill_text + text
-                holder["text"] = text
+                if use_json_system:
+                    kwargs["system"] = _JSON_SYSTEM_PROMPT
+                msg = client.messages.create(**kwargs)
+                holder["text"] = msg.content[0].text if msg.content else None
             except Exception as exc:  # noqa: BLE001
                 holder["exc"] = exc
 
