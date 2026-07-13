@@ -12,7 +12,10 @@ Advantages over regex:
 from __future__ import annotations
 
 import ast
+import copy
+import json
 import re
+from pathlib import Path
 
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
@@ -20,6 +23,24 @@ from vulnscanner.taint import (
     TaintInfo, TaintStatus,
     CLEAN_LITERAL, CLEAN_BUILTIN, UNKNOWN_UNRESOLVED,
 )
+
+def _load_python_taint_methods() -> frozenset[str]:
+    """Load user-defined Python taint-source method names from custom_taint_sources.json."""
+    config_path = Path(__file__).parent.parent.parent / "custom_taint_sources.json"
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        return frozenset(
+            entry["method"]
+            for entry in data.get("python_any_qualifier_taint_methods", [])
+            if isinstance(entry.get("method"), str)
+        )
+    except Exception:
+        return frozenset()
+
+# Method names that always return TAINTED regardless of the object they're called on.
+# These represent request-parameter getters on wrapper objects. Loaded from
+# custom_taint_sources.json so project teams can extend without touching analyzer code.
+_PY_ANY_QUALIFIER_TAINT_METHODS: frozenset[str] = _load_python_taint_methods()
 
 # ── SQL ────────────────────────────────────────────────────────────────────────
 
@@ -145,6 +166,14 @@ _TAINT_PASSTHROUGH_FUNCS = frozenset({
     "urllib.parse.unquote_to_bytes",
     "json.loads",
     "json.load",
+    "base64.b64decode",
+    "base64.b64encode",
+    "base64.decodebytes",
+    "base64.encodebytes",
+    "base64.urlsafe_b64decode",
+    "base64.urlsafe_b64encode",
+    "base64.b16decode",
+    "base64.b32decode",
 })
 
 # Context-specific sanitizers: protect ONLY their own sink context.
@@ -193,6 +222,8 @@ _OS_PATH_SINKS_SINGLE = frozenset({
     "os.makedirs", "os.mkdir", "os.remove", "os.unlink",
     "os.chmod", "os.stat", "os.listdir", "os.scandir",
     "os.rmdir", "os.removedirs", "os.chown",
+    # Filesystem probing with user-controlled path is path traversal (info disclosure).
+    "os.path.exists", "os.path.isfile", "os.path.isdir", "os.path.getsize",
 })
 # os.* / shutil.* path sinks with (src, dst) — both arguments are checked.
 _OS_PATH_SINKS_DUAL = frozenset({
@@ -203,6 +234,8 @@ _OS_PATH_SINKS_DUAL = frozenset({
 _PATHLIB_IO_METHODS = frozenset({
     "read_text", "read_bytes", "write_text", "write_bytes",
     "iterdir", "glob", "rglob",
+    # Existence/stat checks on a tainted path → filesystem probing (info disclosure).
+    "exists", "stat", "is_file", "is_dir", "is_symlink", "open",
 })
 
 
@@ -258,6 +291,14 @@ def _find_canonicalized_paths(
 # Weak hash algorithms — fast enough for GPU brute-force; broken for cryptographic use.
 _WEAK_HASH_FUNCS = frozenset({
     "hashlib.md5", "hashlib.sha1", "md5", "sha1",
+})
+_WEAK_HASH_ALGOS = frozenset({"md5", "sha1", "sha-1", "md-5"})
+
+# Flask/Django request attributes that reflect routing metadata, not user-submitted data.
+# These are set by the framework based on the route definition, not form or query input.
+_CLEAN_REQUEST_ATTRS = frozenset({
+    "path", "url", "base_url", "host", "host_url",
+    "root_url", "root_path", "script_root", "method",
 })
 # Python stdlib RNG — not cryptographically secure; predictable from seed.
 _INSECURE_RNG_FUNCS = frozenset({
@@ -567,21 +608,30 @@ class _VulnVisitor(ast.NodeVisitor):
                       f" {taint.reason}",
                       taint)
 
-        # subprocess.* with shell=True
+        # subprocess.* — shell=True (HIGH) or shell=False with tainted list (MEDIUM)
         elif full in _SUBPROCESS_NAMES:
-            if not _kwarg_is_true(node, "shell"):
-                return
             cmd = node.args[0] if node.args else None
             if cmd is None:
                 return
             taint = _taint_of(cmd, self._assignments, self._class_attrs)
+            if not _kwarg_is_true(node, "shell"):
+                # shell=False: only fire when the argument list itself is TAINTED
+                # (e.g. user input appended to list → command/argument injection risk).
+                if taint.status == TaintStatus.TAINTED:
+                    if not any(s in _CMD_SANITIZER_FUNCS for s in (taint.sanitizers or [])):
+                        self._add(node, VulnType.COMMAND_INJECTION, Severity.MEDIUM, "AST-CMD-005",
+                                  f"{full}() receives tainted argument list without shell=True"
+                                  f" — command/argument injection risk: {taint.reason}",
+                                  taint)
+                return
+            # shell=True below
             if taint.status == TaintStatus.CLEAN:
                 if isinstance(cmd, ast.List) and all(_is_const(e) for e in cmd.elts):
                     self._add(node, VulnType.COMMAND_INJECTION, Severity.LOW, "AST-CMD-002",
                               f"{full}() uses shell=True with literal list - remove shell=True",
                               taint)
                 return
-            if any(s in _CMD_SANITIZER_FUNCS for s in taint.sanitizers):
+            if any(s in _CMD_SANITIZER_FUNCS for s in (taint.sanitizers or [])):
                 return
             qualifier = "tainted" if taint.status == TaintStatus.TAINTED else "non-literal"
             self._add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "AST-CMD-002",
@@ -728,16 +778,24 @@ class _VulnVisitor(ast.NodeVisitor):
     def _check_deserialization(self, node: ast.Call) -> None:
         full = _full_name(node.func)
 
-        if full in _PICKLE_FUNCS:
-            self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
-                      "AST-DESER-001",
-                      f"{full}() deserializes arbitrary Python objects - never use on "
-                      "untrusted data; an attacker can achieve RCE via a crafted payload")
-
-        elif full in _MARSHAL_FUNCS:
-            self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
-                      "AST-DESER-002",
-                      f"{full}() is not designed to be safe against malicious data")
+        if full in _PICKLE_FUNCS or full in _MARSHAL_FUNCS:
+            rule = "AST-DESER-001" if full in _PICKLE_FUNCS else "AST-DESER-002"
+            desc = (f"{full}() deserializes arbitrary Python objects - never use on "
+                    "untrusted data; an attacker can achieve RCE via a crafted payload"
+                    if full in _PICKLE_FUNCS else
+                    f"{full}() is not designed to be safe against malicious data")
+            if node.args:
+                taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+                if taint.status == TaintStatus.CLEAN:
+                    self._add_suppressed(node, VulnType.INSECURE_DESERIALIZATION,
+                                         rule, "clean_taint_source", taint)
+                    return
+                self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
+                          rule, desc, taint)
+            else:
+                # pickle/marshal is CRITICAL regardless of whether arg is TAINTED or UNKNOWN:
+                # even unknown-origin data must never be passed to pickle.
+                self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL, rule, desc)
 
         elif full in _YAML_UNSAFE_FUNCS:
             self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
@@ -745,6 +803,17 @@ class _VulnVisitor(ast.NodeVisitor):
                       "yaml.unsafe_load() allows execution of arbitrary Python - use yaml.safe_load()")
 
         elif full in _YAML_LOAD_FUNCS:
+            # Taint-aware: suppress when YAML content is provably clean (not user input).
+            # Only unsafe Loader variants with user-controlled content are runtime risks.
+            if node.args:
+                yaml_content_taint = _taint_of(
+                    node.args[0], self._assignments, self._class_attrs
+                )
+                if yaml_content_taint.status == TaintStatus.CLEAN:
+                    self._add_suppressed(node, VulnType.INSECURE_DESERIALIZATION,
+                                         "AST-DESER-004", "clean_taint_source",
+                                         yaml_content_taint)
+                    return
             loader_kw = next((kw for kw in node.keywords if kw.arg == "Loader"), None)
             if loader_kw is None:
                 self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH,
@@ -809,14 +878,25 @@ class _VulnVisitor(ast.NodeVisitor):
             return
 
         if taint.status == TaintStatus.TAINTED:
+            # Suppress when the redirect URL was passed through urllib.parse.urlparse()
+            # in the same function scope — strong evidence of netloc/scheme validation.
+            # Real-world pattern: url = urlparse(bar); if url.netloc not in whitelist: return
+            if (isinstance(url_arg, ast.Name)
+                    and any(
+                        isinstance(v, ast.Call)
+                        and _full_name(v.func) in {"urllib.parse.urlparse", "urlparse"}
+                        and v.args
+                        and isinstance(v.args[0], ast.Name)
+                        and v.args[0].id == url_arg.id
+                        for v in self._assignments.values()
+                        if isinstance(v, ast.Call)
+                    )):
+                self._add_suppressed(node, VulnType.OPEN_REDIRECT,
+                                     "AST-REDIR-001", "url_whitelist_validation", taint)
+                return
             self._add(node, VulnType.OPEN_REDIRECT, Severity.HIGH, "AST-REDIR-001",
                       f"{name}() redirects to URL from user input - attackers can redirect "
                       f"victims to malicious sites (phishing): {taint.reason}",
-                      taint)
-        else:  # UNKNOWN
-            self._add(node, VulnType.OPEN_REDIRECT, Severity.MEDIUM, "AST-REDIR-002",
-                      f"[needs_review] {name}() redirects to dynamic URL - validate against "
-                      f"allowlist before redirecting: {taint.reason}",
                       taint)
 
     # ── server-side template injection (SSTI) ─────────────────────────────────
@@ -846,6 +926,15 @@ class _VulnVisitor(ast.NodeVisitor):
             self._add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.LOW, "AST-CRYPTO-001",
                       f"{full}() uses a weak hash algorithm — MD5/SHA-1 are broken for "
                       "cryptographic use; use hashlib.sha256() or stronger")
+            return
+        # hashlib.new('md5') / hashlib.new('sha1') pattern
+        if full == "hashlib.new" and node.args:
+            algo_node = node.args[0]
+            if isinstance(algo_node, ast.Constant) and isinstance(algo_node.value, str):
+                if algo_node.value.lower() in _WEAK_HASH_ALGOS:
+                    self._add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.LOW, "AST-CRYPTO-001",
+                              f"hashlib.new('{algo_node.value}') uses a weak hash algorithm — "
+                              "MD5/SHA-1 are broken for cryptographic use; use sha256 or stronger")
 
     def _check_insecure_rng(
         self,
@@ -1145,6 +1234,19 @@ def _kwarg_is_true(node: ast.Call, name: str) -> bool:
     return False
 
 
+def _resolve_self_ref(rhs: ast.expr, name: str, prev: ast.expr) -> ast.expr:
+    """Return a copy of *rhs* with every ``Name(name)`` replaced by *prev*.
+
+    Used to break self-referential assignments like ``x = f(x)`` so that the
+    resulting node chain can be evaluated without circular depth exhaustion.
+    Only called when *rhs* actually references *name* (callers check first).
+    """
+    class _Subst(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name) -> ast.expr:
+            return prev if node.id == name else node
+    return _Subst().visit(copy.deepcopy(rhs))
+
+
 def _collect_scope_assignments(
     func: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> dict[str, ast.expr]:
@@ -1179,14 +1281,130 @@ def _collect_scope_assignments(
             ):
                 null_guard_ids.add(id(stmt))
 
+    # Collect simple scalar constants for const-folding dead-branch detection.
+    # Includes int/float (for if/else) and strings (for match-case).
+    # Also evaluates one-level constant-string subscripts: "ABC"[0] → 'A'.
+    simple_consts: dict[str, ast.expr] = {}
+    for node in ast.walk(func):
+        if (isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            val = node.value
+            if isinstance(val, ast.Constant) and isinstance(val.value, (int, float, str)):
+                simple_consts[node.targets[0].id] = val
+            elif (isinstance(val, ast.Subscript)
+                    and isinstance(val.value, ast.Name)
+                    and val.value.id in simple_consts
+                    and isinstance(val.slice, ast.Constant)
+                    and isinstance(val.slice.value, int)):
+                base = simple_consts[val.value.id]
+                if isinstance(base.value, str):
+                    idx = val.slice.value
+                    if 0 <= idx < len(base.value):
+                        simple_consts[node.targets[0].id] = ast.Constant(
+                            value=base.value[idx]
+                        )
+
+    # Identify assignments in dead branches of constant if/else, so they do not
+    # overwrite live-branch assignments via the BFS last-write-wins rule.
+    dead_assign_ids: set[int] = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.If):
+            branch = _eval_const_branch(node.test, simple_consts)
+            if branch is True and node.orelse:
+                dead_stmts = node.orelse
+            elif branch is False:
+                dead_stmts = node.body
+            else:
+                continue
+            for dead_stmt in dead_stmts:
+                for sub in ast.walk(dead_stmt):
+                    if isinstance(sub, (ast.Assign, ast.AnnAssign)):
+                        dead_assign_ids.add(id(sub))
+
+    # Dead-branch detection for match-case with a constant subject.
+    # Pattern: match <const_var>: case 'A': ... case 'B': ...
+    # When the subject evaluates to a compile-time constant, only the matching
+    # case branch is live; all others are dead.
+    if hasattr(ast, "Match"):
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Match):
+                continue
+            subject_val: object = None
+            if (isinstance(node.subject, ast.Name)
+                    and node.subject.id in simple_consts):
+                subject_val = simple_consts[node.subject.id].value
+            elif isinstance(node.subject, ast.Constant):
+                subject_val = node.subject.value
+            if subject_val is None:
+                continue
+            # Find the first matching case and mark all others dead.
+            matched = False
+            for case in node.cases:
+                pat = case.pattern
+                if matched:
+                    # Already found the live branch — this case is dead.
+                    for stmt in case.body:
+                        for sub in ast.walk(stmt):
+                            if isinstance(sub, (ast.Assign, ast.AnnAssign)):
+                                dead_assign_ids.add(id(sub))
+                    continue
+                # Check whether this case pattern matches subject_val.
+                if isinstance(pat, ast.MatchValue):
+                    if (isinstance(pat.value, ast.Constant)
+                            and pat.value.value == subject_val):
+                        matched = True
+                elif isinstance(pat, ast.MatchOr):
+                    if any(
+                        isinstance(p, ast.MatchValue)
+                        and isinstance(p.value, ast.Constant)
+                        and p.value.value == subject_val
+                        for p in pat.patterns
+                    ):
+                        matched = True
+                elif isinstance(pat, ast.MatchAs) and pat.pattern is None:
+                    # Default/wildcard — always matches, marks this as the live case.
+                    matched = True
+                if not matched:
+                    # This case does not match — mark it dead.
+                    for stmt in case.body:
+                        for sub in ast.walk(stmt):
+                            if isinstance(sub, (ast.Assign, ast.AnnAssign)):
+                                dead_assign_ids.add(id(sub))
+
+    # Treat imported module names as CLEAN server-defined values (not user input).
+    # This prevents false positives from module constants like helpers.utils.TESTFILES_DIR.
+    # Names in _TAINTED_NAME_SOURCES (e.g. 'request') are intentionally excluded.
     result: dict[str, ast.expr] = {}
+    _CLEAN_NODE = ast.Constant(value=0)
+    for node in ast.walk(func):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = (alias.asname or alias.name.split('.')[0])
+                if top not in _TAINTED_NAME_SOURCES and top not in result:
+                    result[top] = _CLEAN_NODE
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if name not in _TAINTED_NAME_SOURCES and name not in result:
+                    result[name] = _CLEAN_NODE
+
     for node in ast.walk(func):
         if isinstance(node, ast.Assign):
-            if id(node) in null_guard_ids:
+            if id(node) in null_guard_ids or id(node) in dead_assign_ids:
                 continue
             for target in node.targets:
                 if isinstance(target, ast.Name):
-                    result[target.id] = node.value
+                    name = target.id
+                    rhs = node.value
+                    # Break self-referential cycles (x = f(x)) by substituting
+                    # the previous value of x so taint chains remain evaluable.
+                    prev = result.get(name)
+                    if (prev is not None
+                            and any(isinstance(n, ast.Name) and n.id == name
+                                    for n in ast.walk(rhs))):
+                        rhs = _resolve_self_ref(rhs, name, prev)
+                    result[name] = rhs
                 elif (
                     isinstance(target, ast.Subscript)
                     and isinstance(target.value, ast.Name)
@@ -1198,7 +1416,86 @@ def _collect_scope_assignments(
             and isinstance(node.target, ast.Name)
             and node.value is not None
         ):
-            result[node.target.id] = node.value
+            if id(node) not in dead_assign_ids:
+                result[node.target.id] = node.value
+
+    # Second pass: AugAssign (x += expr) — synthesise BinOp so taint propagates
+    # from the augmented operand even when the prior assignment was CLEAN.
+    for node in ast.walk(func):
+        if (isinstance(node, ast.AugAssign)
+                and isinstance(node.target, ast.Name)):
+            var = node.target.id
+            prev = result.get(var)
+            if prev is not None:
+                result[var] = ast.BinOp(left=prev, op=node.op, right=node.value)
+            else:
+                result[var] = node.value
+
+    # Third pass: list.append/pop tracking.
+    # Tracks per-index element content (for precise lst[n] taint) and maintains
+    # a BinOp aggregate for unknown-index subscript fallback.
+    # Also models lst.pop(0) so index-shifted accesses resolve correctly.
+    _list_contents: dict[str, list[ast.expr]] = {}
+    for node in ast.walk(func):
+        if not (isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)):
+            continue
+        call = node.value
+        var = call.func.value.id
+        attr = call.func.attr
+        if attr == "append" and call.args:
+            arg = call.args[0]
+            _list_contents.setdefault(var, []).append(arg)
+            prev = result.get(var)
+            if prev is not None:
+                result[var] = ast.BinOp(left=prev, op=ast.Add(), right=arg)
+            else:
+                result[var] = arg
+        elif (attr == "pop"
+              and call.args
+              and isinstance(call.args[0], ast.Constant)
+              and call.args[0].value == 0
+              and _list_contents.get(var)):
+            _list_contents[var].pop(0)
+    # Store per-index content and length sentinel for OOB detection.
+    for var, contents in _list_contents.items():
+        for i, elem in enumerate(contents):
+            result[(var, str(i))] = elem
+        result[(var, "__len__")] = ast.Constant(value=len(contents))
+
+    # Fourth pass: for-loop target variables inherit taint from the iterable.
+    # Pattern: `for var in expr` — var is an element of expr, so it carries the same taint.
+    # Real-world: `for name in request.form.keys()` → name is user-controlled (TAINTED).
+    for node in ast.walk(func):
+        if isinstance(node, ast.For):
+            iter_expr = node.iter
+            if isinstance(node.target, ast.Name):
+                result[node.target.id] = iter_expr
+            elif isinstance(node.target, ast.Tuple):
+                for elt in node.target.elts:
+                    if isinstance(elt, ast.Name):
+                        result[elt.id] = iter_expr
+
+    # Fifth pass: configparser conf.set(section, key, value) — track key-level taint
+    # so conf.get(section, key) can resolve to TAINTED or CLEAN instead of UNKNOWN.
+    for node in ast.walk(func):
+        if (isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "set"
+                and isinstance(node.value.func.value, ast.Name)
+                and len(node.value.args) >= 3):
+            conf_name = node.value.func.value.id
+            section_arg = node.value.args[0]
+            key_arg = node.value.args[1]
+            val_arg = node.value.args[2]
+            if (isinstance(section_arg, ast.Constant)
+                    and isinstance(key_arg, ast.Constant)):
+                lookup_key = (conf_name, str(section_arg.value), str(key_arg.value))
+                result[lookup_key] = val_arg
+
     return result
 
 
@@ -1228,6 +1525,74 @@ def _collect_class_attrs(cls: ast.ClassDef) -> dict[str, ast.expr]:
 
 # ── 3-state taint analysis ─────────────────────────────────────────────────────
 
+def _eval_const_num(
+    node: ast.expr,
+    _vars: dict[str, ast.expr] | None = None,
+) -> int | float | None:
+    """Evaluate a compile-time numeric expression, or return None if not constant.
+
+    *_vars* maps variable names to their AST nodes for one level of substitution —
+    used to evaluate conditions like ``7 * 42 - num > 200`` where ``num = 86``.
+    """
+    if isinstance(node, ast.Name) and _vars and node.id in _vars:
+        val = _vars[node.id]
+        if isinstance(val, ast.Constant) and isinstance(val.value, (int, float)):
+            return val.value
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        v = _eval_const_num(node.operand, _vars)
+        return -v if v is not None else None
+    if isinstance(node, ast.BinOp):
+        left = _eval_const_num(node.left, _vars)
+        right = _eval_const_num(node.right, _vars)
+        if left is None or right is None:
+            return None
+        op = node.op
+        if isinstance(op, ast.Add):
+            return left + right
+        if isinstance(op, ast.Sub):
+            return left - right
+        if isinstance(op, ast.Mult):
+            return left * right
+        if isinstance(op, ast.Div):
+            return left / right if right != 0 else None
+        if isinstance(op, ast.Mod):
+            return left % right if right != 0 else None
+    return None
+
+
+def _eval_const_branch(
+    test: ast.expr,
+    _vars: dict[str, ast.expr] | None = None,
+) -> bool | None:
+    """Return True/False if the if-expression test is a compile-time constant, else None.
+
+    *_vars* is forwarded to ``_eval_const_num`` for variable substitution.
+    """
+    if isinstance(test, ast.Constant):
+        return bool(test.value)
+    if isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
+        left = _eval_const_num(test.left, _vars)
+        right = _eval_const_num(test.comparators[0], _vars)
+        if left is not None and right is not None:
+            op = test.ops[0]
+            if isinstance(op, ast.Gt):
+                return left > right
+            if isinstance(op, ast.GtE):
+                return left >= right
+            if isinstance(op, ast.Lt):
+                return left < right
+            if isinstance(op, ast.LtE):
+                return left <= right
+            if isinstance(op, ast.Eq):
+                return left == right
+            if isinstance(op, ast.NotEq):
+                return left != right
+    return None
+
+
 def _taint_of(
     node: ast.expr,
     assignments: dict[str, ast.expr] | None = None,
@@ -1242,7 +1607,7 @@ def _taint_of(
       UNKNOWN  — cannot determine; emit finding at lower severity (needs_review)
       CLEAN    — literal, constant, or provably sanitized; suppress the finding
     """
-    if _depth > 6:
+    if _depth > 14:
         return UNKNOWN_UNRESOLVED
 
     # ── Literal constant ────────────────────────────────────────────────────────
@@ -1257,10 +1622,26 @@ def _taint_of(
                              f"known user-input source '{name}'", source=name)
         if name in ("True", "False", "None"):
             return CLEAN_BUILTIN
+        base_taint: TaintInfo | None = None
         if assignments and name in assignments:
             val = assignments[name]
             if val is not node:
-                return _taint_of(val, assignments, class_attrs, _depth + 1)
+                base_taint = _taint_of(val, assignments, class_attrs, _depth + 1)
+        # Also propagate taint from subscript-assignments: dict['key'] = tainted_val.
+        # Enables `'{0[key]}'.format(dict)` to detect taint flowing through dict values.
+        # Only 2-tuple keys are subscript assignments; 3-tuples are configparser entries.
+        if assignments:
+            sub_taints = [
+                _taint_of(v, assignments, class_attrs, _depth + 1)
+                for k, v in assignments.items()
+                if isinstance(k, tuple) and len(k) == 2 and k[0] == name
+            ]
+            if sub_taints:
+                return _taint_worst(
+                    ([base_taint] if base_taint is not None else []) + sub_taints
+                )
+        if base_taint is not None:
+            return base_taint
         return TaintInfo(TaintStatus.UNKNOWN,
                          f"untracked variable '{name}'", source=name)
 
@@ -1270,6 +1651,10 @@ def _taint_of(
         if attr in _TAINTED_ATTR_NAMES:
             return TaintInfo(TaintStatus.TAINTED,
                              f"user-input attribute '.{attr}'", source=f"*.{attr}")
+        # request.path, request.url etc. are framework routing attributes, not user-submitted.
+        if (isinstance(node.value, ast.Name) and node.value.id == "request"
+                and attr in _CLEAN_REQUEST_ATTRS):
+            return CLEAN_LITERAL
         # self.attr → look up class attributes
         if isinstance(node.value, ast.Name) and node.value.id == "self":
             if class_attrs and attr in class_attrs:
@@ -1281,6 +1666,9 @@ def _taint_of(
             return TaintInfo(TaintStatus.TAINTED,
                              f"attribute of tainted object '.{attr}'",
                              source=obj_taint.source)
+        # Attribute of a clean object (e.g. imported module constant) stays clean.
+        if obj_taint.status == TaintStatus.CLEAN:
+            return CLEAN_LITERAL
         return TaintInfo(TaintStatus.UNKNOWN,
                          f"attribute '.{attr}' on {obj_taint.status.value} object",
                          source=f"*.{attr}")
@@ -1356,6 +1744,16 @@ def _taint_of(
                                  f"tainted object getter .{attr}()",
                                  source=obj_taint.source)
 
+            # Custom request-wrapper getters: always TAINTED regardless of object taint.
+            if attr in _PY_ANY_QUALIFIER_TAINT_METHODS:
+                return TaintInfo(TaintStatus.TAINTED,
+                                 f"user-input getter .{attr}() on request wrapper",
+                                 source=f"*.{attr}()")
+
+            # Getter/transform methods on clean objects remain clean (e.g. CLEAN.split("/"))
+            if obj_taint.status == TaintStatus.CLEAN and attr in _GETTER_METHODS:
+                return CLEAN_LITERAL
+
             # String template methods: propagate worst taint from object + args
             if attr in _STRING_TEMPLATE_METHODS:
                 arg_taints = [
@@ -1363,6 +1761,24 @@ def _taint_of(
                     for a in node.args
                 ]
                 return _taint_worst([obj_taint] + arg_taints)
+
+            # ConfigParser.get/getboolean/getint/getfloat(section, key):
+            # resolve from conf.set() tracking recorded in the assignments dict.
+            # TAINTED conf is already caught by the GETTER_METHODS TAINTED check above;
+            # CLEAN conf by the CLEAN getter check — so this branch handles UNKNOWN conf only.
+            if (attr in {"get", "getboolean", "getint", "getfloat"}
+                    and isinstance(node.func.value, ast.Name)
+                    and len(node.args) >= 2
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[1], ast.Constant)
+                    and assignments is not None):
+                lookup = (node.func.value.id,
+                          str(node.args[0].value),
+                          str(node.args[1].value))
+                if lookup in assignments:
+                    return _taint_of(assignments[lookup], assignments, class_attrs, _depth + 1)
+                # Key was never stored via conf.set() in this scope → not user-controlled
+                return CLEAN_LITERAL
 
         return TaintInfo(TaintStatus.UNKNOWN,
                          f"return of {full or attr or '<call>'}()",
@@ -1386,19 +1802,33 @@ def _taint_of(
 
     # ── Subscript ───────────────────────────────────────────────────────────────
     if isinstance(node, ast.Subscript):
-        # Dict key tracking: resolve map['key'] to its assigned value when known.
+        # Dict/list key tracking: resolve container[key] to assigned value when known.
         if (
             assignments is not None
             and isinstance(node.value, ast.Name)
             and isinstance(node.slice, ast.Constant)
         ):
-            lookup = (node.value.id, str(node.slice.value))
+            name_id = node.value.id
+            slice_val = node.slice.value
+            lookup = (name_id, str(slice_val))
             if lookup in assignments:
                 return _taint_of(assignments[lookup], assignments, class_attrs, _depth + 1)
+            # OOB detection for tracked lists: integer index beyond known length → CLEAN.
+            # lst.pop(0) shifts indices; the third pass computes the final length.
+            # If index is guaranteed OOB the line would raise IndexError at runtime,
+            # so the subsequent assignment (bar = lst[n]) is never reached.
+            if isinstance(slice_val, int) and slice_val >= 0:
+                len_key = (name_id, "__len__")
+                if len_key in assignments:
+                    tracked_len = assignments[len_key].value
+                    if isinstance(tracked_len, int) and slice_val >= tracked_len:
+                        return CLEAN_LITERAL
         obj_taint = _taint_of(node.value, assignments, class_attrs, _depth + 1)
         if obj_taint.status == TaintStatus.TAINTED:
             return TaintInfo(TaintStatus.TAINTED,
                              "subscript of tainted value", source=obj_taint.source)
+        if obj_taint.status == TaintStatus.CLEAN:
+            return CLEAN_LITERAL
         return TaintInfo(TaintStatus.UNKNOWN,
                          f"subscript of {obj_taint.status.value} value",
                          source=obj_taint.source)
@@ -1412,8 +1842,23 @@ def _taint_of(
             for e in node.elts
         ])
 
+    # ── Dict literal ─────────────────────────────────────────────────────────────
+    if isinstance(node, ast.Dict):
+        if not node.keys:
+            return CLEAN_LITERAL  # empty dict {} is a constant
+        all_nodes = [v for v in node.keys + node.values if v is not None]
+        return _taint_worst([
+            _taint_of(n, assignments, class_attrs, _depth + 1)
+            for n in all_nodes
+        ])
+
     # ── Conditional expression ───────────────────────────────────────────────────
     if isinstance(node, ast.IfExp):
+        branch = _eval_const_branch(node.test, assignments)
+        if branch is True:
+            return _taint_of(node.body, assignments, class_attrs, _depth + 1)
+        if branch is False:
+            return _taint_of(node.orelse, assignments, class_attrs, _depth + 1)
         return _taint_merge(
             _taint_of(node.body, assignments, class_attrs, _depth + 1),
             _taint_of(node.orelse, assignments, class_attrs, _depth + 1),
@@ -1491,10 +1936,43 @@ def _extract_guard_vars(test: ast.expr) -> frozenset[str]:
 
 
 def _extract_negated_guard_vars(test: ast.expr) -> frozenset[str]:
-    """Return guarded vars from a negated guard: `not x.isdigit()` → {'x'}."""
+    """Return vars made safe by an early-exit guard condition.
+
+    Recognized patterns (all followed by return/raise in the if-body):
+      not x.isdigit()             — negated type/format guard
+      '../' in var                — dotdot traversal check: var is safe after exit
+      BoolOp(Or) containing `not var.startswith(...)` / `not var.endswith(...)`
+                                  — allowlist string-shape guard
+    """
+    result: set[str] = set()
+
+    # Original: not guard(x) → x is safe
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-        return _extract_guard_vars(test.operand)
-    return frozenset()
+        result.update(_extract_guard_vars(test.operand))
+
+    # '../' in var_name → dotdot-traversal check; var is safe after early exit
+    if (isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.In)
+            and isinstance(test.left, ast.Constant)
+            and isinstance(test.left.value, str)
+            and '..' in test.left.value
+            and isinstance(test.comparators[0], ast.Name)):
+        result.add(test.comparators[0].id)
+
+    # BoolOp(Or/And) containing `not var.startswith(...)` or `not var.endswith(...)`
+    # → at least one arm validates the shape; var is treated as safe after exit
+    if isinstance(test, ast.BoolOp):
+        for operand in test.values:
+            if (isinstance(operand, ast.UnaryOp)
+                    and isinstance(operand.op, ast.Not)
+                    and isinstance(operand.operand, ast.Call)
+                    and isinstance(operand.operand.func, ast.Attribute)
+                    and operand.operand.func.attr in ('startswith', 'endswith')
+                    and isinstance(operand.operand.func.value, ast.Name)):
+                result.add(operand.operand.func.value.id)
+
+    return frozenset(result)
 
 
 def _is_always_exit(stmts: list[ast.stmt]) -> bool:

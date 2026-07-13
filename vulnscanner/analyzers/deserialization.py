@@ -24,24 +24,26 @@ _JAVA_XMLDECODER_RE = re.compile(r'\bXMLDecoder\b')
 
 # (rule_id, compiled_re, description, severity, vuln_type, exts)
 _RULES = [
-    # ── Python (regex fallback for files the AST analyzer cannot parse) ────────
+    # ── Python: only used as fallback for files the AST analyzer cannot parse.
+    # For parseable .py files, PythonASTAnalyzer provides taint-aware detection (AST-DESER-*)
+    # which suppresses findings when the argument is provably clean.
     (
         "DESER-001",
         re.compile(r'\bpickle\.(?:loads?|Unpickler)\s*\(', re.IGNORECASE),
         "pickle deserialization - arbitrary code execution if data is attacker-controlled",
-        Severity.CRITICAL, VulnType.INSECURE_DESERIALIZATION, (".py",),
+        Severity.CRITICAL, VulnType.INSECURE_DESERIALIZATION, (),
     ),
     (
         "DESER-002",
         re.compile(r'\byaml\.(?:load|unsafe_load)\s*\(', re.IGNORECASE),
         "yaml.load() without SafeLoader - use yaml.safe_load() to prevent code execution",
-        Severity.HIGH, VulnType.INSECURE_DESERIALIZATION, (".py",),
+        Severity.HIGH, VulnType.INSECURE_DESERIALIZATION, (),
     ),
     (
         "DESER-003",
         re.compile(r'\bmarshal\.loads?\s*\(', re.IGNORECASE),
         "marshal deserialization - not safe against malicious data",
-        Severity.CRITICAL, VulnType.INSECURE_DESERIALIZATION, (".py",),
+        Severity.CRITICAL, VulnType.INSECURE_DESERIALIZATION, (),
     ),
     # ── PHP ────────────────────────────────────────────────────────────────────
     (

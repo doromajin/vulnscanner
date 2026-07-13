@@ -76,6 +76,8 @@ def scan(file_path: Path) -> set[VulnType]:
     path_str = str(file_path)
     found: set[VulnType] = set()
     for analyzer in _ANALYZERS:
+        if not analyzer.supports(path_str):
+            continue
         try:
             for f in analyzer.analyze(path_str, content):
                 if not f.suppression_reason:

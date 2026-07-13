@@ -1,9 +1,27 @@
 {
-  "_comment": "User-defined taint sources for VulnScanner Java AST analyzer. Add entries here to teach the analyzer about custom request-wrapper methods in your codebase.",
+  "_comment": "User-defined taint sources for VulnScanner analyzers. Add entries here to teach the analyzer about custom request-wrapper methods in your codebase.",
   "any_qualifier_taint_methods": [
     {
       "method": "getTheParameter",
       "description": "OWASP Benchmark SeparateClassRequest wrapper — delegates to HttpServletRequest.getParameter() and returns user-controlled data regardless of the object it is called on. Add similar entries for your own request-wrapper classes."
+    }
+  ],
+  "python_any_qualifier_taint_methods": [
+    {
+      "method": "get_form_parameter",
+      "description": "Request wrapper method that retrieves a form parameter — functionally equivalent to request.form.get(). Returns user-controlled data regardless of the wrapper object type."
+    },
+    {
+      "method": "get_query_parameter",
+      "description": "Request wrapper method that retrieves a query string parameter — functionally equivalent to request.args.get(). Returns user-controlled data regardless of the wrapper object type."
+    },
+    {
+      "method": "get_request_parameter",
+      "description": "Generic request parameter getter on wrapper objects — returns user-controlled data."
+    },
+    {
+      "method": "get_header_value",
+      "description": "Request header getter on wrapper objects — returns user-controlled data."
     }
   ]
 }
