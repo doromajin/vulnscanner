@@ -286,7 +286,12 @@ def call_claude(prompt: str, task_type: str = "proposal") -> tuple[str | None, f
 
 
 def _call_claude_api(prompt: str, task_type: str = "proposal") -> tuple[str | None, float, bool]:
-    """Anthropic Python SDK で Claude API を直接呼び出す。"""
+    """Anthropic Python SDK で Claude API を直接呼び出す。
+
+    proposal / revise タスクは JSON を期待するので prefill テクニックを使う。
+    アシスタントメッセージを "{" で始めることで Claude が必ず JSON オブジェクトを
+    返すよう強制する（Anthropic API の assistant-prefill 機能）。
+    """
     try:
         import anthropic as _anthropic
     except ImportError:
@@ -297,17 +302,29 @@ def _call_claude_api(prompt: str, task_type: str = "proposal") -> tuple[str | No
     t_start = time.monotonic()
     retry_delays = [30, 60, 120]
 
+    # proposal / revise は JSON を返す必要があるので prefill で強制する
+    use_prefill = task_type in ("proposal", "revise")
+    prefill_text = "{"
+
     for attempt in range(MAX_RETRIES):
         holder: dict = {"text": None, "exc": None}
 
         def _worker() -> None:
             try:
+                messages: list[dict] = [{"role": "user", "content": prompt}]
+                if use_prefill:
+                    messages.append({"role": "assistant", "content": prefill_text})
                 msg = client.messages.create(
                     model=model,
                     max_tokens=4096,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                 )
-                holder["text"] = msg.content[0].text if msg.content else None
+                text = msg.content[0].text if msg.content else None
+                # prefill を使った場合、Claude の返答は "{" の続きから始まるので
+                # 先頭に "{" を戻す
+                if use_prefill and text is not None:
+                    text = prefill_text + text
+                holder["text"] = text
             except Exception as exc:  # noqa: BLE001
                 holder["exc"] = exc
 
@@ -1395,12 +1412,14 @@ def _run_loop(args: argparse.Namespace) -> int:
     iteration:           int         = 0
     best_idx:            int         = -1
     best_composite:      float       = -999.0
-    loop_results:        list[dict]  = []
-    previous_attempts:   list[dict]  = []
-    loop_times:          list[float] = []
-    stop_reason:         str         = "time_limit"
-    fugu_ever_available: bool        = False
-    claude_call_count:   int         = 0   # 報告用カウンタ（制限には使わない）
+    loop_results:              list[dict]  = []
+    previous_attempts:         list[dict]  = []
+    loop_times:                list[float] = []
+    stop_reason:               str         = "time_limit"
+    fugu_ever_available:       bool        = False
+    claude_call_count:         int         = 0   # 報告用カウンタ（制限には使わない）
+    consecutive_parse_failures: int        = 0   # JSON パース失敗の連続回数
+    _MAX_CONSECUTIVE_PARSE_FAIL = 3              # この回数連続したらバグとみなし停止
 
     token_record: dict = {
         "date": window_started_at.strftime("%Y-%m-%d"),
@@ -1517,12 +1536,23 @@ def _run_loop(args: argparse.Namespace) -> int:
 
         draft_proposal = parse_claude_json(draft_raw)
         if not draft_proposal:
+            consecutive_parse_failures += 1
             preview = draft_raw[:600].replace('\n', '↵')
-            log(f"  draft JSON パース失敗 → スキップ\n"
+            log(f"  draft JSON パース失敗 ({consecutive_parse_failures}回連続) → スキップ\n"
                 f"  [診断] 応答 {len(draft_raw)} 文字, 先頭: {preview!r}")
+            if consecutive_parse_failures >= _MAX_CONSECUTIVE_PARSE_FAIL:
+                log(
+                    f"\n  ⛔ JSON パース失敗が {_MAX_CONSECUTIVE_PARSE_FAIL} 回連続 — "
+                    f"ループを自動停止します。\n"
+                    f"  API がプロンプト指示を無視している可能性があります。\n"
+                    f"  バグを修正してからループを再実行してください。"
+                )
+                stop_reason = "systematic_parse_failure"
+                break
             _skip("draft_json_parse_error", "Return valid JSON only — no markdown fences")
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
 
+        consecutive_parse_failures = 0  # パース成功 → リセット
         rule_id     = draft_proposal.get("rule_id", "UNKNOWN")
         change_summ = draft_proposal.get("change_summary", "")
         # diff 形式で受け取り、original に適用して draft_content を得る
