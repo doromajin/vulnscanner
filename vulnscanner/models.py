@@ -30,6 +30,7 @@ class VulnType(str, Enum):
     WEAK_CRYPTOGRAPHY = "Weak Cryptography"
     LDAP_INJECTION = "LDAP Injection"
     IAC_MISCONFIGURATION = "IaC Misconfiguration"
+    MISSING_AUTHORIZATION = "Missing Authorization"
 
 
 @dataclass
