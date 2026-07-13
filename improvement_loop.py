@@ -508,35 +508,51 @@ def _escape_json_string_literals(segment: str) -> str:
     return ''.join(result)
 
 
-def _extract_json_object(text: str) -> str | None:
-    """Extract the first complete JSON object from text, string-context-aware.
+def _iter_json_objects(text: str):
+    """Yield all top-level JSON-object segments from text, string-context-aware.
 
-    Naive brace-counting fails when the "diff" field contains { or } inside
-    Python code.  This implementation tracks whether the current position is
-    inside a JSON string value, so only structural braces are counted.
+    Claude often writes analysis prose before the JSON object, and that prose
+    may contain Python set/dict literals like frozenset({"key"}) whose braces
+    confuse a naive counter.  This generator scans past any such invalid
+    objects and keeps yielding until the text is exhausted.
+
+    For each candidate it also tries _escape_json_string_literals() so that
+    literal newlines inside diff values are repaired.
     """
-    start = text.find('{')
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    i = start
-    while i < len(text):
-        ch = text[i]
-        if ch == '\\' and in_string:
-            i += 2  # skip the escaped character
-            continue
-        if ch == '"':
-            in_string = not in_string
-        elif not in_string:
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    return text[start:i + 1]
-        i += 1
-    return None
+    pos = 0
+    while True:
+        start = text.find('{', pos)
+        if start == -1:
+            return
+        depth = 0
+        in_string = False
+        i = start
+        end = -1
+        while i < len(text):
+            ch = text[i]
+            if ch == '\\' and in_string:
+                i += 2
+                continue
+            if ch == '"':
+                in_string = not in_string
+            elif not in_string:
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            i += 1
+        if end == -1:
+            return  # unclosed brace — give up
+        segment = text[start:end]
+        yield segment
+        # Also yield the newline-escaped version if it differs
+        fixed = _escape_json_string_literals(segment)
+        if fixed != segment:
+            yield fixed
+        pos = start + 1  # advance past this '{' and look for the next object
 
 
 def parse_claude_json(raw: str) -> dict | None:
@@ -546,7 +562,7 @@ def parse_claude_json(raw: str) -> dict | None:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Try 2: strip outer code fence only (first + last line) — handles ```json, ```python, etc.
+    # Try 2: strip outer code fence only (first + last line)
     m_outer = re.match(r'^```[a-zA-Z]*\s*\n(.*)\n```\s*$', text, re.DOTALL)
     if m_outer:
         inner = m_outer.group(1).strip()
@@ -554,33 +570,28 @@ def parse_claude_json(raw: str) -> dict | None:
             return json.loads(inner)
         except json.JSONDecodeError:
             pass
-    # Try 3: strip all fence lines (less precise but catches multi-fence responses)
+    # Try 3: strip all fence lines
     cleaned = re.sub(r'^```[a-zA-Z]*\s*$', '', text, flags=re.MULTILINE).strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-    # Try 4: string-aware brace extraction (handles { and } inside diff string values)
-    brace_segment: str | None = _extract_json_object(text)
-    if brace_segment:
+    # Try 4+: walk ALL JSON-object-shaped segments in the text (string-aware brace
+    # matching).  Claude may write prose with frozenset({...}) or dict examples
+    # before the real JSON object, so we must not stop at the first candidate.
+    # _iter_json_objects also yields newline-escaped variants automatically.
+    for segment in _iter_json_objects(text):
         try:
-            return json.loads(brace_segment)
+            return json.loads(segment)
         except json.JSONDecodeError:
-            pass
-    # Try 5: escape literal control characters (bare newlines in diff fields) and retry.
-    for candidate in filter(None, [brace_segment, cleaned, text]):
-        fixed = _escape_json_string_literals(candidate)
-        if fixed == candidate:
             continue
-        try:
-            return json.loads(fixed)
-        except json.JSONDecodeError:
-            seg = _extract_json_object(fixed)
-            if seg:
-                try:
-                    return json.loads(seg)
-                except json.JSONDecodeError:
-                    pass
+    # Try on the fence-stripped text too (catches responses with fences around prose+json)
+    if cleaned != text:
+        for segment in _iter_json_objects(cleaned):
+            try:
+                return json.loads(segment)
+            except json.JSONDecodeError:
+                continue
     return None
 
 
@@ -799,9 +810,9 @@ def validate_python_syntax(code: str, label: str) -> bool:
 
 # ファイルコンテンツをプロンプトに埋め込む際の上限。
 # これを超えるファイルは先頭75% + 末尾25% に分割してトークンを削減する。
-# 精度への影響: アーキテクチャ全体が見えなくなる代わりに、冒頭の設計パターンと
-# 末尾の追加挿入点が見えるので提案品質は維持できる。
-_PROMPT_FILE_MAX_CHARS = 10_000
+# ast_python.py は 89k 文字あり、10k では visit_Call()(L422) が見えない。
+# 40k にすると先頭 30k(≈680行: 定数+visit_Call+主要 check) が見えるようになる。
+_PROMPT_FILE_MAX_CHARS = 40_000
 
 _rule_ids_cache: list[str] | None = None
 
