@@ -451,6 +451,43 @@ def call_fugu(prompt: str, max_tokens: int = 512) -> tuple[str | None, int]:
 
 # ── JSON パース ────────────────────────────────────────────────────────────────
 
+def _escape_json_string_literals(segment: str) -> str:
+    """Escape literal control characters inside JSON string values.
+
+    Claude sometimes emits multi-line unified diffs embedded as JSON string
+    values without escaping the real newlines.  This makes json.loads() reject
+    the payload.  We walk the segment character-by-character, tracking
+    whether we are inside a JSON string, and replace bare control characters
+    with their JSON escape sequences.
+    """
+    result: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(segment):
+        ch = segment[i]
+        if ch == '\\' and in_string:
+            # Already-escaped character — copy verbatim (both chars).
+            result.append(ch)
+            i += 1
+            if i < len(segment):
+                result.append(segment[i])
+            i += 1
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+        elif in_string and ch == '\n':
+            result.append('\\n')
+        elif in_string and ch == '\r':
+            result.append('\\r')
+        elif in_string and ch == '\t':
+            result.append('\\t')
+        else:
+            result.append(ch)
+        i += 1
+    return ''.join(result)
+
+
 def parse_claude_json(raw: str) -> dict | None:
     text = raw.strip()
     # Try 1: direct parse
@@ -473,6 +510,7 @@ def parse_claude_json(raw: str) -> dict | None:
     except json.JSONDecodeError:
         pass
     # Try 4: extract outermost JSON object by brace matching
+    brace_segment: str | None = None
     start = text.find('{')
     if start != -1:
         depth, end = 0, -1
@@ -485,10 +523,38 @@ def parse_claude_json(raw: str) -> dict | None:
                     end = i + 1
                     break
         if end != -1:
+            brace_segment = text[start:end]
             try:
-                return json.loads(text[start:end])
+                return json.loads(brace_segment)
             except json.JSONDecodeError:
                 pass
+    # Try 5: escape literal control characters in string values (e.g. bare newlines
+    # in the "diff" field) and retry.  Apply to both the full text and the brace
+    # segment found above.
+    for candidate in filter(None, [brace_segment, cleaned, text]):
+        fixed = _escape_json_string_literals(candidate)
+        if fixed == candidate:
+            continue
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            # Brace-match again on the fixed text in case fence stripping changed it
+            s2 = fixed.find('{')
+            if s2 != -1:
+                d2, e2 = 0, -1
+                for j, c2 in enumerate(fixed[s2:], s2):
+                    if c2 == '{':
+                        d2 += 1
+                    elif c2 == '}':
+                        d2 -= 1
+                        if d2 == 0:
+                            e2 = j + 1
+                            break
+                if e2 != -1:
+                    try:
+                        return json.loads(fixed[s2:e2])
+                    except json.JSONDecodeError:
+                        pass
     return None
 
 
@@ -1451,7 +1517,9 @@ def _run_loop(args: argparse.Namespace) -> int:
 
         draft_proposal = parse_claude_json(draft_raw)
         if not draft_proposal:
-            log("  draft JSON パース失敗 → スキップ")
+            preview = draft_raw[:600].replace('\n', '↵')
+            log(f"  draft JSON パース失敗 → スキップ\n"
+                f"  [診断] 応答 {len(draft_raw)} 文字, 先頭: {preview!r}")
             _skip("draft_json_parse_error", "Return valid JSON only — no markdown fences")
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
 
