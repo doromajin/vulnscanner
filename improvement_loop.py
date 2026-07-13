@@ -196,7 +196,7 @@ def get_run_dir(started_at: datetime) -> Path:
 
 def _run_with_ticker(
     cmd: list[str], input_text: str, encoding: str,
-    timeout: float, label: str,
+    timeout: float, label: str, env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     holder: dict = {"result": None, "exc": None}
 
@@ -204,7 +204,7 @@ def _run_with_ticker(
         try:
             holder["result"] = subprocess.run(
                 cmd, input=input_text, capture_output=True,
-                text=True, encoding=encoding, timeout=timeout,
+                text=True, encoding=encoding, timeout=timeout, env=env,
             )
         except Exception as exc:  # noqa: BLE001
             holder["exc"] = exc
@@ -330,16 +330,27 @@ def _call_claude_api(prompt: str, task_type: str = "proposal") -> tuple[str | No
     return None, time.monotonic() - t_start, False
 
 
+_CLAUDE_CODE_GUARD_VARS = frozenset({
+    "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID",
+    # API キーが渡されると CLI がサブスクリプションではなく API 課金を使うため除外する。
+    "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+})
+
+
 def _call_claude_cli(prompt: str, task_type: str = "proposal") -> tuple[str | None, float, bool]:
     """claude CLI を呼び出す（フォールバック）。"""
     model        = _TASK_MODEL_MAP.get(task_type, "claude-sonnet-5")
     cmd          = _find_claude_cmd() + ["--model", model, "-p", "--output-format", "json"]
     retry_delays = [30, 60, 120]
     t_start      = time.monotonic()
+    # Claude Code が子プロセスに設定するガード変数を除外しないと、
+    # ネスト実行としてブロックされ rc=1 になる。
+    cli_env = {k: v for k, v in os.environ.items() if k not in _CLAUDE_CODE_GUARD_VARS}
 
     for attempt in range(MAX_RETRIES):
         try:
-            result = _run_with_ticker(cmd, prompt, "utf-8", 600, "Claude")
+            result = _run_with_ticker(cmd, prompt, "utf-8", 600, "Claude", env=cli_env)
         except FileNotFoundError as exc:
             raise FatalError(f"claude CLI が見つかりません: {exc}") from exc
         except subprocess.TimeoutExpired:
@@ -358,7 +369,7 @@ def _call_claude_cli(prompt: str, task_type: str = "proposal") -> tuple[str | No
                 return None, time.monotonic() - t_start, False
 
         severity = _classify_claude_error(result.returncode, result.stderr)
-        log(f"  [診断] Claude エラー (rc={result.returncode}): {result.stderr[:200].strip()}")
+        log(f"  [診断] Claude エラー (rc={result.returncode}): {result.stderr[:200].strip()} | stdout={result.stdout[:200].strip()}")
 
         if severity == "fatal":
             raise FatalError(
