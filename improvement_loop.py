@@ -89,8 +89,7 @@ FUGU_API_BASE = os.environ.get("FUGU_API_BASE", "https://api.sakana.ai/v1")
 FUGU_MODEL    = os.environ.get("FUGU_MODEL", "fugu")
 
 # Claude バックエンド選択 ("api" | "cli") — main() で --claude-backend から上書きされる
-# デフォルト cli: Pro/Max サブスクリプション消費（API トークン課金なし）
-_CLAUDE_BACKEND: str = "cli"
+_CLAUDE_BACKEND: str = "api"
 
 # task_type → Claude モデル対応表（CLI 用）
 _TASK_MODEL_MAP: dict[str, str] = {
@@ -1509,8 +1508,7 @@ def _run_loop(args: argparse.Namespace) -> int:
     stop_reason:               str         = "time_limit"
     fugu_ever_available:       bool        = False
     claude_call_count:         int         = 0   # 報告用カウンタ（制限には使わない）
-    consecutive_parse_failures: int        = 0   # JSON パース失敗の連続回数
-    _MAX_CONSECUTIVE_PARSE_FAIL = 3              # この回数連続したらバグとみなし停止
+    consecutive_parse_failures: int        = 0   # JSON パース失敗の連続回数（自動回復用）
 
     token_record: dict = {
         "date": window_started_at.strftime("%Y-%m-%d"),
@@ -1633,15 +1631,15 @@ def _run_loop(args: argparse.Namespace) -> int:
             _tail_diag = f"\n  [診断] 末尾: {_tail!r}" if _tail else ""
             log(f"  draft JSON パース失敗 ({consecutive_parse_failures}回連続) → スキップ\n"
                 f"  [診断] 応答 {len(draft_raw)} 文字, 先頭: {_head!r}{_tail_diag}")
-            if consecutive_parse_failures >= _MAX_CONSECUTIVE_PARSE_FAIL:
-                log(
-                    f"\n  ⛔ JSON パース失敗が {_MAX_CONSECUTIVE_PARSE_FAIL} 回連続 — "
-                    f"ループを自動停止します。\n"
-                    f"  API がプロンプト指示を無視している可能性があります。\n"
-                    f"  バグを修正してからループを再実行してください。"
-                )
-                stop_reason = "systematic_parse_failure"
-                break
+            # 連続失敗でも止めない — バックオフして次のイテレーションへ
+            if consecutive_parse_failures >= 6:
+                backoff = 120
+                log(f"  ⚠ パース失敗 {consecutive_parse_failures} 回連続 — {backoff}s バックオフ後に継続")
+                time.sleep(backoff)
+            elif consecutive_parse_failures >= 3:
+                backoff = 30
+                log(f"  ⚠ パース失敗 {consecutive_parse_failures} 回連続 — {backoff}s バックオフ後に継続")
+                time.sleep(backoff)
             _skip("draft_json_parse_error", "Return valid JSON only — no markdown fences")
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
 
@@ -2078,11 +2076,11 @@ def main() -> None:
                              "例: vulnscanner/analyzers/ast_python.py  "
                              "(指定すると全イテレーションでそのファイルのみ対象にする)")
     parser.add_argument(
-        "--claude-backend", choices=["api", "cli"], default="cli",
+        "--claude-backend", choices=["api", "cli"], default="api",
         help=(
             "Claude バックエンド: "
-            "cli = claude CLI (デフォルト, Pro/Max サブスクリプション消費) / "
-            "api = Anthropic API (ANTHROPIC_API_KEY 必須, トークン従量課金) / "
+            "api = Anthropic API (デフォルト, ANTHROPIC_API_KEY 必須) / "
+            "cli = claude CLI (Pro/Max サブスクリプション消費, レート制限あり) / "
             "cli = claude CLI (claude auth login でログイン済みであること)"
         ),
     )
