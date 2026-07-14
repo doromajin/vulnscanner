@@ -628,3 +628,7 @@ def knowledge_stats() -> None:
             )
         rc.print(t)
     rc.print()
+
+
+if __name__ == "__main__":
+    main()
