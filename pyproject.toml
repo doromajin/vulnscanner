@@ -16,6 +16,9 @@ dependencies = [
     "Jinja2>=3.1.4",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
 [project.scripts]
 vulnscan = "vulnscanner.cli:main"
 

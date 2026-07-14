@@ -1,0 +1,62 @@
+# VulnScanner CI template
+# Copy this file to .github/workflows/vulnscanner.yml in your repository.
+#
+# Required secrets: none (public repos)
+# Optional secrets: GITHUB_TOKEN (auto-provided), VULNSCANNER_GITHUB_TOKEN (for private repo scanning)
+#
+# Results appear in: Security > Code scanning alerts
+
+name: VulnScanner
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "0 2 * * 1"  # weekly on Monday 02:00 UTC
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write  # required to upload SARIF
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install VulnScanner
+        run: pip install git+https://github.com/doromajin/vulnscanner.git
+
+      - name: Scan
+        run: |
+          python -m vulnscanner.cli scan . \
+            --sarif vulnscanner.sarif \
+            --min-severity LOW \
+            --fail-on HIGH \
+            --exclude "tests/**" \
+            --exclude "vendor/**" \
+            --exclude "node_modules/**"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload results to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: vulnscanner.sarif
+          category: vulnscanner
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnscanner-sarif
+          path: vulnscanner.sarif
+          retention-days: 30

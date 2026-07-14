@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest tests/ -q --tb=short
+
+      - name: Self-scan (dogfooding)
+        run: |
+          python -m vulnscanner.cli scan . \
+            --sarif self-scan.sarif \
+            --fail-on CRITICAL \
+            --exclude "repos/**" \
+            --exclude "tests/fixtures/**"
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: self-scan.sarif
+          category: vulnscanner-self
