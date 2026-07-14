@@ -107,11 +107,7 @@ def scan(
     except Exception:
         confirmed_keys = set()
 
-    if detail:
-        print_finding_detail(result)
-    else:
-        print_results(result, confirmed_keys=confirmed_keys)
-
+    # Write persistent artifacts first so they exist even if display crashes
     if output:
         write_json(result, output)
         console.print(f"[green]JSON report written to {output}[/green]")
@@ -119,6 +115,11 @@ def scan(
     if sarif:
         write_sarif(result, sarif)
         console.print(f"[green]SARIF report written to {sarif}[/green]")
+
+    if detail:
+        print_finding_detail(result)
+    else:
+        print_results(result, confirmed_keys=confirmed_keys)
 
     if fail_on:
         fail_sev = Severity(fail_on.upper())

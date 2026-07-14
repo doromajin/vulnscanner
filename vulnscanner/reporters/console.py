@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import sys
 from pathlib import Path
 
 from rich.console import Console
@@ -10,7 +12,14 @@ from rich.text import Text
 
 from vulnscanner.models import ScanResult, Severity
 
-console = Console(width=120)
+# Force UTF-8 output so Unicode characters in finding descriptions (e.g. em dashes)
+# don't crash on Windows terminals with narrow encodings like cp932.
+_stdout_utf8 = (
+    io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    if hasattr(sys.stdout, "buffer")
+    else sys.stdout
+)
+console = Console(width=120, legacy_windows=False, file=_stdout_utf8)
 
 _GRADE_BADGE = {
     "HIGH":    "[bold red][HIGH][/bold red]",
