@@ -770,24 +770,53 @@ def apply_unified_diff(original: str, diff_text: str, fuzz: int = 3) -> str | No
     for orig_start_0, hunk_lines in reversed(hunks):
         # old = context lines + removed lines (the block that must exist in result)
         # new = context lines + added lines  (what to replace it with)
-        old_lines = [l[1:] for l in hunk_lines if l and l[0] in (" ", "-")]
-        new_lines = [l[1:] for l in hunk_lines if l and l[0] in (" ", "+")]
+        #
+        # Bare empty lines in diffs: diff tools often strip the trailing space from
+        # empty context lines, emitting "\n" instead of " \n".  Such lines have
+        # l[0] == "\n" which is NOT in (" ", "-"), causing them to be silently
+        # dropped from old_lines.  The missing empty line then shifts subsequent
+        # context lines by one, making every hunk fail to match.
+        # Fix: treat any line whose first char is not "+" as a context/remove line,
+        # falling back to an empty string for bare-newline lines.
+        def _is_old(l: str) -> bool:
+            return bool(l) and l[0] != "+"
+
+        def _is_new(l: str) -> bool:
+            return bool(l) and l[0] != "-"
+
+        def _strip_marker(l: str) -> str:
+            if l and l[0] in (" ", "-", "+"):
+                return l[1:]
+            return l  # bare "\n" or whitespace-only line → keep as-is
+
+        old_lines = [_strip_marker(l) for l in hunk_lines if _is_old(l)]
+        new_lines = [_strip_marker(l) for l in hunk_lines if _is_new(l)]
         n_old = len(old_lines)
 
-        # 先頭行がヒットする位置を fuzz ウィンドウで検索
-        search_start = max(0, orig_start_0 - fuzz)
-        search_end   = min(len(result), orig_start_0 + fuzz + 1)
-
-        match_pos = -1
-        for pos in range(search_start, search_end):
+        # 先頭行がヒットする位置をまず fuzz ウィンドウで検索し、
+        # 見つからなければファイル全体を検索する（LLMが @@ 行番号を誤る場合を救済）
+        def _matches_at(pos: int) -> bool:
             if pos + n_old > len(result):
-                break
-            if all(
+                return False
+            return all(
                 result[pos + i].rstrip("\r\n") == old_lines[i].rstrip("\r\n")
                 for i in range(n_old)
-            ):
+            )
+
+        match_pos = -1
+        search_start = max(0, orig_start_0 - fuzz)
+        search_end   = min(len(result), orig_start_0 + fuzz + 1)
+        for pos in range(search_start, search_end):
+            if _matches_at(pos):
                 match_pos = pos
                 break
+
+        # フォールバック: ファイル全体を検索（行番号ズレが大きい場合）
+        if match_pos == -1 and n_old > 0:
+            for pos in range(len(result)):
+                if _matches_at(pos):
+                    match_pos = pos
+                    break
 
         if match_pos == -1:
             return None  # ハンク適用失敗
@@ -1628,10 +1657,15 @@ def _run_loop(args: argparse.Namespace) -> int:
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
 
         if _raw_diff and not draft_content:
-            log("  diff 適用失敗 → スキップ")
+            # 診断: 実際の diff を表示して何が間違っているか確認する
+            _diff_preview = _raw_diff[:1200].replace('\n', '\n    ')
+            log(f"  diff 適用失敗 → スキップ\n"
+                f"  [診断] 生成された diff ({len(_raw_diff)}文字):\n    {_diff_preview}")
             _skip("draft_diff_apply_error",
-                  f"Diff failed to apply against '{target_file}' — copy exact context lines "
-                  f"(including indentation) from the file shown in the prompt.")
+                  f"Diff failed to apply against '{target_file}' — the context lines "
+                  f"(lines starting with space) must EXACTLY match the file. "
+                  f"Use only lines you can see in the prompt. "
+                  f"If the insertion point is in the omitted section, choose a visible location instead.")
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
         if not draft_content:
             _skip("draft_empty_content")
