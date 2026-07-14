@@ -18,7 +18,7 @@ from vulnscanner.analyzers.file_context import (
 from vulnscanner.fetcher.github import GitHubFetcher
 from vulnscanner.fetcher.local import LocalFetcher
 from vulnscanner.cwe_map import get_cwe_id
-from vulnscanner.models import Finding, ScanResult
+from vulnscanner.models import Finding, ScanResult, VulnType
 
 # Matches:  # vulnscanner: ignore  or  // vulnscanner: ignore[XSS-001,SQL-001]
 _SUPPRESS_RE = re.compile(
@@ -219,13 +219,19 @@ class VulnScanner:
         raw = [f for f in raw if f.suppression_reason != "clean_taint_source"]
 
         # 3. File-context suppression (test / fixture / vendor paths)
+        #    MALWARE findings are always surfaced regardless of file context —
+        #    malicious code hidden in test/ or vendor/ directories is still malware.
         ctx_reason = _context_suppression_reason(file_path)
         if ctx_reason:
-            for f in raw:
+            malware = [f for f in raw if f.vuln_type == VulnType.MALWARE]
+            suppressed = [f for f in raw if f.vuln_type != VulnType.MALWARE]
+            for f in suppressed:
                 f.suppression_reason = ctx_reason
-            if raw:
-                partial.suppression_breakdown[ctx_reason] = len(raw)
-            return partial  # none of these findings reach result.findings
+            if suppressed:
+                partial.suppression_breakdown[ctx_reason] = len(suppressed)
+            raw = malware
+            if not raw:
+                return partial
 
         deduped = _deduplicate(raw)
         for f in deduped:

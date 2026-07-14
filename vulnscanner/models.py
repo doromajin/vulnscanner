@@ -31,6 +31,7 @@ class VulnType(str, Enum):
     LDAP_INJECTION = "LDAP Injection"
     IAC_MISCONFIGURATION = "IaC Misconfiguration"
     MISSING_AUTHORIZATION = "Missing Authorization"
+    MALWARE = "Malicious Code"
 
 
 @dataclass

@@ -1,4 +1,5 @@
 from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
+from vulnscanner.analyzers.malware import MalwareAnalyzer
 from vulnscanner.analyzers.csrf import CSRFAnalyzer
 from vulnscanner.analyzers.missing_auth import MissingAuthAnalyzer
 from vulnscanner.analyzers.nosql_injection import NoSQLInjectionAnalyzer
@@ -54,4 +55,5 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     WeakCryptoAnalyzer(),
     LDAPInjectionAnalyzer(),
     IaCAnalyzer(),
+    MalwareAnalyzer(),
 ]
