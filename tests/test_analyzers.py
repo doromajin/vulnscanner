@@ -625,6 +625,65 @@ class TestTaintTracking:
         findings = AST.analyze("t.py", code)
         assert any(f.rule_id == "AST-CMD-002" for f in findings)
 
+    # ── interprocedural Phase 1 ───────────────────────────────────────────────
+
+    def test_interprocedural_3stmt_wrapper_detected(self):
+        """3-statement wrapper (prev only ≤2 were handled) should propagate taint."""
+        code = (
+            "import sqlite3\n"
+            "import logging\n"
+            "def get_user_id():\n"
+            "    raw = request.args.get('id')\n"
+            "    logging.debug('got id: %s', raw)\n"
+            "    return raw\n"
+            "\n"
+            "def view():\n"
+            "    uid = get_user_id()\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute('SELECT * FROM users WHERE id = ' + uid)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert any(f.rule_id.startswith("AST-SQL-") for f in findings)
+
+    def test_interprocedural_if_branch_tainted_detected(self):
+        """Wrapper with if/else: tainted branch makes the whole call tainted."""
+        code = (
+            "import sqlite3\n"
+            "def get_param(flag):\n"
+            "    if flag:\n"
+            "        return 'default'\n"
+            "    return request.args.get('q')\n"
+            "\n"
+            "def view():\n"
+            "    q = get_param(False)\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute('SELECT * FROM t WHERE x = ' + q)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert any(f.rule_id.startswith("AST-SQL-") for f in findings)
+
+    def test_interprocedural_nested_func_no_outer_contamination(self):
+        """Tainted return inside a nested function must not mark the outer function."""
+        code = (
+            "import sqlite3\n"
+            "def get_safe():\n"
+            "    def _inner():\n"
+            "        return request.args.get('x')\n"
+            "    return 'safe_value'\n"
+            "\n"
+            "def view():\n"
+            "    val = get_safe()\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute('SELECT * FROM t WHERE x = ' + val)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        # get_safe() is CLEAN — its only return is a literal.
+        # val is therefore UNKNOWN → any SQL finding would be MEDIUM, not HIGH/CRITICAL.
+        assert not any(
+            f.rule_id == "AST-SQL-001" and f.severity in (Severity.HIGH, Severity.CRITICAL)
+            for f in findings
+        )
+
 
 # ── suppression comments ──────────────────────────────────────────────────────
 

@@ -15,6 +15,7 @@ import ast
 import copy
 import json
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 from vulnscanner.analyzers.base import BaseAnalyzer
@@ -1987,32 +1988,45 @@ def _is_always_exit(stmts: list[ast.stmt]) -> bool:
     )
 
 
-def _find_taint_source_funcs(tree: ast.AST) -> frozenset[str]:
-    """Pre-pass: find names of functions that always return a tainted value.
+def _iter_func_returns(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> Iterator[ast.Return]:
+    """Yield every Return node inside func without descending into nested definitions.
 
-    Handles simple wrappers like:
-      def get_user_id():
-          return request.GET.get("id")
+    Uses an explicit stack so that nested FunctionDef / AsyncFunctionDef / ClassDef
+    subtrees are skipped entirely — their returns belong to a different scope.
+    """
+    stack: list[ast.AST] = list(func.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Return):
+            yield node
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            pass  # skip nested definitions — they have their own scope
+        else:
+            stack.extend(ast.iter_child_nodes(node))
+
+
+def _find_taint_source_funcs(tree: ast.AST) -> frozenset[str]:
+    """Pre-pass: collect function names whose bodies contain at least one tainted return.
+
+    Handles arbitrary-length bodies including intermediate assignments, logging
+    calls, if/else branches, try/except, and early-return guards.  Does not
+    descend into nested function or class definitions.
+
+    Security-first: if any code path can return a tainted value the function is
+    marked as a taint source, even if other paths return a clean sentinel.  This
+    avoids false negatives at the cost of a small number of additional MEDIUM
+    findings when a caller always takes the clean branch.
     """
     sources: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        # Collect only non-docstring, non-pass statements
-        body = [s for s in node.body
-                if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
         assignments = _collect_scope_assignments(node)
-        # Single return statement
-        if (len(body) == 1
-                and isinstance(body[0], ast.Return)
-                and body[0].value is not None):
-            if _taint_of(body[0].value, assignments, {}).status == TaintStatus.TAINTED:
+        for ret in _iter_func_returns(node):
+            if (ret.value is not None
+                    and _taint_of(ret.value, assignments, {}).status == TaintStatus.TAINTED):
                 sources.add(node.name)
-        # Assignment then return
-        elif (len(body) == 2
-                and isinstance(body[0], ast.Assign)
-                and isinstance(body[1], ast.Return)
-                and body[1].value is not None):
-            if _taint_of(body[1].value, assignments, {}).status == TaintStatus.TAINTED:
-                sources.add(node.name)
+                break  # one tainted return is sufficient
     return frozenset(sources)
