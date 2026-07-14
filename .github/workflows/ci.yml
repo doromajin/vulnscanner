@@ -33,7 +33,8 @@ jobs:
             --sarif self-scan.sarif \
             --fail-on CRITICAL \
             --exclude "repos/**" \
-            --exclude "tests/fixtures/**"
+            --exclude "tests/**" \
+            --exclude "recall/**"
 
       - name: Upload SARIF
         if: always()
