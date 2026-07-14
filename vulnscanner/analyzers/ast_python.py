@@ -898,6 +898,11 @@ class _VulnVisitor(ast.NodeVisitor):
                       f"{name}() redirects to URL from user input - attackers can redirect "
                       f"victims to malicious sites (phishing): {taint.reason}",
                       taint)
+        else:  # UNKNOWN
+            self._add(node, VulnType.OPEN_REDIRECT, Severity.MEDIUM, "AST-REDIR-002",
+                      f"[needs_review] {name}() receives a dynamic URL argument - verify "
+                      f"the value cannot be controlled by user input: {taint.reason}",
+                      taint)
 
     # ── server-side template injection (SSTI) ─────────────────────────────────
 

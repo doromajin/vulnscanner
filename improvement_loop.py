@@ -93,9 +93,9 @@ _CLAUDE_BACKEND: str = "api"
 
 # task_type → Claude モデル対応表（CLI 用）
 _TASK_MODEL_MAP: dict[str, str] = {
-    "proposal":  "claude-sonnet-5",            # draft 生成（創造性・セキュリティ知識が必要）
-    "report":    "claude-sonnet-5",            # レポート作成
-    "revise":    "claude-sonnet-5",             # FuguAI 指示に従って複雑な改訂を行う
+    "proposal":  "claude-sonnet-4-6",          # draft 生成（創造性・セキュリティ知識が必要）
+    "report":    "claude-sonnet-4-6",          # レポート作成
+    "revise":    "claude-sonnet-4-6",          # FuguAI 指示に従って複雑な改訂を行う
     "log":       "claude-haiku-4-5-20251001",  # ログ整理
     "diagnosis": "claude-haiku-4-5-20251001",  # エラー診断
 }
@@ -1922,14 +1922,19 @@ def _run_loop(args: argparse.Namespace) -> int:
         _no_instructions = _instr_text in ("", "none")
         _no_issues       = _issues_text in ("", "none")
         _quality_high    = (iter_result.get("fugu_quality") or 0) >= 7
-        _skip_revise     = _no_instructions or (_quality_high and _no_issues)
+        _quality_low     = (iter_result.get("fugu_quality") or 0) < FUGU_QUALITY_MIN
+        # quality < 採用閾値の場合は revise をスキップ: 採用されない提案に API コストを使わない
+        _skip_revise     = _no_instructions or (_quality_high and _no_issues) or _quality_low
 
         revise_raw          = None
         revise_rate_limited = False
         revision_notes      = "(FuguAI 改善指示なし — draft をそのまま final として使用)"
 
         if _skip_revise:
-            if _quality_high and _no_issues and not _no_instructions:
+            if _quality_low:
+                log(f"  [Step 4/5] quality={iter_result.get('fugu_quality')}/10 < {FUGU_QUALITY_MIN} → revise スキップ (採用不可、API コスト節約)")
+                revision_notes = f"(quality={iter_result.get('fugu_quality')}/10 < {FUGU_QUALITY_MIN} — 採用不可のため revise スキップ)"
+            elif _quality_high and _no_issues and not _no_instructions:
                 log(f"  [Step 4/5] 採用閾値到達 (quality={iter_result.get('fugu_quality')}/10≥7, 実装問題なし) → revise スキップ")
                 revision_notes = f"(quality={iter_result.get('fugu_quality')}/10≥7 かつ実装問題なし — revise スキップ)"
             else:
@@ -1960,7 +1965,7 @@ def _run_loop(args: argparse.Namespace) -> int:
         # revise 失敗または未実施の場合は draft を final として使う
         final_content  = draft_content
         final_summ     = change_summ
-        if not _skip_revise and not revision_notes.startswith("("):
+        if not _skip_revise:
             revision_notes = "(revise 失敗 — draft をそのまま final として使用)"
 
         if revise_raw:
@@ -2065,11 +2070,11 @@ def _run_loop(args: argparse.Namespace) -> int:
             (run_dir / "proposal_best.py").write_text(final_content, encoding="utf-8")
             (run_dir / "proposal_best.patch").write_text(final_patch_text, encoding="utf-8")
             log(f"  → ★ 採用 (composite={composite:.1f}) — 新ベスト!")
+        else:
+            log(f"  → 棄却 ({reason})")
         # セッション内提案IDとして記録（採否に関わらず — 棄却案でもID重複を防ぐ）
         if rule_id and rule_id != "UNKNOWN":
             _proposed_this_session.add(rule_id)
-        else:
-            log(f"  → 棄却 ({reason})")
 
         iter_result["adopted"]          = adopted
         iter_result["rejection_reason"] = reason
