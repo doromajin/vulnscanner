@@ -1668,8 +1668,7 @@ def _run_loop(args: argparse.Namespace) -> int:
             if consecutive_no_response >= 10:
                 log(f"  ⚠ 無応答 {consecutive_no_response} 回連続 — API障害と判断してループ停止")
                 stop_reason = "consecutive_no_response"
-                _skip("claude_draft_no_response")
-                loop_results.append(iter_result)
+                _skip("claude_draft_no_response")  # loop_results への追記は _skip 内部で実施
                 break
             if consecutive_no_response >= 5:
                 backoff = 300
