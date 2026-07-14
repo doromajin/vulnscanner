@@ -89,7 +89,8 @@ FUGU_API_BASE = os.environ.get("FUGU_API_BASE", "https://api.sakana.ai/v1")
 FUGU_MODEL    = os.environ.get("FUGU_MODEL", "fugu")
 
 # Claude バックエンド選択 ("api" | "cli") — main() で --claude-backend から上書きされる
-_CLAUDE_BACKEND: str = "api"
+# デフォルト cli: Pro/Max サブスクリプション消費（API トークン課金なし）
+_CLAUDE_BACKEND: str = "cli"
 
 # task_type → Claude モデル対応表（CLI 用）
 _TASK_MODEL_MAP: dict[str, str] = {
@@ -2077,10 +2078,11 @@ def main() -> None:
                              "例: vulnscanner/analyzers/ast_python.py  "
                              "(指定すると全イテレーションでそのファイルのみ対象にする)")
     parser.add_argument(
-        "--claude-backend", choices=["api", "cli"], default="api",
+        "--claude-backend", choices=["api", "cli"], default="cli",
         help=(
             "Claude バックエンド: "
-            "api = Anthropic API (デフォルト, ANTHROPIC_API_KEY 必須) / "
+            "cli = claude CLI (デフォルト, Pro/Max サブスクリプション消費) / "
+            "api = Anthropic API (ANTHROPIC_API_KEY 必須, トークン従量課金) / "
             "cli = claude CLI (claude auth login でログイン済みであること)"
         ),
     )
