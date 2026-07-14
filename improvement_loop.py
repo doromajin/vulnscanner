@@ -811,10 +811,42 @@ def apply_unified_diff(original: str, diff_text: str, fuzz: int = 3) -> str | No
                 match_pos = pos
                 break
 
-        # フォールバック: ファイル全体を検索（行番号ズレが大きい場合）
+        # フォールバック2: ファイル全体を検索（行番号ズレが大きい場合）
         if match_pos == -1 and n_old > 0:
             for pos in range(len(result)):
                 if _matches_at(pos):
+                    match_pos = pos
+                    break
+
+        # フォールバック3: 先頭空白を無視した比較（LLMがインデント幅を誤った場合を救済）
+        if match_pos == -1 and n_old > 0:
+            for pos in range(len(result)):
+                if pos + n_old > len(result):
+                    break
+                if all(result[pos + i].strip() == old_lines[i].strip()
+                       for i in range(n_old)):
+                    # インデントずれ量を算出（最初の非空行から）
+                    indent_delta = 0
+                    for i, ol in enumerate(old_lines):
+                        if ol.strip():
+                            actual_ind = len(result[pos + i]) - len(result[pos + i].lstrip())
+                            diff_ind   = len(ol) - len(ol.lstrip())
+                            indent_delta = actual_ind - diff_ind
+                            break
+                    # new_lines のインデントを補正
+                    if indent_delta != 0:
+                        log(f"  [diff] インデント補正 delta={indent_delta:+d} spaces (stripped fallback)")
+                        fixed: list[str] = []
+                        for l in new_lines:
+                            if not l.strip():
+                                fixed.append(l)
+                            elif indent_delta > 0:
+                                fixed.append(" " * indent_delta + l)
+                            elif indent_delta < 0 and l.startswith(" " * (-indent_delta)):
+                                fixed.append(l[(-indent_delta):])
+                            else:
+                                fixed.append(l)
+                        new_lines = fixed
                     match_pos = pos
                     break
 
