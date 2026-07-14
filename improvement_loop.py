@@ -275,14 +275,20 @@ def _classify_claude_error(returncode: int, stderr: str) -> str:
 
 # ── API 呼び出し ───────────────────────────────────────────────────────────────
 
-def call_claude(prompt: str, task_type: str = "proposal") -> tuple[str | None, float, bool]:
+def call_claude(
+    prompt: str,
+    task_type: str = "proposal",
+    system_extra: "list[dict] | None" = None,
+) -> tuple[str | None, float, bool]:
     """Claude を呼び出す。_CLAUDE_BACKEND で api / cli を選択。
 
+    system_extra: APIバックエンドのみ使用。キャッシュ済みファイル内容ブロック等を
+                  system に追加し、プロンプトキャッシングを有効化する。
     戻り値: (text, elapsed_seconds, rate_limited)
     """
     if _CLAUDE_BACKEND == "cli":
         return _call_claude_cli(prompt, task_type)
-    return _call_claude_api(prompt, task_type)
+    return _call_claude_api(prompt, task_type, system_extra=system_extra)
 
 
 _JSON_SYSTEM_PROMPT = (
@@ -292,7 +298,29 @@ _JSON_SYSTEM_PROMPT = (
 )
 
 
-def _call_claude_api(prompt: str, task_type: str = "proposal") -> tuple[str | None, float, bool]:
+def _make_cached_system(target_file: str, file_content: str) -> list[dict]:
+    """APIバックエンド用: ファイル内容をsystemブロックに移してキャッシュ可能にする。
+
+    draft と revise が同じ system を共有するため、revise呼び出し時にキャッシュヒットし
+    ファイル全文（最大~10k tokens）の入力コストが約90%削減される。
+    """
+    return [
+        {
+            "type": "text",
+            "text": (
+                f"Target file: {target_file}\n\n"
+                f"--- FILE CONTENT ---\n{file_content}\n--- END FILE CONTENT ---"
+            ),
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+
+def _call_claude_api(
+    prompt: str,
+    task_type: str = "proposal",
+    system_extra: "list[dict] | None" = None,
+) -> tuple[str | None, float, bool]:
     """Anthropic Python SDK で Claude API を直接呼び出す。
 
     proposal / revise タスクは JSON を返す必要があるため、system プロンプトで
@@ -325,7 +353,10 @@ def _call_claude_api(prompt: str, task_type: str = "proposal") -> tuple[str | No
                     messages=[{"role": "user", "content": prompt}],
                 )
                 if use_json_system:
-                    kwargs["system"] = _JSON_SYSTEM_PROMPT
+                    if system_extra:
+                        kwargs["system"] = [{"type": "text", "text": _JSON_SYSTEM_PROMPT}] + system_extra
+                    else:
+                        kwargs["system"] = _JSON_SYSTEM_PROMPT
                 msg = client.messages.create(**kwargs)
                 holder["text"] = msg.content[0].text if msg.content else None
             except Exception as exc:  # noqa: BLE001
@@ -989,7 +1020,13 @@ def _format_previous_attempts(previous_attempts: list[dict], target_file: str = 
     return "\n".join(lines)
 
 
-def build_draft_prompt(target_file: str, previous_attempts: list[dict], baseline: dict | None = None) -> str:
+def build_draft_prompt(
+    target_file: str,
+    previous_attempts: list[dict],
+    baseline: dict | None = None,
+    *,
+    use_cache_system: bool = False,
+) -> str:
     raw_content = Path(target_file).read_text(encoding="utf-8")
     content  = _truncate_file_for_prompt(raw_content)   # トークン節約: 大ファイルは圧縮
     existing = _relevant_rule_ids(target_file)           # 同ファイルのIDを詳細表示、他は件数のみ
@@ -1103,9 +1140,7 @@ Existing rule IDs (ALL are forbidden — do not reuse any):
 {prev}{lang_hint}
 Target file: {target_file}
 
---- CURRENT FILE CONTENT ---
-{content}
---- END FILE CONTENT ---
+{("--- CURRENT FILE CONTENT ---" + chr(10) + content + chr(10) + "--- END FILE CONTENT ---") if not use_cache_system else "(ファイル内容はシステムプロンプト参照)"}
 
 Task: Propose EXACTLY ONE new detection rule for a real vulnerability pattern NOT yet covered.
 Focus on: real CVE/bug-bounty patterns, broad generality, low FP risk, low FN risk.
@@ -1192,6 +1227,8 @@ def build_revise_prompt(
     target_file: str, original_content: str, draft_content: str,
     fugu_review: dict, draft_metrics: dict,
     rule_id: str, change_summary: str,
+    *,
+    use_cache_system: bool = False,
 ) -> str:
     total_chk = draft_metrics.get("total", 39)
     bench     = "ALL PASS" if draft_metrics["ok"] else f"FAILED ({total_chk - draft_metrics['passed']} checks)"
@@ -1225,9 +1262,7 @@ Overall assessment: {fugu_review.get('comments', '')}
 {diff_text}
 --- END DRAFT DIFF ---
 
---- ORIGINAL FILE (revise against this) ---
-{_truncate_file_for_prompt(original_content)}
---- END ORIGINAL ---
+{("--- ORIGINAL FILE (revise against this) ---" + chr(10) + _truncate_file_for_prompt(original_content) + chr(10) + "--- END ORIGINAL ---") if not use_cache_system else "(元ファイルはシステムプロンプト参照)"}
 
 Revise the proposal to address every point in the improvement instructions.
 Keep rule ID {rule_id} unless the critique says to change the vulnerability type entirely.
@@ -1570,6 +1605,13 @@ def _run_loop(args: argparse.Namespace) -> int:
 
         original_content = Path(target_file).read_text(encoding="utf-8")
 
+        # APIバックエンド: ファイル内容をsystemキャッシュに移してdraft/revise両方で再利用
+        _use_cache    = (_CLAUDE_BACKEND == "api")
+        _cached_system = (
+            _make_cached_system(target_file, _truncate_file_for_prompt(original_content))
+            if _use_cache else None
+        )
+
         iter_result: dict = {
             "iteration": iteration + 1, "target_file": target_file,
             "rule_id": "?", "change_summary": "", "revision_notes": "",
@@ -1594,8 +1636,9 @@ def _run_loop(args: argparse.Namespace) -> int:
         # ────────────────────────────────────────────────────────────────────
         log("  [Step 1/5] Claude — draft proposal 生成...")
         draft_raw, draft_elapsed, draft_rate_limited = call_claude(
-            build_draft_prompt(target_file, previous_attempts, baseline_metrics),
+            build_draft_prompt(target_file, previous_attempts, baseline_metrics, use_cache_system=_use_cache),
             task_type="proposal",
+            system_extra=_cached_system,
         )
         _record_claude_call()
         log(f"  → {draft_elapsed:.0f}s (累計 {claude_call_count} calls)")
@@ -1712,15 +1755,74 @@ def _run_loop(args: argparse.Namespace) -> int:
         draft_patch.write_text(generate_patch(original_content, draft_content, target_file), encoding="utf-8")
 
         # ────────────────────────────────────────────────────────────────────
-        # Step 2: isolated eval (draft)
+        # Step 2+3: recall_check(isolated) と FuguAI critique を並列実行
+        # FuguAI キャッシュヒット時は recall_check のみ逐次実行（無駄なAPI呼び出し不要）
+        # キャッシュなし時: 両者を並列化して壁時計時間を ~20s/iter 短縮
         # ────────────────────────────────────────────────────────────────────
-        log("  [Step 2/5] recall_check (isolated, draft)...")
-        try:
-            draft_metrics = run_recall_check_isolated(target_file, draft_content, f"{iteration+1:03d}_draft")
-        except Exception as exc:
-            log(f"  評価エラー: {exc} → スキップ")
-            _skip(f"eval_error: {exc}")
-            iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
+        _fugu_cache_key = (rule_id, target_file)
+        _fugu_cached    = _fugu_cache_key in _fugu_review_cache
+        fugu_raw: str | None = None
+        ftok: int = 0
+
+        if _fugu_cached:
+            log("  [Step 2/5] recall_check (isolated, draft)...")
+            log(f"  [Step 3/5] FuguAI キャッシュ使用 (rule_id={rule_id} の前回レビューを再利用、トークン節約)")
+            fugu_review = _fugu_review_cache[_fugu_cache_key]
+            try:
+                draft_metrics = run_recall_check_isolated(target_file, draft_content, f"{iteration+1:03d}_draft")
+            except Exception as exc:
+                log(f"  評価エラー: {exc} → スキップ")
+                _skip(f"eval_error: {exc}")
+                iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
+        else:
+            log("  [Step 2+3/5] recall_check & FuguAI — 並列実行中...")
+            _recall_holder: dict = {"result": None, "exc": None}
+            _fugu_holder:   dict = {"raw": None, "tokens": 0}
+
+            def _recall_worker(_h: dict = _recall_holder) -> None:
+                try:
+                    _h["result"] = run_recall_check_isolated(
+                        target_file, draft_content, f"{iteration+1:03d}_draft"
+                    )
+                except Exception as _exc:
+                    _h["exc"] = _exc
+
+            def _fugu_worker(_h: dict = _fugu_holder) -> None:
+                _fp = build_fugu_critique_prompt(
+                    rule_id, change_summ, target_file, draft_content,
+                    {
+                        "precision": BASELINE["precision"], "recall": BASELINE["recall"],
+                        "f1": BASELINE["f1"], "passed": BASELINE["passed"],
+                        "total": BASELINE["passed"], "ok": True,
+                    },
+                )
+                _raw, _tok = call_fugu(_fp, max_tokens=FUGU_CRITIQUE_MAX_TOKENS)
+                _h["raw"]    = _raw
+                _h["tokens"] = _tok
+
+            _t_recall = threading.Thread(target=_recall_worker, daemon=True)
+            _t_fugu   = threading.Thread(target=_fugu_worker,   daemon=True)
+            _t_recall.start()
+            _t_fugu.start()
+            _t_recall.join()
+            _t_fugu.join()
+
+            if _recall_holder["exc"] is not None:
+                log(f"  評価エラー: {_recall_holder['exc']} → スキップ")
+                _skip(f"eval_error: {_recall_holder['exc']}")
+                iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
+
+            draft_metrics = _recall_holder["result"]
+            fugu_raw      = _fugu_holder["raw"]
+            ftok          = _fugu_holder["tokens"]
+            fugu_tokens_used += ftok
+            token_record["sessions"].append({
+                "iteration": iteration+1, "stage": "critique",
+                "rule_id": rule_id, "tokens": ftok, "cumulative": fugu_tokens_used,
+            })
+            token_record["total_tokens"] = fugu_tokens_used
+            save_token_usage(run_dir, token_record)
+            fugu_review = parse_fugu_critique(fugu_raw)
 
         iter_result["draft_metrics"] = draft_metrics
         save_eval_result(run_dir, iteration + 1, "draft", draft_metrics)
@@ -1731,7 +1833,7 @@ def _run_loop(args: argparse.Namespace) -> int:
         )
 
         if not draft_metrics["ok"]:
-            log("  draft ベンチマーク失敗 → FuguAI レビューをスキップして棄却")
+            log("  draft ベンチマーク失敗 → FuguAI 結果を破棄して棄却")
             hint = (
                 f"Benchmark regression: P={draft_metrics['precision']:.1f}% "
                 f"R={draft_metrics['recall']:.1f}%. Use a narrower regex to avoid FP/FN."
@@ -1747,31 +1849,6 @@ def _run_loop(args: argparse.Namespace) -> int:
                 "decision": "rejected", "rejection_reason": "benchmark_failed_on_draft", "next_hint": hint,
             })
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
-
-        # ────────────────────────────────────────────────────────────────────
-        # Step 3: FuguAI critique (キャッシュ優先)
-        # 同一 (rule_id, target_file) の2回目以降はキャッシュを再利用し
-        # FuguAI トークンと待ち時間を節約する
-        # ────────────────────────────────────────────────────────────────────
-        _fugu_cache_key = (rule_id, target_file)
-        if _fugu_cache_key in _fugu_review_cache:
-            fugu_review = _fugu_review_cache[_fugu_cache_key]
-            ftok = 0
-            log(f"  [Step 3/5] FuguAI キャッシュ使用 (rule_id={rule_id} の前回レビューを再利用、トークン節約)")
-        else:
-            log("  [Step 3/5] FuguAI — 構造化レビュー...")
-            fugu_prompt   = build_fugu_critique_prompt(rule_id, change_summ, target_file, draft_content, draft_metrics)
-            fugu_raw, ftok = call_fugu(fugu_prompt, max_tokens=FUGU_CRITIQUE_MAX_TOKENS)
-            fugu_tokens_used += ftok
-
-            token_record["sessions"].append({
-                "iteration": iteration+1, "stage": "critique",
-                "rule_id": rule_id, "tokens": ftok, "cumulative": fugu_tokens_used,
-            })
-            token_record["total_tokens"] = fugu_tokens_used
-            save_token_usage(run_dir, token_record)
-
-            fugu_review = parse_fugu_critique(fugu_raw)
 
         if fugu_review is None:
             # パース失敗の原因を記録
@@ -1862,10 +1939,12 @@ def _run_loop(args: argparse.Namespace) -> int:
             revise_prompt = build_revise_prompt(
                 target_file, original_content, draft_content,
                 fugu_review, draft_metrics, rule_id, change_summ,
+                use_cache_system=_use_cache,
             )
             revise_raw, revise_elapsed, revise_rate_limited = call_claude(
                 revise_prompt,
                 task_type="revise",
+                system_extra=_cached_system,
             )
             _record_claude_call()
             log(f"  → {revise_elapsed:.0f}s (累計 {claude_call_count} calls)")
