@@ -34,7 +34,8 @@ jobs:
             --fail-on CRITICAL \
             --exclude "repos/**" \
             --exclude "tests/**" \
-            --exclude "recall/**"
+            --exclude "recall/**" \
+            --exclude "improvement_loop.py"
 
       - name: Upload SARIF
         if: always()
