@@ -1544,6 +1544,7 @@ def _run_loop(args: argparse.Namespace) -> int:
     fugu_ever_available:       bool        = False
     claude_call_count:         int         = 0   # 報告用カウンタ（制限には使わない）
     consecutive_parse_failures: int        = 0   # JSON パース失敗の連続回数（自動回復用）
+    consecutive_no_response:    int        = 0   # Claude 無応答の連続回数（サーキットブレーカー用）
 
     token_record: dict = {
         "date": window_started_at.strftime("%Y-%m-%d"),
@@ -1662,10 +1663,22 @@ def _run_loop(args: argparse.Namespace) -> int:
             })
 
         if not draft_raw:
-            log("  draft 応答なし → スキップ")
+            consecutive_no_response += 1
+            log(f"  draft 応答なし ({consecutive_no_response}回連続) → スキップ")
+            if consecutive_no_response >= 10:
+                log(f"  ⚠ 無応答 {consecutive_no_response} 回連続 — API障害と判断してループ停止")
+                stop_reason = "consecutive_no_response"
+                _skip("claude_draft_no_response")
+                loop_results.append(iter_result)
+                break
+            if consecutive_no_response >= 5:
+                backoff = 300
+                log(f"  ⚠ 無応答 {consecutive_no_response} 回連続 — {backoff}s バックオフ後にリトライ")
+                time.sleep(backoff)
             _skip("claude_draft_no_response")
             iteration += 1; loop_times.append(time.monotonic() - loop_start); continue
 
+        consecutive_no_response = 0  # 応答あり → リセット
         draft_proposal = parse_claude_json(draft_raw)
         if not draft_proposal:
             consecutive_parse_failures += 1
