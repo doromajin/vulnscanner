@@ -370,6 +370,7 @@ def fuzz(
       vulnscan fuzz ./repos/my-app --max-seconds 60 --output fuzz_report.json
     """
     from vulnscanner.fuzzer import run_fuzz, FuzzTarget, LEGAL_NOTICE
+    from vulnscanner.fuzzer.malware_check import BLOCK
     from vulnscanner.models import VulnType
     import json
 
@@ -390,6 +391,7 @@ def fuzz(
             execute = False
 
     console.print(f"\n[bold]VulnScanner Fuzz[/bold] — target: [cyan]{target}[/cyan]")
+    console.print("[dim]Step 0/3: Malware pre-flight scan...[/dim]")
     console.print("[dim]Step 1/3: Static analysis...[/dim]")
 
     result = run_fuzz(
@@ -399,11 +401,32 @@ def fuzz(
         max_examples=max_examples,
     )
 
+    # ── Malware warnings ───────────────────────────────────────────────────────
+
+    if result.malware_warnings:
+        console.print()
+        blocks = [w for w in result.malware_warnings if w.severity == BLOCK]
+        warns  = [w for w in result.malware_warnings if w.severity != BLOCK]
+
+        if blocks:
+            console.print(f"[bold red]⛔  Malware scan: {len(blocks)} BLOCK finding(s) — dynamic execution suppressed[/bold red]")
+            for w in blocks:
+                console.print(w.to_display())
+        if warns:
+            console.print(f"[bold yellow]⚠   Malware scan: {len(warns)} warning(s)[/bold yellow]")
+            for w in warns:
+                console.print(w.to_display())
+        console.print()
+    elif execute:
+        console.print("[dim]  Malware scan: clean[/dim]")
+
     # ── Report ─────────────────────────────────────────────────────────────────
 
     console.print(f"[dim]Step 2/3: Payload generation... {len(result.payloads)} payloads generated[/dim]")
-    if execute:
+    if not result.execution_blocked and execute:
         console.print(f"[dim]Step 3/3: Dynamic execution complete[/dim]")
+    elif result.execution_blocked:
+        console.print(f"[dim]Step 3/3: Dynamic execution skipped (malware detected)[/dim]")
 
     console.print()
     console.print(f"[bold]Static findings:[/bold] {len(result.static_findings)} total, "
@@ -442,6 +465,17 @@ def fuzz(
     if output:
         report = {
             "target": str(result.target_path),
+            "execution_blocked": result.execution_blocked,
+            "malware_warnings": [
+                {
+                    "file": w.file_path,
+                    "line": w.line,
+                    "category": w.category,
+                    "severity": w.severity,
+                    "description": w.description,
+                }
+                for w in result.malware_warnings
+            ],
             "static_findings": len(result.static_findings),
             "payloads": [
                 {"value": p.value, "type": p.vuln_type.value, "description": p.description}

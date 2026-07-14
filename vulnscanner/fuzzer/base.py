@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from vulnscanner.models import Finding, VulnType, Severity
+from vulnscanner.fuzzer.malware_check import MalwareWarning
 
 # ── Legal disclaimer (shown before execution) ─────────────────────────────────
 
@@ -87,6 +88,8 @@ class FuzzResult:
     payloads: list[FuzzPayload] = field(default_factory=list)
     fuzz_findings: list[FuzzFinding] = field(default_factory=list)
     skipped_functions: list[str] = field(default_factory=list)
+    malware_warnings: list[MalwareWarning] = field(default_factory=list)
+    execution_blocked: bool = False
     error: str = ""
 
     @property

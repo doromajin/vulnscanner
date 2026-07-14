@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from vulnscanner.fuzzer.base import FuzzResult, FuzzTarget
+from vulnscanner.fuzzer.malware_check import BLOCK, scan_for_malware
 from vulnscanner.fuzzer.payload_gen import generate_all_payloads
 
 
@@ -36,6 +37,12 @@ def run_fuzz(
     target = FuzzTarget(target_path, max_seconds=max_seconds, max_examples=max_examples)
 
     result = FuzzResult(target_path=target.path)
+
+    # Step 0: Malware pre-flight scan (static, never executes code)
+    result.malware_warnings = scan_for_malware(target.path)
+    if any(w.severity == BLOCK for w in result.malware_warnings):
+        result.execution_blocked = True
+        execute = False
 
     # Step 1: Static analysis
     from vulnscanner.scanner import VulnScanner

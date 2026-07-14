@@ -4,6 +4,7 @@ Public API:
   from vulnscanner.fuzzer import run_fuzz, FuzzResult, FuzzTarget
 """
 from vulnscanner.fuzzer.base import FuzzFinding, FuzzPayload, FuzzResult, FuzzTarget, LEGAL_NOTICE
+from vulnscanner.fuzzer.malware_check import MalwareWarning, scan_for_malware
 from vulnscanner.fuzzer.runner import run_fuzz
 
 __all__ = [
@@ -13,4 +14,6 @@ __all__ = [
     "FuzzResult",
     "FuzzTarget",
     "LEGAL_NOTICE",
+    "MalwareWarning",
+    "scan_for_malware",
 ]
