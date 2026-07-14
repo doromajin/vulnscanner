@@ -336,8 +336,9 @@ _XXE_PARSE_FUNCS = frozenset({
 _LDAP3_SEARCH_METHODS = frozenset({"search"})
 
 # ── interprocedural taint (per-file, single-threaded) ─────────────────────────
-# Updated by PythonASTAnalyzer.analyze() before each file visit.
+# Both globals are updated by PythonASTAnalyzer.analyze() before each file visit.
 _interprocedural_taint_sources: frozenset[str] = frozenset()
+_local_func_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
 
 
 # ── public analyzer ────────────────────────────────────────────────────────────
@@ -354,13 +355,19 @@ class PythonASTAnalyzer(BaseAnalyzer):
     supported_extensions = (".py",)
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        global _interprocedural_taint_sources
+        global _interprocedural_taint_sources, _local_func_defs
         try:
             tree = ast.parse(content, filename=file_path)
         except SyntaxError:
             return []
 
         lines = content.splitlines()
+        # Build per-file function definition map for interprocedural call-site injection.
+        _local_func_defs = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
         _interprocedural_taint_sources = _find_taint_source_funcs(tree)
         visitor = _VulnVisitor(file_path, lines, repo_url, self, content)
         visitor.visit(tree)
@@ -388,6 +395,7 @@ class _VulnVisitor(ast.NodeVisitor):
         self._class_attrs: dict[str, ast.expr] = {}
         self._canonicalized_paths: frozenset[str] = frozenset()
         self._in_enum_class: bool = False
+        self._call_stack: set[str] = set()  # recursion guard for interprocedural re-analysis
 
     # ── scope tracking ─────────────────────────────────────────────────────────
 
@@ -1105,26 +1113,34 @@ class _VulnVisitor(ast.NodeVisitor):
         taint_info: TaintInfo | None = None,
     ) -> None:
         lineno: int = getattr(node, "lineno", 0)
-        self.findings.append(
-            Finding(
-                vuln_type=vuln_type,
-                severity=severity,
-                file_path=self.file_path,
-                line_number=lineno,
-                line_content=(
-                    self.lines[lineno - 1].strip()
-                    if 0 < lineno <= len(self.lines) else ""
-                ),
-                description=description,
-                rule_id=rule_id,
-                repo_url=self.repo_url,
-                snippet=self.analyzer._extract_snippet(self.lines, lineno),
-                taint_status=taint_info.status.value if taint_info else None,
-                taint_reason=taint_info.reason if taint_info else None,
-                taint_source=taint_info.source if taint_info else None,
-                confidence=taint_info.confidence if taint_info else 1.0,
-            )
+        new_finding = Finding(
+            vuln_type=vuln_type,
+            severity=severity,
+            file_path=self.file_path,
+            line_number=lineno,
+            line_content=(
+                self.lines[lineno - 1].strip()
+                if 0 < lineno <= len(self.lines) else ""
+            ),
+            description=description,
+            rule_id=rule_id,
+            repo_url=self.repo_url,
+            snippet=self.analyzer._extract_snippet(self.lines, lineno),
+            taint_status=taint_info.status.value if taint_info else None,
+            taint_reason=taint_info.reason if taint_info else None,
+            taint_source=taint_info.source if taint_info else None,
+            confidence=taint_info.confidence if taint_info else 1.0,
         )
+        # Deduplicate: if a lower-severity finding exists at the same location,
+        # upgrade it rather than appending a duplicate.
+        _sev = list(Severity)
+        key = (self.file_path, lineno, vuln_type)
+        for i, existing in enumerate(self.findings):
+            if (existing.file_path, existing.line_number, existing.vuln_type) == key:
+                if _sev.index(severity) < _sev.index(existing.severity):
+                    self.findings[i] = new_finding
+                return
+        self.findings.append(new_finding)
 
     def _add_suppressed(
         self,
@@ -1155,6 +1171,56 @@ class _VulnVisitor(ast.NodeVisitor):
             )
         )
 
+    def _analyze_with_tainted_params(
+        self,
+        func_def: ast.FunctionDef | ast.AsyncFunctionDef,
+        arg_taints: list[TaintInfo],
+    ) -> None:
+        """Re-analyze func_def's body with tainted call arguments injected as params.
+
+        For each positional parameter whose corresponding argument is TAINTED, a
+        synthetic ``ast.Name(id='request')`` is injected into the scope assignments
+        so that ``_taint_of`` propagates TAINTED through the function body.
+        The call stack guard prevents infinite recursion on recursive functions.
+        """
+        param_assignments: dict[str, ast.expr] = {}
+        for i, param in enumerate(func_def.args.args):
+            if i < len(arg_taints) and arg_taints[i].status == TaintStatus.TAINTED:
+                param_assignments[param.arg] = ast.Name(id="request", ctx=ast.Load())
+        if not param_assignments:
+            return
+        saved_assignments = self._assignments
+        saved_stack = self._call_stack
+        self._call_stack = self._call_stack | {func_def.name}
+        self._assignments = {**_collect_scope_assignments(func_def), **param_assignments}
+        self._visit_stmts(func_def.body)
+        self._assignments = saved_assignments
+        self._call_stack = saved_stack
+
+    def _check_interprocedural_calls(self, stmt: ast.stmt) -> None:
+        """Walk stmt for calls to local functions that receive ≥1 tainted argument.
+
+        When found, re-analyse the callee's body with those params marked as tainted
+        so that sink checks inside the callee fire at the correct (higher) severity.
+        Skips functions already on the call stack to prevent infinite recursion.
+        """
+        for node in ast.walk(stmt):
+            if not isinstance(node, ast.Call):
+                continue
+            func_name = _full_name(node.func)
+            if not func_name or func_name not in _local_func_defs:
+                continue
+            if func_name in self._call_stack:
+                continue
+            arg_taints = [
+                _taint_of(arg, self._assignments, self._class_attrs)
+                for arg in node.args
+            ]
+            if any(t.status == TaintStatus.TAINTED for t in arg_taints):
+                self._analyze_with_tainted_params(
+                    _local_func_defs[func_name], arg_taints
+                )
+
     def _visit_stmts(self, stmts: list[ast.stmt]) -> None:
         """Visit a statement list, detecting early-return guards for taint suppression.
 
@@ -1180,6 +1246,7 @@ class _VulnVisitor(ast.NodeVisitor):
                     return
             else:
                 self.visit(stmt)
+            self._check_interprocedural_calls(stmt)
             i += 1
 
 

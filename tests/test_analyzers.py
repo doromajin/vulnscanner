@@ -662,6 +662,54 @@ class TestTaintTracking:
         findings = AST.analyze("t.py", code)
         assert any(f.rule_id.startswith("AST-SQL-") for f in findings)
 
+    # ── Phase 2: argument→parameter taint injection ───────────────────────────
+
+    def test_interprocedural_tainted_arg_to_sink_inside_callee(self):
+        """Tainted arg passed to a local function that uses it in a sink."""
+        code = (
+            "import sqlite3\n"
+            "def run_query(sql):\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute(sql)\n"
+            "\n"
+            "def view():\n"
+            "    run_query('SELECT * FROM t WHERE x = ' + request.args.get('q'))\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert any(f.rule_id.startswith("AST-SQL-") for f in findings)
+
+    def test_interprocedural_tainted_arg_severity_upgrades_to_high(self):
+        """When tainted arg reaches a sink inside callee, severity is HIGH not MEDIUM."""
+        code = (
+            "import sqlite3\n"
+            "def run_query(sql):\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute(sql)\n"
+            "\n"
+            "def view():\n"
+            "    run_query('SELECT * FROM t WHERE x = ' + request.args.get('q'))\n"
+        )
+        findings = AST.analyze("t.py", code)
+        sql_findings = [f for f in findings if f.rule_id.startswith("AST-SQL-")]
+        assert any(f.severity in (Severity.HIGH, Severity.CRITICAL) for f in sql_findings)
+
+    def test_interprocedural_clean_arg_no_upgrade(self):
+        """Literal (CLEAN) arg passed to a local function must not produce HIGH SQL finding."""
+        code = (
+            "import sqlite3\n"
+            "def run_query(sql):\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute(sql)\n"
+            "\n"
+            "def view():\n"
+            "    run_query('SELECT * FROM t WHERE x = 1')\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert not any(
+            f.rule_id.startswith("AST-SQL-") and f.severity in (Severity.HIGH, Severity.CRITICAL)
+            for f in findings
+        )
+
     def test_interprocedural_nested_func_no_outer_contamination(self):
         """Tainted return inside a nested function must not mark the outer function."""
         code = (
