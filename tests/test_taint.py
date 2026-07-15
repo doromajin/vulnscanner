@@ -695,3 +695,79 @@ class TestCrossFileTaint:
             and f.taint_status == "tainted"
         ]
         assert not high_sql, "without cross-file context, confirmed-taint SQL should not fire"
+
+
+# ── exploitability filter ──────────────────────────────────────────────────────
+
+class TestExploitabilityFilter:
+    """#9: confidence adjustment based on web entry-point detection."""
+
+    def test_web_entry_unknown_taint_keeps_normal_confidence(self):
+        # Function has @app.route decorator → web entry point.
+        # UNKNOWN-taint MEDIUM finding should keep confidence 0.5.
+        code = (
+            "@app.route('/search')\n"
+            "def search(cursor, q):\n"
+            "    cursor.execute('SELECT * FROM t WHERE name = ' + q)\n"
+        )
+        findings = [
+            f for f in AST.analyze("app.py", code)
+            if "SQL" in f.rule_id and f.suppression_reason is None
+               and f.taint_status == "unknown"
+        ]
+        assert findings, "UNKNOWN-taint SQL finding must be emitted for unresolved variable"
+        assert findings[0].confidence == pytest.approx(0.5), (
+            "web entry point function must keep confidence=0.5 for UNKNOWN taint"
+        )
+        assert "[low_reach]" not in findings[0].description
+
+    def test_non_web_entry_unknown_taint_lowered_confidence(self):
+        # Helper function with no decorator and no 'request' param → not a web entry.
+        # UNKNOWN-taint finding should have confidence 0.3 and [low_reach] tag.
+        code = (
+            "def helper(cursor, q):\n"
+            "    cursor.execute('SELECT * FROM t WHERE name = ' + q)\n"
+        )
+        findings = [
+            f for f in AST.analyze("helper.py", code)
+            if "SQL" in f.rule_id and f.suppression_reason is None
+               and f.taint_status == "unknown"
+        ]
+        assert findings, "UNKNOWN-taint SQL finding must be emitted for unresolved variable"
+        assert findings[0].confidence == pytest.approx(0.3), (
+            "non-web-entry function must have confidence=0.3 for UNKNOWN taint"
+        )
+        assert "[low_reach]" in findings[0].description
+
+    def test_request_param_treated_as_web_entry(self):
+        # Django FBV pattern: def my_view(request) → web entry point.
+        code = (
+            "def my_view(request, cursor):\n"
+            "    q = request.POST.get('q')\n"
+            "    cursor.execute('SELECT * FROM t WHERE name = ' + q)\n"
+        )
+        findings = [
+            f for f in AST.analyze("views.py", code)
+            if "SQL" in f.rule_id and f.suppression_reason is None
+        ]
+        assert findings
+        # TAINTED via request.POST.get → should be HIGH with confidence 0.9 (web entry irrelevant)
+        tainted = [f for f in findings if f.taint_status == "tainted"]
+        assert tainted, "request.POST.get must yield TAINTED finding"
+
+    def test_tainted_finding_unaffected_by_filter(self):
+        # TAINTED findings (HIGH) must never have confidence lowered by exploit filter.
+        code = (
+            "def helper(cursor):\n"
+            "    q = input()\n"
+            "    cursor.execute('SELECT * FROM t WHERE name = ' + q)\n"
+        )
+        findings = [
+            f for f in AST.analyze("t.py", code)
+            if "SQL" in f.rule_id and f.suppression_reason is None
+               and f.taint_status == "tainted"
+        ]
+        assert findings, "input() is a taint source → TAINTED SQL finding"
+        assert findings[0].confidence == pytest.approx(0.9), (
+            "TAINTED findings must always keep confidence=0.9 regardless of web entry status"
+        )

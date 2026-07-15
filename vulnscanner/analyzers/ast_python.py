@@ -93,6 +93,23 @@ _REDIRECT_FUNCS = frozenset({
 
 _TEMPLATE_RENDER_FUNCS = frozenset({"render_template_string"})
 
+# ── Exploitability ─────────────────────────────────────────────────────────────
+
+# Decorator attribute names that identify a function as a web request handler.
+# When a function carries one of these decorators, UNKNOWN-taint findings inside
+# it are more likely reachable from real user input (confidence stays at 0.5).
+# Functions with no such marker get confidence downgraded to 0.3 and their
+# [needs_review] tag is replaced with [low_reach] to indicate lower exploitability.
+_WEB_ROUTE_DECORATORS = frozenset({
+    # Flask / Quart / FastAPI / Starlette
+    "route", "get", "post", "put", "delete", "patch", "head", "options",
+    # DRF / Flask-RESTful
+    "api_view", "action", "endpoint",
+    # Django view decorators
+    "require_GET", "require_POST", "require_http_methods", "csrf_exempt",
+    "login_required", "permission_required",
+})
+
 # ── Secrets ────────────────────────────────────────────────────────────────────
 
 _SECRET_NAME_RE = re.compile(
@@ -461,6 +478,30 @@ def _callee_returns_tainted(
     return False
 
 
+def _func_is_web_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return True if *node* is likely a web request handler.
+
+    Checks two signals:
+    - A decorator whose attribute/name is in _WEB_ROUTE_DECORATORS (e.g. @app.route, @login_required).
+    - A parameter named 'request' (Django/DRF/Flask-class-based-views pattern).
+    """
+    for dec in node.decorator_list:
+        name = ""
+        if isinstance(dec, ast.Attribute):
+            name = dec.attr
+        elif isinstance(dec, ast.Name):
+            name = dec.id
+        elif isinstance(dec, ast.Call):
+            inner = dec.func
+            if isinstance(inner, ast.Attribute):
+                name = inner.attr
+            elif isinstance(inner, ast.Name):
+                name = inner.id
+        if name in _WEB_ROUTE_DECORATORS:
+            return True
+    return any(a.arg == "request" for a in node.args.args)
+
+
 # ── public analyzer ────────────────────────────────────────────────────────────
 
 class PythonASTAnalyzer(BaseAnalyzer):
@@ -535,6 +576,7 @@ class _VulnVisitor(ast.NodeVisitor):
         self._canonicalized_paths: frozenset[str] = frozenset()
         self._in_enum_class: bool = False
         self._call_stack: set[str] = set()  # recursion guard for interprocedural re-analysis
+        self._current_func_is_web_entry: bool = False  # exploitability filter
 
     # ── scope tracking ─────────────────────────────────────────────────────────
 
@@ -557,11 +599,14 @@ class _VulnVisitor(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         saved = self._assignments
         saved_canon = self._canonicalized_paths
+        saved_web = self._current_func_is_web_entry
         self._assignments = _collect_scope_assignments(node)
         self._canonicalized_paths = _find_canonicalized_paths(node)
+        self._current_func_is_web_entry = _func_is_web_entry(node)
         self._visit_stmts(node.body)
         self._assignments = saved
         self._canonicalized_paths = saved_canon
+        self._current_func_is_web_entry = saved_web
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
@@ -1263,6 +1308,18 @@ class _VulnVisitor(ast.NodeVisitor):
         taint_info: TaintInfo | None = None,
     ) -> None:
         lineno: int = getattr(node, "lineno", 0)
+
+        # Exploitability filter: UNKNOWN-taint findings in functions with no detected
+        # web entry-point markers (route decorator or 'request' parameter) are less
+        # likely to be reachable from user-controlled HTTP input.  Lower confidence and
+        # swap [needs_review] → [low_reach] in the description to signal this.
+        confidence = taint_info.confidence if taint_info else 1.0
+        if (taint_info is not None
+                and taint_info.status == TaintStatus.UNKNOWN
+                and not self._current_func_is_web_entry):
+            confidence = 0.3
+            description = description.replace("[needs_review]", "[low_reach]", 1)
+
         new_finding = Finding(
             vuln_type=vuln_type,
             severity=severity,
@@ -1279,7 +1336,7 @@ class _VulnVisitor(ast.NodeVisitor):
             taint_status=taint_info.status.value if taint_info else None,
             taint_reason=taint_info.reason if taint_info else None,
             taint_source=taint_info.source if taint_info else None,
-            confidence=taint_info.confidence if taint_info else 1.0,
+            confidence=confidence,
         )
         # Deduplicate: if a lower-severity finding exists at the same location,
         # upgrade it rather than appending a duplicate.
