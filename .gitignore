@@ -19,6 +19,8 @@ htmlcov/
 *.json
 !tests/fixtures/**/*.json
 !custom_taint_sources.json
+*.sarif
+!benchmark_python/results/*.sarif
 
 # Cloned repos used for local scanning
 repos/
