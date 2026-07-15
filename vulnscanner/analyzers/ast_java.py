@@ -121,6 +121,14 @@ _LDAP_HINTS = frozenset({
 _LDAP_SEARCH_METHODS = frozenset({"search", "lookup", "bind", "getAttributes"})
 
 
+# Spring MVC: method parameters carrying these annotations receive user-supplied data.
+# Equivalent in taint terms to request.getParameter() on the same value.
+_SPRING_PARAM_ANNOTATIONS = frozenset({
+    "RequestParam", "PathVariable", "RequestBody",
+    "RequestHeader", "CookieValue", "MatrixVariable",
+    "ModelAttribute",
+})
+
 # ── taint helpers ──────────────────────────────────────────────────────────────
 
 def _type_name(ref_type) -> str:
@@ -575,6 +583,20 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
             return False
         key = _literal_str(args[0])
         return key is not None and key in map_keys[q]
+
+    # Spring MVC: collect @RequestParam / @PathVariable / @RequestBody annotated
+    # method parameters as taint sources before the fixed-point propagation loop.
+    try:
+        for _, method in tree.filter(jt.MethodDeclaration):
+            for param in (method.parameters or []):
+                for ann in (getattr(param, "annotations", None) or []):
+                    if getattr(ann, "name", "") in _SPRING_PARAM_ANNOTATIONS:
+                        pname = getattr(param, "name", "")
+                        if pname:
+                            tainted.add(pname)
+                        break
+    except Exception:
+        pass
 
     for _ in range(6):
         changed = False

@@ -1020,19 +1020,30 @@ class _VulnVisitor(ast.NodeVisitor):
         if _is_const(url_arg):
             return
 
+        # Flask url_for() generates server-side URLs from endpoint names — always safe.
+        if (isinstance(url_arg, ast.Call)
+                and _full_name(url_arg.func) in {"url_for", "flask.url_for"}):
+            return
+
         taint = _taint_of(url_arg, self._assignments, self._class_attrs)
 
         if taint.status == TaintStatus.CLEAN:
             return
 
         if taint.status == TaintStatus.TAINTED:
-            # Suppress when the redirect URL was passed through urllib.parse.urlparse()
-            # in the same function scope — strong evidence of netloc/scheme validation.
-            # Real-world pattern: url = urlparse(bar); if url.netloc not in whitelist: return
+            # Suppress when the redirect URL was validated in the same function scope.
+            # Recognised validators (assign the URL through one of these calls):
+            #   - urllib.parse.urlparse()   — scheme/netloc whitelist pattern
+            #   - url_has_allowed_host_and_scheme()  — Django built-in redirect guard
+            _REDIRECT_VALIDATORS = {
+                "urllib.parse.urlparse", "urlparse",
+                "url_has_allowed_host_and_scheme",
+                "django.utils.http.url_has_allowed_host_and_scheme",
+            }
             if (isinstance(url_arg, ast.Name)
                     and any(
                         isinstance(v, ast.Call)
-                        and _full_name(v.func) in {"urllib.parse.urlparse", "urlparse"}
+                        and _full_name(v.func) in _REDIRECT_VALIDATORS
                         and v.args
                         and isinstance(v.args[0], ast.Name)
                         and v.args[0].id == url_arg.id
