@@ -341,6 +341,22 @@ _interprocedural_taint_sources: frozenset[str] = frozenset()
 _local_func_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
 
 
+def _callee_returns_tainted(
+    func_def: ast.FunctionDef | ast.AsyncFunctionDef,
+    param_assignments: dict[str, ast.expr],
+    _depth: int,
+) -> bool:
+    """Return True if any return path of func_def yields a TAINTED value given param_assignments."""
+    if _depth > 14:
+        return False
+    merged = {**_collect_scope_assignments(func_def), **param_assignments}
+    for ret in _iter_func_returns(func_def):
+        if ret.value is not None:
+            if _taint_of(ret.value, merged, {}, _depth).status == TaintStatus.TAINTED:
+                return True
+    return False
+
+
 # ── public analyzer ────────────────────────────────────────────────────────────
 
 class PythonASTAnalyzer(BaseAnalyzer):
@@ -1770,6 +1786,24 @@ def _taint_of(
         if full in _interprocedural_taint_sources:
             return TaintInfo(TaintStatus.TAINTED,
                              f"return of taint-source function '{full}'", source=full)
+
+        # Phase 3: tainted arg → return propagation.
+        # If the callee is a local function and any arg is TAINTED, check whether the tainted
+        # parameter flows to a return value inside the callee. If so, the call expression itself
+        # is TAINTED in the caller's context (e.g. val = process(request.args.get('q'))).
+        if full and full in _local_func_defs and _depth <= 12:
+            _arg_taints = [
+                _taint_of(a, assignments, class_attrs, _depth + 1) for a in node.args
+            ]
+            if any(t.status == TaintStatus.TAINTED for t in _arg_taints):
+                _fd = _local_func_defs[full]
+                _param_assigns: dict[str, ast.expr] = {}
+                for _i, _param in enumerate(_fd.args.args):
+                    if _i < len(_arg_taints) and _arg_taints[_i].status == TaintStatus.TAINTED:
+                        _param_assigns[_param.arg] = ast.Name(id="request", ctx=ast.Load())
+                if _param_assigns and _callee_returns_tainted(_fd, _param_assigns, _depth + 1):
+                    return TaintInfo(TaintStatus.TAINTED,
+                                     f"tainted arg flows through '{full}' return", source=full)
 
         # Context-specific sanitizers: record sanitizer in metadata, preserve taint status.
         # html.escape / bleach.clean  → protects HTML/XSS only

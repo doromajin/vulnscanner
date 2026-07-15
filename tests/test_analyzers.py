@@ -710,6 +710,60 @@ class TestTaintTracking:
             for f in findings
         )
 
+    # ── Phase 3: tainted arg → return → caller propagation ────────────────────
+
+    def test_phase3_passthrough_return_tainted(self):
+        """val = f(tainted_arg) where f returns its param → val must be TAINTED in caller."""
+        code = (
+            "import sqlite3\n"
+            "def passthrough(x):\n"
+            "    return x\n"
+            "\n"
+            "def view():\n"
+            "    val = passthrough(request.args.get('q'))\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute('SELECT * FROM t WHERE x = ' + val)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        sql = [f for f in findings if f.rule_id.startswith("AST-SQL-")]
+        assert sql, "expected SQL finding"
+        assert any(f.severity in (Severity.HIGH, Severity.CRITICAL) for f in sql)
+
+    def test_phase3_transform_return_tainted(self):
+        """f(tainted) that strips and returns tainted param must propagate TAINTED."""
+        code = (
+            "import sqlite3\n"
+            "def clean_input(x):\n"
+            "    return x.strip()\n"
+            "\n"
+            "def view():\n"
+            "    val = clean_input(request.args.get('q'))\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute('SELECT * FROM t WHERE x = ' + val)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        sql = [f for f in findings if f.rule_id.startswith("AST-SQL-")]
+        assert sql, "expected SQL finding"
+        assert any(f.severity in (Severity.HIGH, Severity.CRITICAL) for f in sql)
+
+    def test_phase3_clean_arg_not_propagated(self):
+        """Literal arg through passthrough must not upgrade to HIGH in caller."""
+        code = (
+            "import sqlite3\n"
+            "def passthrough(x):\n"
+            "    return x\n"
+            "\n"
+            "def view():\n"
+            "    val = passthrough('safe_literal')\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute('SELECT * FROM t WHERE x = ' + val)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert not any(
+            f.rule_id.startswith("AST-SQL-") and f.severity in (Severity.HIGH, Severity.CRITICAL)
+            for f in findings
+        )
+
     def test_interprocedural_nested_func_no_outer_contamination(self):
         """Tainted return inside a nested function must not mark the outer function."""
         code = (
