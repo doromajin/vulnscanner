@@ -1997,6 +1997,8 @@ def _extract_guard_var(test: ast.expr) -> str | None:
     Recognized patterns:
       isinstance(var, int | float | bool | Decimal)   — numeric type check
       var.isdigit() / var.isnumeric() / var.isalpha() / var.isalnum()
+      re.match/fullmatch/search(pattern, var)          — regex validation
+      var in [allowlist]                               — allowlist membership
     """
     if (isinstance(test, ast.Call)
             and isinstance(test.func, ast.Name)
@@ -2010,6 +2012,22 @@ def _extract_guard_var(test: ast.expr) -> str | None:
             and test.func.attr in _GUARD_VALIDATION_METHODS
             and isinstance(test.func.value, ast.Name)):
         return test.func.value.id
+    # re.match/fullmatch/search(pattern, var) — var is regex-validated inside the if body
+    if (isinstance(test, ast.Call)
+            and isinstance(test.func, ast.Attribute)
+            and test.func.attr in ("match", "fullmatch", "search")
+            and isinstance(test.func.value, ast.Name)
+            and test.func.value.id == "re"
+            and len(test.args) >= 2
+            and isinstance(test.args[1], ast.Name)):
+        return test.args[1].id
+    # var in [literal_list / tuple / set / named_constant] — allowlist membership check
+    if (isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.In)
+            and isinstance(test.left, ast.Name)
+            and isinstance(test.comparators[0], (ast.List, ast.Tuple, ast.Set, ast.Name))):
+        return test.left.id
     return None
 
 
@@ -2066,6 +2084,14 @@ def _extract_negated_guard_vars(test: ast.expr) -> frozenset[str]:
             and '..' in test.left.value
             and isinstance(test.comparators[0], ast.Name)):
         result.add(test.comparators[0].id)
+
+    # var not in ALLOWED → var is allowlist-validated after early exit
+    if (isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.NotIn)
+            and isinstance(test.left, ast.Name)
+            and isinstance(test.comparators[0], (ast.List, ast.Tuple, ast.Set, ast.Name))):
+        result.add(test.left.id)
 
     # BoolOp(Or/And) containing `not var.startswith(...)` or `not var.endswith(...)`
     # → at least one arm validates the shape; var is treated as safe after exit

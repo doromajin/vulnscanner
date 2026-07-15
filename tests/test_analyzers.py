@@ -764,6 +764,90 @@ class TestTaintTracking:
             for f in findings
         )
 
+    # ── #8 条件分岐ガード ─────────────────────────────────────────────────────────
+
+    def test_guard_re_match_if_body(self):
+        """re.match() in if condition suppresses HIGH inside the guarded body."""
+        code = (
+            "import sqlite3, re\n"
+            "def view():\n"
+            "    uid = request.args.get('id')\n"
+            "    if re.match(r'^\\d+$', uid):\n"
+            "        conn = sqlite3.connect('db')\n"
+            "        conn.execute('SELECT * FROM users WHERE id = ' + uid)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert not any(
+            f.rule_id.startswith("AST-SQL-") and f.severity in (Severity.HIGH, Severity.CRITICAL)
+            for f in findings
+        )
+
+    def test_guard_re_match_early_return(self):
+        """not re.match() followed by return suppresses HIGH in subsequent stmts."""
+        code = (
+            "import sqlite3, re\n"
+            "def view():\n"
+            "    uid = request.args.get('id')\n"
+            "    if not re.match(r'^\\d+$', uid):\n"
+            "        return\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute('SELECT * FROM users WHERE id = ' + uid)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert not any(
+            f.rule_id.startswith("AST-SQL-") and f.severity in (Severity.HIGH, Severity.CRITICAL)
+            for f in findings
+        )
+
+    def test_guard_allowlist_not_in_early_return(self):
+        """var not in ALLOWED followed by return suppresses HIGH in subsequent stmts."""
+        code = (
+            "import sqlite3\n"
+            "ALLOWED = ['asc', 'desc']\n"
+            "def view():\n"
+            "    order = request.args.get('order')\n"
+            "    if order not in ALLOWED:\n"
+            "        return\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute('SELECT * FROM t ORDER BY col ' + order)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert not any(
+            f.rule_id.startswith("AST-SQL-") and f.severity in (Severity.HIGH, Severity.CRITICAL)
+            for f in findings
+        )
+
+    def test_guard_allowlist_in_if_body(self):
+        """var in [literal_list] inside if body suppresses HIGH."""
+        code = (
+            "import sqlite3\n"
+            "def view():\n"
+            "    order = request.args.get('order')\n"
+            "    if order in ['asc', 'desc']:\n"
+            "        conn = sqlite3.connect('db')\n"
+            "        conn.execute('SELECT * FROM t ORDER BY col ' + order)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert not any(
+            f.rule_id.startswith("AST-SQL-") and f.severity in (Severity.HIGH, Severity.CRITICAL)
+            for f in findings
+        )
+
+    def test_guard_absent_still_fires(self):
+        """Without any guard, unvalidated tainted input must still produce HIGH."""
+        code = (
+            "import sqlite3\n"
+            "def view():\n"
+            "    uid = request.args.get('id')\n"
+            "    conn = sqlite3.connect('db')\n"
+            "    conn.execute('SELECT * FROM users WHERE id = ' + uid)\n"
+        )
+        findings = AST.analyze("t.py", code)
+        assert any(
+            f.rule_id.startswith("AST-SQL-") and f.severity in (Severity.HIGH, Severity.CRITICAL)
+            for f in findings
+        )
+
     def test_interprocedural_nested_func_no_outer_contamination(self):
         """Tainted return inside a nested function must not mark the outer function."""
         code = (
