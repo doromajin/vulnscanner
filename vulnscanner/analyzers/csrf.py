@@ -86,7 +86,7 @@ class CSRFAnalyzer(BaseAnalyzer):
             if file_path.endswith(".py") and _DJANGO_EXEMPT_RE.search(line):
                 findings.append(self._make(
                     "CSRF-001", Severity.HIGH,
-                    "Django @csrf_exempt disables CSRF protection on this view",
+                    "Django @csrf_exempt disables CSRF protection on this view",  # vulnscanner: ignore[CSRF-001]
                     file_path, lineno, stripped, lines, repo_url,
                 ))
 
@@ -105,7 +105,7 @@ class CSRFAnalyzer(BaseAnalyzer):
             if file_path.endswith(".py") and _FLASK_CSRF_OFF_RE.search(line):
                 findings.append(self._make(
                     "CSRF-003", Severity.HIGH,
-                    "Flask-WTF CSRF protection explicitly disabled (WTF_CSRF_ENABLED = False)",
+                    "Flask-WTF CSRF protection explicitly disabled (WTF_CSRF_ENABLED = False)",  # vulnscanner: ignore[CSRF-003]
                     file_path, lineno, stripped, lines, repo_url,
                 ))
 

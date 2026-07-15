@@ -22,6 +22,41 @@
 
 ---
 
+## git push 自動化ルール
+
+### 自動 push の条件（全て満たした場合のみ確認不要）
+
+以下の 6 条件を **全て** パスした場合のみ `git push` を実行してよい。
+1 つでも失敗したら push せず、**どの条件で失敗したか**を明記してユーザーに報告し、判断を仰ぐこと。
+
+1. **pytest 全通過** — `pytest tests/` がエラーなく完了する
+2. **self-scan 正常終了** — `python -m vulnscanner.cli scan . --fail-on CRITICAL` が hang・クラッシュなしで終了する
+   （Phase 3 hang バグの教訓：interprocedural 等の新機能追加後は必ずself-scanで無限ループ/タイムアウトがないことを確認）
+3. **パフォーマンス** — 1000 行規模のファイルを 10 秒以内に解析できる
+4. **機密情報チェック** — `git diff` に `.env` や秘密鍵らしき文字列が含まれていない
+5. **変更量** — 1 コミットの変更行数が 5000 行を超えていない
+6. **新規外部パッケージなし** — `requirements.txt` / `package.json` に新規の外部パッケージ追加がない
+
+### 常に確認不要な操作
+
+- `vulnscan` / `pytest` / `git add` / `git commit`
+- `C:\VulnScanner` 配下での `cd` 操作
+- 既存パッケージの `pip install`
+
+### 常に確認必須な操作
+
+- `rm`（ファイル削除）
+- 外部通信（`curl` / `wget` 等）
+- 新規パッケージの `pip install`
+- ブラウザ操作
+- `C:\VulnScanner` 外部へのあらゆる操作
+
+### 夜間自動ループ（improvement_loop.py）
+
+push 禁止を維持する。最良提案は `proposal_best.patch` として保存し、朝に人間が `git apply` する運用のまま変更しない。
+
+---
+
 ## ベンチマーク改善時の必須ルール
 
 OWASP Benchmark 等の第三者ベンチマークのスコア改善作業を行う際は、以下を必ず守ること。

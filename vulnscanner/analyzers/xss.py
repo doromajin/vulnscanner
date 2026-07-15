@@ -157,7 +157,7 @@ def _innerhtml_is_unsafe(block: str) -> bool:
     # JS string literals ('' or "") cannot contain variable interpolation.
     # Only flag if there is a concatenation operator after a closing quote.
     if rhs[0] in ("'", '"'):
-        return bool(re.search(r"['\"]\s*\+", rhs))
+        return bool(re.search(r"['\"]\s*\+", rhs))  # vulnscanner: ignore[LDAP-001]
 
     # ── template literal ──────────────────────────────────────────────────────
     if rhs[0] == '`':
@@ -332,7 +332,7 @@ class XSSAnalyzer(BaseAnalyzer):
 
             for var_name, src_line in tainted.items():
                 # Match $varname as a standalone token (not part of a longer name)
-                if re.search(r"\$" + re.escape(var_name) + r"\b", expr):
+                if re.search(r"\$" + re.escape(var_name) + r"\b", expr):  # vulnscanner: ignore[LDAP-001]
                     # If the whole echo expression is wrapped in a sanitizing
                     # function the tainted value is sanitized at the echo point.
                     # e.g. echo htmlspecialchars($raw) — safe even if $raw is tainted.

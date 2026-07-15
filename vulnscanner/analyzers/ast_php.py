@@ -7,7 +7,7 @@ Detects patterns that regex-based analysis (XSS-008) misses:
   PHP-XSS-012  function return taint        (function f(){return $_GET[..];} echo f())
 
 Intentionally does NOT re-detect what XSS-005 / XSS-008 already cover:
-  - Direct superglobal echo: echo $_GET[...] (XSS-005)
+  - Direct superglobal echo: echo $_GET[...] (XSS-005)  # vulnscanner: ignore[XSS-005]
   - 1-hop var taint:         $a=$_GET[..]; echo $a (XSS-008)
 """
 from __future__ import annotations
