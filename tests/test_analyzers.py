@@ -996,6 +996,58 @@ class TestSARIFReporter:
         }
         assert "src/app.js" in uris
 
+    def test_sarif_rank_default(self):
+        # Findings with default confidence=1.0 get rank=100.0
+        result = self._make_result()
+        with tempfile.NamedTemporaryFile(suffix=".sarif", delete=False, mode="w") as f:
+            path = f.name
+        write_sarif(result, path)
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        for r in doc["runs"][0]["results"]:
+            assert r["rank"] == 100.0, f"{r['ruleId']} should have rank=100 for confidence=1.0"
+
+    def test_sarif_rank_taint_confidence(self):
+        # Taint-based finding with confidence<1.0 must emit rank=confidence*100
+        from vulnscanner.taint import TaintInfo, TaintStatus
+        result = ScanResult(repo_url="test")
+        result.findings = [
+            Finding(
+                vuln_type=VulnType.SQL_INJECTION,
+                severity=Severity.MEDIUM,
+                file_path="app.py",
+                line_number=5,
+                line_content="cursor.execute(q)",
+                description="[low_reach] execute() receives a variable",
+                rule_id="AST-SQL-005",
+                taint_status="unknown",
+                confidence=0.3,
+            ),
+            Finding(
+                vuln_type=VulnType.SQL_INJECTION,
+                severity=Severity.HIGH,
+                file_path="app.py",
+                line_number=6,
+                line_content="cursor.execute(q)",
+                description="execute() receives tainted input",
+                rule_id="AST-SQL-001",
+                taint_status="tainted",
+                confidence=0.9,
+            ),
+        ]
+        with tempfile.NamedTemporaryFile(suffix=".sarif", delete=False, mode="w") as f:
+            path = f.name
+        write_sarif(result, path)
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        by_rule = {r["ruleId"]: r for r in doc["runs"][0]["results"]}
+        assert by_rule["AST-SQL-005"]["rank"] == 30.0
+        assert by_rule["AST-SQL-001"]["rank"] == 90.0
+        # low_reach finding must carry confidence in properties
+        assert by_rule["AST-SQL-005"]["properties"]["confidence"] == 0.3
+        assert by_rule["AST-SQL-005"]["properties"]["taint_status"] == "unknown"
+        # high-confidence finding has no 'properties' key (confidence omitted when 1.0)
+        assert "properties" not in by_rule["AST-SQL-001"] or \
+               by_rule["AST-SQL-001"].get("properties", {}).get("confidence") == 0.9
+
 
 # ── dependency parser unit tests ──────────────────────────────────────────────
 

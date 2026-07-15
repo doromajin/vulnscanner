@@ -47,9 +47,21 @@ def write_sarif(result: ScanResult, output_path: str) -> None:
 
         uri = f.file_path.replace("\\", "/").lstrip("/")
 
-        sarif_results.append({
+        result_props: dict = {}
+        if f.confidence < 1.0:
+            result_props["confidence"] = round(f.confidence, 3)
+        if f.taint_status:
+            result_props["taint_status"] = f.taint_status
+        if f.taint_source:
+            result_props["taint_source"] = f.taint_source
+
+        sarif_result: dict = {
             "ruleId": f.rule_id,
             "level": _LEVEL.get(f.severity, "warning"),
+            # rank: 0–100 (higher = more urgent). Derived from confidence so that
+            # [low_reach] UNKNOWN findings (confidence=0.3) sort below confirmed
+            # TAINTED findings (confidence=0.9) in IDE triage views.
+            "rank": round(f.confidence * 100, 1),
             "message": {"text": f.description},
             "locations": [{
                 "physicalLocation": {
@@ -60,7 +72,10 @@ def write_sarif(result: ScanResult, output_path: str) -> None:
                     "region": {"startLine": max(f.line_number, 1)},
                 }
             }],
-        })
+        }
+        if result_props:
+            sarif_result["properties"] = result_props
+        sarif_results.append(sarif_result)
 
     doc = {
         "$schema": (

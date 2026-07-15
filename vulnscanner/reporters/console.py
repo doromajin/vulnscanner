@@ -68,6 +68,7 @@ def print_results(
         table.add_column("Type", width=24)
         table.add_column("File", overflow="fold")
         table.add_column("Line", justify="right", width=6)
+        table.add_column("Conf", justify="right", width=5)
         table.add_column("Description")
 
         for f in group:
@@ -79,6 +80,7 @@ def print_results(
                 f.vuln_type.value,
                 f.file_path,
                 str(f.line_number),
+                _conf_cell(f.confidence),
                 desc,
             )
 
@@ -143,6 +145,24 @@ def _print_summary(result: ScanResult) -> None:
     bar = _score_bar(p.score)
     console.print(f"Risk     {badge}  Score {p.score}/100  {bar}")
     console.print()
+
+
+def _conf_cell(confidence: float) -> str:
+    """Render a confidence percentage for the CLI table.
+
+    confidence=1.0 means no taint tracking was applied (structural finding);
+    displayed as '—' to avoid misleading precision.  Taint-based values are
+    colour-coded: ≥70% green (confirmed), ≥40% yellow (needs review), <40%
+    dim (low reach / unlikely to be directly exploitable).
+    """
+    if confidence >= 1.0:
+        return "[dim]—[/dim]"
+    pct = f"{confidence:.0%}"
+    if confidence >= 0.7:
+        return f"[green]{pct}[/green]"
+    if confidence >= 0.4:
+        return f"[yellow]{pct}[/yellow]"
+    return f"[dim]{pct}[/dim]"
 
 
 def _score_bar(score: int, width: int = 20) -> str:
