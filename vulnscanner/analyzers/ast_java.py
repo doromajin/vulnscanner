@@ -239,8 +239,12 @@ def _eval_const_expr(node, const_ints: dict, const_strings: dict) -> "int | None
     return None
 
 
-def _collect_const_context(tree):
+def _collect_const_context(tree, properties: "dict | None" = None):
     """Collect constant integer/char/string variable values from the tree.
+
+    Also resolves Properties.getProperty("key", default) calls: if the key
+    exists in *properties* (a pre-loaded .properties dict), the runtime value
+    is used; otherwise the literal default argument is used as a fallback.
 
     Returns (const_ints, const_strings) where const_ints maps variable name → int
     and const_strings maps variable name → str value (without surrounding quotes).
@@ -282,6 +286,18 @@ def _collect_const_context(tree):
                     val = _eval_const_expr(init, const_ints, const_strings)
                     if val is not None:
                         const_ints[decl.name] = val
+                # Properties.getProperty("key", "default") — resolve via loaded .properties
+                if isinstance(init, jt.MethodInvocation) and init.member == "getProperty":
+                    _gp_args = init.arguments or []
+                    if _gp_args:
+                        _key = _literal_str(_gp_args[0])
+                        _resolved: "str | None" = None
+                        if _key and properties:
+                            _resolved = properties.get(_key)
+                        if _resolved is None and len(_gp_args) >= 2:
+                            _resolved = _literal_str(_gp_args[1])
+                        if _resolved is not None:
+                            const_strings[decl.name] = _resolved
     except Exception:
         pass
     return const_ints, const_strings
@@ -848,6 +864,48 @@ def _literal_str(node) -> str | None:
     return None
 
 
+def _algo_str(node, const_strings: dict) -> str | None:
+    """Resolve an algorithm string from a literal node or a const-tracked variable."""
+    lit = _literal_str(node)
+    if lit is not None:
+        return lit
+    if isinstance(node, jt.MemberReference):
+        return const_strings.get(node.member)
+    return None
+
+
+def _load_properties_files(file_path_str: str) -> dict:
+    """Load key→value pairs from .properties files found near file_path.
+
+    Walks up from file_path until a project root marker is found (pom.xml,
+    build.gradle, or src/), then rglob-scans for *.properties files.
+    Returns a merged dict; later files' keys override earlier ones.
+    """
+    props: dict = {}
+    try:
+        search_root = Path(file_path_str).resolve().parent
+        for _ in range(12):
+            if any((search_root / m).exists() for m in ("pom.xml", "build.gradle", "src")):
+                break
+            parent = search_root.parent
+            if parent == search_root:
+                break
+            search_root = parent
+        for pf in search_root.rglob("*.properties"):
+            try:
+                for raw_line in pf.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    props[k.strip()] = v.strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return props
+
+
 # ── analyzer ───────────────────────────────────────────────────────────────────
 
 class JavaASTAnalyzer(BaseAnalyzer):
@@ -864,8 +922,10 @@ class JavaASTAnalyzer(BaseAnalyzer):
             return []
 
         lines = content.splitlines()
+        _props = _load_properties_files(file_path)
         tainted, list_tainted_vars = _collect_tainted(tree)
         writers = _collect_writers(tree)
+        _, _const_strings = _collect_const_context(tree, _props)
         findings: list[Finding] = []
 
         def _add(node, vuln_type, severity, rule_id, desc, *, line_override: int = 0):
@@ -1024,7 +1084,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 args = node.arguments or []
                 if not args:
                     continue
-                algo = _literal_str(args[0])
+                algo = _algo_str(args[0], _const_strings)
                 if algo and algo.upper() in _WEAK_HASH_ALGOS:
                     _add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "JAST-CRYPTO-002",
                          f"MessageDigest.getInstance(\"{algo}\") uses a broken hash algorithm — "
@@ -1043,7 +1103,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 args = node.arguments or []
                 if not args:
                     continue
-                algo = _literal_str(args[0])
+                algo = _algo_str(args[0], _const_strings)
                 if algo:
                     algo_up = algo.upper()
                     if any(algo_up.startswith(p) for p in _WEAK_CIPHER_PREFIXES):
