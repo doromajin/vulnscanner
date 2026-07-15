@@ -15,6 +15,7 @@ import ast
 import copy
 import json
 import re
+import threading as _threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -340,6 +341,109 @@ _LDAP3_SEARCH_METHODS = frozenset({"search"})
 _interprocedural_taint_sources: frozenset[str] = frozenset()
 _local_func_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
 
+# ── cross-file taint context (thread-local) ────────────────────────────────────
+# Set once per file analysis via set_cross_file_context(); read in analyze() and _taint_of().
+_cross_file_local = _threading.local()
+
+
+def set_cross_file_context(all_contents: dict[str, str]) -> None:
+    """Register the full {relative_path: content} map for cross-file taint resolution.
+
+    Uses thread-local storage so parallel scan workers don't interfere with each other.
+    Call this once per scan before submitting analysis jobs.
+    """
+    _cross_file_local.all_contents = all_contents
+
+
+def _resolve_module_to_file(
+    module_name: str,
+    current_file: str,
+    all_contents: dict[str, str],
+) -> str | None:
+    """Resolve a dotted Python module name to a relative file path in all_contents.
+
+    Tries both ``module/path.py`` and ``module/path/__init__.py`` forms,
+    first relative to the project root, then relative to the importing file's directory.
+    """
+    current_dir = current_file.rsplit("/", 1)[0] if "/" in current_file else ""
+    bases = [
+        module_name.replace(".", "/") + ".py",
+        module_name.replace(".", "/") + "/__init__.py",
+    ]
+    candidates = list(bases)
+    if current_dir:
+        candidates += [f"{current_dir}/{b}" for b in bases]
+    for cand in candidates:
+        if cand in all_contents:
+            return cand
+    return None
+
+
+def _build_remote_func_defs(
+    file_path: str,
+    content: str,
+    all_contents: dict[str, str],
+) -> dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]]:
+    """Parse import statements in *content* and return a map of imported project-local
+    functions: ``{imported_name: (FunctionDef_node, source_file_path)}``.
+
+    Handles:
+    - ``from utils import process`` → key ``"process"``
+    - ``from utils import process as p`` → key ``"p"``
+    - ``import utils`` → keys ``"utils.func_name"``
+    - ``from utils import *`` → all public functions
+
+    Only resolves to files that exist in *all_contents* (project-local);
+    third-party packages (e.g. ``import requests``) are silently skipped.
+    """
+    remote: dict[str, tuple] = {}
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return remote
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            module_file = _resolve_module_to_file(node.module, file_path, all_contents)
+            if not module_file:
+                continue
+            module_content = all_contents.get(module_file, "")
+            try:
+                module_tree = ast.parse(module_content)
+            except SyntaxError:
+                continue
+            module_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
+                n.name: n
+                for n in ast.walk(module_tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            for alias in node.names:
+                name, as_name = alias.name, alias.asname or alias.name
+                if name == "*":
+                    for fn, fn_node in module_funcs.items():
+                        if not fn.startswith("_"):
+                            remote[fn] = (fn_node, module_file)
+                elif name in module_funcs:
+                    remote[as_name] = (module_funcs[name], module_file)
+
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                module_file = _resolve_module_to_file(alias.name, file_path, all_contents)
+                if not module_file:
+                    continue
+                module_content = all_contents.get(module_file, "")
+                try:
+                    module_tree = ast.parse(module_content)
+                except SyntaxError:
+                    continue
+                as_name = alias.asname or alias.name
+                for n in ast.walk(module_tree):
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if not n.name.startswith("_"):
+                            remote[f"{as_name}.{n.name}"] = (n, module_file)
+
+    return remote
+
 
 def _callee_returns_tainted(
     func_def: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -385,6 +489,25 @@ class PythonASTAnalyzer(BaseAnalyzer):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         _interprocedural_taint_sources = _find_taint_source_funcs(tree)
+
+        # Cross-file taint: build remote function defs from thread-local context.
+        # set_cross_file_context() is called by the scanner before parallel analysis.
+        _all = getattr(_cross_file_local, "all_contents", None)
+        if _all:
+            _rfd = _build_remote_func_defs(file_path, content, _all)
+            _cross_file_local.remote_func_defs = _rfd
+            # Extend taint sources with remote functions that themselves return tainted data
+            # (e.g. utils.get_user_input() defined in utils.py that reads request.args).
+            _extra: set[str] = set()
+            for _fn_name, (_fn_node, _) in _rfd.items():
+                _fake = ast.Module(body=[_fn_node], type_ignores=[])
+                if _fn_name in _find_taint_source_funcs(_fake):
+                    _extra.add(_fn_name)
+            if _extra:
+                _interprocedural_taint_sources = _interprocedural_taint_sources | frozenset(_extra)
+        else:
+            _cross_file_local.remote_func_defs = {}
+
         visitor = _VulnVisitor(file_path, lines, repo_url, self, content)
         visitor.visit(tree)
         return visitor.findings
@@ -1804,6 +1927,32 @@ def _taint_of(
                 if _param_assigns and _callee_returns_tainted(_fd, _param_assigns, _depth + 1):
                     return TaintInfo(TaintStatus.TAINTED,
                                      f"tainted arg flows through '{full}' return", source=full)
+
+        # Phase 4: cross-file taint propagation.
+        # If the called function is imported from another project-local file, check
+        # whether a tainted argument flows through its return value.
+        # (Remote taint-source functions — those that read request data directly —
+        # are already merged into _interprocedural_taint_sources in analyze(), so the
+        # check above at line ~1786 handles them. Phase 4 only needs to cover
+        # the passthrough case: remote func receives a tainted arg and returns it.)
+        if full and full not in _local_func_defs and _depth <= 11:
+            _rfd_x = getattr(_cross_file_local, "remote_func_defs", {})
+            if full in _rfd_x:
+                _rfn, _rsrc = _rfd_x[full]
+                _arg_taints_x = [
+                    _taint_of(a, assignments, class_attrs, _depth + 1) for a in node.args
+                ]
+                if any(t.status == TaintStatus.TAINTED for t in _arg_taints_x):
+                    _pm: dict[str, ast.expr] = {}
+                    for _i, _p in enumerate(_rfn.args.args):
+                        if _i < len(_arg_taints_x) and _arg_taints_x[_i].status == TaintStatus.TAINTED:
+                            _pm[_p.arg] = ast.Name(id="request", ctx=ast.Load())
+                    if _pm and _callee_returns_tainted(_rfn, _pm, _depth + 1):
+                        return TaintInfo(
+                            TaintStatus.TAINTED,
+                            f"tainted arg flows through '{full}' (from {_rsrc}) return",
+                            source=f"{_rsrc}:{full}",
+                        )
 
         # Context-specific sanitizers: record sanitizer in metadata, preserve taint status.
         # html.escape / bleach.clean  → protects HTML/XSS only

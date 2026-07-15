@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from vulnscanner.analyzers import ALL_ANALYZERS, BaseAnalyzer
+from vulnscanner.analyzers.ast_python import set_cross_file_context
 from vulnscanner.analyzers.file_context import (
     INCLUDE_TEST_FILES,
     INCLUDE_VENDOR_FILES,
@@ -162,6 +163,10 @@ class VulnScanner:
             and (changed_files is None or fp in changed_files)
         ]
 
+        # Build cross-file content map for interprocedural taint tracking across files.
+        # Only Python files are needed; others are included harmlessly and ignored.
+        all_contents = {fp: content for fp, content in files}
+
         start = time.perf_counter()
         with Progress(
             SpinnerColumn("line"),
@@ -174,7 +179,7 @@ class VulnScanner:
 
             with ThreadPoolExecutor(max_workers=self._workers) as pool:
                 futures = {
-                    pool.submit(self._analyze_file_pure, fp, content, directory): fp
+                    pool.submit(self._analyze_file_pure, fp, content, directory, all_contents): fp
                     for fp, content in files
                 }
                 for future in as_completed(futures):
@@ -191,9 +196,15 @@ class VulnScanner:
         return result
 
     def _analyze_file_pure(
-        self, file_path: str, content: str, source: str
+        self, file_path: str, content: str, source: str,
+        all_contents: dict[str, str] | None = None,
     ) -> _FileResult:
         """Analyze a single file; returns results without mutating shared state."""
+        # Provide cross-file content map to PythonASTAnalyzer via thread-local storage.
+        # This enables interprocedural taint tracking across imported project files.
+        if all_contents is not None:
+            set_cross_file_context(all_contents)
+
         partial = _FileResult(scanned_lines=content.count("\n") + 1)
         lines = content.splitlines()
 

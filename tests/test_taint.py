@@ -10,6 +10,7 @@ from vulnscanner.analyzers.ast_python import (
     _taint_merge,
     _collect_class_attrs,
     _collect_scope_assignments,
+    set_cross_file_context,
 )
 from vulnscanner.models import Severity
 
@@ -599,3 +600,98 @@ class TestSanitizerSinkAwareness:
         assert "html.escape" in result.sanitizers, (
             "sanitizer name must be recorded in metadata even when taint is preserved"
         )
+
+
+# ── cross-file taint tracking ──────────────────────────────────────────────────
+
+class TestCrossFileTaint:
+    """Phase 4: taint propagation across imported project-local files."""
+
+    def _scan_with_context(self, files: dict[str, str], target_file: str) -> list:
+        """Analyze target_file with cross-file context from files dict."""
+        set_cross_file_context(files)
+        return AST.analyze(target_file, files[target_file])
+
+    def test_tainted_arg_passthrough_via_import(self):
+        # utils.py: process(s) returns s unchanged (passthrough)
+        # app.py: from utils import process; db.execute(... + process(request.args['q']))
+        files = {
+            "utils.py": (
+                "def process(s):\n"
+                "    return s\n"
+            ),
+            "app.py": (
+                "from utils import process\n"
+                "def view(request, cursor):\n"
+                "    q = request.args.get('q')\n"
+                "    cursor.execute('SELECT * FROM t WHERE id=' + process(q))\n"
+            ),
+        }
+        findings = self._scan_with_context(files, "app.py")
+        sql = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert sql, "tainted arg passthrough via imported function must be detected"
+
+    def test_remote_taint_source_function(self):
+        # utils.py: get_input() reads request.args directly, so it is a taint source
+        # app.py: from utils import get_input; db.execute(... + get_input())
+        files = {
+            "utils.py": (
+                "def get_input(request):\n"
+                "    return request.args.get('q')\n"
+            ),
+            "app.py": (
+                "from utils import get_input\n"
+                "def view(request, cursor):\n"
+                "    val = get_input(request)\n"
+                "    cursor.execute('SELECT * FROM t WHERE id=' + val)\n"
+            ),
+        }
+        findings = self._scan_with_context(files, "app.py")
+        sql = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert sql, "remote taint-source function must propagate taint to callers"
+
+    def test_no_cross_file_fp_for_clean_passthrough(self):
+        # utils.py: sanitize(s) returns int(s), which is universally safe.
+        # Phase 4 must not report a confirmed-TAINTED (HIGH) SQL finding;
+        # an UNKNOWN/MEDIUM finding is acceptable since we cannot prove the
+        # remote function always returns a safe value without full analysis.
+        files = {
+            "utils.py": (
+                "def sanitize(s):\n"
+                "    return int(s)\n"
+            ),
+            "app.py": (
+                "from utils import sanitize\n"
+                "def view(request, cursor):\n"
+                "    q = request.args.get('q')\n"
+                "    cursor.execute('SELECT * FROM t WHERE id=' + str(sanitize(q)))\n"
+            ),
+        }
+        findings = self._scan_with_context(files, "app.py")
+        confirmed_tainted_sql = [
+            f for f in findings
+            if "SQL" in f.rule_id
+            and f.suppression_reason is None
+            and f.taint_status == "tainted"
+        ]
+        assert not confirmed_tainted_sql, (
+            "int() sanitizer in remote function must prevent confirmed-TAINTED SQL finding"
+        )
+
+    def test_no_cross_file_detection_without_context(self):
+        # Without cross-file context the call to process(q) is UNKNOWN, not confirmed-tainted.
+        set_cross_file_context({})
+        code = (
+            "from utils import process\n"
+            "def view(request, cursor):\n"
+            "    q = request.args.get('q')\n"
+            "    cursor.execute('SELECT * FROM t WHERE id=' + process(q))\n"
+        )
+        findings = AST.analyze("app.py", code)
+        high_sql = [
+            f for f in findings
+            if "SQL" in f.rule_id
+            and f.suppression_reason is None
+            and f.taint_status == "tainted"
+        ]
+        assert not high_sql, "without cross-file context, confirmed-taint SQL should not fire"
