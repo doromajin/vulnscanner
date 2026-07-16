@@ -694,6 +694,8 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_insecure_rng_call(node)
         self._check_xxe(node)
         self._check_ldap_injection(node)
+        self._check_xpath_injection(node)
+        self._check_insecure_cookie(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -1312,6 +1314,86 @@ class _VulnVisitor(ast.NodeVisitor):
                       f"LDAP injection allows authentication bypass: {taint.reason}",
                       taint)
 
+    # ── XPath injection ────────────────────────────────────────────────────────
+
+    def _check_xpath_injection(self, node: ast.Call) -> None:
+        """Detect XPath injection via tainted XPath expression strings.
+
+        Three real-world patterns (all from lxml / elementpath ecosystem):
+          root.xpath(query)               — lxml Element method, arg 0 is expression
+          elementpath.select(root, query) — second positional arg is expression
+          lxml.etree.XPath(query)         — XPath object constructor, arg 0 is expression
+        """
+        full = _full_name(node.func)
+        attr = _attr_name(node.func)
+
+        # root.xpath(tainted_expr)
+        if attr == "xpath" and isinstance(node.func, ast.Attribute):
+            if not node.args:
+                return
+            taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                return
+            if _expr_apos_replaced(node.args[0], self._assignments):
+                return
+            sev = Severity.HIGH if taint.status == TaintStatus.TAINTED else Severity.MEDIUM
+            self._add(node, VulnType.XPATH_INJECTION, sev, "AST-XPATH-001",
+                      f"lxml .xpath() called with {'tainted' if sev == Severity.HIGH else 'non-literal'} "
+                      f"expression — XPath injection allows data extraction bypass: {taint.reason}",
+                      taint)
+
+        # elementpath.select(root, tainted_query)
+        elif full == "elementpath.select":
+            if len(node.args) < 2:
+                return
+            taint = _taint_of(node.args[1], self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                return
+            if _expr_apos_replaced(node.args[1], self._assignments):
+                return
+            sev = Severity.HIGH if taint.status == TaintStatus.TAINTED else Severity.MEDIUM
+            self._add(node, VulnType.XPATH_INJECTION, sev, "AST-XPATH-002",
+                      f"elementpath.select() called with {'tainted' if sev == Severity.HIGH else 'non-literal'} "
+                      f"XPath query — injection allows data extraction bypass: {taint.reason}",
+                      taint)
+
+        # lxml.etree.XPath(tainted_expr) constructor
+        elif full == "lxml.etree.XPath":
+            if not node.args:
+                return
+            taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                return
+            if _expr_apos_replaced(node.args[0], self._assignments):
+                return
+            sev = Severity.HIGH if taint.status == TaintStatus.TAINTED else Severity.MEDIUM
+            self._add(node, VulnType.XPATH_INJECTION, sev, "AST-XPATH-003",
+                      f"lxml.etree.XPath() constructed with {'tainted' if sev == Severity.HIGH else 'non-literal'} "
+                      f"expression — XPath injection allows data extraction bypass: {taint.reason}",
+                      taint)
+
+    # ── Insecure cookie ────────────────────────────────────────────────────────
+
+    def _check_insecure_cookie(self, node: ast.Call) -> None:
+        """Detect Flask response.set_cookie() with secure=False (CWE-614).
+
+        Only flags explicit secure=False — the unambiguous developer mistake.
+        Missing secure= is not flagged (too many FPs in non-HTTPS dev contexts
+        and non-sensitive cookies).
+        """
+        if not isinstance(node.func, ast.Attribute):
+            return
+        if node.func.attr != "set_cookie":
+            return
+        for kw in node.keywords:
+            if kw.arg == "secure" and isinstance(kw.value, ast.Constant):
+                if kw.value.value is False:
+                    self._add(node, VulnType.INSECURE_COOKIE, Severity.MEDIUM,
+                              "AST-COOKIE-001",
+                              "response.set_cookie(secure=False) — cookie transmitted over plain HTTP; "
+                              "set secure=True to restrict to HTTPS connections (CWE-614)")
+                    return
+
     # ── XSS: Flask/Django response body accumulation ───────────────────────────
 
     def _check_xss_response(self, node: ast.AugAssign) -> None:
@@ -1531,6 +1613,17 @@ class _VulnVisitor(ast.NodeVisitor):
                     self._visit_stmts(stmts[i + 1:])
                     self._assignments = saved
                     return
+            elif isinstance(stmt, ast.Try):
+                # Process the try body with sequential guard propagation so that
+                # guards like `if "'" in bar: return` inside try blocks suppress
+                # subsequent sinks within the same try body.
+                self._visit_stmts(stmt.body)
+                for handler in stmt.handlers:
+                    self.visit(handler)
+                if stmt.orelse:
+                    self._visit_stmts(stmt.orelse)
+                if stmt.finalbody:
+                    self._visit_stmts(stmt.finalbody)
             else:
                 self.visit(stmt)
             self._check_interprocedural_calls(stmt)
@@ -2480,13 +2573,21 @@ def _extract_negated_guard_vars(test: ast.expr) -> frozenset[str]:
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
         result.update(_extract_guard_vars(test.operand))
 
-    # '../' in var_name → dotdot-traversal check; var is safe after early exit
+    # DANGEROUS_CHAR in var → early-exit injection-character check; var is safe after exit.
+    # Covers two patterns from real-world code:
+    #   '../' in var  — path-traversal check (original)
+    #   "'"  in var   — XPath / SQL injection character check
+    #   '"'  in var   — XPath injection character check
+    # The constant must be a recognised dangerous string, not an arbitrary literal,
+    # to avoid over-marking guards like `if "foo" in var: return`.
+    _DANGEROUS_CHAR_GUARDS = frozenset({"'", '"', "../", "..", ";"})
     if (isinstance(test, ast.Compare)
             and len(test.ops) == 1
             and isinstance(test.ops[0], ast.In)
             and isinstance(test.left, ast.Constant)
             and isinstance(test.left.value, str)
-            and '..' in test.left.value
+            and any(test.left.value == c or c in test.left.value
+                    for c in _DANGEROUS_CHAR_GUARDS)
             and isinstance(test.comparators[0], ast.Name)):
         result.add(test.comparators[0].id)
 
@@ -2511,6 +2612,39 @@ def _extract_negated_guard_vars(test: ast.expr) -> frozenset[str]:
                 result.add(operand.operand.func.value.id)
 
     return frozenset(result)
+
+
+def _expr_apos_replaced(node: ast.expr, assignments: dict[str, ast.expr]) -> bool:
+    """True if all tainted parts of the expression have apostrophes replaced.
+
+    Recognises the real-world XPath sanitisation pattern `var.replace("'", X)`
+    where X does not contain an apostrophe (e.g. "&apos;", "").  When embedded
+    in an f-string, every FormattedValue part must satisfy this property.
+    """
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Name):
+        val = assignments.get(node.id)
+        return _expr_apos_replaced(val, assignments) if val is not None else False
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "replace":
+            if len(node.args) >= 2:
+                a0, a1 = node.args[0], node.args[1]
+                if (isinstance(a0, ast.Constant) and isinstance(a0.value, str)
+                        and "'" in a0.value
+                        and isinstance(a1, ast.Constant) and isinstance(a1.value, str)
+                        and "'" not in a1.value):
+                    return True
+    if isinstance(node, ast.JoinedStr):
+        return all(
+            _expr_apos_replaced(part.value, assignments)
+            for part in node.values
+            if isinstance(part, ast.FormattedValue)
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return (_expr_apos_replaced(node.left, assignments)
+                and _expr_apos_replaced(node.right, assignments))
+    return False
 
 
 def _is_always_exit(stmts: list[ast.stmt]) -> bool:

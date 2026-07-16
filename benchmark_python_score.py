@@ -28,20 +28,23 @@ EXPECTED   = BENCH_DIR / "expectedresults-0.1.csv"
 # ── category → VulnType mapping ───────────────────────────────────────────────
 
 CATEGORY_MAP: dict[str, set[VulnType]] = {
-    "pathtraver":     {VulnType.PATH_TRAVERSAL},
-    "sqli":           {VulnType.SQL_INJECTION},
-    "xss":            {VulnType.XSS},
-    "cmdi":           {VulnType.COMMAND_INJECTION},
-    "weakrand":       {VulnType.WEAK_CRYPTOGRAPHY},
-    "hash":           {VulnType.WEAK_CRYPTOGRAPHY},
-    "ldapi":          {VulnType.LDAP_INJECTION},
-    "xxe":            {VulnType.XXE},
-    "redirect":       {VulnType.OPEN_REDIRECT},
-    "deserialization":{VulnType.INSECURE_DESERIALIZATION},
-    # Not covered:
-    # xpathi, trustbound, securecookie, codeinj
+    "pathtraver":      {VulnType.PATH_TRAVERSAL},
+    "sqli":            {VulnType.SQL_INJECTION},
+    "xss":             {VulnType.XSS},
+    "cmdi":            {VulnType.COMMAND_INJECTION},
+    "weakrand":        {VulnType.WEAK_CRYPTOGRAPHY},
+    "hash":            {VulnType.WEAK_CRYPTOGRAPHY},
+    "ldapi":           {VulnType.LDAP_INJECTION},
+    "xxe":             {VulnType.XXE},
+    "redirect":        {VulnType.OPEN_REDIRECT},
+    "deserialization": {VulnType.INSECURE_DESERIALIZATION},
+    "codeinj":         {VulnType.COMMAND_INJECTION},   # exec/eval already detected
+    "xpathi":          {VulnType.XPATH_INJECTION},
+    "securecookie":    {VulnType.INSECURE_COOKIE},
+    # trustbound (CWE-501): session key injection — FP risk too high in real Flask
+    # apps; requires scope-boundary analysis incompatible with current taint arch
 }
-NOT_COVERED = {"xpathi", "trustbound", "securecookie", "codeinj"}
+NOT_COVERED = {"trustbound"}
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
