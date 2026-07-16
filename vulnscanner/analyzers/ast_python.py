@@ -408,9 +408,19 @@ def _build_remote_func_defs(
     file_path: str,
     content: str,
     all_contents: dict[str, str],
-) -> dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]]:
-    """Parse import statements in *content* and return a map of imported project-local
-    functions: ``{imported_name: (FunctionDef_node, source_file_path)}``.
+) -> tuple[
+    dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]],
+    dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]],
+]:
+    """Parse import statements in *content* and return:
+
+    1. ``remote_funcs`` — ``{imported_name: (FunctionDef_node, source_file_path)}``
+       for module-level functions (existing behaviour).
+    2. ``class_methods`` — ``{method_name: [FunctionDef_node, ...]}``
+       collecting every class method found in imported project-local modules so
+       that calls like ``obj.doSomething(tainted_arg)`` can be resolved even when
+       the type of *obj* is unknown.  Multiple classes may define the same method;
+       all implementations are stored so taint analysis can take the worst case.
 
     Handles:
     - ``from utils import process`` → key ``"process"``
@@ -422,16 +432,38 @@ def _build_remote_func_defs(
     third-party packages (e.g. ``import requests``) are silently skipped.
     """
     remote: dict[str, tuple] = {}
+    class_methods: dict[str, list] = {}
+    seen_module_files: set[str] = set()
     try:
         tree = ast.parse(content)
     except SyntaxError:
-        return remote
+        return remote, class_methods
+
+    def _collect_module(module_file: str) -> None:
+        if module_file in seen_module_files:
+            return
+        seen_module_files.add(module_file)
+        module_content = all_contents.get(module_file, "")
+        try:
+            module_tree = ast.parse(module_content)
+        except SyntaxError:
+            return
+        # Collect class methods into class_methods dict
+        for class_node in module_tree.body:
+            if not isinstance(class_node, ast.ClassDef):
+                continue
+            for item in class_node.body:
+                if (isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and item.name != "__init__"
+                        and not item.name.startswith("__")):
+                    class_methods.setdefault(item.name, []).append(item)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
             module_file = _resolve_module_to_file(node.module, file_path, all_contents)
             if not module_file:
                 continue
+            _collect_module(module_file)
             module_content = all_contents.get(module_file, "")
             try:
                 module_tree = ast.parse(module_content)
@@ -456,6 +488,7 @@ def _build_remote_func_defs(
                 module_file = _resolve_module_to_file(alias.name, file_path, all_contents)
                 if not module_file:
                     continue
+                _collect_module(module_file)
                 module_content = all_contents.get(module_file, "")
                 try:
                     module_tree = ast.parse(module_content)
@@ -467,7 +500,7 @@ def _build_remote_func_defs(
                         if not n.name.startswith("_"):
                             remote[f"{as_name}.{n.name}"] = (n, module_file)
 
-    return remote
+    return remote, class_methods
 
 
 def _callee_returns_tainted(
@@ -543,8 +576,9 @@ class PythonASTAnalyzer(BaseAnalyzer):
         # set_cross_file_context() is called by the scanner before parallel analysis.
         _all = getattr(_cross_file_local, "all_contents", None)
         if _all:
-            _rfd = _build_remote_func_defs(file_path, content, _all)
+            _rfd, _rcm = _build_remote_func_defs(file_path, content, _all)
             _cross_file_local.remote_func_defs = _rfd
+            _cross_file_local.remote_class_methods = _rcm
             # Extend taint sources with remote functions that themselves return tainted data
             # (e.g. utils.get_user_input() defined in utils.py that reads request.args).
             _extra: set[str] = set()
@@ -556,6 +590,7 @@ class PythonASTAnalyzer(BaseAnalyzer):
                 _interprocedural_taint_sources = _interprocedural_taint_sources | frozenset(_extra)
         else:
             _cross_file_local.remote_func_defs = {}
+            _cross_file_local.remote_class_methods = {}
 
         visitor = _VulnVisitor(file_path, lines, repo_url, self, content)
         visitor.visit(tree)
@@ -1274,9 +1309,15 @@ class _VulnVisitor(ast.NodeVisitor):
         taint = _taint_of(node.value, self._assignments, self._class_attrs)
         if taint.status != TaintStatus.TAINTED:
             return
-        # Suppress if an HTML-specific sanitizer (markupsafe.escape, html.escape, etc.) was applied
-        if any(s in _HTML_SANITIZER_FUNCS or s in _HTML_SANITIZER_METHODS
-               for s in (taint.sanitizers or [])):
+        # Suppress if an HTML-specific sanitizer was applied.
+        # Sanitizer names may be stored as fully-qualified paths (e.g. "helpers.utils.escape_for_html"),
+        # so also check the last component against _HTML_SANITIZER_METHODS.
+        if any(
+            s in _HTML_SANITIZER_FUNCS
+            or s in _HTML_SANITIZER_METHODS
+            or s.rsplit(".", 1)[-1] in _HTML_SANITIZER_METHODS
+            for s in (taint.sanitizers or [])
+        ):
             return
         self._add(node, VulnType.XSS, Severity.HIGH, "AST-XSS-002",
                   f"Tainted user input appended to response string without HTML encoding — "
@@ -2073,7 +2114,13 @@ def _taint_of(
         # are already merged into _interprocedural_taint_sources in analyze(), so the
         # check above at line ~1786 handles them. Phase 4 only needs to cover
         # the passthrough case: remote func receives a tainted arg and returns it.)
-        if full and full not in _local_func_defs and _depth <= 11:
+        # Skip Phase 4 for known sanitizer functions: the sanitizer handler below records
+        # the sanitizer metadata correctly and must not be bypassed by Phase 4's TAINTED return.
+        _phase4_is_sanitizer = (
+            full in _HTML_SANITIZER_FUNCS | _URL_SANITIZER_FUNCS | _CMD_SANITIZER_FUNCS
+            or attr in _HTML_SANITIZER_METHODS | _URL_SANITIZER_METHODS
+        )
+        if full and full not in _local_func_defs and _depth <= 11 and not _phase4_is_sanitizer:
             _rfd_x = getattr(_cross_file_local, "remote_func_defs", {})
             if full in _rfd_x:
                 _rfn, _rsrc = _rfd_x[full]
@@ -2173,6 +2220,42 @@ def _taint_of(
                     return _taint_of(assignments[lookup], assignments, class_attrs, _depth + 1)
                 # Key was never stored via conf.set() in this scope → not user-controlled
                 return CLEAN_LITERAL
+
+        # Cross-file class method resolution: find all known class implementations of this
+        # method and take the worst-case taint across them.  Handles two real patterns:
+        #   thing = ThingFactory.createThing()   → UNKNOWN type
+        #   bar = thing.doSomething(tainted)     → TAINTED (method returns its arg)
+        # and suppresses FPs from safe wrapper methods that return constants:
+        #   scr = request_wrapper(request)
+        #   val = scr.get_safe_value("key")      → CLEAN (always returns "bar")
+        if attr and _depth <= 11:
+            _rcm = getattr(_cross_file_local, "remote_class_methods", {})
+            if attr in _rcm:
+                _arg_taints_cm = [
+                    _taint_of(a, assignments, class_attrs, _depth + 1)
+                    for a in node.args
+                ]
+                _cm_results: list[TaintInfo] = []
+                for _m_node in _rcm[attr]:
+                    # Map positional args to params, skipping 'self'
+                    _params = [p for p in _m_node.args.args if p.arg != "self"]
+                    _pm: dict[str, ast.expr] = {}
+                    for _i, _p in enumerate(_params):
+                        if _i < len(_arg_taints_cm):
+                            if _arg_taints_cm[_i].status == TaintStatus.TAINTED:
+                                _pm[_p.arg] = ast.Name(id="request", ctx=ast.Load())
+                            elif _arg_taints_cm[_i].status == TaintStatus.CLEAN:
+                                _pm[_p.arg] = ast.Constant(value="safe_literal")
+                    if _callee_returns_tainted(_m_node, _pm, _depth + 1):
+                        _cm_results.append(TaintInfo(
+                            TaintStatus.TAINTED,
+                            f"tainted arg flows through .{attr}() implementation",
+                            source=attr,
+                        ))
+                    else:
+                        _cm_results.append(CLEAN_LITERAL)
+                if _cm_results:
+                    return _taint_worst(_cm_results)
 
         return TaintInfo(TaintStatus.UNKNOWN,
                          f"return of {full or attr or '<call>'}()",
