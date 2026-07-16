@@ -519,6 +519,30 @@ def _callee_returns_tainted(
     return False
 
 
+def _callee_return_taint_status(
+    func_def: ast.FunctionDef | ast.AsyncFunctionDef,
+    param_assignments: dict[str, ast.expr],
+    _depth: int,
+) -> TaintStatus:
+    """Return the worst-case TaintStatus across all return paths of func_def.
+
+    Unlike _callee_returns_tainted (bool), this distinguishes CLEAN (provably
+    safe constant return) from UNKNOWN (calls unresolved external APIs), which
+    lets class-method resolution avoid the CLEAN-assumption FN where a method
+    that wraps an opaque external call is incorrectly treated as safe.
+    """
+    if _depth > 14:
+        return TaintStatus.UNKNOWN
+    merged = {**_collect_scope_assignments(func_def), **param_assignments}
+    worst = TaintStatus.CLEAN
+    for ret in _iter_func_returns(func_def):
+        if ret.value is not None:
+            status = _taint_of(ret.value, merged, {}, _depth).status
+            if _TAINT_ORDER[status] > _TAINT_ORDER[worst]:
+                worst = status
+    return worst
+
+
 def _func_is_web_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     """Return True if *node* is likely a web request handler.
 
@@ -2221,13 +2245,21 @@ def _taint_of(
                 # Key was never stored via conf.set() in this scope → not user-controlled
                 return CLEAN_LITERAL
 
-        # Cross-file class method resolution: find all known class implementations of this
-        # method and take the worst-case taint across them.  Handles two real patterns:
+        # Cross-file class method resolution: evaluate all known class implementations of
+        # this method and derive a consensus taint result.  Handles two real patterns:
         #   thing = ThingFactory.createThing()   → UNKNOWN type
-        #   bar = thing.doSomething(tainted)     → TAINTED (method returns its arg)
+        #   bar = thing.doSomething(tainted)     → TAINTED (all impls pass arg through)
         # and suppresses FPs from safe wrapper methods that return constants:
         #   scr = request_wrapper(request)
-        #   val = scr.get_safe_value("key")      → CLEAN (always returns "bar")
+        #   val = scr.get_safe_value("key")      → CLEAN (sole impl returns "bar")
+        #
+        # Consensus rules (avoids two bugs in the naive any-match approach):
+        #   ALL TAINTED → TAINTED   (confident the call propagates taint)
+        #   ALL CLEAN   → CLEAN     (every impl is provably constant/safe)
+        #   otherwise   → fall through to UNKNOWN
+        # "Otherwise" covers: mixed TAINTED+CLEAN (different classes behave differently,
+        # we can't determine which is instantiated without type inference) and any impl
+        # that returns UNKNOWN (wraps an opaque external API — don't assume CLEAN).
         if attr and _depth <= 11:
             _rcm = getattr(_cross_file_local, "remote_class_methods", {})
             if attr in _rcm:
@@ -2235,7 +2267,7 @@ def _taint_of(
                     _taint_of(a, assignments, class_attrs, _depth + 1)
                     for a in node.args
                 ]
-                _cm_results: list[TaintInfo] = []
+                _cm_statuses: list[TaintStatus] = []
                 for _m_node in _rcm[attr]:
                     # Map positional args to params, skipping 'self'
                     _params = [p for p in _m_node.args.args if p.arg != "self"]
@@ -2246,16 +2278,19 @@ def _taint_of(
                                 _pm[_p.arg] = ast.Name(id="request", ctx=ast.Load())
                             elif _arg_taints_cm[_i].status == TaintStatus.CLEAN:
                                 _pm[_p.arg] = ast.Constant(value="safe_literal")
-                    if _callee_returns_tainted(_m_node, _pm, _depth + 1):
-                        _cm_results.append(TaintInfo(
+                    _cm_statuses.append(
+                        _callee_return_taint_status(_m_node, _pm, _depth + 1)
+                    )
+                if _cm_statuses:
+                    if all(s == TaintStatus.TAINTED for s in _cm_statuses):
+                        return TaintInfo(
                             TaintStatus.TAINTED,
                             f"tainted arg flows through .{attr}() implementation",
                             source=attr,
-                        ))
-                    else:
-                        _cm_results.append(CLEAN_LITERAL)
-                if _cm_results:
-                    return _taint_worst(_cm_results)
+                        )
+                    if all(s == TaintStatus.CLEAN for s in _cm_statuses):
+                        return CLEAN_LITERAL
+                    # Mixed or UNKNOWN implementations: fall through to UNKNOWN below
 
         return TaintInfo(TaintStatus.UNKNOWN,
                          f"return of {full or attr or '<call>'}()",
