@@ -117,6 +117,14 @@ _SECRET_NAME_RE = re.compile(
     r"access_token|auth_token|private_key|secret_key|token",
     re.IGNORECASE,
 )
+
+# Variable names that look like they accumulate HTML response content.
+# _check_xss_response only fires for AugAssign targets matching this pattern,
+# to avoid FPs on intermediate variables like string59781 that are never rendered.
+_RESPONSE_VAR_RE = re.compile(
+    r"^(?:RESPONSE|response|html|body|output|result|page|content|markup|rendered?|buf(?:fer)?|template|text)",
+    re.IGNORECASE,
+)
 _SECRET_SKIP_RE = re.compile(
     r"example|sample|placeholder|your[_\-]|<[^>]+>|\*{2,}|"
     r"xxx|dummy|fake|change[_\-]?me|todo|test|mock",
@@ -201,7 +209,7 @@ _TAINT_PASSTHROUGH_FUNCS = frozenset({
 _HTML_SANITIZER_FUNCS = frozenset({
     "html.escape", "cgi.escape", "bleach.clean", "markupsafe.escape",
 })
-_HTML_SANITIZER_METHODS = frozenset({"escape", "html_escape", "sanitize", "bleach_clean"})
+_HTML_SANITIZER_METHODS = frozenset({"escape", "html_escape", "sanitize", "bleach_clean", "escape_for_html"})
 _URL_SANITIZER_FUNCS = frozenset({
     "urllib.parse.quote", "urllib.parse.quote_plus", "urllib.parse.urlencode",
 })
@@ -1075,29 +1083,28 @@ class _VulnVisitor(ast.NodeVisitor):
         if taint.status == TaintStatus.CLEAN:
             return
 
+        # Suppress when the URL is validated via urlparse+allowlist or Django guard —
+        # applies for both TAINTED and UNKNOWN taint.
+        _REDIRECT_VALIDATORS = {
+            "urllib.parse.urlparse", "urlparse",
+            "url_has_allowed_host_and_scheme",
+            "django.utils.http.url_has_allowed_host_and_scheme",
+        }
+        if (isinstance(url_arg, ast.Name)
+                and any(
+                    isinstance(v, ast.Call)
+                    and _full_name(v.func) in _REDIRECT_VALIDATORS
+                    and v.args
+                    and isinstance(v.args[0], ast.Name)
+                    and v.args[0].id == url_arg.id
+                    for v in self._assignments.values()
+                    if isinstance(v, ast.Call)
+                )):
+            self._add_suppressed(node, VulnType.OPEN_REDIRECT,
+                                 "AST-REDIR-001", "url_whitelist_validation", taint)
+            return
+
         if taint.status == TaintStatus.TAINTED:
-            # Suppress when the redirect URL was validated in the same function scope.
-            # Recognised validators (assign the URL through one of these calls):
-            #   - urllib.parse.urlparse()   — scheme/netloc whitelist pattern
-            #   - url_has_allowed_host_and_scheme()  — Django built-in redirect guard
-            _REDIRECT_VALIDATORS = {
-                "urllib.parse.urlparse", "urlparse",
-                "url_has_allowed_host_and_scheme",
-                "django.utils.http.url_has_allowed_host_and_scheme",
-            }
-            if (isinstance(url_arg, ast.Name)
-                    and any(
-                        isinstance(v, ast.Call)
-                        and _full_name(v.func) in _REDIRECT_VALIDATORS
-                        and v.args
-                        and isinstance(v.args[0], ast.Name)
-                        and v.args[0].id == url_arg.id
-                        for v in self._assignments.values()
-                        if isinstance(v, ast.Call)
-                    )):
-                self._add_suppressed(node, VulnType.OPEN_REDIRECT,
-                                     "AST-REDIR-001", "url_whitelist_validation", taint)
-                return
             self._add(node, VulnType.OPEN_REDIRECT, Severity.HIGH, "AST-REDIR-001",
                       f"{name}() redirects to URL from user input - attackers can redirect "
                       f"victims to malicious sites (phishing): {taint.reason}",
@@ -1257,6 +1264,11 @@ class _VulnVisitor(ast.NodeVisitor):
         if not isinstance(node.op, ast.Add):
             return
         if not isinstance(node.target, ast.Name):
+            return
+        # Only fire for variable names that look like response/output accumulators.
+        # Avoids FPs on intermediate variables (e.g. string59781 += param) that are
+        # never rendered as HTML.
+        if not _RESPONSE_VAR_RE.match(node.target.id):
             return
         # Check taint of the value being appended
         taint = _taint_of(node.value, self._assignments, self._class_attrs)
@@ -1778,6 +1790,61 @@ def _collect_scope_assignments(
                     and isinstance(key_arg, ast.Constant)):
                 lookup_key = (conf_name, str(section_arg.value), str(key_arg.value))
                 result[lookup_key] = val_arg
+
+    # Corrective pass: fix stale Name references introduced by the BFS second pass for
+    # AugAssign.  Pattern that causes FPs:
+    #   copy = var        # copy aliases var when var is clean (Constant)
+    #   var = ''          # var reset (still clean)
+    #   var += param      # var becomes TAINTED
+    #   copy += 'literal' # BFS sets result['copy'] = BinOp(Name('var'), Add, literal)
+    #                     # which evaluates as TAINTED, but copy was clean at runtime.
+    # Strategy: track which top-level variables hold constant values in execution order.
+    # For each top-level AugAssign where the BFS result has a stale Name on the left
+    # AND the augmented variable itself was a constant just before this AugAssign,
+    # replace the stale Name with the concrete constant so taint is not over-propagated.
+    _lin_state: dict[str, ast.expr | None] = {}
+    for _stmt in func.body:
+        if (
+            isinstance(_stmt, ast.Assign)
+            and id(_stmt) not in null_guard_ids
+            and id(_stmt) not in dead_assign_ids
+            and len(_stmt.targets) == 1
+            and isinstance(_stmt.targets[0], ast.Name)
+        ):
+            _name = _stmt.targets[0].id
+            _rhs = _stmt.value
+            if isinstance(_rhs, ast.Constant):
+                _lin_state[_name] = _rhs
+            elif (
+                isinstance(_rhs, ast.Name)
+                and _rhs.id in _lin_state
+                and isinstance(_lin_state[_rhs.id], ast.Constant)
+            ):
+                # Alias to a constant — propagate the constant value
+                _lin_state[_name] = _lin_state[_rhs.id]
+            else:
+                _lin_state[_name] = None  # opaque / non-constant value
+        elif (
+            isinstance(_stmt, ast.AugAssign)
+            and isinstance(_stmt.target, ast.Name)
+        ):
+            _var = _stmt.target.id
+            _bfs = result.get(_var)
+            # If the BFS second pass produced BinOp(Name('Y'), op, rhs) and the
+            # variable being augmented (_var) was tracked as a constant in the
+            # linear state just before this AugAssign, the Name('Y') is stale.
+            # Replace it with the concrete constant to avoid over-propagating taint.
+            if (
+                isinstance(_bfs, ast.BinOp)
+                and isinstance(_bfs.left, ast.Name)
+                and isinstance(_lin_state.get(_var), ast.Constant)
+            ):
+                result[_var] = ast.BinOp(
+                    left=_lin_state[_var],
+                    op=_bfs.op,
+                    right=_bfs.right,
+                )
+            _lin_state[_var] = None  # variable no longer holds a simple constant
 
     return result
 
