@@ -29,18 +29,21 @@ from vulnscanner.models import VulnType
 
 # ── category mapping: OWASP → VulnType ────────────────────────────────────────
 CATEGORY_MAP: dict[str, set[VulnType]] = {
-    "sqli":        {VulnType.SQL_INJECTION},
-    "cmdi":        {VulnType.COMMAND_INJECTION},
-    "xss":         {VulnType.XSS},
-    "pathtraver":  {VulnType.PATH_TRAVERSAL},
-    "ldapi":       {VulnType.LDAP_INJECTION},
-    "crypto":      {VulnType.WEAK_CRYPTOGRAPHY},
-    "hash":        {VulnType.WEAK_CRYPTOGRAPHY},
-    "weakrand":    {VulnType.WEAK_CRYPTOGRAPHY},
-    # trustbound / securecookie / xpathi - not covered by VulnScanner
+    "sqli":         {VulnType.SQL_INJECTION},
+    "cmdi":         {VulnType.COMMAND_INJECTION},
+    "xss":          {VulnType.XSS},
+    "pathtraver":   {VulnType.PATH_TRAVERSAL},
+    "ldapi":        {VulnType.LDAP_INJECTION},
+    "crypto":       {VulnType.WEAK_CRYPTOGRAPHY},
+    "hash":         {VulnType.WEAK_CRYPTOGRAPHY},
+    "weakrand":     {VulnType.WEAK_CRYPTOGRAPHY},
+    "xpathi":       {VulnType.XPATH_INJECTION},
+    "securecookie": {VulnType.INSECURE_COOKIE},
+    # trustbound (CWE-501) - not covered: requires scope-boundary analysis
+    # incompatible with current taint-flow architecture; high FP risk in real code
 }
 COVERED = set(CATEGORY_MAP)
-NOT_COVERED = {"trustbound", "securecookie", "xpathi"}
+NOT_COVERED = {"trustbound"}
 
 # ── load expected results ──────────────────────────────────────────────────────
 Expected = dict[str, tuple[str, bool]]  # name → (category, is_vuln)

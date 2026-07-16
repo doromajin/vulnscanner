@@ -120,6 +120,24 @@ _LDAP_HINTS = frozenset({
 
 _LDAP_SEARCH_METHODS = frozenset({"search", "lookup", "bind", "getAttributes"})
 
+# ── XPath injection ────────────────────────────────────────────────────────────
+# File-level markers that indicate XPath API usage — used to avoid FPs from
+# other evaluate()/compile() calls (e.g. JavaScript engines, regex Pattern.compile).
+_XPATH_FILE_HINTS = frozenset({
+    "XPathFactory", "javax.xml.xpath", "XPathConstants", "XPathExpression",
+})
+
+# Sink methods on javax.xml.xpath.XPath and XPathExpression.
+# evaluate(expression, context, ...) — first arg is the XPath query string.
+# compile(expression) — the expression itself is the sink.
+_XPATH_SINK_METHODS = frozenset({"evaluate", "compile"})
+
+# ── Insecure cookie ────────────────────────────────────────────────────────────
+# Only flag when the developer explicitly passes false — "missing call" heuristics
+# produce too many FPs in real codebases (non-HTTPS dev contexts, non-sensitive
+# cookies, etc.).  Explicit setSecure(false) / setHttpOnly(false) is unambiguous.
+_COOKIE_FLAG_METHODS = frozenset({"setSecure", "setHttpOnly"})
+
 
 # Spring MVC: method parameters carrying these annotations receive user-supplied data.
 # Equivalent in taint terms to request.getParameter() on the same value.
@@ -1186,6 +1204,45 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                  "SpEL parseExpression() with user-controlled input — "
                                  "Spring Expression Language injection allows RCE; avoid dynamic SpEL on user data")
                             break
+        except Exception:
+            pass
+
+        # ── XPath injection ────────────────────────────────────────────────────
+        # Only run when the file actually uses XPath APIs — avoids FPs from
+        # other evaluate()/compile() calls (JavaScript, regex, etc.).
+        try:
+            if any(hint in content for hint in _XPATH_FILE_HINTS):
+                for _, node in tree.filter(jt.MethodInvocation):
+                    if node.member not in _XPATH_SINK_METHODS:
+                        continue
+                    args = node.arguments or []
+                    if args and _is_tainted(args[0], tainted):
+                        _add(node, VulnType.XPATH_INJECTION, Severity.HIGH, "JAST-XPATH-001",
+                             f"XPath {node.member}() with user-controlled expression — "
+                             "allows attacker to manipulate XPath query and bypass authentication "
+                             "or extract arbitrary XML data; use parameterized XPath or whitelist input")
+        except Exception:
+            pass
+
+        # ── Insecure cookie ────────────────────────────────────────────────────
+        # Flag explicit setSecure(false) / setHttpOnly(false) on Cookie objects.
+        # CWE-614 (Secure attribute) and CWE-1004 (HttpOnly attribute).
+        try:
+            for _, node in tree.filter(jt.MethodInvocation):
+                if node.member not in _COOKIE_FLAG_METHODS:
+                    continue
+                args = node.arguments or []
+                if not args:
+                    continue
+                arg = args[0]
+                if isinstance(arg, jt.Literal) and str(arg.value) == "false":
+                    cwe_label = "614" if node.member == "setSecure" else "1004"
+                    flag_name = "Secure" if node.member == "setSecure" else "HttpOnly"
+                    _add(node, VulnType.INSECURE_COOKIE, Severity.MEDIUM,
+                         "JAST-COOKIE-001",
+                         f"Cookie.{node.member}(false) — {flag_name} flag disabled; "
+                         f"{'cookies sent over plain HTTP expose session tokens to network eavesdroppers' if node.member == 'setSecure' else 'missing HttpOnly allows client-side JS to steal the cookie via XSS'} "
+                         f"(CWE-{cwe_label})")
         except Exception:
             pass
 

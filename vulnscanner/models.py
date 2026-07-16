@@ -29,6 +29,8 @@ class VulnType(str, Enum):
     CSRF = "Cross-Site Request Forgery (CSRF)"
     WEAK_CRYPTOGRAPHY = "Weak Cryptography"
     LDAP_INJECTION = "LDAP Injection"
+    XPATH_INJECTION = "XPath Injection"
+    INSECURE_COOKIE = "Insecure Cookie"
     IAC_MISCONFIGURATION = "IaC Misconfiguration"
     MISSING_AUTHORIZATION = "Missing Authorization"
     MALWARE = "Malicious Code"
