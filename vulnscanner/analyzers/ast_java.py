@@ -898,10 +898,16 @@ def _load_properties_files(file_path_str: str) -> dict:
     Walks up from file_path until a project root marker is found (pom.xml,
     build.gradle, or src/), then rglob-scans for *.properties files.
     Returns a merged dict; later files' keys override earlier ones.
+
+    Returns an empty dict if file_path_str does not resolve to a real file
+    (e.g. when the scanner passes a relative path stripped of the project root).
     """
     props: dict = {}
     try:
-        search_root = Path(file_path_str).resolve().parent
+        resolved = Path(file_path_str).resolve()
+        if not resolved.is_file():
+            return props
+        search_root = resolved.parent
         for _ in range(12):
             if any((search_root / m).exists() for m in ("pom.xml", "build.gradle", "src")):
                 break
