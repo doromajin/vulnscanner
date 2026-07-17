@@ -42,6 +42,9 @@ class BaseAnalyzer(ABC):
 
         *rules* is a list of ``(rule_id, compiled_re, description, severity, vuln_type)``
         tuples where ``compiled_re`` is a pre-compiled :class:`re.Pattern`.
+        An optional 6th element may be a ``re.Pattern`` that, when it matches the
+        same line, suppresses the finding (useful for excluding method definitions
+        or other false-positive patterns that cannot be expressed as a lookbehind).
 
         The outer loop iterates lines once; every rule is tested per line so
         ``_is_comment`` is called exactly once per line (not once per rule per line)
@@ -59,8 +62,12 @@ class BaseAnalyzer(ABC):
             if self._is_comment(line):
                 continue
             stripped = line.strip()
-            for rule_id, pattern_re, description, severity, vuln_type in rules:
+            for rule_tuple in rules:
+                rule_id, pattern_re, description, severity, vuln_type = rule_tuple[:5]
+                skip_re: re.Pattern | None = rule_tuple[5] if len(rule_tuple) > 5 else None
                 if pattern_re.search(line):
+                    if skip_re and skip_re.search(line):
+                        continue
                     findings.append(Finding(
                         vuln_type=vuln_type,
                         severity=severity,

@@ -76,6 +76,19 @@ class TestCommandInjection:
         findings = CommandInjectionAnalyzer().analyze("test.py", safe)
         assert findings == []
 
+    def test_php_method_exec_not_flagged(self):
+        # PHP object/static method calls named exec() are not OS exec
+        php_cases = [
+            '$this->command_executor->exec($command, $output);',
+            '$this->optimize->exec();',
+            'CommandExecutor::exec($cmd);',
+            'public function exec(string $command): void {',
+        ]
+        for code in php_cases:
+            findings = CommandInjectionAnalyzer().analyze("test.php", code)
+            rule_ids = {f.rule_id for f in findings}
+            assert "CMD-004" not in rule_ids, f"CMD-004 FP on: {code}"
+
 
 class TestXSS:
     # ── true positives ────────────────────────────────────────────────────────

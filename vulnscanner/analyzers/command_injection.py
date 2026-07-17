@@ -28,12 +28,16 @@ _RULES = [
     (
         "CMD-004",
         re.compile(
-            r'(?<![\w.])eval\s*\(\s*(?![\'\"]\s*[\'\"]\s*\))'
-            r'|(?<![\w.])exec\s*\(\s*(?![\'\"#])',
+            # Exclude ->eval()/::eval() and string-prefixed 'eval(
+            r"(?<![\w.>:'\"])eval\s*\(\s*(?![\'\"]\s*[\'\"]\s*\))"
+            # Exclude ->exec()/::exec() and string-prefixed 'exec(
+            r"|(?<![\w.>:'\"])exec\s*\(\s*(?![\'\"#])",
             re.IGNORECASE,
         ),
         "eval()/exec() with non-literal argument",
         Severity.CRITICAL, _CI,
+        # Skip method definitions (`function exec(`) and class instantiations (`new Exec(`)
+        re.compile(r'\bfunction\s+(?:exec|eval)\s*\(|\bnew\s+\w*(?:exec|eval)\w*\s*\(', re.IGNORECASE),
     ),
     (
         "CMD-005",
