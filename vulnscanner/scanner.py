@@ -296,15 +296,26 @@ def _is_suppressed(finding: Finding, lines: list[str]) -> bool:
     return False
 
 
+_AST_PREFIXES = ("JAST-", "AST-")
+
+
 def _deduplicate(findings: list) -> list:
     """When AST and regex both report the same (file, line, vuln_type),
-    keep the AST finding - it is more precise and context-aware."""
-    seen: dict[tuple, object] = {}
+    keep the AST finding(s) - they are more precise and context-aware.
+    Multiple distinct AST rules at the same location are all preserved."""
+    groups: dict[tuple, list] = {}
     for f in findings:
-        key = (f.file_path, f.line_number, f.vuln_type)
-        existing = seen.get(key)
-        if existing is None:
-            seen[key] = f
-        elif f.rule_id.startswith("AST-") and not existing.rule_id.startswith("AST-"):
-            seen[key] = f  # prefer AST finding over regex finding
-    return list(seen.values())
+        groups.setdefault((f.file_path, f.line_number, f.vuln_type), []).append(f)
+
+    result = []
+    for group in groups.values():
+        ast_findings = [f for f in group if f.rule_id.startswith(_AST_PREFIXES)]
+        if ast_findings:
+            seen_rules: set[str] = set()
+            for f in ast_findings:
+                if f.rule_id not in seen_rules:
+                    result.append(f)
+                    seen_rules.add(f.rule_id)
+        else:
+            result.append(group[0])
+    return result

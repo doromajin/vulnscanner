@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
 from vulnscanner.analyzers.command_injection import CommandInjectionAnalyzer
+from vulnscanner.analyzers.java_analyzer import JavaAnalyzer
 from vulnscanner.analyzers.dependencies import (
     DependencyAnalyzer,
     _parse_gemfile_lock,
@@ -486,6 +488,78 @@ class TestPythonASTDeserialization:
         code = "import yaml\nresult = yaml.load(stream, Loader=yaml.SafeLoader)"
         rule_ids = {f.rule_id for f in AST.analyze("t.py", code)}
         assert "AST-DESER-004" not in rule_ids
+
+
+class TestPythonTLSVerify:
+    def test_requests_verify_false_flagged(self):
+        code = "import requests\nrequests.get(url, verify=False)"
+        rule_ids = {f.rule_id for f in AST.analyze("t.py", code)}
+        assert "AST-TLS-001" in rule_ids
+
+    def test_requests_post_verify_false_flagged(self):
+        code = "import requests\nrequests.post(url, data=body, verify=False)"
+        rule_ids = {f.rule_id for f in AST.analyze("t.py", code)}
+        assert "AST-TLS-001" in rule_ids
+
+    def test_requests_verify_true_not_flagged(self):
+        code = "import requests\nrequests.get(url, verify=True)"
+        rule_ids = {f.rule_id for f in AST.analyze("t.py", code)}
+        assert "AST-TLS-001" not in rule_ids
+
+    def test_requests_verify_capath_not_flagged(self):
+        code = "import requests\nrequests.get(url, verify='/etc/ssl/certs/ca-bundle.crt')"
+        rule_ids = {f.rule_id for f in AST.analyze("t.py", code)}
+        assert "AST-TLS-001" not in rule_ids
+
+    def test_requests_no_verify_kwarg_not_flagged(self):
+        code = "import requests\nrequests.get(url)"
+        rule_ids = {f.rule_id for f in AST.analyze("t.py", code)}
+        assert "AST-TLS-001" not in rule_ids
+
+
+def _java_class(body: str) -> str:
+    return f"public class T {{\n{body}\n}}"
+
+
+class TestJavaSnakeYAML:
+    def test_new_yaml_no_arg_flagged(self):
+        code = _java_class("public Object p(String s){Yaml yaml=new Yaml();return yaml.load(s);}")
+        findings = JavaASTAnalyzer().analyze("Test.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-DESER-002" in rule_ids
+
+    def test_new_yaml_unsafe_constructor_flagged(self):
+        code = _java_class("public Object p(String s){Yaml y=new Yaml(new Constructor(Foo.class));return y.load(s);}")
+        findings = JavaASTAnalyzer().analyze("Test.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-DESER-002" in rule_ids
+
+    def test_new_yaml_safe_constructor_not_flagged(self):
+        code = _java_class("public Object p(String s){Yaml y=new Yaml(new SafeConstructor(new LoaderOptions()));return y.load(s);}")
+        findings = JavaASTAnalyzer().analyze("Test.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-DESER-002" not in rule_ids
+
+
+class TestJavaSSLBypass:
+    def test_allow_all_hostname_verifier_flagged(self):
+        code = "conn.setHostnameVerifier(SSLConnectionSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER);"
+        findings = JavaAnalyzer().analyze("Test.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAVA-TLS-001" in rule_ids
+
+    def test_noop_hostname_verifier_flagged(self):
+        code = "builder.setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE);"
+        findings = JavaAnalyzer().analyze("Test.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAVA-TLS-001" in rule_ids
+
+    def test_allow_all_no_false_positives_on_safe_yaml(self):
+        # JAVA-TLS-001 must not fire on SnakeYAML SafeConstructor usage
+        code = "Yaml yaml = new Yaml(new SafeConstructor(new LoaderOptions()));"
+        findings = JavaAnalyzer().analyze("Test.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAVA-TLS-001" not in rule_ids
 
 
 class TestPythonASTSSRF:

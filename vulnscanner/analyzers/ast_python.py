@@ -688,6 +688,7 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_xss(node)
         self._check_deserialization(node)
         self._check_ssrf(node)
+        self._check_tls_verify(node)
         self._check_open_redirect(node)
         self._check_ssti(node)
         self._check_weak_crypto(node)
@@ -1120,6 +1121,19 @@ class _VulnVisitor(ast.NodeVisitor):
                       f"[needs_review] {full}() called with dynamic URL - verify not "
                       f"user-controlled: {taint.reason}",
                       taint)
+
+    # ── SSL/TLS certificate verification bypass ────────────────────────────────
+
+    def _check_tls_verify(self, node: ast.Call) -> None:
+        full = _full_name(node.func)
+        if full not in _HTTP_CLIENT_FUNCS:
+            return
+        for kw in node.keywords:
+            if kw.arg == "verify" and isinstance(kw.value, ast.Constant) and kw.value.value is False:
+                self._add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "AST-TLS-001",
+                          f"{full}(..., verify=False) disables SSL/TLS certificate verification — "
+                          "allows MITM attacks; remove verify=False or pin a CA bundle")
+                return
 
     # ── open redirect ──────────────────────────────────────────────────────────
 

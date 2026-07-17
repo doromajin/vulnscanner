@@ -1187,6 +1187,35 @@ class JavaASTAnalyzer(BaseAnalyzer):
         except Exception:
             pass
 
+        # ── SnakeYAML unsafe deserialization (CVE-2022-1471) ─────────────────
+        # new Yaml() / new Yaml(new Constructor(...)) allows arbitrary class
+        # instantiation.  Only new Yaml(new SafeConstructor(...)) is safe.
+        try:
+            for _, node in tree.filter(jt.ClassCreator):
+                if _type_name(node.type) != "Yaml":
+                    continue
+                args = node.arguments or []
+                has_safe = any(
+                    isinstance(a, jt.ClassCreator)
+                    and _type_name(a.type) == "SafeConstructor"
+                    for a in args
+                )
+                if not has_safe:
+                    arg_desc = (
+                        ", ".join(
+                            _type_name(a.type) if isinstance(a, jt.ClassCreator) else "?"
+                            for a in args
+                        )
+                        or "no-arg"
+                    )
+                    _add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
+                         "JAST-DESER-002",
+                         f"new Yaml({arg_desc}) without SafeConstructor: SnakeYAML can "
+                         "instantiate arbitrary Java types; use "
+                         "new Yaml(new SafeConstructor(new LoaderOptions())) (CVE-2022-1471)")
+        except Exception:
+            pass
+
         # ── JNDI injection ────────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.MethodInvocation):

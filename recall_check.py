@@ -97,6 +97,7 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     ("DESER-009",     "java/deserialization.java",     "CRITICAL", "Java XStream.fromXML() RCE"),
     ("DESER-010",     "java/deserialization.java",     "CRITICAL", "Java XMLDecoder arbitrary object instantiation"),
     ("JAST-DESER-001","java/deserialization.java",     "CRITICAL", "Java AST deserialization"),
+    ("JAST-DESER-002","java/deserialization.java",     "CRITICAL", "SnakeYAML new Yaml() without SafeConstructor (CVE-2022-1471)"),
 ]
 
 

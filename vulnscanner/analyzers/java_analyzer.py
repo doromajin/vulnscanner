@@ -197,6 +197,23 @@ _RULES = [
         "LDAP DirContext.search() with potentially user-controlled filter — LDAP injection risk",
         Severity.HIGH, _LDAP,
     ),
+    # JAVA-TLS-001: Hostname verification disabled (MITM attack surface)
+    # AllowAllHostnameVerifier / NoopHostnameVerifier / ALLOW_ALL_HOSTNAME_VERIFIER
+    # are well-known Apache HttpComponents / OkHttp constants that bypass host checks.
+    (
+        "JAVA-TLS-001",
+        re.compile(
+            r'\b(?:ALLOW_ALL_HOSTNAME_VERIFIER'
+            r'|AllowAllHostnameVerifier'
+            r'|NullHostnameVerifier'
+            r'|NoopHostnameVerifier'
+            r'|TrustAllHostnameVerifier)\b',
+            re.IGNORECASE,
+        ),
+        "SSL/TLS hostname verification disabled — allows MITM attacks; "
+        "use the default HostnameVerifier or pin expected hostnames",
+        Severity.HIGH, _WKCP,
+    ),
 ]
 
 _GUARD = re.compile(
@@ -207,7 +224,9 @@ _GUARD = re.compile(
     r'|prepareStatement|prepareCall|executeQuery|executeUpdate'
     r'|new\s+File|Paths\.get|Path\.of'
     r'|getWriter|new\s+Random|MessageDigest|Cipher\.getInstance'
-    r'|DirContext|InitialDirContext|LdapContext',
+    r'|DirContext|InitialDirContext|LdapContext'
+    r'|ALLOW_ALL_HOSTNAME_VERIFIER|AllowAllHostnameVerifier'
+    r'|NullHostnameVerifier|NoopHostnameVerifier',
     re.IGNORECASE,
 )
 

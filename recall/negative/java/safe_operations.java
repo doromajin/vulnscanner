@@ -1,6 +1,9 @@
 import java.util.Base64;
 import java.util.List;
 import java.util.ArrayList;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
+import org.yaml.snakeyaml.LoaderOptions;
 
 /**
  * Safe Java operations — no vulnerabilities expected.
@@ -35,5 +38,11 @@ public class SafeOperations {
     // Safe: logging with no tainted data
     public void logInfo(String message) {
         System.out.println("[INFO] " + message);
+    }
+
+    // Safe: SnakeYAML with SafeConstructor (JAST-DESER-002 must NOT fire)
+    public Object safeYamlParse(String input) {
+        Yaml yaml = new Yaml(new SafeConstructor(new LoaderOptions()));
+        return yaml.load(input);
     }
 }
