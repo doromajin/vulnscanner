@@ -45,4 +45,18 @@ public class SafeOperations {
         Yaml yaml = new Yaml(new SafeConstructor(new LoaderOptions()));
         return yaml.load(input);
     }
+
+    // Safe: Spring JdbcTemplate with parameterized queries — bound params are NOT the SQL
+    // (JAST-SQL-001 must NOT fire: the tainted value is a parameter, not the SQL string)
+    public String getUserByIdSafe(org.springframework.jdbc.core.JdbcTemplate tpl,
+                                  javax.servlet.http.HttpServletRequest request) {
+        String id = request.getParameter("id");
+        return tpl.queryForObject("SELECT name FROM users WHERE id = ?", String.class, id);
+    }
+
+    public java.util.List<?> listUsersSafe(org.springframework.jdbc.core.JdbcTemplate tpl,
+                                           javax.servlet.http.HttpServletRequest request) {
+        String name = request.getParameter("name");
+        return tpl.queryForList("SELECT * FROM users WHERE name = ?", name);
+    }
 }

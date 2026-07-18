@@ -109,6 +109,10 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     ("JAST-SQL-001",  "java/interprocedural.java",   "HIGH",     "Java bare-call helper -> SQL injection"),
     ("JAST-SQL-001",  "java/interprocedural.java",   "HIGH",     "Java this.method(tainted) passthrough -> SQL injection"),
 
+    # -- Java: Spring JdbcTemplate SQL injection ----------------------------------
+    ("JAST-SQL-001",  "java/spring_sqli.java",  "HIGH",     "Spring queryForObject() with tainted SQL string"),
+    ("JAST-SQL-001",  "java/spring_sqli.java",  "HIGH",     "Spring query() with tainted SQL string"),
+
     # -- Java: deserialization ----------------------------------------------------
     ("DESER-005",     "java/deserialization.java",     "CRITICAL", "Java ObjectInputStream.readObject() RCE"),
     ("DESER-009",     "java/deserialization.java",     "CRITICAL", "Java XStream.fromXML() RCE"),

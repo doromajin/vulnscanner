@@ -605,6 +605,69 @@ class TestJavaSSLBypass:
         assert "JAVA-TLS-001" not in rule_ids
 
 
+@_skip_no_javalang
+class TestSpringJdbcTemplate:
+    """Spring JdbcTemplate: tainted SQL string = TP; bound param args = FP-free."""
+
+    _PREAMBLE = (
+        "import javax.servlet.http.HttpServletRequest;\n"
+        "import org.springframework.jdbc.core.JdbcTemplate;\n"
+    )
+
+    def test_tainted_sql_first_arg_flagged(self):
+        code = self._PREAMBLE + """
+public class T {
+    JdbcTemplate tpl;
+    public String get(HttpServletRequest req) {
+        String id = req.getParameter("id");
+        return tpl.queryForObject("SELECT name FROM users WHERE id = " + id, String.class);
+    }
+}"""
+        findings = JavaASTAnalyzer().analyze("T.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SQL-001" in rule_ids, "tainted SQL first arg must be flagged"
+
+    def test_parameterized_bound_arg_not_flagged(self):
+        code = self._PREAMBLE + """
+public class T {
+    JdbcTemplate tpl;
+    public String get(HttpServletRequest req) {
+        String id = req.getParameter("id");
+        return tpl.queryForObject("SELECT name FROM users WHERE id = ?", String.class, id);
+    }
+}"""
+        findings = JavaASTAnalyzer().analyze("T.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SQL-001" not in rule_ids, "bound parameter must NOT be flagged as SQLi"
+
+    def test_query_tainted_sql_flagged(self):
+        code = self._PREAMBLE + """
+public class T {
+    JdbcTemplate tpl;
+    public void list(HttpServletRequest req) {
+        String name = req.getParameter("name");
+        tpl.query("SELECT * FROM users WHERE name = '" + name + "'",
+                  (rs, r) -> rs.getString("id"));
+    }
+}"""
+        findings = JavaASTAnalyzer().analyze("T.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SQL-001" in rule_ids, "tainted SQL in query() must be flagged"
+
+    def test_query_parameterized_not_flagged(self):
+        code = self._PREAMBLE + """
+public class T {
+    JdbcTemplate tpl;
+    public void list(HttpServletRequest req) {
+        String name = req.getParameter("name");
+        tpl.query("SELECT * FROM users WHERE name = ?", (rs, r) -> rs.getString("id"), name);
+    }
+}"""
+        findings = JavaASTAnalyzer().analyze("T.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SQL-001" not in rule_ids, "parameterized query() with bound arg must NOT be flagged"
+
+
 class TestPythonASTSSRF:
     def test_detects_requests_get_user_url(self):
         rule_ids = {f.rule_id for f in AST.analyze("t.py", FIXTURE_AST)}

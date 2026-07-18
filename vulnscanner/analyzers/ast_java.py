@@ -58,14 +58,21 @@ _ANY_QUALIFIER_TAINT_METHODS = _load_custom_taint_sources()
 
 # ── sink sets ──────────────────────────────────────────────────────────────────
 
-_SQL_EXEC_METHODS = frozenset({
+# Standard JDBC: any tainted argument (or tainted qualifier/statement object) is suspicious.
+_JDBC_EXEC_METHODS = frozenset({
     "execute", "executeQuery", "executeUpdate", "executeLargeUpdate",
     "executeBatch", "addBatch", "prepareCall", "prepareStatement",
-    # Spring JdbcTemplate
+})
+
+# Spring JdbcTemplate / NamedParameterJdbcTemplate: the first argument is the SQL string;
+# subsequent arguments are BOUND parameters (safe).  Only the first arg must be checked.
+_SPRING_JDBC_METHODS = frozenset({
     "queryForLong", "queryForInt", "queryForObject", "queryForList",
     "queryForMap", "queryForRowSet", "queryForStream",
-    "query", "batchUpdate",
+    "query", "batchUpdate", "update",
 })
+
+_SQL_EXEC_METHODS = _JDBC_EXEC_METHODS | _SPRING_JDBC_METHODS
 
 _JPA_METHODS = frozenset({
     "createQuery", "createNativeQuery", "createNamedQuery",
@@ -999,11 +1006,11 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # ── SQL injection ──────────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.MethodInvocation):
-                if node.member in _SQL_EXEC_METHODS:
-                    q = str(node.qualifier or "")
-                    # Case 1: arg is tainted  (executeQuery(sql), prepareStatement(sql))
+                q = str(node.qualifier or "")
+                if node.member in _JDBC_EXEC_METHODS:
+                    # Case 1: any tainted arg  (executeQuery(sql), prepareStatement(sql), addBatch(sql))
                     flagged = any(_is_tainted(a, tainted) for a in (node.arguments or []))
-                    # Case 2: qualifier (statement object) is tainted
+                    # Case 2: tainted qualifier/statement object
                     # e.g. stmt = conn.prepareCall(taintedSql); stmt.executeQuery()
                     if not flagged and q in tainted:
                         flagged = True
@@ -1011,6 +1018,14 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         _add(node, VulnType.SQL_INJECTION, Severity.HIGH, "JAST-SQL-001",
                              f"{node.member}() receives user-controlled value — "
                              "SQL injection; use PreparedStatement with parameterized queries")
+                elif node.member in _SPRING_JDBC_METHODS:
+                    # Only the FIRST argument is the SQL string; subsequent args are bound
+                    # parameters and are safe (e.g. queryForObject(sql, type, param...)).
+                    first_arg = (node.arguments or [None])[0]
+                    if first_arg is not None and _is_tainted(first_arg, tainted):
+                        _add(node, VulnType.SQL_INJECTION, Severity.HIGH, "JAST-SQL-001",
+                             f"Spring JdbcTemplate.{node.member}() SQL argument is user-controlled — "
+                             "SQL injection; use '?' placeholders with bound parameters")
                 elif node.member in _JPA_METHODS:
                     for arg in (node.arguments or []):
                         if _is_tainted(arg, tainted):
