@@ -227,6 +227,15 @@ _SAFE_ISINSTANCE_TYPES = frozenset({"int", "float", "bool", "Decimal"})
 _DJANGO_RAW_SQL_METHODS = frozenset({"raw", "extra"})
 _DJANGO_ORM_RAW_FUNCS = frozenset({"RawSQL"})
 
+# Log injection sinks: stdlib logging module functions and common logger method names.
+_LOG_MODULE_FUNCS = frozenset({
+    "logging.debug", "logging.info", "logging.warning", "logging.error",
+    "logging.critical", "logging.exception", "logging.log",
+})
+_LOG_INSTANCE_METHODS = frozenset({
+    "debug", "info", "warning", "error", "critical", "exception", "log",
+})
+
 # SQLAlchemy raw-SQL wrapper: text() explicitly opts out of ORM parameterisation.
 _SQLALCHEMY_TEXT_FUNCS = frozenset({"text", "sqlalchemy.text"})
 
@@ -697,6 +706,7 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_ldap_injection(node)
         self._check_xpath_injection(node)
         self._check_insecure_cookie(node)
+        self._check_log_injection(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -1407,6 +1417,32 @@ class _VulnVisitor(ast.NodeVisitor):
                               "response.set_cookie(secure=False) — cookie transmitted over plain HTTP; "
                               "set secure=True to restrict to HTTPS connections (CWE-614)")
                     return
+
+    # ── Log injection ──────────────────────────────────────────────────────────
+
+    def _check_log_injection(self, node: ast.Call) -> None:
+        """Detect log injection: user-controlled data passed to logging calls.
+
+        Fires only when the first argument is TAINTED (confirmed user input).
+        Rationale: unsanitized user input in logs allows attackers to forge log
+        entries by injecting newlines — e.g. '\nERROR: admin logged in as root'.
+        Fix: strip or escape newlines before logging, or use structured logging.
+        """
+        full = _full_name(node.func)
+        attr = _attr_name(node.func)
+        is_log_call = (
+            full in _LOG_MODULE_FUNCS
+            or (attr in _LOG_INSTANCE_METHODS and isinstance(node.func, ast.Attribute))
+        )
+        if not is_log_call or not node.args:
+            return
+        taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+        if taint.status != TaintStatus.TAINTED:
+            return
+        self._add(node, VulnType.LOG_INJECTION, Severity.MEDIUM, "AST-LOG-001",
+                  f"{full or f'.{attr}'}() logs tainted user input — enables log forging "
+                  f"via newline injection; strip \\n/\\r or use structured logging: {taint.reason}",
+                  taint)
 
     # ── XSS: Flask/Django response body accumulation ───────────────────────────
 

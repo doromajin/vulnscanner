@@ -27,6 +27,7 @@ _PREFIX: dict[str, int] = {
     "NOSQL":    943,   # CWE-943:  Improper Neutralization of Special Elements in Data Query
     "IAC-TF":   284,   # CWE-284:  Improper Access Control (IaC misconfig)
     "IAC-K8S":  250,   # CWE-250:  Execution with Unnecessary Privileges
+    "LOG":      117,   # CWE-117:  Improper Output Neutralization for Logs
 }
 
 

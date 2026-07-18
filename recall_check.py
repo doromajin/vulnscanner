@@ -98,6 +98,13 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     ("AST-SQL-002",   "python/interprocedural.py",    "HIGH",     "Phase 3a: self._get_id() inherent taint source"),
     ("AST-CMD-001",   "python/interprocedural.py",    "HIGH",     "Phase 3b: self._wrap(tainted) passthrough"),
 
+    # -- Python: log injection ----------------------------------------------------
+    ("AST-LOG-001",   "python/log_injection.py",     "MEDIUM",   "stdlib logging with tainted arg"),
+    ("AST-LOG-001",   "python/log_injection.py",     "MEDIUM",   "logger instance method with tainted arg"),
+
+    # -- Java: log injection ------------------------------------------------------
+    ("JAST-LOG-001",  "java/log_injection.java",     "MEDIUM",   "SLF4J logger.info with tainted arg"),
+
     # -- Java: interprocedural taint ----------------------------------------------
     ("JAST-SQL-001",  "java/interprocedural.java",   "HIGH",     "Java bare-call helper -> SQL injection"),
     ("JAST-SQL-001",  "java/interprocedural.java",   "HIGH",     "Java this.method(tainted) passthrough -> SQL injection"),

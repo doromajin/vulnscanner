@@ -1048,6 +1048,30 @@ class JavaASTAnalyzer(BaseAnalyzer):
         except Exception:
             pass
 
+        # ── Log injection ──────────────────────────────────────────────────────
+        # Covers SLF4J (logger.info/warn/error/debug), java.util.logging (log.info),
+        # Log4j, and common logger variable names.
+        _LOG_SINK_METHODS = frozenset({"info", "warn", "warning", "error", "debug",
+                                       "trace", "fatal", "log", "severe", "fine"})
+        _LOG_QUALIFIER_HINTS = frozenset({"log", "logger", "LOG", "LOGGER",
+                                          "logging", "log4j"})
+        try:
+            for _, node in tree.filter(jt.MethodInvocation):
+                if node.member not in _LOG_SINK_METHODS:
+                    continue
+                q = str(node.qualifier or "")
+                if not (q in _LOG_QUALIFIER_HINTS or q.lower().endswith("log")
+                        or q.lower().endswith("logger")):
+                    continue
+                for arg in (node.arguments or []):
+                    if _is_tainted(arg, tainted):
+                        _add(node, VulnType.LOG_INJECTION, Severity.MEDIUM, "JAST-LOG-001",
+                             f"{q}.{node.member}() logs user-controlled data — log forging "
+                             "via newline injection; strip \\n/\\r or use structured logging")
+                        break
+        except Exception:
+            pass
+
         # ── Command injection ──────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.MethodInvocation):

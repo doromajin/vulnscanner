@@ -34,6 +34,7 @@ class VulnType(str, Enum):
     IAC_MISCONFIGURATION = "IaC Misconfiguration"
     MISSING_AUTHORIZATION = "Missing Authorization"
     MALWARE = "Malicious Code"
+    LOG_INJECTION = "Log Injection"
 
 
 @dataclass

@@ -1406,6 +1406,30 @@ class TestClientSideAnalyzer:
         assert not any(f.rule_id == "CLIENT-MSG-001" for f in findings)
 
 
+class TestLogInjection:
+    def test_stdlib_logging_tainted_flagged(self):
+        code = "import logging\nfrom flask import request\nlogging.info(request.args.get('u'))"
+        findings = AST.analyze("t.py", code, "")
+        assert any(f.rule_id == "AST-LOG-001" for f in findings)
+
+    def test_logger_instance_tainted_flagged(self):
+        code = "import logging\nfrom flask import request\nlogger=logging.getLogger(__name__)\nlogger.warning(request.form.get('x'))"
+        findings = AST.analyze("t.py", code, "")
+        assert any(f.rule_id == "AST-LOG-001" for f in findings)
+
+    def test_logging_literal_not_flagged(self):
+        code = "import logging\nlogging.info('server started')"
+        findings = AST.analyze("t.py", code, "")
+        assert not any(f.rule_id == "AST-LOG-001" for f in findings)
+
+    def test_logging_unknown_not_flagged(self):
+        code = "import logging\ndef f(user_name): logging.info(user_name)"
+        findings = AST.analyze("t.py", code, "")
+        # UNKNOWN param → should NOT fire (only TAINTED fires)
+        crits = [f for f in findings if f.rule_id == "AST-LOG-001" and f.taint_status == "tainted"]
+        assert not crits
+
+
 class TestInterproceduralTaint:
     """Fixed-point iteration in _find_taint_source_funcs resolves transitive chains."""
 
