@@ -1800,3 +1800,75 @@ col.find(q)
         findings = AST.analyze("t.py", code, "")
         nosql = [f for f in findings if "NOSQL" in f.rule_id]
         assert not nosql, "Generic .find(tainted) must NOT fire to avoid FPs"
+
+
+# ── Guard / taint suppression ─────────────────────────────────────────────────
+
+class TestGuardSuppression:
+    """Condition-based taint guards that suppress findings inside validated branches."""
+
+    def test_isdigit_guard_suppresses_sql(self):
+        code = """
+from flask import request
+import sqlite3
+
+conn = sqlite3.connect(':memory:')
+
+def handle():
+    uid = request.args.get('id')
+    if uid.isdigit():
+        conn.execute('SELECT * FROM users WHERE id=' + uid)
+"""
+        findings = AST.analyze("t.py", code, "")
+        active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert not active, "isdigit() guard must suppress SQL injection finding inside if-body"
+
+    def test_early_return_guard_suppresses_sql(self):
+        code = """
+from flask import request
+import sqlite3
+
+conn = sqlite3.connect(':memory:')
+
+def handle():
+    uid = request.args.get('id')
+    if not uid.isdigit():
+        return 'bad input'
+    conn.execute('SELECT * FROM users WHERE id=' + uid)
+"""
+        findings = AST.analyze("t.py", code, "")
+        active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert not active, "early-return guard must suppress subsequent SQL injection finding"
+
+    def test_regex_guard_suppresses_sql(self):
+        code = """
+import re
+from flask import request
+import sqlite3
+
+conn = sqlite3.connect(':memory:')
+
+def handle():
+    uid = request.args.get('id')
+    if re.match(r'\\d+', uid):
+        conn.execute('SELECT * FROM users WHERE id=' + uid)
+"""
+        findings = AST.analyze("t.py", code, "")
+        active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert not active, "re.match() guard must suppress SQL injection finding inside if-body"
+
+    def test_unguarded_tainted_name_still_fires(self):
+        code = """
+from flask import request
+import sqlite3
+
+conn = sqlite3.connect(':memory:')
+
+def handle():
+    uid = request.args.get('id')
+    conn.execute('SELECT * FROM users WHERE id=' + uid)
+"""
+        findings = AST.analyze("t.py", code, "")
+        active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert active, "Unguarded tainted variable must still fire SQL injection"
+        assert active[0].severity == "HIGH"
