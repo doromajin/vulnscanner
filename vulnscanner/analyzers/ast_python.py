@@ -386,6 +386,20 @@ _XXE_SAFE_PARSE_QUALIFIERS = frozenset({
 # We detect taint in the variable used as the filter argument.
 _LDAP3_SEARCH_METHODS = frozenset({"search"})
 
+# ── NoSQL injection (MongoDB / pymongo) ────────────────────────────────────────
+# Methods that accept a filter dict as first arg — used for $where detection.
+_MONGO_FILTER_METHODS = frozenset({
+    "find", "find_one", "aggregate",
+    "find_one_and_update", "find_one_and_replace", "find_one_and_delete",
+    "count_documents", "distinct", "delete_one", "delete_many",
+    "update_one", "update_many",
+})
+# Subset of methods with unambiguously MongoDB-specific names (for tainted-filter detection).
+_MONGO_SPECIFIC_METHODS = frozenset({
+    "find_one_and_update", "find_one_and_replace", "find_one_and_delete",
+    "count_documents",
+})
+
 # ── interprocedural taint (per-file, single-threaded) ─────────────────────────
 # Both globals are updated by PythonASTAnalyzer.analyze() before each file visit.
 _interprocedural_taint_sources: frozenset[str] = frozenset()
@@ -721,6 +735,7 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_xxe(node)
         self._check_ldap_injection(node)
         self._check_xpath_injection(node)
+        self._check_nosql_injection(node)
         self._check_insecure_cookie(node)
         self._check_log_injection(node)
         self.generic_visit(node)
@@ -1453,6 +1468,54 @@ class _VulnVisitor(ast.NodeVisitor):
                       f"lxml.etree.XPath() constructed with {'tainted' if sev == Severity.HIGH else 'non-literal'} "
                       f"expression — XPath injection allows data extraction bypass: {taint.reason}",
                       taint)
+
+    # ── NoSQL injection ─────────────────────────────────────────────────────────
+
+    def _check_nosql_injection(self, node: ast.Call) -> None:
+        """Detect NoSQL injection in MongoDB (pymongo) operations.
+
+        Two patterns:
+          collection.find({"$where": tainted})  — JavaScript execution in MongoDB → CRITICAL
+          collection.count_documents(tainted)    — tainted filter on MongoDB-specific sinks → HIGH
+        """
+        if not isinstance(node.func, ast.Attribute):
+            return
+        attr = node.func.attr
+        if attr not in _MONGO_FILTER_METHODS:
+            return
+        if not node.args:
+            return
+        filter_arg = node.args[0]
+
+        # Pattern 1: {"$where": tainted} — JS execution (always CRITICAL, method agnostic)
+        if isinstance(filter_arg, ast.Dict):
+            for key, val in zip(filter_arg.keys, filter_arg.values):
+                if isinstance(key, ast.Constant) and key.value == "$where":
+                    if _is_const(val):
+                        return
+                    taint = _taint_of(val, self._assignments, self._class_attrs)
+                    if taint.status == TaintStatus.CLEAN:
+                        return
+                    self._add(node, VulnType.NOSQL_INJECTION, Severity.CRITICAL,
+                              "AST-NOSQL-001",
+                              f"MongoDB {attr}() with tainted $where — executes arbitrary JavaScript "
+                              f"on the database server; allows full collection access: {taint.reason}",
+                              taint)
+            return  # dict literal without $where — skip to avoid FPs
+
+        # Pattern 2: entire filter arg is tainted (MongoDB-specific method names only)
+        if attr not in _MONGO_SPECIFIC_METHODS:
+            return
+        if _is_const(filter_arg):
+            return
+        taint = _taint_of(filter_arg, self._assignments, self._class_attrs)
+        if taint.status == TaintStatus.CLEAN:
+            return
+        sev = Severity.HIGH if taint.status == TaintStatus.TAINTED else Severity.MEDIUM
+        self._add(node, VulnType.NOSQL_INJECTION, sev, "AST-NOSQL-002",
+                  f"MongoDB {attr}() called with {'tainted' if sev == Severity.HIGH else 'non-literal'} "
+                  f"filter — NoSQL injection may allow query manipulation: {taint.reason}",
+                  taint)
 
     # ── Insecure cookie ────────────────────────────────────────────────────────
 

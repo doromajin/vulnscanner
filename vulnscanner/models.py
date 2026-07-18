@@ -36,6 +36,7 @@ class VulnType(str, Enum):
     MALWARE = "Malicious Code"
     LOG_INJECTION = "Log Injection"
     TRUST_BOUNDARY_VIOLATION = "Trust Boundary Violation"
+    NOSQL_INJECTION = "NoSQL Injection"
 
 
 @dataclass

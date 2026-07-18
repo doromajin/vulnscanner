@@ -1739,3 +1739,64 @@ def handler():
         findings = AST.analyze("t.py", code, "")
         tainted_cmds = [f for f in findings if f.rule_id == "AST-CMD-001" and f.taint_status == "tainted"]
         assert not tainted_cmds, "constant-return function must not be promoted to TAINTED taint source"
+
+
+# ── NoSQL injection ───────────────────────────────────────────────────────────
+
+class TestNoSQLInjection:
+    """MongoDB $where JS execution and tainted filter detection."""
+
+    def test_dollar_where_with_tainted_value_is_critical(self):
+        code = """
+from flask import request
+from pymongo import MongoClient
+
+client = MongoClient()
+col = client.db.users
+user_input = request.args.get('q')
+col.find({"$where": user_input})
+"""
+        findings = AST.analyze("t.py", code, "")
+        hits = [f for f in findings if f.rule_id == "AST-NOSQL-001"]
+        assert hits, "MongoDB $where with tainted value must fire AST-NOSQL-001"
+        assert hits[0].severity == "CRITICAL"
+
+    def test_dollar_where_with_literal_is_safe(self):
+        code = """
+from pymongo import MongoClient
+col = MongoClient().db.users
+col.find({"$where": "this.age > 18"})
+"""
+        findings = AST.analyze("t.py", code, "")
+        hits = [f for f in findings if f.rule_id == "AST-NOSQL-001"]
+        assert not hits, "Literal $where must not fire"
+
+    def test_count_documents_tainted_filter_is_high(self):
+        code = """
+from flask import request
+from pymongo import MongoClient
+
+col = MongoClient().db.users
+
+def handle():
+    q = request.args.get('filter')
+    col.count_documents(q)
+"""
+        findings = AST.analyze("t.py", code, "")
+        hits = [f for f in findings if f.rule_id == "AST-NOSQL-002"]
+        assert hits, "count_documents() with tainted filter must fire AST-NOSQL-002"
+        assert hits[0].severity == "HIGH"
+
+    def test_generic_find_with_tainted_filter_does_not_fire(self):
+        """collection.find(tainted) alone must not fire — too many non-Mongo .find() callers."""
+        code = """
+from flask import request
+from pymongo import MongoClient
+
+col = MongoClient().db.users
+q = request.args.get('filter')
+col.find(q)
+"""
+        findings = AST.analyze("t.py", code, "")
+        nosql = [f for f in findings if "NOSQL" in f.rule_id]
+        assert not nosql, "Generic .find(tainted) must NOT fire to avoid FPs"
