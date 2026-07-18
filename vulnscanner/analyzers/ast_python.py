@@ -2296,16 +2296,18 @@ def _taint_of(
     # ── Variable name ───────────────────────────────────────────────────────────
     if isinstance(node, ast.Name):
         name = node.id
-        if name in _TAINTED_NAME_SOURCES:
-            return TaintInfo(TaintStatus.TAINTED,
-                             f"known user-input source '{name}'", source=name)
         if name in ("True", "False", "None"):
             return CLEAN_BUILTIN
         base_taint: TaintInfo | None = None
         if assignments and name in assignments:
+            # Assignments take precedence over name heuristics so that guard patches
+            # (visit_If sets var→Constant to suppress within validated branch) work.
             val = assignments[name]
             if val is not node:
                 base_taint = _taint_of(val, assignments, class_attrs, _depth + 1)
+        elif name in _TAINTED_NAME_SOURCES:
+            return TaintInfo(TaintStatus.TAINTED,
+                             f"known user-input source '{name}'", source=name)
         # Also propagate taint from subscript-assignments: dict['key'] = tainted_val.
         # Enables `'{0[key]}'.format(dict)` to detect taint flowing through dict values.
         # Only 2-tuple keys are subscript assignments; 3-tuples are configparser entries.
