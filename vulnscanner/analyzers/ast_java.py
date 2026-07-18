@@ -664,6 +664,21 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                     tainted.add(decl.name)
                                     changed = True
                                 continue  # analysis decided; skip arg-based fallback
+                        # this.method(args): javalang represents as This(selectors=[MethodInvocation])
+                        if (isinstance(init, jt.This)
+                                and init.selectors
+                                and isinstance(init.selectors[0], jt.MethodInvocation)):
+                            _this_sel = init.selectors[0]
+                            if not _is_request_source(_this_sel):
+                                _this_result = _analyze_local_method(
+                                    tree, _this_sel.member, _this_sel.arguments or [],
+                                    tainted, const_ints,
+                                )
+                                if _this_result is not None:
+                                    if _this_result:
+                                        tainted.add(decl.name)
+                                        changed = True
+                                    continue
                         # Ordered list.get(idx) taint propagation — always continue so the
                         # general _is_tainted fallback cannot over-taint via qualifier-in-tainted.
                         _li_inner = init.expression if isinstance(init, jt.Cast) else init
@@ -758,6 +773,21 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                 tainted.add(_vname)
                                 changed = True
                             continue  # analysis decided; skip arg-based fallback
+                    # this.method(args) in assignment RHS
+                    if (isinstance(rhs, jt.This)
+                            and rhs.selectors
+                            and isinstance(rhs.selectors[0], jt.MethodInvocation)):
+                        _this_rhs = rhs.selectors[0]
+                        if not _is_request_source(_this_rhs):
+                            _this_r = _analyze_local_method(
+                                tree, _this_rhs.member, _this_rhs.arguments or [],
+                                tainted, const_ints,
+                            )
+                            if _this_r is not None:
+                                if _this_r:
+                                    tainted.add(_vname)
+                                    changed = True
+                                continue
                     if _is_tainted(rhs, tainted, const_ints):
                         tainted.add(_vname)
                         changed = True

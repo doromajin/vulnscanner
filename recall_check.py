@@ -98,6 +98,10 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     ("AST-SQL-002",   "python/interprocedural.py",    "HIGH",     "Phase 3a: self._get_id() inherent taint source"),
     ("AST-CMD-001",   "python/interprocedural.py",    "HIGH",     "Phase 3b: self._wrap(tainted) passthrough"),
 
+    # -- Java: interprocedural taint ----------------------------------------------
+    ("JAST-SQL-001",  "java/interprocedural.java",   "HIGH",     "Java bare-call helper -> SQL injection"),
+    ("JAST-SQL-001",  "java/interprocedural.java",   "HIGH",     "Java this.method(tainted) passthrough -> SQL injection"),
+
     # -- Java: deserialization ----------------------------------------------------
     ("DESER-005",     "java/deserialization.java",     "CRITICAL", "Java ObjectInputStream.readObject() RCE"),
     ("DESER-009",     "java/deserialization.java",     "CRITICAL", "Java XStream.fromXML() RCE"),

@@ -524,6 +524,45 @@ def _java_class(body: str) -> str:
 
 
 @_skip_no_javalang
+class TestJavaInterproceduralTaint:
+    def test_this_method_tainted_arg_passthrough(self):
+        code = """
+import javax.servlet.http.HttpServletRequest;
+import java.sql.Connection;
+import java.sql.Statement;
+public class T {
+    private String wrap(String x) { return x; }
+    public void handle(HttpServletRequest req, Connection conn) throws Exception {
+        String raw = req.getParameter("q");
+        String val = this.wrap(raw);
+        Statement st = conn.createStatement();
+        st.executeQuery("SELECT * FROM t WHERE x='" + val + "'");
+    }
+}"""
+        findings = JavaASTAnalyzer().analyze("T.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SQL-001" in rule_ids, "this.method(tainted) passthrough not detected"
+
+    def test_this_method_inherent_request_source(self):
+        code = """
+import javax.servlet.http.HttpServletRequest;
+import java.sql.Connection;
+import java.sql.Statement;
+public class T {
+    HttpServletRequest req;
+    private String getInput() { return req.getParameter("input"); }
+    public void handle(Connection conn) throws Exception {
+        String val = getInput();
+        Statement st = conn.createStatement();
+        st.executeQuery("SELECT * FROM t WHERE x='" + val + "'");
+    }
+}"""
+        findings = JavaASTAnalyzer().analyze("T.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SQL-001" in rule_ids, "bare call to inherent taint-source method not detected"
+
+
+@_skip_no_javalang
 class TestJavaSnakeYAML:
     def test_new_yaml_no_arg_flagged(self):
         code = _java_class("public Object p(String s){Yaml yaml=new Yaml();return yaml.load(s);}")
