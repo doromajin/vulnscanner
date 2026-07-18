@@ -133,7 +133,9 @@ _SECRET_SKIP_RE = re.compile(
 
 # ── XSS ───────────────────────────────────────────────────────────────────────
 
-_UNSAFE_TEMPLATE_FUNCS = frozenset({"mark_safe", "format_html"})
+# Django: mark_safe() / format_html() — mark content as HTML-safe, bypassing escaping.
+# Flask/Jinja2: Markup() — wraps string as safe HTML, bypasses Jinja2 auto-escaping.
+_UNSAFE_TEMPLATE_FUNCS = frozenset({"mark_safe", "format_html", "Markup", "markupsafe.Markup", "flask.Markup"})
 
 # ── Taint sources and sinks ────────────────────────────────────────────────────
 
@@ -1042,9 +1044,21 @@ class _VulnVisitor(ast.NodeVisitor):
             return
         if not node.args:
             return
-        if not _is_const(node.args[0]):
+        arg = node.args[0]
+        if _is_const(arg):
+            return
+        taint = _taint_of(arg, self._assignments, self._class_attrs)
+        if taint.status == TaintStatus.CLEAN:
+            return
+        if taint.status == TaintStatus.TAINTED:
+            self._add(node, VulnType.XSS, Severity.HIGH, "AST-XSS-001",
+                      f"{name}() called with user-controlled input — bypasses HTML auto-escaping:"
+                      f" {taint.reason}",
+                      taint)
+        else:
             self._add(node, VulnType.XSS, Severity.MEDIUM, "AST-XSS-001",
-                      f"{name}() called with a non-literal value - verify no user input reaches this")
+                      f"[needs_review] {name}() called with a non-literal value —"
+                      " verify no user input reaches this")
 
     # ── insecure deserialization ───────────────────────────────────────────────
 

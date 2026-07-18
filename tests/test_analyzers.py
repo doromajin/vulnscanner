@@ -1493,6 +1493,52 @@ class TestLogInjection:
         assert not crits
 
 
+class TestFlaskMarkupXSS:
+    """Flask Markup() with user input should fire AST-XSS-001; literals must not."""
+
+    def test_markup_tainted_arg_flagged(self):
+        code = (
+            "from flask import request\n"
+            "from markupsafe import Markup\n"
+            "def view():\n"
+            "    name = request.args.get('name')\n"
+            "    return Markup(name)\n"
+        )
+        findings = AST.analyze("views.py", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "AST-XSS-001" in rule_ids, "Markup(tainted) must be flagged"
+
+    def test_markup_tainted_fires_high(self):
+        code = (
+            "from flask import request\n"
+            "from markupsafe import Markup\n"
+            "def view():\n"
+            "    name = request.args.get('name')\n"
+            "    return Markup(name)\n"
+        )
+        findings = AST.analyze("views.py", code)
+        highs = [f for f in findings if f.rule_id == "AST-XSS-001" and f.severity == "HIGH"]
+        assert highs, "Markup(tainted) must fire HIGH"
+
+    def test_markup_literal_not_flagged(self):
+        code = "from markupsafe import Markup\nresult = Markup('<b>safe</b>')\n"
+        findings = AST.analyze("views.py", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "AST-XSS-001" not in rule_ids, "Markup(literal) must NOT be flagged"
+
+    def test_mark_safe_tainted_flagged(self):
+        code = (
+            "from django.utils.safestring import mark_safe\n"
+            "from django.http import HttpRequest\n"
+            "def view(request):\n"
+            "    name = request.GET['name']\n"
+            "    return mark_safe(name)\n"
+        )
+        findings = AST.analyze("views.py", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "AST-XSS-001" in rule_ids, "mark_safe(tainted) must be flagged"
+
+
 class TestInterproceduralTaint:
     """Fixed-point iteration in _find_taint_source_funcs resolves transitive chains."""
 
