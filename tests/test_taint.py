@@ -696,6 +696,66 @@ class TestCrossFileTaint:
         ]
         assert not high_sql, "without cross-file context, confirmed-taint SQL should not fire"
 
+    def test_2hop_inherent_source_chain(self):
+        # Phase A: 2-hop inherent source chain
+        #   utils.py:   get_user_id() reads request.args (taint source)
+        #   helpers.py: fetch_user() calls get_user_id() — cross-file 1-hop
+        #   views.py:   uid = fetch_user() → passed to SQLi sink — cross-file 2-hop
+        files = {
+            "utils.py": (
+                "def get_user_id(request):\n"
+                "    return request.args.get('id')\n"
+            ),
+            "helpers.py": (
+                "from utils import get_user_id\n"
+                "def fetch_user(request):\n"
+                "    uid = get_user_id(request)\n"
+                "    return uid\n"
+            ),
+            "views.py": (
+                "from helpers import fetch_user\n"
+                "def handle(request, cursor):\n"
+                "    uid = fetch_user(request)\n"
+                "    cursor.execute('SELECT * FROM users WHERE id=' + uid)\n"
+            ),
+        }
+        findings = self._scan_with_context(files, "views.py")
+        sql = [
+            f for f in findings
+            if "SQL" in f.rule_id and f.suppression_reason is None
+        ]
+        assert sql, "2-hop cross-file inherent source chain must reach SQL sink"
+
+    def test_2hop_passthrough_chain(self):
+        # Phase A: 2-hop passthrough chain
+        #   utils.py:   inner(val) returns val (passthrough)
+        #   helpers.py: wrap(x) calls inner(x) — cross-file 1-hop passthrough
+        #   views.py:   result = wrap(tainted) → SQLi sink — cross-file 2-hop
+        files = {
+            "utils.py": (
+                "def inner(val):\n"
+                "    return val\n"
+            ),
+            "helpers.py": (
+                "from utils import inner\n"
+                "def wrap(x):\n"
+                "    return inner(x)\n"
+            ),
+            "views.py": (
+                "from helpers import wrap\n"
+                "def handle(request, cursor):\n"
+                "    q = request.args.get('q')\n"
+                "    cursor.execute('SELECT * FROM t WHERE id=' + wrap(q))\n"
+            ),
+        }
+        findings = self._scan_with_context(files, "views.py")
+        sql = [
+            f for f in findings
+            if "SQL" in f.rule_id and f.suppression_reason is None
+            and f.taint_status == "tainted"
+        ]
+        assert sql, "2-hop cross-file passthrough chain must propagate taint to SQL sink"
+
 
 # ── exploitability filter ──────────────────────────────────────────────────────
 

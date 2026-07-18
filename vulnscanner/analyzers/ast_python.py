@@ -478,8 +478,17 @@ def _build_remote_func_defs(
     except SyntaxError:
         return remote, class_methods
 
-    def _collect_module(module_file: str) -> None:
-        if module_file in seen_module_files:
+    def _collect_module(module_file: str, depth: int = 1) -> None:
+        """Collect class methods (all depths) and module-level functions (depth > 1)
+        from *module_file*, then recursively follow its imports up to depth 4.
+
+        Phase A — transitive resolution: depth > 1 functions are added to *remote*
+        with their original names so that calls inside directly-imported functions
+        can be resolved by Phase 4 (cross-file passthrough).  Direct-import alias
+        bindings (depth 1) are added by the outer loop with proper alias resolution
+        and take precedence because they are written first.
+        """
+        if module_file in seen_module_files or depth > 4:
             return
         seen_module_files.add(module_file)
         module_content = all_contents.get(module_file, "")
@@ -496,6 +505,28 @@ def _build_remote_func_defs(
                         and item.name != "__init__"
                         and not item.name.startswith("__")):
                     class_methods.setdefault(item.name, []).append(item)
+        # Phase A: add module-level functions at depth > 1 so callee bodies can be
+        # resolved when Phase 4 evaluates a directly-imported function's body.
+        # Don't overwrite direct-import entries (they have correct alias keys).
+        if depth > 1:
+            for stmt in module_tree.body:
+                if (isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and stmt.name not in remote):
+                    remote[stmt.name] = (stmt, module_file)
+        # Recursively follow this module's imports (cycle-safe via seen_module_files)
+        if depth < 4:
+            for imp in ast.walk(module_tree):
+                if isinstance(imp, ast.ImportFrom) and imp.module:
+                    sub = _resolve_module_to_file(imp.module, module_file, all_contents)
+                    if sub:
+                        _collect_module(sub, depth + 1)
+                elif isinstance(imp, ast.Import):
+                    for sub_alias in imp.names:
+                        sub = _resolve_module_to_file(
+                            sub_alias.name, module_file, all_contents
+                        )
+                        if sub:
+                            _collect_module(sub, depth + 1)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
@@ -633,7 +664,6 @@ class PythonASTAnalyzer(BaseAnalyzer):
             for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        _interprocedural_taint_sources = _find_taint_source_funcs(tree)
 
         # Cross-file taint: build remote function defs from thread-local context.
         # set_cross_file_context() is called by the scanner before parallel analysis.
@@ -642,16 +672,22 @@ class PythonASTAnalyzer(BaseAnalyzer):
             _rfd, _rcm = _build_remote_func_defs(file_path, content, _all)
             _cross_file_local.remote_func_defs = _rfd
             _cross_file_local.remote_class_methods = _rcm
-            # Extend taint sources with remote functions that themselves return tainted data
-            # (e.g. utils.get_user_input() defined in utils.py that reads request.args).
-            _extra: set[str] = set()
-            for _fn_name, (_fn_node, _) in _rfd.items():
-                _fake = ast.Module(body=[_fn_node], type_ignores=[])
-                if _fn_name in _find_taint_source_funcs(_fake):
-                    _extra.add(_fn_name)
-            if _extra:
-                _interprocedural_taint_sources = _interprocedural_taint_sources | frozenset(_extra)
+            if _rfd:
+                # Phase A: run fixed-point on local + ALL transitively-reachable remote
+                # functions together.  A single combined pass lets the fixed-point
+                # iteration resolve multi-hop chains:
+                #   Pass 1: utils.get_user_id() → request.args.get() → TAINTED
+                #   Pass 2: helpers.fetch_user() → get_user_id() (now in sources) → TAINTED
+                _all_func_nodes = (
+                    list(_local_func_defs.values())
+                    + [_n for _n, _ in _rfd.values()]
+                )
+                _fake_combined = ast.Module(body=_all_func_nodes, type_ignores=[])
+                _interprocedural_taint_sources = _find_taint_source_funcs(_fake_combined)
+            else:
+                _interprocedural_taint_sources = _find_taint_source_funcs(tree)
         else:
+            _interprocedural_taint_sources = _find_taint_source_funcs(tree)
             _cross_file_local.remote_func_defs = {}
             _cross_file_local.remote_class_methods = {}
 
