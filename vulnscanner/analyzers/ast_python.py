@@ -367,6 +367,12 @@ _XXE_PARSE_FUNCS = frozenset({
     "parseString", "parse",
 })
 
+# Qualifiers whose .parse() method is NOT an XML parser — suppress XXE for these.
+_XXE_SAFE_PARSE_QUALIFIERS = frozenset({
+    "ast", "json", "re", "argparse", "shlex", "configparser", "dateutil.parser",
+    "urllib.parse", "email", "html.parser", "toml", "yaml", "tomllib",
+})
+
 # ── LDAP injection ────────────────────────────────────────────────────────────
 # ldap3 conn.search() — first positional arg is base, second is the filter.
 # We detect taint in the variable used as the filter argument.
@@ -1302,6 +1308,12 @@ class _VulnVisitor(ast.NodeVisitor):
         full = _full_name(node.func) or ""
         attr = _attr_name(node.func) or ""
         if full not in _XXE_PARSE_FUNCS and attr not in {"parseString", "parse"}:
+            return
+        # Exclude non-XML parsers that share the name "parse" (e.g. ast.parse, json.loads)
+        obj_qualifier = ""
+        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            obj_qualifier = node.func.value.id
+        if obj_qualifier in _XXE_SAFE_PARSE_QUALIFIERS:
             return
         if not node.args:
             return
