@@ -2220,6 +2220,13 @@ def _taint_of(
             return TaintInfo(TaintStatus.TAINTED,
                              f"return of taint-source function '{full}'", source=full)
 
+        # Phase 3a: self.method() / obj.method() where the short method name is a local
+        # taint source.  _full_name returns "self.foo" which won't match _local_func_defs
+        # keys (stored as "foo"), so we check attr separately.
+        if attr and isinstance(node.func, ast.Attribute) and attr in _interprocedural_taint_sources:
+            return TaintInfo(TaintStatus.TAINTED,
+                             f"return of taint-source method '.{attr}()'", source=attr)
+
         # Phase 3: tainted arg → return propagation.
         # If the callee is a local function and any arg is TAINTED, check whether the tainted
         # parameter flows to a return value inside the callee. If so, the call expression itself
@@ -2237,6 +2244,23 @@ def _taint_of(
                 if _param_assigns and _callee_returns_tainted(_fd, _param_assigns, _depth + 1):
                     return TaintInfo(TaintStatus.TAINTED,
                                      f"tainted arg flows through '{full}' return", source=full)
+
+        # Phase 3b: self.method(tainted_arg) — attr call where the short method name is
+        # in _local_func_defs but full ("self.foo") is not.  Skips 'self' when mapping params.
+        if (attr and isinstance(node.func, ast.Attribute)
+                and attr in _local_func_defs and _depth <= 12
+                and (not full or full not in _local_func_defs)):
+            _fd_m = _local_func_defs[attr]
+            _arg_taints_m = [_taint_of(a, assignments, class_attrs, _depth + 1) for a in node.args]
+            if any(t.status == TaintStatus.TAINTED for t in _arg_taints_m):
+                _params_m = [p for p in _fd_m.args.args if p.arg != "self"]
+                _pm_m: dict[str, ast.expr] = {}
+                for _i, _param in enumerate(_params_m):
+                    if _i < len(_arg_taints_m) and _arg_taints_m[_i].status == TaintStatus.TAINTED:
+                        _pm_m[_param.arg] = ast.Name(id="request", ctx=ast.Load())
+                if _pm_m and _callee_returns_tainted(_fd_m, _pm_m, _depth + 1):
+                    return TaintInfo(TaintStatus.TAINTED,
+                                     f"tainted arg flows through .{attr}() return", source=attr)
 
         # Phase 4: cross-file taint propagation.
         # If the called function is imported from another project-local file, check

@@ -1408,6 +1408,45 @@ def handler():
         assert cmds, "2-hop transitive taint chain not detected"
         assert cmds[0].severity.value == "HIGH"
 
+    def test_self_method_inherent_taint_source(self):
+        # Phase 3a: self.method() where method is in _interprocedural_taint_sources
+        code = """
+import os
+from flask import request
+
+class View:
+    def _get_param(self):
+        return request.args.get('p')
+
+    def handle(self):
+        p = self._get_param()
+        os.system(p)
+"""
+        findings = AST.analyze("t.py", code, "")
+        cmds = [f for f in findings if f.rule_id == "AST-CMD-001"]
+        assert cmds, "Phase 3a: self.method() taint source not detected"
+        assert cmds[0].severity.value == "HIGH"
+
+    def test_self_method_arg_passthrough(self):
+        # Phase 3b: self.method(tainted_arg) where method passes arg to return
+        code = """
+import os
+from flask import request
+
+class Proc:
+    def _wrap(self, x):
+        return x
+
+    def run(self):
+        val = request.form.get('cmd')
+        result = self._wrap(val)
+        os.system(result)
+"""
+        findings = AST.analyze("t.py", code, "")
+        cmds = [f for f in findings if f.rule_id == "AST-CMD-001"]
+        assert cmds, "Phase 3b: self.method(tainted_arg) passthrough not detected"
+        assert cmds[0].severity.value == "HIGH"
+
     def test_clean_return_not_promoted_to_tainted(self):
         # get_const() returns a literal — must NOT be promoted to a taint source.
         # os.system(UNKNOWN) still fires HIGH by design, but taint_status must be 'unknown',

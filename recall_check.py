@@ -95,6 +95,8 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     # -- Python: interprocedural taint --------------------------------------------
     ("AST-CMD-001",   "python/interprocedural.py",    "HIGH",     "1-hop: get_user_direct() -> os.system()"),
     ("AST-SQL-002",   "python/interprocedural.py",    "HIGH",     "2-hop: wrap_raw() -> get_raw() -> execute() via concatenation"),
+    ("AST-SQL-002",   "python/interprocedural.py",    "HIGH",     "Phase 3a: self._get_id() inherent taint source"),
+    ("AST-CMD-001",   "python/interprocedural.py",    "HIGH",     "Phase 3b: self._wrap(tainted) passthrough"),
 
     # -- Java: deserialization ----------------------------------------------------
     ("DESER-005",     "java/deserialization.java",     "CRITICAL", "Java ObjectInputStream.readObject() RCE"),
