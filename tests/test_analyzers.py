@@ -606,6 +606,40 @@ class TestJavaSSLBypass:
 
 
 @_skip_no_javalang
+class TestJavaTrustBoundaryViolation:
+    """session.setAttribute(key, tainted) should fire JAST-TBV-001."""
+
+    def test_session_set_tainted_value_flagged(self):
+        code = """
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpSession;
+public class T {
+    public void handle(HttpServletRequest req) {
+        HttpSession session = req.getSession();
+        String user = req.getParameter("user");
+        session.setAttribute("user", user);
+    }
+}"""
+        findings = JavaASTAnalyzer().analyze("T.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-TBV-001" in rule_ids, "session.setAttribute(tainted) must be flagged"
+
+    def test_session_set_literal_not_flagged(self):
+        code = """
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpSession;
+public class T {
+    public void handle(HttpServletRequest req) {
+        HttpSession session = req.getSession();
+        session.setAttribute("logged_in", "true");
+    }
+}"""
+        findings = JavaASTAnalyzer().analyze("T.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-TBV-001" not in rule_ids, "setAttribute(literal) must NOT be flagged"
+
+
+@_skip_no_javalang
 class TestSpringRestTemplateSSRF:
     """Spring RestTemplate.getForObject(taintedUrl) must fire JAST-SSRF-002."""
 

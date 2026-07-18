@@ -28,6 +28,7 @@ _PREFIX: dict[str, int] = {
     "IAC-TF":   284,   # CWE-284:  Improper Access Control (IaC misconfig)
     "IAC-K8S":  250,   # CWE-250:  Execution with Unnecessary Privileges
     "LOG":      117,   # CWE-117:  Improper Output Neutralization for Logs
+    "TBV":      501,   # CWE-501:  Trust Boundary Violation
 }
 
 

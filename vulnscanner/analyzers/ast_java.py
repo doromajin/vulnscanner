@@ -135,6 +135,14 @@ _WEAK_HASH_ALGOS = frozenset({"MD5", "SHA-1", "SHA1", "MD2", "MD4"})
 # Prefixes/exact names to flag for Cipher.getInstance(algo)
 _WEAK_CIPHER_PREFIXES = ("DES", "RC2", "RC4", "ARCFOUR", "BLOWFISH")
 
+# ── Trust Boundary Violation (CWE-501) ────────────────────────────────────────
+# session.setAttribute(key, tainted) stores untrusted request data in the HTTP session.
+_SESSION_SET_METHODS = frozenset({"setAttribute", "putValue"})
+_SESSION_QUALIFIERS = frozenset({
+    "session", "httpSession", "sess", "userSession", "req_session",
+    "request_session",
+})
+
 # ── LDAP ──────────────────────────────────────────────────────────────────────
 
 _LDAP_HINTS = frozenset({
@@ -1101,6 +1109,24 @@ class JavaASTAnalyzer(BaseAnalyzer):
                              f"{q}.{node.member}() logs user-controlled data — log forging "
                              "via newline injection; strip \\n/\\r or use structured logging")
                         break
+        except Exception:
+            pass
+
+        # ── Trust Boundary Violation (CWE-501) ────────────────────────────────
+        # session.setAttribute(key, tainted) — untrusted request data stored in session.
+        try:
+            for _, node in tree.filter(jt.MethodInvocation):
+                if node.member not in _SESSION_SET_METHODS:
+                    continue
+                q = str(node.qualifier or "")
+                if not (q in _SESSION_QUALIFIERS
+                        or "session" in q.lower()):
+                    continue
+                args = node.arguments or []
+                if len(args) >= 2 and _is_tainted(args[1], tainted):
+                    _add(node, VulnType.TRUST_BOUNDARY_VIOLATION, Severity.MEDIUM, "JAST-TBV-001",
+                         f"session.{node.member}() with user-controlled value — "
+                         "storing untrusted request data in session (CWE-501); validate before storing")
         except Exception:
             pass
 

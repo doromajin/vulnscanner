@@ -35,6 +35,7 @@ class VulnType(str, Enum):
     MISSING_AUTHORIZATION = "Missing Authorization"
     MALWARE = "Malicious Code"
     LOG_INJECTION = "Log Injection"
+    TRUST_BOUNDARY_VIOLATION = "Trust Boundary Violation"
 
 
 @dataclass
