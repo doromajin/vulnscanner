@@ -977,10 +977,11 @@ class _VulnVisitor(ast.NodeVisitor):
         full = _full_name(node.func)
         attr = _attr_name(node.func)
 
-        # open(path) / codecs.open(path, …) / io.open(path, …) — file-open sinks
+        # open(path) / codecs.open(path, …) / io.open(path, …) / flask.send_file(path) — file-open sinks
+        # send_from_directory(dir, file) is safe (uses werkzeug safe_join internally) — excluded.
         _is_open = (
-            (isinstance(node.func, ast.Name) and node.func.id == "open")
-            or full in ("codecs.open", "io.open")
+            (isinstance(node.func, ast.Name) and node.func.id in ("open", "send_file"))
+            or full in ("codecs.open", "io.open", "flask.send_file")
         )
         if _is_open:
             if not node.args:
