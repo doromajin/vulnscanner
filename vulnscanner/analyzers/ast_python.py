@@ -17,6 +17,7 @@ import json
 import re
 import threading as _threading
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from vulnscanner.analyzers.base import BaseAnalyzer
@@ -405,6 +406,21 @@ _MONGO_SPECIFIC_METHODS = frozenset({
     "count_documents",
 })
 
+# ── cross-file pre-scan summary (Phase C) ─────────────────────────────────────
+
+@dataclass
+class CrossFileTaintSummary:
+    """Global taint information built by build_cross_file_summary() before per-file analysis.
+
+    Phase C improvement: _interprocedural_taint_sources is pre-seeded with
+    global_taint_sources before Phase B (module-global scanning) runs, so
+    function-call chains like ``config.HOST = get_host()`` are correctly resolved
+    even when get_host() is defined in a transitively imported file.
+    """
+    global_taint_sources: frozenset[str] = field(default_factory=frozenset)
+    tainted_globals: dict[str, frozenset[str]] = field(default_factory=dict)
+
+
 # ── interprocedural taint (per-file, single-threaded) ─────────────────────────
 # Both globals are updated by PythonASTAnalyzer.analyze() before each file visit.
 _interprocedural_taint_sources: frozenset[str] = frozenset()
@@ -415,13 +431,21 @@ _local_func_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
 _cross_file_local = _threading.local()
 
 
-def set_cross_file_context(all_contents: dict[str, str]) -> None:
+def set_cross_file_context(
+    all_contents: dict[str, str],
+    summary: CrossFileTaintSummary | None = None,
+) -> None:
     """Register the full {relative_path: content} map for cross-file taint resolution.
 
+    *summary* is the optional Phase C pre-scan result from build_cross_file_summary().
+    When provided, _interprocedural_taint_sources is pre-seeded with globally-known
+    taint sources before per-file analysis, enabling resolution of function-call chains
+    in module-level variable assignments (e.g. ``ALLOWED_HOST = get_host()``).
+
     Uses thread-local storage so parallel scan workers don't interfere with each other.
-    Call this once per scan before submitting analysis jobs.
     """
     _cross_file_local.all_contents = all_contents
+    _cross_file_local.cf_summary = summary
 
 
 def _resolve_module_to_file(
@@ -702,14 +726,39 @@ class PythonASTAnalyzer(BaseAnalyzer):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
 
+        # Phase C: pre-seed _interprocedural_taint_sources from global pre-scan summary.
+        # This MUST happen before _build_remote_func_defs so Phase B (module-global
+        # scanning inside _collect_module) can see globally-known taint source functions.
+        # Without this, Phase B evaluates "ALLOWED_HOST = get_host()" but get_host is not
+        # in _interprocedural_taint_sources yet → assignment falsely returns UNKNOWN.
+        _cf_summary: CrossFileTaintSummary | None = getattr(
+            _cross_file_local, "cf_summary", None
+        )
+        _global_sources: frozenset[str] = (
+            _cf_summary.global_taint_sources if _cf_summary else frozenset()
+        )
+        _interprocedural_taint_sources = _global_sources
+
         # Cross-file taint: build remote function defs from thread-local context.
         # set_cross_file_context() is called by the scanner before parallel analysis.
         _all = getattr(_cross_file_local, "all_contents", None)
         if _all:
             _rfd, _rcm, _rtg = _build_remote_func_defs(file_path, content, _all)
+            # Phase C safety-net: augment _rtg with summary's pre-computed tainted globals
+            # for direct imports the current file makes from any source file.
+            if _cf_summary and _cf_summary.tainted_globals:
+                for _imp in tree.body:
+                    if isinstance(_imp, ast.ImportFrom) and _imp.module:
+                        _src_fp = _resolve_module_to_file(_imp.module, file_path, _all)
+                        if _src_fp and _src_fp in _cf_summary.tainted_globals:
+                            _src_tainted = _cf_summary.tainted_globals[_src_fp]
+                            for _al in _imp.names:
+                                _as = _al.asname or _al.name
+                                if _al.name in _src_tainted and _as not in _rtg:
+                                    _rtg[_as] = _src_fp
             _cross_file_local.remote_func_defs = _rfd
             _cross_file_local.remote_class_methods = _rcm
-            _cross_file_local.remote_tainted_globals = _rtg  # Phase B
+            _cross_file_local.remote_tainted_globals = _rtg
             if _rfd:
                 # Phase A: run fixed-point on local + ALL transitively-reachable remote
                 # functions together.  A single combined pass lets the fixed-point
@@ -721,11 +770,14 @@ class PythonASTAnalyzer(BaseAnalyzer):
                     + [_n for _n, _ in _rfd.values()]
                 )
                 _fake_combined = ast.Module(body=_all_func_nodes, type_ignores=[])
-                _interprocedural_taint_sources = _find_taint_source_funcs(_fake_combined)
+                _per_file_sources = _find_taint_source_funcs(_fake_combined)
+                _interprocedural_taint_sources = _global_sources | _per_file_sources
             else:
-                _interprocedural_taint_sources = _find_taint_source_funcs(tree)
+                _per_file_sources = _find_taint_source_funcs(tree)
+                _interprocedural_taint_sources = _global_sources | _per_file_sources
         else:
-            _interprocedural_taint_sources = _find_taint_source_funcs(tree)
+            _per_file_sources = _find_taint_source_funcs(tree)
+            _interprocedural_taint_sources = _global_sources | _per_file_sources
             _cross_file_local.remote_func_defs = {}
             _cross_file_local.remote_class_methods = {}
             _cross_file_local.remote_tainted_globals = {}
@@ -3010,3 +3062,95 @@ def _find_taint_source_funcs(tree: ast.AST) -> frozenset[str]:
         current = current | frozenset(added)
 
     return current
+
+
+def build_cross_file_summary(all_contents: dict[str, str]) -> CrossFileTaintSummary:
+    """Phase C pre-scan: build a global taint summary over *all_contents* before
+    per-file analysis begins.
+
+    Two-step algorithm:
+    1. Collect ALL FunctionDef nodes from every Python file and run a single global
+       fixed-point (_find_taint_source_funcs) to find inherent taint-source functions.
+       Cross-file function chains are resolved because all functions are in scope.
+    2. Fixed-point evaluation of module-level assignments across all files, using
+       global_taint_sources so calls like ``HOST = get_host()`` are recognised even
+       when get_host is defined in a transitively imported file.
+
+    The resulting CrossFileTaintSummary is passed to set_cross_file_context() and
+    consumed by analyze() which pre-seeds _interprocedural_taint_sources before
+    calling _build_remote_func_defs (Phase B), enabling correct resolution of:
+        config.py: ALLOWED_HOST = get_host()   ← get_host now in global sources
+        views.py:  from config import ALLOWED_HOST → correctly TAINTED
+    """
+    global _interprocedural_taint_sources
+
+    # ── Step 1: collect all function nodes from all Python files ───────────────
+    all_func_nodes: list[ast.stmt] = []
+    parsed_trees: dict[str, ast.Module] = {}
+
+    for fp, content in all_contents.items():
+        if not fp.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(content)
+            parsed_trees[fp] = tree
+            all_func_nodes.extend(
+                n for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
+        except SyntaxError:
+            pass
+
+    # ── Step 2: global fixed-point for inherent taint source functions ─────────
+    if all_func_nodes:
+        _fake_all = ast.Module(body=all_func_nodes, type_ignores=[])
+        global_sources = _find_taint_source_funcs(_fake_all)
+    else:
+        global_sources = frozenset()
+
+    # ── Step 3: fixed-point for module-level tainted globals ───────────────────
+    # Make global sources visible to _taint_of during the global scan pass.
+    _interprocedural_taint_sources = global_sources
+
+    tainted_by_file: dict[str, frozenset[str]] = {}
+    for _pass in range(6):
+        _changed = False
+        for fp, tree in parsed_trees.items():
+            # Build sentinel assignments for tainted names imported from known files
+            _imp_taint: dict[str, ast.expr] = {}
+            for _s in tree.body:
+                if isinstance(_s, ast.ImportFrom) and _s.module:
+                    _src = _resolve_module_to_file(_s.module, fp, all_contents)
+                    if _src and _src in tainted_by_file:
+                        for _al in _s.names:
+                            _as = _al.asname or _al.name
+                            if _al.name in tainted_by_file[_src] or _al.name == "*":
+                                _imp_taint[_as] = _TAINTED_MODULE_SENTINEL
+
+            # Evaluate module-level assignments
+            _new: set[str] = set()
+            for _s in tree.body:
+                if isinstance(_s, ast.Assign):
+                    if _taint_of(_s.value, _imp_taint, {}).status == TaintStatus.TAINTED:
+                        for _t in _s.targets:
+                            if isinstance(_t, ast.Name):
+                                _new.add(_t.id)
+                elif isinstance(_s, ast.AnnAssign) and _s.value is not None:
+                    if _taint_of(_s.value, _imp_taint, {}).status == TaintStatus.TAINTED:
+                        if isinstance(_s.target, ast.Name):
+                            _new.add(_s.target.id)
+
+            _nf = frozenset(_new)
+            if _nf != tainted_by_file.get(fp, frozenset()):
+                tainted_by_file[fp] = _nf
+                _changed = True
+        if not _changed:
+            break
+
+    # Restore to empty so it is cleanly set per-file during analyze()
+    _interprocedural_taint_sources = frozenset()
+
+    return CrossFileTaintSummary(
+        global_taint_sources=global_sources,
+        tainted_globals=tainted_by_file,
+    )

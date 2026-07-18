@@ -11,6 +11,7 @@ from vulnscanner.analyzers.ast_python import (
     _collect_class_attrs,
     _collect_scope_assignments,
     set_cross_file_context,
+    build_cross_file_summary,
 )
 from vulnscanner.models import Severity
 
@@ -612,6 +613,12 @@ class TestCrossFileTaint:
         set_cross_file_context(files)
         return AST.analyze(target_file, files[target_file])
 
+    def _scan_with_prescan(self, files: dict[str, str], target_file: str) -> list:
+        """Analyze target_file with full Phase C pre-scan summary."""
+        summary = build_cross_file_summary(files)
+        set_cross_file_context(files, summary)
+        return AST.analyze(target_file, files[target_file])
+
     def test_tainted_arg_passthrough_via_import(self):
         # utils.py: process(s) returns s unchanged (passthrough)
         # app.py: from utils import process; db.execute(... + process(request.args['q']))
@@ -818,6 +825,84 @@ class TestCrossFileTaint:
         findings = self._scan_with_context(files, "views.py")
         cmd = [f for f in findings if "CMD" in f.rule_id and f.suppression_reason is None]
         assert cmd, "2-hop tainted module global chain must propagate to CMD sink"
+
+    # ── Phase C: global pre-scan (function-call chains in module globals) ───────
+
+    def test_prescan_module_global_via_function_call(self):
+        # Phase C core scenario: module global assigned from a taint-source FUNCTION.
+        # Phase B alone cannot detect this because get_host() is not yet in
+        # _interprocedural_taint_sources when _collect_module evaluates config.py.
+        # Phase C pre-seeds _interprocedural_taint_sources before Phase B runs.
+        #
+        #   utils.py:   get_host() returns request.META.get(...)  ← inherent source
+        #   config.py:  ALLOWED_HOST = get_host()                 ← module global via call
+        #   views.py:   from config import ALLOWED_HOST; subprocess.run(ALLOWED_HOST)
+        files = {
+            "utils.py": (
+                "def get_host():\n"
+                "    return request.META.get('HTTP_HOST')\n"
+            ),
+            "config.py": (
+                "from utils import get_host\n"
+                "ALLOWED_HOST = get_host()\n"
+            ),
+            "views.py": (
+                "from config import ALLOWED_HOST\n"
+                "import subprocess\n"
+                "def handle():\n"
+                "    subprocess.run(ALLOWED_HOST, shell=True)\n"
+            ),
+        }
+        findings = self._scan_with_prescan(files, "views.py")
+        cmd = [f for f in findings if "CMD" in f.rule_id and f.suppression_reason is None]
+        assert cmd, (
+            "Phase C must detect CMD injection when module global is assigned from a "
+            "function-call chain (get_host from utils.py)"
+        )
+
+    def test_prescan_global_sources_returns_frozenset(self):
+        # Smoke-test: build_cross_file_summary returns a valid CrossFileTaintSummary.
+        files = {
+            "utils.py": (
+                "def get_data(request):\n"
+                "    return request.args.get('q')\n"
+            ),
+            "app.py": (
+                "from utils import get_data\n"
+                "def view(request, cursor):\n"
+                "    cursor.execute('SELECT ' + get_data(request))\n"
+            ),
+        }
+        summary = build_cross_file_summary(files)
+        assert "get_data" in summary.global_taint_sources, (
+            "global pre-scan must identify get_data as a taint source"
+        )
+
+    def test_prescan_clean_global_not_in_tainted_globals(self):
+        # FP guard: literal module global must NOT appear in tainted_globals
+        files = {
+            "config.py": "DB_HOST = 'localhost'\n",
+            "app.py": (
+                "from config import DB_HOST\n"
+                "import subprocess\n"
+                "def handle():\n"
+                "    subprocess.run(DB_HOST, shell=True)\n"
+            ),
+        }
+        summary = build_cross_file_summary(files)
+        tainted_in_config = summary.tainted_globals.get("config.py", frozenset())
+        assert "DB_HOST" not in tainted_in_config, (
+            "literal global must not be classified as tainted by global pre-scan"
+        )
+        findings = self._scan_with_prescan(files, "app.py")
+        confirmed_cmd = [
+            f for f in findings
+            if "CMD" in f.rule_id and f.suppression_reason is None
+            and f.taint_status == "tainted"
+        ]
+        assert not confirmed_cmd, (
+            "Phase C must not produce confirmed-TAINTED CMD finding for literal global"
+        )
 
 
 # ── exploitability filter ──────────────────────────────────────────────────────

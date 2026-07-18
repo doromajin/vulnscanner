@@ -10,7 +10,10 @@ from dataclasses import dataclass, field
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from vulnscanner.analyzers import ALL_ANALYZERS, BaseAnalyzer
-from vulnscanner.analyzers.ast_python import set_cross_file_context
+from vulnscanner.analyzers.ast_python import (
+    build_cross_file_summary,
+    set_cross_file_context,
+)
 from vulnscanner.analyzers.file_context import (
     INCLUDE_TEST_FILES,
     INCLUDE_VENDOR_FILES,
@@ -167,6 +170,12 @@ class VulnScanner:
         # Only Python files are needed; others are included harmlessly and ignored.
         all_contents = {fp: content for fp, content in files}
 
+        # Phase C pre-scan: build global taint summary BEFORE parallel per-file analysis.
+        # This seeds _interprocedural_taint_sources with globally-known taint sources so
+        # Phase B (module-global scanning) correctly resolves function-call chains like
+        # ``config.ALLOWED_HOST = get_host()`` where get_host is in a transitive import.
+        cf_summary = build_cross_file_summary(all_contents)
+
         start = time.perf_counter()
         with Progress(
             SpinnerColumn("line"),
@@ -179,7 +188,7 @@ class VulnScanner:
 
             with ThreadPoolExecutor(max_workers=self._workers) as pool:
                 futures = {
-                    pool.submit(self._analyze_file_pure, fp, content, directory, all_contents): fp
+                    pool.submit(self._analyze_file_pure, fp, content, directory, all_contents, cf_summary): fp
                     for fp, content in files
                 }
                 for future in as_completed(futures):
@@ -198,12 +207,13 @@ class VulnScanner:
     def _analyze_file_pure(
         self, file_path: str, content: str, source: str,
         all_contents: dict[str, str] | None = None,
+        cf_summary=None,
     ) -> _FileResult:
         """Analyze a single file; returns results without mutating shared state."""
-        # Provide cross-file content map to PythonASTAnalyzer via thread-local storage.
-        # This enables interprocedural taint tracking across imported project files.
+        # Provide cross-file content map and Phase C summary via thread-local storage.
+        # cf_summary is built once before the pool and shared (read-only) across workers.
         if all_contents is not None:
-            set_cross_file_context(all_contents)
+            set_cross_file_context(all_contents, cf_summary)
 
         partial = _FileResult(scanned_lines=content.count("\n") + 1)
         lines = content.splitlines()
