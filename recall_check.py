@@ -92,6 +92,10 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     # -- Python: sanitizer bypass -------------------------------------------------
     ("AST-SQL-002",   "python/sanitizer_bypass.py",   "HIGH",     "html.escape() does NOT suppress SQL injection"),
 
+    # -- Python: interprocedural taint --------------------------------------------
+    ("AST-CMD-001",   "python/interprocedural.py",    "HIGH",     "1-hop: get_user_direct() -> os.system()"),
+    ("AST-SQL-002",   "python/interprocedural.py",    "HIGH",     "2-hop: wrap_raw() -> get_raw() -> execute() via concatenation"),
+
     # -- Java: deserialization ----------------------------------------------------
     ("DESER-005",     "java/deserialization.java",     "CRITICAL", "Java ObjectInputStream.readObject() RCE"),
     ("DESER-009",     "java/deserialization.java",     "CRITICAL", "Java XStream.fromXML() RCE"),

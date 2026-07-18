@@ -2690,23 +2690,40 @@ def _iter_func_returns(
 def _find_taint_source_funcs(tree: ast.AST) -> frozenset[str]:
     """Pre-pass: collect function names whose bodies contain at least one tainted return.
 
-    Handles arbitrary-length bodies including intermediate assignments, logging
-    calls, if/else branches, try/except, and early-return guards.  Does not
-    descend into nested function or class definitions.
+    Uses fixed-point iteration to handle transitive chains:
+      def get_raw():    return request.args.get('q')   # direct source
+      def get_wrapped(): data = get_raw(); return data  # transitive source
+
+    Each pass expands the known-tainted set by one hop until stable.  Capped at 8
+    passes (sufficient for all realistic nesting depths; O(n*passes) time).
 
     Security-first: if any code path can return a tainted value the function is
-    marked as a taint source, even if other paths return a clean sentinel.  This
-    avoids false negatives at the cost of a small number of additional MEDIUM
-    findings when a caller always takes the clean branch.
+    marked as a taint source, even if other paths return a clean sentinel.
     """
-    sources: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        assignments = _collect_scope_assignments(node)
-        for ret in _iter_func_returns(node):
-            if (ret.value is not None
-                    and _taint_of(ret.value, assignments, {}).status == TaintStatus.TAINTED):
-                sources.add(node.name)
-                break  # one tainted return is sufficient
-    return frozenset(sources)
+    global _interprocedural_taint_sources
+
+    func_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    current: frozenset[str] = frozenset()
+    for _ in range(min(len(func_nodes) + 1, 8)):
+        # Expose current known sources to _taint_of so transitive calls resolve.
+        _interprocedural_taint_sources = current
+        added: set[str] = set()
+        for name, node in func_nodes.items():
+            if name in current:
+                continue
+            assignments = _collect_scope_assignments(node)
+            for ret in _iter_func_returns(node):
+                if (ret.value is not None
+                        and _taint_of(ret.value, assignments, {}).status == TaintStatus.TAINTED):
+                    added.add(name)
+                    break  # one tainted return is sufficient
+        if not added:
+            break
+        current = current | frozenset(added)
+
+    return current

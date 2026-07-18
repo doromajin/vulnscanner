@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
+from vulnscanner.analyzers.ast_java import JavaASTAnalyzer, _HAS_JAVALANG
+
+_skip_no_javalang = pytest.mark.skipif(not _HAS_JAVALANG, reason="javalang not installed")
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
 from vulnscanner.analyzers.command_injection import CommandInjectionAnalyzer
 from vulnscanner.analyzers.java_analyzer import JavaAnalyzer
@@ -521,6 +523,7 @@ def _java_class(body: str) -> str:
     return f"public class T {{\n{body}\n}}"
 
 
+@_skip_no_javalang
 class TestJavaSnakeYAML:
     def test_new_yaml_no_arg_flagged(self):
         code = _java_class("public Object p(String s){Yaml yaml=new Yaml();return yaml.load(s);}")
@@ -541,6 +544,7 @@ class TestJavaSnakeYAML:
         assert "JAST-DESER-002" not in rule_ids
 
 
+@_skip_no_javalang
 class TestJavaSSLBypass:
     def test_allow_all_hostname_verifier_flagged(self):
         code = "conn.setHostnameVerifier(SSLConnectionSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER);"
@@ -1361,3 +1365,63 @@ class TestClientSideAnalyzer:
         )
         findings = CS.analyze("t.js", code)
         assert not any(f.rule_id == "CLIENT-MSG-001" for f in findings)
+
+
+class TestInterproceduralTaint:
+    """Fixed-point iteration in _find_taint_source_funcs resolves transitive chains."""
+
+    def test_single_hop_inherent_source(self):
+        code = """
+from flask import request
+import os
+
+def get_user():
+    return request.args.get('user')
+
+def handler():
+    u = get_user()
+    os.system(u)
+"""
+        findings = AST.analyze("t.py", code, "")
+        cmds = [f for f in findings if f.rule_id == "AST-CMD-001"]
+        assert cmds, "single-hop taint source not detected"
+        assert cmds[0].severity.value == "HIGH"
+
+    def test_two_hop_transitive_chain(self):
+        code = """
+from flask import request
+import os
+
+def get_raw():
+    return request.args.get('q')
+
+def wrap():
+    v = get_raw()
+    return v
+
+def handler():
+    u = wrap()
+    os.system(u)
+"""
+        findings = AST.analyze("t.py", code, "")
+        cmds = [f for f in findings if f.rule_id == "AST-CMD-001"]
+        assert cmds, "2-hop transitive taint chain not detected"
+        assert cmds[0].severity.value == "HIGH"
+
+    def test_clean_return_not_promoted_to_tainted(self):
+        # get_const() returns a literal — must NOT be promoted to a taint source.
+        # os.system(UNKNOWN) still fires HIGH by design, but taint_status must be 'unknown',
+        # not 'tainted'. This verifies the fixed-point does not incorrectly expand sources.
+        code = """
+import os
+
+def get_const():
+    return "safe_value"
+
+def handler():
+    v = get_const()
+    os.system(v)
+"""
+        findings = AST.analyze("t.py", code, "")
+        tainted_cmds = [f for f in findings if f.rule_id == "AST-CMD-001" and f.taint_status == "tainted"]
+        assert not tainted_cmds, "constant-return function must not be promoted to TAINTED taint source"
