@@ -606,6 +606,41 @@ class TestJavaSSLBypass:
 
 
 @_skip_no_javalang
+class TestSpringRestTemplateSSRF:
+    """Spring RestTemplate.getForObject(taintedUrl) must fire JAST-SSRF-002."""
+
+    _PREAMBLE = (
+        "import javax.servlet.http.HttpServletRequest;\n"
+        "import org.springframework.web.client.RestTemplate;\n"
+    )
+
+    def test_get_for_object_tainted_url_flagged(self):
+        code = self._PREAMBLE + """
+public class T {
+    RestTemplate restTemplate;
+    public String fetch(HttpServletRequest req) {
+        String url = req.getParameter("target");
+        return restTemplate.getForObject(url, String.class);
+    }
+}"""
+        findings = JavaASTAnalyzer().analyze("T.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SSRF-002" in rule_ids, "restTemplate.getForObject(tainted) must be flagged"
+
+    def test_hardcoded_url_not_flagged(self):
+        code = self._PREAMBLE + """
+public class T {
+    RestTemplate restTemplate;
+    public String fetch() {
+        return restTemplate.getForObject("https://api.example.com/data", String.class);
+    }
+}"""
+        findings = JavaASTAnalyzer().analyze("T.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SSRF-002" not in rule_ids, "hardcoded URL must NOT be flagged"
+
+
+@_skip_no_javalang
 class TestSpringJdbcTemplate:
     """Spring JdbcTemplate: tainted SQL string = TP; bound param args = FP-free."""
 

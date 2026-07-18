@@ -92,6 +92,23 @@ _DESER_CLASSES = frozenset({"ObjectInputStream"})
 
 _SPEL_METHODS = frozenset({"parseExpression"})
 
+# Spring RestTemplate / WebClient methods: first arg is the URL.
+_SPRING_REST_URL_METHODS = frozenset({
+    "getForObject", "getForEntity", "postForObject", "postForEntity",
+    "postForLocation", "put", "delete", "patchForObject", "exchange",
+    "execute",
+})
+_SPRING_REST_QUALIFIERS = frozenset({
+    "restTemplate", "RestTemplate", "rt", "template", "webClient", "WebClient",
+})
+
+# HTTP client constructors that take a URL string directly.
+_HTTP_CLIENT_URL_CTORS = frozenset({
+    "HttpGet", "HttpPost", "HttpPut", "HttpDelete", "HttpPatch", "HttpHead",
+    "HttpOptions",
+    "URI",
+})
+
 # ── XSS writer sinks and sanitizers ───────────────────────────────────────────
 
 _RESPONSE_OBJECTS = frozenset({
@@ -1226,13 +1243,38 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # ── SSRF ──────────────────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.ClassCreator):
-                if _type_name(node.type) == "URL":
+                ctype = _type_name(node.type)
+                if ctype == "URL":
                     for arg in (node.arguments or []):
                         if _is_tainted(arg, tainted):
                             _add(node, VulnType.SSRF, Severity.HIGH, "JAST-SSRF-001",
                                  "new URL() with user-controlled string — "
                                  "SSRF; validate scheme/host against an allowlist")
                             break
+                elif ctype in _HTTP_CLIENT_URL_CTORS:
+                    first = (node.arguments or [None])[0]
+                    if first is not None and _is_tainted(first, tainted):
+                        _add(node, VulnType.SSRF, Severity.HIGH, "JAST-SSRF-001",
+                             f"new {ctype}() with user-controlled URL — "
+                             "SSRF; validate scheme/host against an allowlist before making HTTP requests")
+        except Exception:
+            pass
+
+        # Spring RestTemplate / WebClient: first arg is the URL.
+        try:
+            for _, node in tree.filter(jt.MethodInvocation):
+                if node.member not in _SPRING_REST_URL_METHODS:
+                    continue
+                q = str(node.qualifier or "")
+                if not (q in _SPRING_REST_QUALIFIERS
+                        or q.lower().endswith("resttemplate")
+                        or q.lower().endswith("webclient")):
+                    continue
+                first = (node.arguments or [None])[0]
+                if first is not None and _is_tainted(first, tainted):
+                    _add(node, VulnType.SSRF, Severity.HIGH, "JAST-SSRF-002",
+                         f"Spring {q}.{node.member}() with user-controlled URL — "
+                         "SSRF; validate scheme/host or use allowlist before making external requests")
         except Exception:
             pass
 

@@ -35,8 +35,8 @@ def get_cwe_id(rule_id: str) -> Optional[int]:
     """Return the CWE ID for *rule_id*, or None if unknown."""
     if rule_id in _SPECIFIC:
         return _SPECIFIC[rule_id]
-    # Strip AST- prefix so e.g. AST-SQL-001 → SQL-001
-    lookup = rule_id.removeprefix("AST-")
+    # Strip AST-/JAST- prefix so e.g. AST-SQL-001 / JAST-SQL-001 → SQL-001
+    lookup = rule_id.removeprefix("AST-").removeprefix("JAST-")
     for prefix, cwe in _PREFIX.items():
         if lookup.startswith(prefix):
             return cwe
