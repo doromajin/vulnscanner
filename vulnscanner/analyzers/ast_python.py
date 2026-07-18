@@ -969,6 +969,22 @@ class _VulnVisitor(ast.NodeVisitor):
                           f" {taint.reason}",
                           taint)
 
+        # paramiko/fabric ssh.exec_command(tainted_cmd) — remote SSH command injection
+        elif attr == "exec_command" and isinstance(node.func, ast.Attribute):
+            if not node.args:
+                return
+            taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                return
+            if any(s in _CMD_SANITIZER_FUNCS for s in (taint.sanitizers or [])):
+                return
+            sev = Severity.HIGH if taint.status == TaintStatus.TAINTED else Severity.MEDIUM
+            label = "tainted" if taint.status == TaintStatus.TAINTED else "non-literal"
+            self._add(node, VulnType.COMMAND_INJECTION, sev, "AST-CMD-006",
+                      f"exec_command() called with {label} command — SSH remote command injection"
+                      f" risk: {taint.reason}",
+                      taint)
+
         # dynamic import — arbitrary module loading from user input
         elif full in _DYNAMIC_IMPORT_FUNCS:
             if not node.args:
