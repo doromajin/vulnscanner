@@ -93,6 +93,14 @@ _REDIRECT_FUNCS = frozenset({
 
 _TEMPLATE_RENDER_FUNCS = frozenset({"render_template_string"})
 
+# Template constructors that compile the template at construction time.
+# Passing user input directly enables SSTI ({{7*7}} execution).
+_TEMPLATE_CTOR_FUNCS = frozenset({
+    "jinja2.Template", "Template",          # Jinja2
+    "mako.template.Template",               # Mako
+    "mako.Template",
+})
+
 # ── Exploitability ─────────────────────────────────────────────────────────────
 
 # Decorator attribute names that identify a function as a web request handler.
@@ -1225,19 +1233,42 @@ class _VulnVisitor(ast.NodeVisitor):
     def _check_ssti(self, node: ast.Call) -> None:
         name = _attr_name(node.func) or _full_name(node.func)
 
+        full = _full_name(node.func) or ""
+
         if name in _TEMPLATE_RENDER_FUNCS:
             if not node.args or _is_const(node.args[0]):
                 return
+            taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                return
             self._add(node, VulnType.SSTI, Severity.CRITICAL, "AST-SSTI-001",
                       f"{name}() renders a non-literal template string - "
-                      "user-controlled template content leads to RCE via SSTI")
+                      "user-controlled template content leads to RCE via SSTI",
+                      taint)
 
         elif name == "from_string":
             if not node.args or _is_const(node.args[0]):
                 return
-            self._add(node, VulnType.SSTI, Severity.HIGH, "AST-SSTI-002",
-                      "Environment.from_string() with non-literal template - "
-                      "verify the template source is not user-controlled")
+            taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                return
+            sev = Severity.HIGH if taint.status == TaintStatus.TAINTED else Severity.MEDIUM
+            self._add(node, VulnType.SSTI, sev, "AST-SSTI-002",
+                      f"Environment.from_string() with {'tainted' if taint.status == TaintStatus.TAINTED else 'non-literal'} template - "
+                      "user-controlled template content leads to RCE via SSTI",
+                      taint)
+
+        elif full in _TEMPLATE_CTOR_FUNCS or name in _TEMPLATE_CTOR_FUNCS:
+            if not node.args or _is_const(node.args[0]):
+                return
+            taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+            if taint.status == TaintStatus.CLEAN:
+                return
+            sev = Severity.CRITICAL if taint.status == TaintStatus.TAINTED else Severity.HIGH
+            self._add(node, VulnType.SSTI, sev, "AST-SSTI-003",
+                      f"{name}() constructed with {'tainted' if taint.status == TaintStatus.TAINTED else 'non-literal'} template string — "
+                      "template constructors compile user input as executable template code; RCE risk",
+                      taint)
 
     # ── weak cryptography ──────────────────────────────────────────────────────
 

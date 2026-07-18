@@ -1493,6 +1493,40 @@ class TestLogInjection:
         assert not crits
 
 
+class TestJinja2TemplateSSTI:
+    """jinja2.Template(user_input) must fire AST-SSTI-003."""
+
+    def test_template_ctor_tainted_flagged(self):
+        code = (
+            "from flask import request\n"
+            "import jinja2\n"
+            "def view():\n"
+            "    t = request.args.get('tmpl')\n"
+            "    return jinja2.Template(t).render()\n"
+        )
+        findings = AST.analyze("views.py", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "AST-SSTI-003" in rule_ids, "jinja2.Template(tainted) must fire SSTI"
+
+    def test_template_ctor_literal_not_flagged(self):
+        code = "import jinja2\nresult = jinja2.Template('Hello {{ name }}').render(name='world')\n"
+        findings = AST.analyze("views.py", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "AST-SSTI-003" not in rule_ids, "jinja2.Template(literal) must NOT be flagged"
+
+    def test_from_string_tainted_high(self):
+        code = (
+            "from flask import request\n"
+            "from jinja2 import Environment\n"
+            "def view():\n"
+            "    src = request.args.get('t')\n"
+            "    return Environment().from_string(src).render()\n"
+        )
+        findings = AST.analyze("views.py", code)
+        highs = [f for f in findings if f.rule_id == "AST-SSTI-002" and f.severity == "HIGH"]
+        assert highs, "Environment.from_string(tainted) must fire HIGH"
+
+
 class TestFlaskMarkupXSS:
     """Flask Markup() with user input should fire AST-XSS-001; literals must not."""
 
