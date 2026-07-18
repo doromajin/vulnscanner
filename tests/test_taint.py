@@ -756,6 +756,69 @@ class TestCrossFileTaint:
         ]
         assert sql, "2-hop cross-file passthrough chain must propagate taint to SQL sink"
 
+    # ── Phase B: tainted module globals ────────────────────────────────────────
+
+    def test_tainted_module_global_direct(self):
+        # Phase B: module-level variable assigned from a taint source
+        # config.py: ALLOWED_HOST = request.META.get("HTTP_HOST")
+        # views.py:  from config import ALLOWED_HOST; redirect(ALLOWED_HOST)
+        files = {
+            "config.py": (
+                "ALLOWED_HOST = request.META.get('HTTP_HOST')\n"
+            ),
+            "views.py": (
+                "from config import ALLOWED_HOST\n"
+                "import subprocess\n"
+                "def handle():\n"
+                "    subprocess.run(ALLOWED_HOST, shell=True)\n"
+            ),
+        }
+        findings = self._scan_with_context(files, "views.py")
+        cmd = [f for f in findings if "CMD" in f.rule_id and f.suppression_reason is None]
+        assert cmd, "tainted module global must propagate taint to command injection sink"
+
+    def test_tainted_module_global_clean_not_flagged(self):
+        # Phase B FP guard: module-level variable assigned from a literal must be CLEAN
+        files = {
+            "config.py": (
+                "DB_HOST = 'localhost'\n"
+            ),
+            "views.py": (
+                "from config import DB_HOST\n"
+                "import subprocess\n"
+                "def handle():\n"
+                "    subprocess.run(DB_HOST, shell=True)\n"
+            ),
+        }
+        findings = self._scan_with_context(files, "views.py")
+        confirmed_cmd = [
+            f for f in findings
+            if "CMD" in f.rule_id and f.suppression_reason is None
+            and f.taint_status == "tainted"
+        ]
+        assert not confirmed_cmd, "literal module global must not produce confirmed-TAINTED CMD finding"
+
+    def test_tainted_module_global_2hop_chain(self):
+        # Phase B 2-hop: utils.HOST is tainted; config.EXTERNAL = HOST; views imports EXTERNAL
+        files = {
+            "utils.py": (
+                "HOST = request.META.get('HTTP_HOST')\n"
+            ),
+            "config.py": (
+                "from utils import HOST\n"
+                "EXTERNAL_HOST = HOST\n"
+            ),
+            "views.py": (
+                "from config import EXTERNAL_HOST\n"
+                "import subprocess\n"
+                "def handle():\n"
+                "    subprocess.run(EXTERNAL_HOST, shell=True)\n"
+            ),
+        }
+        findings = self._scan_with_context(files, "views.py")
+        cmd = [f for f in findings if "CMD" in f.rule_id and f.suppression_reason is None]
+        assert cmd, "2-hop tainted module global chain must propagate to CMD sink"
+
 
 # ── exploitability filter ──────────────────────────────────────────────────────
 

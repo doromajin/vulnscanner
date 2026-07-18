@@ -263,6 +263,11 @@ _CMD_SANITIZER_FUNCS = frozenset({"shlex.quote", "pipes.quote"})
 # Dynamic import sinks: load arbitrary code from user-supplied module names.
 _DYNAMIC_IMPORT_FUNCS = frozenset({"__import__", "importlib.import_module"})
 
+# Phase B sentinel: Name("request") is always in _TAINTED_NAME_SOURCES, so
+# _taint_of(sentinel) returns TAINTED.  Used as a stand-in for "known-tainted
+# value" when evaluating module-level assignments during cross-file global scanning.
+_TAINTED_MODULE_SENTINEL: ast.expr = ast.Name(id="request", ctx=ast.Load())
+
 # os.* path sinks with a single path argument.
 _OS_PATH_SINKS_SINGLE = frozenset({
     "os.makedirs", "os.mkdir", "os.remove", "os.unlink",
@@ -450,33 +455,31 @@ def _build_remote_func_defs(
 ) -> tuple[
     dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]],
     dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]],
+    dict[str, str],
 ]:
-    """Parse import statements in *content* and return:
+    """Parse import statements in *content* and return a 3-tuple:
 
     1. ``remote_funcs`` — ``{imported_name: (FunctionDef_node, source_file_path)}``
-       for module-level functions (existing behaviour).
+       for module-level functions.
     2. ``class_methods`` — ``{method_name: [FunctionDef_node, ...]}``
-       collecting every class method found in imported project-local modules so
-       that calls like ``obj.doSomething(tainted_arg)`` can be resolved even when
-       the type of *obj* is unknown.  Multiple classes may define the same method;
-       all implementations are stored so taint analysis can take the worst case.
+       for class methods found in imported project-local modules.
+    3. ``remote_tainted_globals`` — ``{imported_alias: source_file_path}``
+       Phase B: module-level variables that are assigned from taint sources.
+       E.g. ``ALLOWED_HOST = request.META.get("HTTP_HOST")`` in config.py → the
+       imported name is considered TAINTED in the importing file.
 
-    Handles:
-    - ``from utils import process`` → key ``"process"``
-    - ``from utils import process as p`` → key ``"p"``
-    - ``import utils`` → keys ``"utils.func_name"``
-    - ``from utils import *`` → all public functions
-
-    Only resolves to files that exist in *all_contents* (project-local);
-    third-party packages (e.g. ``import requests``) are silently skipped.
+    Handles ``from X import Y``, ``from X import Y as Z``, ``import X``,
+    ``from X import *``.  Only resolves project-local files (in *all_contents*).
     """
     remote: dict[str, tuple] = {}
     class_methods: dict[str, list] = {}
+    remote_globals: dict[str, str] = {}      # Phase B: {imported_alias: source_file}
+    module_tainted_globals: dict[str, set[str]] = {}  # {module_file: {tainted_var, ...}}
     seen_module_files: set[str] = set()
     try:
         tree = ast.parse(content)
     except SyntaxError:
-        return remote, class_methods
+        return remote, class_methods, remote_globals
 
     def _collect_module(module_file: str, depth: int = 1) -> None:
         """Collect class methods (all depths) and module-level functions (depth > 1)
@@ -484,9 +487,12 @@ def _build_remote_func_defs(
 
         Phase A — transitive resolution: depth > 1 functions are added to *remote*
         with their original names so that calls inside directly-imported functions
-        can be resolved by Phase 4 (cross-file passthrough).  Direct-import alias
-        bindings (depth 1) are added by the outer loop with proper alias resolution
-        and take precedence because they are written first.
+        can be resolved by Phase 4 (cross-file passthrough).
+
+        Phase B — module global scanning: after recursion (DFS-first so sub-files'
+        tainted globals are already known), evaluate module-level Assign statements
+        with _taint_of to find variables assigned from taint sources.  Cross-file
+        chains (HOST = imported_tainted_var) are handled via sentinel substitution.
         """
         if module_file in seen_module_files or depth > 4:
             return
@@ -513,7 +519,7 @@ def _build_remote_func_defs(
                 if (isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
                         and stmt.name not in remote):
                     remote[stmt.name] = (stmt, module_file)
-        # Recursively follow this module's imports (cycle-safe via seen_module_files)
+        # Recursively follow this module's imports (DFS-first; cycle-safe via seen_module_files)
         if depth < 4:
             for imp in ast.walk(module_tree):
                 if isinstance(imp, ast.ImportFrom) and imp.module:
@@ -527,6 +533,30 @@ def _build_remote_func_defs(
                         )
                         if sub:
                             _collect_module(sub, depth + 1)
+        # Phase B: scan module-level variable assignments.
+        # Sub-files have already been processed (DFS), so module_tainted_globals
+        # for their files is populated — enabling cross-file variable chains.
+        _import_taint: dict[str, ast.expr] = {}
+        for _s in module_tree.body:
+            if isinstance(_s, ast.ImportFrom) and _s.module:
+                _sf = _resolve_module_to_file(_s.module, module_file, all_contents)
+                if _sf and _sf in module_tainted_globals:
+                    for _al in _s.names:
+                        _as = _al.asname or _al.name
+                        if _al.name in module_tainted_globals[_sf] or _al.name == "*":
+                            _import_taint[_as] = _TAINTED_MODULE_SENTINEL
+        _this_tainted: set[str] = set()
+        for _s in module_tree.body:
+            if isinstance(_s, ast.Assign):
+                if _taint_of(_s.value, _import_taint, {}).status == TaintStatus.TAINTED:
+                    for _t in _s.targets:
+                        if isinstance(_t, ast.Name):
+                            _this_tainted.add(_t.id)
+            elif isinstance(_s, ast.AnnAssign) and _s.value is not None:
+                if _taint_of(_s.value, _import_taint, {}).status == TaintStatus.TAINTED:
+                    if isinstance(_s.target, ast.Name):
+                        _this_tainted.add(_s.target.id)
+        module_tainted_globals[module_file] = _this_tainted
 
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
@@ -544,14 +574,21 @@ def _build_remote_func_defs(
                 for n in ast.walk(module_tree)
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
             }
+            # Phase B: map tainted module globals to imported aliases
+            tainted_in_module = module_tainted_globals.get(module_file, set())
             for alias in node.names:
                 name, as_name = alias.name, alias.asname or alias.name
                 if name == "*":
                     for fn, fn_node in module_funcs.items():
                         if not fn.startswith("_"):
                             remote[fn] = (fn_node, module_file)
+                    for tname in tainted_in_module:
+                        if not tname.startswith("_"):
+                            remote_globals[tname] = module_file
                 elif name in module_funcs:
                     remote[as_name] = (module_funcs[name], module_file)
+                if name != "*" and name in tainted_in_module:
+                    remote_globals[as_name] = module_file
 
         elif isinstance(node, ast.Import):
             for alias in node.names:
@@ -570,7 +607,7 @@ def _build_remote_func_defs(
                         if not n.name.startswith("_"):
                             remote[f"{as_name}.{n.name}"] = (n, module_file)
 
-    return remote, class_methods
+    return remote, class_methods, remote_globals
 
 
 def _callee_returns_tainted(
@@ -669,9 +706,10 @@ class PythonASTAnalyzer(BaseAnalyzer):
         # set_cross_file_context() is called by the scanner before parallel analysis.
         _all = getattr(_cross_file_local, "all_contents", None)
         if _all:
-            _rfd, _rcm = _build_remote_func_defs(file_path, content, _all)
+            _rfd, _rcm, _rtg = _build_remote_func_defs(file_path, content, _all)
             _cross_file_local.remote_func_defs = _rfd
             _cross_file_local.remote_class_methods = _rcm
+            _cross_file_local.remote_tainted_globals = _rtg  # Phase B
             if _rfd:
                 # Phase A: run fixed-point on local + ALL transitively-reachable remote
                 # functions together.  A single combined pass lets the fixed-point
@@ -690,6 +728,7 @@ class PythonASTAnalyzer(BaseAnalyzer):
             _interprocedural_taint_sources = _find_taint_source_funcs(tree)
             _cross_file_local.remote_func_defs = {}
             _cross_file_local.remote_class_methods = {}
+            _cross_file_local.remote_tainted_globals = {}
 
         visitor = _VulnVisitor(file_path, lines, repo_url, self, content)
         visitor.visit(tree)
@@ -2375,6 +2414,15 @@ def _taint_of(
                 )
         if base_taint is not None:
             return base_taint
+        # Phase B: check cross-file tainted module globals (e.g. HOST imported from config.py
+        # where config.py has HOST = request.META.get("HTTP_HOST")).
+        _rtg_b = getattr(_cross_file_local, "remote_tainted_globals", {})
+        if name in _rtg_b:
+            return TaintInfo(
+                TaintStatus.TAINTED,
+                f"tainted module global '{name}' from {_rtg_b[name]}",
+                source=name,
+            )
         return TaintInfo(TaintStatus.UNKNOWN,
                          f"untracked variable '{name}'", source=name)
 
