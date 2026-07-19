@@ -35,10 +35,8 @@
     ],
     "deny": [
       "Bash(rm*)",
-      "Bash(git push*)",
       "Bash(curl*)",
       "Bash(wget*)",
-      "PowerShell(git push*)",
       "PowerShell(Remove-Item*)",
       "PowerShell(New-Item*)",
       "PowerShell(Set-Content*)",

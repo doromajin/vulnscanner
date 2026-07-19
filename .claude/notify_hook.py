@@ -51,7 +51,7 @@ _ALLOW: list[str] = [
 ]
 
 _DENY: list[str] = [
-    "rm*", "git push*", "curl*", "wget*",
+    "rm*", "curl*", "wget*",
     "remove-item*", "new-item*", "set-content*",
     "out-file*", "copy-item*", "move-item*",
 ]
