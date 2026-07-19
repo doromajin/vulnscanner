@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fnmatch
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -50,21 +52,37 @@ class LocalFetcher:
 
     def iter_files(self) -> Iterator[tuple[str, str]]:
         """Yield (relative_path, content) for every scannable file under root."""
-        for path in self._root.rglob("*"):
-            if not path.is_file():
-                continue
-            if self._should_skip(path):
-                continue
-            if path.suffix not in _SCAN_EXTENSIONS and path.name not in _SCAN_FILENAMES:
-                continue
-            if path.stat().st_size > _MAX_FILE_BYTES:
-                continue
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-                rel = str(path.relative_to(self._root)).replace("\\", "/")
-                yield rel, content
-            except Exception:
-                continue
+        # Load .vulnscannerignore patterns for early directory pruning so we don't
+        # traverse into large excluded trees (owasp_benchmark, improvement_runs, etc.).
+        ignore_path = self._root / ".vulnscannerignore"
+        ignore_patterns: list[str] = []
+        if ignore_path.exists():
+            for line in ignore_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip().rstrip("/")
+                if line and not line.startswith("#"):
+                    ignore_patterns.append(line)
+
+        for dirpath, dirnames, filenames in os.walk(str(self._root)):
+            # Prune directories in-place to avoid traversing excluded subtrees.
+            dirnames[:] = [
+                d for d in dirnames
+                if d.lower() not in _SKIP_DIRS
+                and not any(fnmatch.fnmatch(d, pat) for pat in ignore_patterns)
+            ]
+            for filename in filenames:
+                full_path = Path(dirpath) / filename
+                if self._should_skip(full_path):
+                    continue
+                if full_path.suffix not in _SCAN_EXTENSIONS and filename not in _SCAN_FILENAMES:
+                    continue
+                if full_path.stat().st_size > _MAX_FILE_BYTES:
+                    continue
+                try:
+                    content = full_path.read_text(encoding="utf-8", errors="replace")
+                    rel = str(full_path.relative_to(self._root)).replace("\\", "/")
+                    yield rel, content
+                except Exception:
+                    continue
 
     def _should_skip(self, path: Path) -> bool:
         # Skip if any directory component is a known vendor dir

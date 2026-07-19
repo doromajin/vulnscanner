@@ -1091,7 +1091,7 @@ STRATEGIC PRIORITIES for this file (backlog items):
      with a sanitizing method name; if so, un-taint that var in the if-body scope.
   #6 Framework-specific sink models: Django ORM `.filter(name=user_input)` is SAFE
      (parameterized), but `.extra(where=[...])`, `.raw(sql)`, `RawSQL()` are UNSAFE.
-     Flask `render_template()` is SAFE, `render_template_string(user_input)` is UNSAFE.
+     Flask `render_template()` is SAFE, `render_template_string` with user-controlled input is UNSAFE.
 
 Propose ONE new rule addressing either #8 or #6, or any other high-value Python taint rule.
 """

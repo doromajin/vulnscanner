@@ -642,12 +642,24 @@ def _callee_returns_tainted(
     """Return True if any return path of func_def yields a TAINTED value given param_assignments."""
     if _depth > 14:
         return False
-    merged = {**_collect_scope_assignments(func_def), **param_assignments}
-    for ret in _iter_func_returns(func_def):
-        if ret.value is not None:
-            if _taint_of(ret.value, merged, {}, _depth).status == TaintStatus.TAINTED:
-                return True
-    return False
+    # Recursion guard: prevent exponential blow-up when a function appears in its own
+    # return expressions (e.g. _taint_of calls itself → 51 returns × N depths).
+    _guard = getattr(_cross_file_local, "_callee_analyzing", None)
+    if _guard is None:
+        _guard = set()
+        _cross_file_local._callee_analyzing = _guard
+    if func_def.name in _guard:
+        return False
+    _guard.add(func_def.name)
+    try:
+        merged = {**_collect_scope_assignments(func_def), **param_assignments}
+        for ret in _iter_func_returns(func_def):
+            if ret.value is not None:
+                if _taint_of(ret.value, merged, {}, _depth).status == TaintStatus.TAINTED:
+                    return True
+        return False
+    finally:
+        _guard.discard(func_def.name)
 
 
 def _callee_return_taint_status(
@@ -664,14 +676,24 @@ def _callee_return_taint_status(
     """
     if _depth > 14:
         return TaintStatus.UNKNOWN
-    merged = {**_collect_scope_assignments(func_def), **param_assignments}
-    worst = TaintStatus.CLEAN
-    for ret in _iter_func_returns(func_def):
-        if ret.value is not None:
-            status = _taint_of(ret.value, merged, {}, _depth).status
-            if _TAINT_ORDER[status] > _TAINT_ORDER[worst]:
-                worst = status
-    return worst
+    _guard = getattr(_cross_file_local, "_callee_analyzing", None)
+    if _guard is None:
+        _guard = set()
+        _cross_file_local._callee_analyzing = _guard
+    if func_def.name in _guard:
+        return TaintStatus.UNKNOWN
+    _guard.add(func_def.name)
+    try:
+        merged = {**_collect_scope_assignments(func_def), **param_assignments}
+        worst = TaintStatus.CLEAN
+        for ret in _iter_func_returns(func_def):
+            if ret.value is not None:
+                status = _taint_of(ret.value, merged, {}, _depth).status
+                if _TAINT_ORDER[status] > _TAINT_ORDER[worst]:
+                    worst = status
+        return worst
+    finally:
+        _guard.discard(func_def.name)
 
 
 def _func_is_web_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -809,6 +831,7 @@ class _VulnVisitor(ast.NodeVisitor):
         self._canonicalized_paths: frozenset[str] = frozenset()
         self._in_enum_class: bool = False
         self._call_stack: set[str] = set()  # recursion guard for interprocedural re-analysis
+        self._interproc_visited: set[tuple] = set()  # dedup: (func_name, tainted_param_indices)
         self._current_func_is_web_entry: bool = False  # exploitability filter
 
     # ── scope tracking ─────────────────────────────────────────────────────────
@@ -1866,9 +1889,18 @@ class _VulnVisitor(ast.NodeVisitor):
         so that ``_taint_of`` propagates TAINTED through the function body.
         The call stack guard prevents infinite recursion on recursive functions.
         """
+        tainted_indices = tuple(
+            i for i, t in enumerate(arg_taints) if t.status == TaintStatus.TAINTED
+        )
+        if not tainted_indices:
+            return
+        visit_key = (func_def.name, tainted_indices)
+        if visit_key in self._interproc_visited:
+            return
+        self._interproc_visited.add(visit_key)
         param_assignments: dict[str, ast.expr] = {}
         for i, param in enumerate(func_def.args.args):
-            if i < len(arg_taints) and arg_taints[i].status == TaintStatus.TAINTED:
+            if i in tainted_indices:
                 param_assignments[param.arg] = ast.Name(id="request", ctx=ast.Load())
         if not param_assignments:
             return
@@ -3043,18 +3075,34 @@ def _find_taint_source_funcs(tree: ast.AST) -> frozenset[str]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
+    # Pre-compute assignments and returns ONCE before the fixed-point loop.
+    # _collect_scope_assignments is a pure function of the AST node, so caching
+    # avoids the O(n_funcs × n_passes × nodes_per_func) blow-up on large files.
+    func_assignments: dict[str, dict] = {
+        name: _collect_scope_assignments(node)
+        for name, node in func_nodes.items()
+    }
+    func_returns: dict[str, list[ast.Return]] = {
+        name: list(_iter_func_returns(node))
+        for name, node in func_nodes.items()
+    }
+
     current: frozenset[str] = frozenset()
     for _ in range(min(len(func_nodes) + 1, 8)):
         # Expose current known sources to _taint_of so transitive calls resolve.
         _interprocedural_taint_sources = current
         added: set[str] = set()
-        for name, node in func_nodes.items():
+        for name in func_nodes:
             if name in current:
                 continue
-            assignments = _collect_scope_assignments(node)
-            for ret in _iter_func_returns(node):
+            assignments = func_assignments[name]
+            for ret in func_returns[name]:
                 if (ret.value is not None
-                        and _taint_of(ret.value, assignments, {}).status == TaintStatus.TAINTED):
+                        # _depth=13: disables Phase 3 (≤12) and Phase 4 (≤11) interprocedural
+                        # analysis.  This pre-pass only needs to detect inherent taint sources
+                        # (direct request.args / input() reads and transitive chains via
+                        # _interprocedural_taint_sources).  Full Phase 3/4 runs in analyze().
+                        and _taint_of(ret.value, assignments, {}, 13).status == TaintStatus.TAINTED):
                     added.add(name)
                     break  # one tainted return is sufficient
         if not added:

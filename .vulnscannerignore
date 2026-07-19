@@ -2,4 +2,19 @@
 repos/
 temp_eval/
 improvement_runs/
+improvement_proposals/
 nightly_runs/
+benchmark_python/
+owasp_benchmark/
+recall/
+scan_results/
+
+# スキャン出力 JSON（ルートレベル）
+scan_*.json
+webgoat_*.json
+self_scan.json
+tmprecall_*.json
+token_usage.json
+
+# 一時デバッグスクリプト（git管理外）
+_*.py
