@@ -42,6 +42,7 @@ def _creds() -> tuple[str, str]:
 _ALLOW: list[str] = [
     # Bash
     "python*", "pytest*", "vulnscan*",
+    "cat*", "ls*", "echo*", "grep*", "head*", "tail*", "wc*",
     "pip list*", "pip show*", "pip freeze*", "pip check*",
     "git add*", "git commit*", "git status*", "git log*",
     "git diff*", "git branch*", "git show*", "git mv*",

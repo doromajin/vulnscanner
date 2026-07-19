@@ -43,6 +43,7 @@
 - `C:\VulnScanner` 配下での `cd` 操作
 - 既存パッケージの `pip install`
 - PowerShell の読み取り専用パイプライン（`Get-ChildItem`, `Select-String`, `Select-Object`, `ForEach-Object`, `Measure-Object`, `Where-Object`, `Sort-Object`, `Get-Content` 等の組み合わせで、ファイル一覧・内容検索・表示のみを行うもの）
+- Bash の読み取り専用コマンド（`cat` / `ls` / `echo` / `grep` / `head` / `tail` / `wc`）
 
 ### 常に確認必須な操作
 
