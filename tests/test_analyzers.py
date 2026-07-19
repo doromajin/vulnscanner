@@ -1802,6 +1802,61 @@ col.find(q)
         assert not nosql, "Generic .find(tainted) must NOT fire to avoid FPs"
 
 
+# ── Email header injection ────────────────────────────────────────────────────
+
+class TestEmailHeaderInjection:
+    """CWE-93: email header injection via smtplib / Django send_mail."""
+
+    def test_sendmail_tainted_subject_is_high(self):
+        code = """
+from flask import request
+import smtplib
+def send(server):
+    subj = request.args.get("subject")
+    server.sendmail("from@x.com", "to@x.com", f"Subject: {subj}\\r\\n\\r\\nBody")
+"""
+        findings = AST.analyze("t.py", code, "")
+        email = [f for f in findings if "EMAIL" in f.rule_id]
+        assert email, "Tainted sendmail arg must be detected"
+        assert email[0].severity == Severity.HIGH
+        assert email[0].rule_id == "AST-EMAIL-001"
+
+    def test_django_send_mail_tainted_subject(self):
+        code = """
+from flask import request
+from django.core.mail import send_mail
+def notify(request):
+    subj = request.POST.get("title")
+    send_mail(subject=subj, message="body", from_email="a@b.com", recipient_list=["c@d.com"])
+"""
+        findings = AST.analyze("t.py", code, "")
+        email = [f for f in findings if "EMAIL" in f.rule_id]
+        assert email, "Tainted send_mail subject kwarg must be detected"
+        assert email[0].severity == Severity.HIGH
+
+    def test_unknown_sendmail_is_medium_low_reach(self):
+        code = """
+import smtplib
+def send(server, subject):
+    server.sendmail("from@x.com", "to@x.com", f"Subject: {subject}\\r\\n\\r\\nBody")
+"""
+        findings = AST.analyze("t.py", code, "")
+        email = [f for f in findings if "EMAIL" in f.rule_id]
+        assert email, "UNKNOWN sendmail must produce finding"
+        assert email[0].severity == Severity.LOW
+        assert email[0].rule_id == "AST-EMAIL-002"
+
+    def test_clean_sendmail_no_finding(self):
+        code = """
+import smtplib
+def send(server):
+    server.sendmail("from@x.com", "to@x.com", "Subject: Hello\\r\\n\\r\\nBody")
+"""
+        findings = AST.analyze("t.py", code, "")
+        email = [f for f in findings if "EMAIL" in f.rule_id]
+        assert not email, "Literal sendmail must not fire"
+
+
 # ── Guard / taint suppression ─────────────────────────────────────────────────
 
 class TestGuardSuppression:
