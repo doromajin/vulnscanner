@@ -380,8 +380,8 @@ class TestASTAnalyzerTaintIntegration:
         suppressed = [f for f in findings if f.suppression_reason == "clean_taint_source"]
         assert any(f.rule_id == "AST-SQL-003" for f in suppressed)
 
-    def test_unknown_sql_emits_medium(self):
-        # username is a function parameter → UNKNOWN → MEDIUM
+    def test_unknown_sql_emits_low(self):
+        # username is a function parameter → UNKNOWN, non-web-entry → LOW [low_reach]
         code = (
             'def q(username):\n'
             '    conn.cursor().execute("SELECT * FROM t WHERE name = %s" % username)\n'
@@ -390,7 +390,7 @@ class TestASTAnalyzerTaintIntegration:
         sql_findings = [f for f in findings if f.rule_id == "AST-SQL-003"
                         and f.suppression_reason is None]
         assert sql_findings, "Should detect SQL-003"
-        assert sql_findings[0].severity == Severity.MEDIUM
+        assert sql_findings[0].severity == Severity.LOW
 
     def test_tainted_sql_emits_high(self):
         # request.args[...] → TAINTED → HIGH
@@ -467,8 +467,8 @@ class TestASTAnalyzerTaintIntegration:
         assert any(f.rule_id == "AST-CMD-002" and f.severity == Severity.HIGH
                    for f in findings)
 
-    def test_unknown_ssrf_emits_medium(self):
-        # endpoint is function param → UNKNOWN → MEDIUM, AST-SSRF-002
+    def test_unknown_ssrf_emits_low(self):
+        # endpoint is function param → UNKNOWN, non-web-entry → LOW [low_reach]
         code = (
             "import requests\n"
             "def call(endpoint):\n"
@@ -477,7 +477,7 @@ class TestASTAnalyzerTaintIntegration:
         findings = AST.analyze("t.py", code)
         ssrf = [f for f in findings if f.rule_id == "AST-SSRF-002"]
         assert ssrf
-        assert ssrf[0].severity == Severity.MEDIUM
+        assert ssrf[0].severity == Severity.LOW
 
     def test_tainted_ssrf_emits_high(self):
         code = (
@@ -942,6 +942,9 @@ class TestExploitabilityFilter:
                and f.taint_status == "unknown"
         ]
         assert findings, "UNKNOWN-taint SQL finding must be emitted for unresolved variable"
+        assert findings[0].severity == Severity.LOW, (
+            "non-web-entry function must be downgraded to LOW for UNKNOWN taint"
+        )
         assert findings[0].confidence == pytest.approx(0.3), (
             "non-web-entry function must have confidence=0.3 for UNKNOWN taint"
         )

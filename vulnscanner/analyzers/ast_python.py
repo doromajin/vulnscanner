@@ -1847,8 +1847,8 @@ class _VulnVisitor(ast.NodeVisitor):
 
         # Exploitability filter: UNKNOWN-taint MEDIUM findings in functions with no
         # detected web entry-point markers are less likely to be reachable from
-        # user-controlled HTTP input.  Lower confidence and swap [needs_review] →
-        # [low_reach] in the description.
+        # user-controlled HTTP input.  Downgrade severity to LOW, lower confidence,
+        # and swap [needs_review] → [low_reach] in the description.
         # Restricted to MEDIUM severity: CRITICAL/HIGH with UNKNOWN taint (e.g.
         # pickle.loads, yaml.load) are always high-risk regardless of call site.
         confidence = taint_info.confidence if taint_info else 1.0
@@ -1856,6 +1856,7 @@ class _VulnVisitor(ast.NodeVisitor):
                 and taint_info.status == TaintStatus.UNKNOWN
                 and severity == Severity.MEDIUM
                 and not self._current_func_is_web_entry):
+            severity = Severity.LOW
             confidence = 0.3
             description = description.replace("[needs_review]", "[low_reach]", 1)
 

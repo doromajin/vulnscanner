@@ -1275,7 +1275,7 @@ class TestSARIFReporter:
         result.findings = [
             Finding(
                 vuln_type=VulnType.SQL_INJECTION,
-                severity=Severity.MEDIUM,
+                severity=Severity.LOW,
                 file_path="app.py",
                 line_number=5,
                 line_content="cursor.execute(q)",
