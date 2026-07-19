@@ -1953,28 +1953,46 @@ class _VulnVisitor(ast.NodeVisitor):
         self._call_stack = saved_stack
 
     def _check_interprocedural_calls(self, stmt: ast.stmt) -> None:
-        """Walk stmt for calls to local functions that receive ≥1 tainted argument.
+        """Walk stmt for calls to local or remote functions that receive ≥1 tainted argument.
 
         When found, re-analyse the callee's body with those params marked as tainted
         so that sink checks inside the callee fire at the correct (higher) severity.
+        For remote (cross-file) callees, file_path and lines are temporarily swapped
+        so findings are attributed to the callee's source file at the correct line.
         Skips functions already on the call stack to prevent infinite recursion.
         """
+        _rfd = getattr(_cross_file_local, "remote_func_defs", {})
+        _all = getattr(_cross_file_local, "all_contents", {}) or {}
         for node in ast.walk(stmt):
             if not isinstance(node, ast.Call):
                 continue
             func_name = _full_name(node.func)
-            if not func_name or func_name not in _local_func_defs:
+            if not func_name:
                 continue
             if func_name in self._call_stack:
+                continue
+            is_local = func_name in _local_func_defs
+            is_remote = not is_local and func_name in _rfd
+            if not is_local and not is_remote:
                 continue
             arg_taints = [
                 _taint_of(arg, self._assignments, self._class_attrs)
                 for arg in node.args
             ]
-            if any(t.status == TaintStatus.TAINTED for t in arg_taints):
-                self._analyze_with_tainted_params(
-                    _local_func_defs[func_name], arg_taints
-                )
+            if not any(t.status == TaintStatus.TAINTED for t in arg_taints):
+                continue
+            if is_local:
+                self._analyze_with_tainted_params(_local_func_defs[func_name], arg_taints)
+            else:
+                rfn, src_path = _rfd[func_name]
+                src_lines = _all.get(src_path, "").splitlines()
+                saved_fp = self.file_path
+                saved_lines = self.lines
+                self.file_path = src_path
+                self.lines = src_lines
+                self._analyze_with_tainted_params(rfn, arg_taints)
+                self.file_path = saved_fp
+                self.lines = saved_lines
 
     def _visit_stmts(self, stmts: list[ast.stmt]) -> None:
         """Visit a statement list, detecting early-return guards for taint suppression.
