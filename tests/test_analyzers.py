@@ -27,6 +27,7 @@ from vulnscanner.analyzers.ssrf import SSRFAnalyzer
 from vulnscanner.analyzers.ssti import SSTIAnalyzer
 from vulnscanner.analyzers.xss import XSSAnalyzer
 from vulnscanner.analyzers.path_traversal import PathTraversalAnalyzer
+from vulnscanner.analyzers.js_taint import JSTaintAnalyzer
 from vulnscanner.models import Finding, Severity, ScanResult, VulnType
 from vulnscanner.reporters.sarif import write_sarif
 from vulnscanner.scanner import _is_excluded, _is_suppressed, _parse_ignore_file
@@ -1965,3 +1966,81 @@ def handle():
         active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
         assert active, "Unguarded tainted variable must still fire SQL injection"
         assert active[0].severity == "HIGH"
+
+
+_FIXTURES_DIR = Path(__file__).parent / "fixtures"
+_JS_VULN = _FIXTURES_DIR / "js_taint_vuln.js"
+_JS_SAFE = _FIXTURES_DIR / "js_taint_safe.js"
+_JS = JSTaintAnalyzer()
+
+
+class TestJSTaintAnalyzer:
+    """JavaScript 1-hop taint tracker — indirect source→sink flows."""
+
+    def test_vuln_file_detects_all_patterns(self):
+        content = _JS_VULN.read_text(encoding="utf-8")
+        findings = _JS.analyze("app.js", content)
+        rule_ids = {f.rule_id for f in findings}
+        expected = {
+            "JSTAINT-CMD-001",  # exec(cmd) where cmd = req.body.command
+            "JSTAINT-CMD-002",  # spawn(tool) where tool = req.query.tool
+            "JSTAINT-SQL-003",  # db.query(`... ${id}`) where id = req.query.id
+            "JSTAINT-PATH-001", # fs.readFile(filename) where filename = req.query.file
+            "JSTAINT-XSS-001",  # res.send(query) where query = req.query.q
+            "JSTAINT-EVAL-001", # eval(expr) where expr = req.body.expression
+            "JSTAINT-SSRF-001", # fetch(url) where url = req.query.target
+        }
+        missing = expected - rule_ids
+        assert not missing, f"Expected rules not fired: {missing}"
+
+    def test_destructuring_taint_detected(self):
+        content = _JS_VULN.read_text(encoding="utf-8")
+        findings = _JS.analyze("app.js", content)
+        xss = [f for f in findings if f.rule_id == "JSTAINT-XSS-001"]
+        destuct_finding = any("name" in f.description for f in xss)
+        assert destuct_finding, "Destructured req.body variable must be tainted"
+
+    def test_two_hop_taint_detected(self):
+        content = _JS_VULN.read_text(encoding="utf-8")
+        findings = _JS.analyze("app.js", content)
+        two_hop = [f for f in findings if "fullCmd" in f.description]
+        assert two_hop, "2-hop: dir→fullCmd→execSync must be detected"
+
+    def test_safe_file_no_findings(self):
+        content = _JS_SAFE.read_text(encoding="utf-8")
+        findings = _JS.analyze("safe.js", content)
+        assert not findings, f"Safe file produced unexpected findings: {findings}"
+
+    def test_parseInt_sanitizer_suppresses(self):
+        code = """
+const express = require('express');
+const db = require('./db');
+const app = express();
+app.get('/items', async (req, res) => {
+    const page = parseInt(req.query.page);
+    const rows = await db.query(`SELECT * FROM items LIMIT ${page}`);
+    res.json(rows);
+});
+"""
+        findings = _JS.analyze("app.js", code)
+        assert not findings, "parseInt() must sanitize and suppress SQL finding"
+
+    def test_no_false_positive_on_parameterized_query(self):
+        code = """
+const express = require('express');
+const db = require('./db');
+const app = express();
+app.get('/user', async (req, res) => {
+    const id = req.query.id;
+    const rows = await db.query('SELECT * FROM users WHERE id = ?', [id]);
+    res.json(rows);
+});
+"""
+        findings = _JS.analyze("app.js", code)
+        sql_fps = [f for f in findings if "SQL" in f.rule_id]
+        assert not sql_fps, "Parameterized query must not fire SQL injection"
+
+    def test_non_js_file_ignored(self):
+        content = "req.body.cmd; exec(cmd);"
+        findings = _JS.analyze("notes.txt", content)
+        assert not findings, "Non-JS extension must return no findings"
