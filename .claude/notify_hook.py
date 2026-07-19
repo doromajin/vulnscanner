@@ -108,6 +108,15 @@ def main() -> None:
                 msg      = f"$ {cmd}\n-> deny ルールで自動ブロックされます",
                 priority = 1,
             )
+        elif "\n#" in cmd:
+            # Claude Code's built-in security check fires for newline+# patterns,
+            # showing a y/n prompt AFTER the ALLOW check passes — so this must be
+            # detected here before the ALLOW short-circuit to guarantee notification.
+            _send(
+                title    = f"[security] 確認画面が出ます ({tool})",
+                msg      = f"$ {cmd[:150]}\n-> 改行+# パターン: Claude Code が承認を求めます",
+                priority = 1,
+            )
         elif not _match(cmd, _ALLOW):
             _send(
                 title    = f"[prompt] 承認待ち ({tool})",
