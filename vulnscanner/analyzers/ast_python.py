@@ -119,6 +119,15 @@ _WEB_ROUTE_DECORATORS = frozenset({
     "login_required", "permission_required",
 })
 
+# Decorator attribute names that identify a function as a CLI entry point.
+# Parameters of CLI functions come from the operator command line, not from
+# untrusted web input — treat them as CLEAN to avoid path-traversal FPs.
+_CLI_ENTRY_DECORATORS = frozenset({
+    # Click / Typer
+    "command", "group", "argument", "option",
+    "pass_context", "pass_obj",
+})
+
 # ── Secrets ────────────────────────────────────────────────────────────────────
 
 _SECRET_NAME_RE = re.compile(
@@ -720,6 +729,29 @@ def _func_is_web_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     return any(a.arg == "request" for a in node.args.args)
 
 
+def _func_is_cli_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return True if *node* is a CLI entry point (Click/Typer decorated).
+
+    Parameters of CLI functions come from the operator command line, not from
+    untrusted web input, so they should be treated as CLEAN.
+    """
+    for dec in node.decorator_list:
+        name = ""
+        if isinstance(dec, ast.Attribute):
+            name = dec.attr
+        elif isinstance(dec, ast.Name):
+            name = dec.id
+        elif isinstance(dec, ast.Call):
+            inner = dec.func
+            if isinstance(inner, ast.Attribute):
+                name = inner.attr
+            elif isinstance(inner, ast.Name):
+                name = inner.id
+        if name in _CLI_ENTRY_DECORATORS:
+            return True
+    return False
+
+
 # ── public analyzer ────────────────────────────────────────────────────────────
 
 class PythonASTAnalyzer(BaseAnalyzer):
@@ -857,6 +889,14 @@ class _VulnVisitor(ast.NodeVisitor):
         saved_canon = self._canonicalized_paths
         saved_web = self._current_func_is_web_entry
         self._assignments = _collect_scope_assignments(node)
+        # CLI entry functions: parameters come from the operator command line,
+        # not from untrusted web input.  Inject CLEAN sentinels for any
+        # parameter not already assigned in the body.
+        if _func_is_cli_entry(node):
+            _clean = ast.Constant(value=0)
+            for arg in node.args.args:
+                if arg.arg not in self._assignments and arg.arg != "self":
+                    self._assignments[arg.arg] = _clean
         self._canonicalized_paths = _find_canonicalized_paths(node)
         self._current_func_is_web_entry = _func_is_web_entry(node)
         self._visit_stmts(node.body)
