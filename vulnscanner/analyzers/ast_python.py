@@ -361,6 +361,26 @@ _CLEAN_REQUEST_ATTRS = frozenset({
     "path", "url", "base_url", "host", "host_url",
     "root_url", "root_path", "script_root", "method",
 })
+# Python module-level dunders: set by the interpreter, not by web users.
+_CLEAN_DUNDER_NAMES = frozenset({
+    "__file__", "__name__", "__package__", "__module__",
+    "__path__", "__spec__", "__doc__", "__all__", "__version__",
+})
+# Path navigation/canonicalization attributes on UNKNOWN objects.
+# TAINTED objects are caught by obj_taint propagation upstream; here we handle the
+# UNKNOWN case (untracked parameter or variable) where web injection is unlikely.
+_CLEAN_PATH_ATTRS = frozenset({
+    "parent", "stem", "name", "suffix", "parts", "drive", "root",
+})
+# CLI argument parsers: results are operator-controlled, not web user input.
+_CLI_PARSE_METHODS = frozenset({
+    "parse_args", "parse_known_args",
+    "parse_known_intermixed_args", "parse_intermixed_args",
+})
+# Path canonicalization methods: only apply to UNKNOWN objects (TAINTED caught upstream).
+_PATH_CANON_METHODS = frozenset({"resolve", "absolute"})
+# Filesystem traversal: yields paths that exist on disk, not arbitrary user strings.
+_PATH_ITER_METHODS = frozenset({"rglob", "glob", "iterdir"})
 # Python stdlib RNG — not cryptographically secure; predictable from seed.
 _INSECURE_RNG_FUNCS = frozenset({
     "random.random", "random.randint", "random.choice", "random.choices",
@@ -2386,16 +2406,18 @@ def _collect_scope_assignments(
             result[(var, str(i))] = elem
         result[(var, "__len__")] = ast.Constant(value=len(contents))
 
-    # Fourth pass: for-loop target variables inherit taint from the iterable.
+    # Fourth pass: for-loop and comprehension target variables inherit taint from iterable.
     # Pattern: `for var in expr` — var is an element of expr, so it carries the same taint.
     # Real-world: `for name in request.form.keys()` → name is user-controlled (TAINTED).
+    # Also covers generator/list/set/dict comprehension targets (same semantics, own scope).
     for node in ast.walk(func):
-        if isinstance(node, ast.For):
+        if isinstance(node, (ast.For, ast.comprehension)):
             iter_expr = node.iter
-            if isinstance(node.target, ast.Name):
-                result[node.target.id] = iter_expr
-            elif isinstance(node.target, ast.Tuple):
-                for elt in node.target.elts:
+            target = node.target
+            if isinstance(target, ast.Name):
+                result[target.id] = iter_expr
+            elif isinstance(target, ast.Tuple):
+                for elt in target.elts:
                     if isinstance(elt, ast.Name):
                         result[elt.id] = iter_expr
 
@@ -2595,6 +2617,8 @@ def _taint_of(
         name = node.id
         if name in ("True", "False", "None"):
             return CLEAN_BUILTIN
+        if name in _CLEAN_DUNDER_NAMES:
+            return CLEAN_BUILTIN
         base_taint: TaintInfo | None = None
         if assignments and name in assignments:
             # Assignments take precedence over name heuristics so that guard patches
@@ -2655,6 +2679,10 @@ def _taint_of(
                              source=obj_taint.source)
         # Attribute of a clean object (e.g. imported module constant) stays clean.
         if obj_taint.status == TaintStatus.CLEAN:
+            return CLEAN_LITERAL
+        # Path navigation attributes on UNKNOWN objects: cannot carry injected content
+        # (TAINTED objects are caught above — their attributes propagate TAINTED).
+        if attr in _CLEAN_PATH_ATTRS:
             return CLEAN_LITERAL
         return TaintInfo(TaintStatus.UNKNOWN,
                          f"attribute '.{attr}' on {obj_taint.status.value} object",
@@ -2787,6 +2815,14 @@ def _taint_of(
                 sanitizers=[sanitizer_name] + (arg_taint.sanitizers or []),
             )
 
+        # argparse/click/typer CLI parsers: results are operator-controlled, not web user input.
+        if attr in _CLI_PARSE_METHODS:
+            return CLEAN_LITERAL
+
+        # os.walk() yields (dirpath, dirnames, filenames) tuples from the OS filesystem.
+        if full == "os.walk":
+            return CLEAN_LITERAL
+
         # Path construction: taint propagates from any argument to the resulting path.
         # os.path.join(safe_base, user_input) must remain TAINTED for open() to fire HIGH.
         if full in _PATH_CONSTRUCTION_FUNCS:
@@ -2798,6 +2834,17 @@ def _taint_of(
 
         if isinstance(node.func, ast.Attribute):
             obj_taint = _taint_of(node.func.value, assignments, class_attrs, _depth + 1)
+
+            # Filesystem traversal on non-TAINTED path: yields existing filesystem paths.
+            # TAINTED obj is caught directly by _check_path (AST-PATH-004) on the call itself.
+            if attr in _PATH_ITER_METHODS and obj_taint.status != TaintStatus.TAINTED:
+                return CLEAN_LITERAL
+
+            # Path canonicalization on non-TAINTED objects.
+            # Note: resolve() alone does NOT protect against traversal in web contexts;
+            # TAINTED paths remain TAINTED via obj_taint propagation above.
+            if attr in _PATH_CANON_METHODS and obj_taint.status != TaintStatus.TAINTED:
+                return CLEAN_LITERAL
 
             # Getter methods on tainted objects propagate taint
             if obj_taint.status == TaintStatus.TAINTED and attr in _GETTER_METHODS:
