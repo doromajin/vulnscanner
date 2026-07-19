@@ -38,11 +38,33 @@ _RULES = [
         "Literal path traversal sequence in source code",
         Severity.INFO, _PT, None,
     ),
+    (
+        "PATH-006",
+        re.compile(
+            r'\bfs\s*\.\s*(?:readFile|readFileSync|createReadStream|writeFile|writeFileSync'
+            r'|appendFile|appendFileSync|stat|statSync|lstat|lstatSync|unlink|unlinkSync'
+            r'|rename|renameSync)\s*\([^)]*req\s*\.\s*(?:query|params|body)',
+            re.IGNORECASE,
+        ),
+        "Node.js fs operation with request-derived path — path traversal allows reading arbitrary files",
+        Severity.HIGH, _PT, (".js", ".ts"),
+    ),
+    (
+        "PATH-007",
+        re.compile(
+            r'\bfs\s*\.\s*(?:readFile|readFileSync|createReadStream|stat|statSync)\s*\('
+            r'[^)]*`[^`]*\$\{',
+            re.IGNORECASE,
+        ),
+        "Node.js fs operation with template literal path — verify no request data injected",
+        Severity.MEDIUM, _PT, (".js", ".ts"),
+    ),
 ]
 
 _GUARD = re.compile(
     r'open\s*\(|send_file|send_from_directory|serve_file|file_get_contents'
     r'|include\s*\(|require\s*\(|fopen\s*\(|\.\./|\.\.\\\\'
+    r'|fs\s*\.\s*(?:readFile|writeFile|createReadStream|stat|unlink|rename)'
     , re.IGNORECASE,
 )
 

@@ -73,12 +73,32 @@ _RULES = [
         "Ruby backtick shell execution with params[] interpolation — command injection risk",
         Severity.CRITICAL, _CI,
     ),
+    (
+        "CMD-011",
+        re.compile(
+            r'\b(?:exec|execSync|execFile|execFileSync|spawnSync)\s*\('
+            r'[^)]*req\s*\.\s*(?:query|body|params)',
+            re.IGNORECASE,
+        ),
+        "Node.js child_process with request-derived command — command injection allows arbitrary OS execution",
+        Severity.CRITICAL, _CI,
+    ),
+    (
+        "CMD-012",
+        re.compile(
+            r'\b(?:exec|execSync|execFile|execFileSync)\s*\('
+            r'[^)]*`[^`]*\$\{req\s*\.',
+            re.IGNORECASE,
+        ),
+        "Node.js child_process with template literal containing request data — command injection risk",
+        Severity.CRITICAL, _CI,
+    ),
 ]
 
 _GUARD = re.compile(
     r'os\.system|os\.popen|subprocess\.|shell_exec|passthru|proc_open'
-    r'|eval\s*\(|exec\s*\(|Runtime\.getRuntime'
-    r'|IO\.popen|Open3\.|spawn\s*\(|system\s*\(',
+    r'|eval\s*\(|exec\s*\(|execSync\s*\(|execFile\s*\(|spawnSync\s*\('
+    r'|Runtime\.getRuntime|IO\.popen|Open3\.|spawn\s*\(|system\s*\(',
     re.IGNORECASE,
 )
 

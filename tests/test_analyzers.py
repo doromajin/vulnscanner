@@ -26,6 +26,7 @@ from vulnscanner.analyzers.sql_injection import SQLInjectionAnalyzer
 from vulnscanner.analyzers.ssrf import SSRFAnalyzer
 from vulnscanner.analyzers.ssti import SSTIAnalyzer
 from vulnscanner.analyzers.xss import XSSAnalyzer
+from vulnscanner.analyzers.path_traversal import PathTraversalAnalyzer
 from vulnscanner.models import Finding, Severity, ScanResult, VulnType
 from vulnscanner.reporters.sarif import write_sarif
 from vulnscanner.scanner import _is_excluded, _is_suppressed, _parse_ignore_file
@@ -1855,6 +1856,43 @@ def send(server):
         findings = AST.analyze("t.py", code, "")
         email = [f for f in findings if "EMAIL" in f.rule_id]
         assert not email, "Literal sendmail must not fire"
+
+
+# ── Node.js path traversal and command injection ──────────────────────────────
+
+_NODEJS_FIXTURE = FIXTURES / "vulnerable_nodejs.js"
+
+
+class TestNodeJsPathTraversal:
+    """PATH-006/007: fs.* with request-derived paths in Node.js."""
+
+    def test_fs_req_query_is_high(self):
+        content = _NODEJS_FIXTURE.read_text(encoding="utf-8")
+        findings = PathTraversalAnalyzer().analyze("server.js", content)
+        match = [f for f in findings if f.rule_id == "PATH-006"]
+        assert match, "fs.readFile(req.query.*) must be detected as PATH-006"
+        assert match[0].severity == Severity.HIGH
+
+    def test_fs_template_literal_is_medium(self):
+        content = _NODEJS_FIXTURE.read_text(encoding="utf-8")
+        findings = PathTraversalAnalyzer().analyze("server.js", content)
+        assert any(f.rule_id == "PATH-007" for f in findings)
+
+
+class TestNodeJsCommandInjection:
+    """CMD-011/012: child_process with request-derived args in Node.js."""
+
+    def test_exec_req_body_is_critical(self):
+        content = _NODEJS_FIXTURE.read_text(encoding="utf-8")
+        findings = CommandInjectionAnalyzer().analyze("app.js", content)
+        match = [f for f in findings if f.rule_id == "CMD-011"]
+        assert match, "child_process with req.body must be detected as CMD-011"
+        assert match[0].severity == Severity.CRITICAL
+
+    def test_exec_template_literal_is_critical(self):
+        content = _NODEJS_FIXTURE.read_text(encoding="utf-8")
+        findings = CommandInjectionAnalyzer().analyze("app.ts", content)
+        assert any(f.rule_id == "CMD-012" for f in findings)
 
 
 # ── Guard / taint suppression ─────────────────────────────────────────────────
