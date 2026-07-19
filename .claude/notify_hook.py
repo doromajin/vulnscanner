@@ -41,10 +41,11 @@ def _creds() -> tuple[str, str]:
 # ── Pattern lists  (keep in sync with .claude/settings.json) ─────────────────
 _ALLOW: list[str] = [
     # Bash
-    "python*", "pytest*", "vulnscan*", "pip*",
+    "python*", "pytest*", "vulnscan*",
+    "pip list*", "pip show*", "pip freeze*", "pip check*",
     "git add*", "git commit*", "git status*", "git log*",
     "git diff*", "git branch*", "git show*", "git mv*",
-    "git apply*", "git clone*",
+    "git apply*", "git clone*", "git push*",
     # PowerShell read-only cmdlets
     "get-childitem*", "get-content*", "select-object*",
     "where-object*", "sort-object*", "foreach-object*", "measure-object*",
