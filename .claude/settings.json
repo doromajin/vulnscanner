@@ -57,6 +57,7 @@
           },
           {
             "type": "command",
+            "shell": "bash",
             "command": "python C:/VulnScanner/.claude/notify_hook.py pre"
           }
         ]
@@ -66,6 +67,7 @@
         "hooks": [
           {
             "type": "command",
+            "shell": "bash",
             "command": "python C:/VulnScanner/.claude/notify_hook.py pre"
           }
         ]
@@ -77,6 +79,7 @@
         "hooks": [
           {
             "type": "command",
+            "shell": "bash",
             "command": "python C:/VulnScanner/.claude/notify_hook.py post"
           }
         ]
@@ -86,6 +89,7 @@
         "hooks": [
           {
             "type": "command",
+            "shell": "bash",
             "command": "python C:/VulnScanner/.claude/notify_hook.py post"
           }
         ]
