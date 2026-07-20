@@ -1,4 +1,5 @@
 from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
+from vulnscanner.analyzers.ast_js import JSASTAnalyzer
 from vulnscanner.analyzers.js_taint import JSTaintAnalyzer
 from vulnscanner.analyzers.malware import MalwareAnalyzer
 from vulnscanner.analyzers.csrf import CSRFAnalyzer
@@ -50,7 +51,9 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     JavaASTAnalyzer(),
     JavaAnalyzer(),
     GoAnalyzer(),
-    # JS/TS 1-hop taint tracker (indirect flows not caught by regex rules)
+    # JS AST taint tracker (.js/.jsx/.mjs/.cjs — interprocedural, true AST)
+    JSASTAnalyzer(),
+    # JS/TS regex taint tracker (.ts/.tsx + fallback for .js not caught by AST)
     JSTaintAnalyzer(),
     CSRFAnalyzer(),
     MissingAuthAnalyzer(),

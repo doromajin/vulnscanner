@@ -10,6 +10,9 @@ from vulnscanner.analyzers.ast_java import (
     build_java_cross_file_context,
     set_java_cross_file_context,
 )
+from vulnscanner.analyzers.ast_js import JSASTAnalyzer, _TS_JS_AVAILABLE
+
+_skip_no_tsjs = pytest.mark.skipif(not _TS_JS_AVAILABLE, reason="tree-sitter-javascript not installed")
 
 _skip_no_javalang = pytest.mark.skipif(not _HAS_JAVALANG, reason="javalang not installed")
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
@@ -2130,3 +2133,188 @@ public class Controller {
         findings = self._analyze_with_context("Controller.java", target, {"Clean.java": helper})
         sql = [f for f in findings if f.rule_id == "JAST-SQL-001"]
         assert not sql, "Clean cross-file method must not produce SQL injection FP"
+
+
+_JSAST = JSASTAnalyzer()
+
+
+@_skip_no_tsjs
+class TestJSASTAnalyzer:
+    """JavaScript AST taint analyzer (tree-sitter-javascript)."""
+
+    # ── taint propagation ─────────────────────────────────────────────────────
+
+    def test_sql_direct_variable(self):
+        code = """
+const express = require('express');
+const app = express();
+app.get('/search', (req, res) => {
+    const q = req.query.q;
+    db.query("SELECT * FROM t WHERE name='" + q + "'");
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "Direct tainted variable in SQL query not detected"
+
+    def test_sql_destructuring(self):
+        code = """
+app.post('/login', (req, res) => {
+    const { username, password } = req.body;
+    db.query('SELECT * FROM users WHERE user=\'' + username + '\'');
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "Destructured req.body field in SQL not detected"
+
+    def test_sql_template_literal(self):
+        code = """
+app.get('/item', (req, res) => {
+    const id = req.query.id;
+    db.query(`SELECT * FROM items WHERE id=${id}`);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "Template literal SQL injection not detected"
+
+    def test_cmd_injection(self):
+        code = """
+const { exec } = require('child_process');
+app.post('/run', (req, res) => {
+    const cmd = req.body.command;
+    exec(cmd, (err, stdout) => res.send(stdout));
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-CMD-001" in rule_ids, "Command injection not detected"
+
+    def test_path_traversal_fs(self):
+        code = """
+const fs = require('fs');
+app.get('/file', (req, res) => {
+    const filename = req.query.name;
+    fs.readFile(filename, 'utf8', (err, data) => res.send(data));
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-PATH-001" in rule_ids, "Path traversal via fs.readFile not detected"
+
+    def test_xss_res_send(self):
+        code = """
+app.get('/greet', (req, res) => {
+    const name = req.query.name;
+    res.send('<h1>Hello ' + name + '</h1>');
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-XSS-001" in rule_ids, "XSS via res.send not detected"
+
+    def test_eval_injection(self):
+        code = """
+app.post('/calc', (req, res) => {
+    const expr = req.body.expression;
+    const result = eval(expr);
+    res.json({ result });
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-EVAL-001" in rule_ids, "eval() with tainted input not detected"
+
+    def test_ssrf_fetch(self):
+        code = """
+app.get('/proxy', async (req, res) => {
+    const url = req.query.url;
+    const resp = await fetch(url);
+    res.send(await resp.text());
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SSRF-001" in rule_ids, "SSRF via fetch not detected"
+
+    # ── interprocedural (function return taint) ───────────────────────────────
+
+    def test_interprocedural_function_return(self):
+        """Function that returns req.query data should propagate taint to call site."""
+        code = """
+function getQuery(req) {
+    return req.query.search;
+}
+app.get('/search', (req, res) => {
+    const term = getQuery(req);
+    db.query('SELECT * FROM t WHERE name=\'' + term + '\'');
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "Interprocedural function return taint not propagated"
+
+    def test_async_function_return_taint(self):
+        """Async function returning tainted value propagates via await."""
+        code = """
+async function getUser(req) {
+    const id = req.query.id;
+    return id;
+}
+app.get('/user', async (req, res) => {
+    const userId = await getUser(req);
+    db.query('SELECT * FROM users WHERE id=\'' + userId + '\'');
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "Async interprocedural return taint not propagated"
+
+    # ── no false positives ────────────────────────────────────────────────────
+
+    def test_no_fp_parseint_sanitizer(self):
+        code = """
+app.get('/page', (req, res) => {
+    const page = parseInt(req.query.page);
+    db.query('SELECT * FROM items LIMIT ' + page);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        sql = [f for f in findings if f.rule_id == "JSAST-SQL-001"]
+        assert not sql, "parseInt() must suppress taint"
+
+    def test_no_fp_parameterized_query(self):
+        code = """
+app.get('/user', async (req, res) => {
+    const id = req.query.id;
+    const rows = await db.query('SELECT * FROM users WHERE id = ?', [id]);
+    res.json(rows);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        sql = [f for f in findings if f.rule_id == "JSAST-SQL-001"]
+        assert not sql, "Parameterized query must not fire SQL injection"
+
+    def test_no_fp_clean_constant(self):
+        code = """
+app.get('/list', (req, res) => {
+    const sql = 'SELECT * FROM items';
+    db.query(sql);
+    res.send('OK');
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        sql = [f for f in findings if f.rule_id == "JSAST-SQL-001"]
+        assert not sql, "Constant SQL string must not fire"
+
+    def test_ts_file_not_analyzed(self):
+        """TypeScript files must be skipped (JS parser chokes on type annotations)."""
+        code = "const x: string = req.query.x; db.query(x);"
+        findings = _JSAST.analyze("app.ts", code)
+        assert not findings, ".ts files must not be analyzed by JSASTAnalyzer"
+
+    def test_non_js_file_ignored(self):
+        code = "req.body.cmd; exec(cmd);"
+        findings = _JSAST.analyze("notes.txt", code)
+        assert not findings, "Non-JS extension must return no findings"
