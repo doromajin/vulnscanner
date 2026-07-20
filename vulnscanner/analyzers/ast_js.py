@@ -1,11 +1,11 @@
-"""JavaScript AST taint analyzer (tree-sitter-javascript).
+"""JavaScript/TypeScript AST taint analyzer (tree-sitter).
 
 Improvements over the regex-based JSTaintAnalyzer (JSTAINT-* rules):
   - True AST parsing: no false matches inside comments or string literals
-  - Interprocedural analysis: functions that return tainted data propagate
+  - Interprocedural analysis: named functions that return tainted data propagate
     taint to their call sites (same-file, fixed-point iteration)
   - Accurate object destructuring (shorthand, aliased, default-value forms)
-  - await_expression unwrapping for async call chains
+  - await_expression / TypeScript as_expression / non_null_expression unwrapping
 
 Rule IDs (JSAST-*):
   JSAST-SQL-001   SQL injection (query / execute with tainted arg)
@@ -16,9 +16,9 @@ Rule IDs (JSAST-*):
   JSAST-EVAL-001  Code injection (eval / new Function)
   JSAST-SSRF-001  SSRF (fetch / axios / http)
 
-TypeScript (.ts/.tsx) is intentionally excluded: the JS parser produces
-ERROR nodes for TS type annotations; those files remain covered by the
-regex-based JSTaintAnalyzer.
+Analyzers:
+  JSASTAnalyzer  — .js / .jsx / .mjs / .cjs  (tree-sitter-javascript)
+  TSASTAnalyzer  — .ts / .tsx                 (tree-sitter-typescript)
 """
 from __future__ import annotations
 
@@ -31,10 +31,22 @@ try:
 except Exception:
     _TS_JS_AVAILABLE = False
 
+try:
+    import tree_sitter_typescript as _tsts
+    from tree_sitter import Language as _TSLang, Parser as _TSParserCls
+    _TS_LANGUAGE = _TSLang(_tsts.language_typescript())
+    _TSX_LANGUAGE = _TSLang(_tsts.language_tsx())
+    _ts_parser = _TSParserCls(_TS_LANGUAGE)
+    _tsx_parser = _TSParserCls(_TSX_LANGUAGE)
+    _TS_TS_AVAILABLE = True
+except Exception:
+    _TS_TS_AVAILABLE = False
+
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
 _JS_AST_EXTS = (".js", ".jsx", ".mjs", ".cjs")
+_TS_AST_EXTS = (".ts", ".tsx")
 
 # ── Taint source detection ────────────────────────────────────────────────────
 
@@ -115,11 +127,23 @@ def _walk(node):
         yield from _walk(child)
 
 
-def _unwrap_await(node):
-    """If node is an await_expression, return the inner expression."""
-    if node.type == "await_expression" and node.named_children:
-        return node.named_children[0]
+def _unwrap(node):
+    """Strip JS/TS wrapper nodes that don't affect taint semantics.
+
+    Handles: await_expression, as_expression (TS type cast),
+    non_null_expression (TS ! operator), parenthesized_expression.
+    """
+    _STRIP = frozenset({
+        "await_expression",
+        "as_expression",        # expr as Type  (TypeScript)
+        "non_null_expression",  # expr!          (TypeScript)
+        "parenthesized_expression",
+    })
+    while node.type in _STRIP and node.named_children:
+        node = node.named_children[0]
     return node
+
+
 
 
 # ── Taint state ───────────────────────────────────────────────────────────────
@@ -141,7 +165,7 @@ class _JSTaintState:
 
     def is_tainted_node(self, node) -> bool:
         """Return True if this AST node carries taint."""
-        node = _unwrap_await(node)
+        node = _unwrap(node)  # strips await / as / ! / parens
 
         if node.type == "identifier":
             return node.text.decode("utf-8", errors="replace") in self.tainted
@@ -171,9 +195,6 @@ class _JSTaintState:
                     return True
             return False
 
-        if node.type == "parenthesized_expression" and node.named_children:
-            return self.is_tainted_node(node.named_children[0])
-
         return False
 
 
@@ -190,7 +211,7 @@ def _collect_declarations(root, state: _JSTaintState) -> bool:
             if name_node is None or val_node is None:
                 continue
             line = name_node.start_point[0] + 1
-            val_node = _unwrap_await(val_node)
+            val_node = _unwrap(val_node)
 
             if _is_sanitizer(val_node):
                 continue
@@ -234,7 +255,7 @@ def _collect_declarations(root, state: _JSTaintState) -> bool:
             if lhs.type == "identifier":
                 var = lhs.text.decode()
                 line = lhs.start_point[0] + 1
-                rhs = _unwrap_await(rhs)
+                rhs = _unwrap(rhs)
                 if _is_sanitizer(rhs):
                     state.tainted.pop(var, None)
                 elif var not in state.tainted and state.is_tainted_node(rhs):
@@ -291,7 +312,7 @@ def _analyze_functions(root, state: _JSTaintState) -> bool:
         for sub in _walk(body):
             if sub.type == "return_statement" and sub.named_children:
                 ret_val = sub.named_children[0]
-                ret_val = _unwrap_await(ret_val)
+                ret_val = _unwrap(ret_val)
                 if state.is_tainted_node(ret_val) or _is_request_source(ret_val):
                     state.tainted_funcs.add(fname)
                     changed = True
@@ -504,11 +525,25 @@ def _check_sinks(
 
 # ── Analyzer ──────────────────────────────────────────────────────────────────
 
+def _analyze_with_parser(
+    parser, file_path: str, content: str, repo_url: str
+) -> list[Finding]:
+    """Shared analysis entry point for JS and TS parsers."""
+    try:
+        tree = parser.parse(content.encode("utf-8", errors="replace"))
+    except Exception:
+        return []
+    lines = content.splitlines()
+    state = _build_taint_state(tree.root_node)
+    if not state.tainted and not state.tainted_funcs:
+        return []
+    return _check_sinks(tree.root_node, state, file_path, lines, repo_url)
+
+
 class JSASTAnalyzer(BaseAnalyzer):
     """JavaScript AST taint analyzer (tree-sitter-javascript).
 
-    Covers .js / .jsx / .mjs / .cjs — TypeScript excluded (JS parser produces
-    ERROR nodes for TS type annotations; those files stay with JSTaintAnalyzer).
+    Covers .js / .jsx / .mjs / .cjs.
     """
 
     supported_extensions = _JS_AST_EXTS
@@ -518,15 +553,26 @@ class JSASTAnalyzer(BaseAnalyzer):
             return []
         if not any(file_path.endswith(ext) for ext in _JS_AST_EXTS):
             return []
+        return _analyze_with_parser(_js_parser, file_path, content, repo_url)
 
-        try:
-            tree = _js_parser.parse(content.encode("utf-8", errors="replace"))
-        except Exception:
+
+class TSASTAnalyzer(BaseAnalyzer):
+    """TypeScript/TSX AST taint analyzer (tree-sitter-typescript).
+
+    Covers .ts / .tsx — handles TS type annotations, as-expressions,
+    non-null assertions, and generic types that trip up the JS parser.
+    Reuses all taint collection and sink detection logic from JSASTAnalyzer.
+    """
+
+    supported_extensions = _TS_AST_EXTS
+
+    def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
+        if not _TS_TS_AVAILABLE:
             return []
-
-        lines = content.splitlines()
-        state = _build_taint_state(tree.root_node)
-        if not state.tainted and not state.tainted_funcs:
+        if file_path.endswith(".tsx"):
+            parser = _tsx_parser
+        elif file_path.endswith(".ts"):
+            parser = _ts_parser
+        else:
             return []
-
-        return _check_sinks(tree.root_node, state, file_path, lines, repo_url)
+        return _analyze_with_parser(parser, file_path, content, repo_url)

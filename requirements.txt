@@ -32,6 +32,9 @@ javalang==0.13.0
 # JavaScript AST analysis (true AST taint tracking for .js/.jsx/.mjs/.cjs)
 tree-sitter-javascript==0.25.0
 
+# TypeScript AST analysis (.ts/.tsx — same taint logic, TS/TSX grammars)
+tree-sitter-typescript==0.23.2
+
 # Testing
 pytest==8.2.2
 pytest-cov==5.0.0

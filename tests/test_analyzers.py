@@ -10,9 +10,10 @@ from vulnscanner.analyzers.ast_java import (
     build_java_cross_file_context,
     set_java_cross_file_context,
 )
-from vulnscanner.analyzers.ast_js import JSASTAnalyzer, _TS_JS_AVAILABLE
+from vulnscanner.analyzers.ast_js import JSASTAnalyzer, TSASTAnalyzer, _TS_JS_AVAILABLE, _TS_TS_AVAILABLE
 
 _skip_no_tsjs = pytest.mark.skipif(not _TS_JS_AVAILABLE, reason="tree-sitter-javascript not installed")
+_skip_no_tsts = pytest.mark.skipif(not _TS_TS_AVAILABLE, reason="tree-sitter-typescript not installed")
 
 _skip_no_javalang = pytest.mark.skipif(not _HAS_JAVALANG, reason="javalang not installed")
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
@@ -2318,3 +2319,104 @@ app.get('/list', (req, res) => {
         code = "req.body.cmd; exec(cmd);"
         findings = _JSAST.analyze("notes.txt", code)
         assert not findings, "Non-JS extension must return no findings"
+
+
+_TSAST = TSASTAnalyzer()
+
+
+@_skip_no_tsts
+class TestTSASTAnalyzer:
+    """TypeScript AST taint analyzer (tree-sitter-typescript)."""
+
+    def test_sql_with_type_annotation(self):
+        code = """
+import { Request, Response } from 'express';
+app.get('/search', (req: Request, res: Response): void => {
+    const q: string = req.query.q as string;
+    db.query("SELECT * FROM t WHERE name='" + q + "'");
+});
+"""
+        findings = _TSAST.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "Tainted TS variable with type annotation not detected"
+
+    def test_destructuring_with_interface_type(self):
+        code = """
+interface LoginBody { username: string; password: string; }
+app.post('/login', (req: Request, res: Response) => {
+    const { username }: LoginBody = req.body;
+    db.query('SELECT * FROM users WHERE user=\'' + username + '\'');
+});
+"""
+        findings = _TSAST.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "TS destructuring with interface type not handled"
+
+    def test_non_null_assertion_still_tainted(self):
+        """expr! strips the TS non-null wrapper but taint must propagate."""
+        code = """
+app.get('/file', (req: Request, res: Response) => {
+    const name = req.query.name!;
+    fs.readFile(name, 'utf8', cb);
+});
+"""
+        findings = _TSAST.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-PATH-001" in rule_ids, "Non-null assertion must not suppress taint"
+
+    def test_as_expression_still_tainted(self):
+        """expr as Type strips the TS cast but taint must propagate."""
+        code = """
+app.get('/run', (req: Request, res: Response) => {
+    const cmd = req.body.command as string;
+    exec(cmd);
+});
+"""
+        findings = _TSAST.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-CMD-001" in rule_ids, "as-expression must not suppress taint"
+
+    def test_tsx_file_parsed(self):
+        """TSX files should be parsed with the TSX grammar."""
+        code = """
+import React from 'react';
+export async function getServerSideProps(ctx: any) {
+    const id = ctx.query.id;
+    const data = await db.query('SELECT * FROM t WHERE id=\'' + id + '\'');
+    return { props: { data } };
+}
+"""
+        findings = _TSAST.analyze("page.tsx", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "TSX file SQL injection not detected"
+
+    def test_interprocedural_ts(self):
+        """TypeScript named function returning tainted value propagates taint."""
+        code = """
+function getParam(req: Request): string {
+    return req.query.search as string;
+}
+app.get('/search', async (req: Request, res: Response) => {
+    const term: string = getParam(req);
+    db.query('SELECT * FROM t WHERE name=\'' + term + '\'');
+});
+"""
+        findings = _TSAST.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "TS interprocedural return taint not propagated"
+
+    def test_no_fp_parseint_sanitizer(self):
+        code = """
+app.get('/page', (req: Request, res: Response): void => {
+    const page: number = parseInt(req.query.page as string);
+    db.query('SELECT * FROM items LIMIT ' + page);
+});
+"""
+        findings = _TSAST.analyze("app.ts", code)
+        sql = [f for f in findings if f.rule_id == "JSAST-SQL-001"]
+        assert not sql, "parseInt() must suppress taint in TypeScript too"
+
+    def test_js_file_not_analyzed_by_ts_analyzer(self):
+        code = "const x = req.query.x; db.query(x);"
+        findings = _TSAST.analyze("app.js", code)
+        assert not findings, ".js files must not be analyzed by TSASTAnalyzer"
