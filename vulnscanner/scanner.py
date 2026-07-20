@@ -313,7 +313,7 @@ def _is_suppressed(finding: Finding, lines: list[str]) -> bool:
     return False
 
 
-_AST_PREFIXES = ("JAST-", "AST-", "JSAST-", "GOAST-")
+_AST_PREFIXES = ("JAST-", "AST-", "JSAST-", "GOAST-", "RBAST-")
 
 
 def _deduplicate(findings: list) -> list:

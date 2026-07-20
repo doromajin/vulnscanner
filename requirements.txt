@@ -38,6 +38,9 @@ tree-sitter-typescript==0.23.2
 # Go AST analysis (.go — net/http, Gin, Echo, Chi taint tracking)
 tree-sitter-go==0.25.0
 
+# Ruby AST analysis (.rb — Rails, Sinatra, Rack taint tracking)
+tree-sitter-ruby==0.23.1
+
 # Testing
 pytest==8.2.2
 pytest-cov==5.0.0

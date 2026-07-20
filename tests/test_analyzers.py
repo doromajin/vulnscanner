@@ -12,10 +12,12 @@ from vulnscanner.analyzers.ast_java import (
 )
 from vulnscanner.analyzers.ast_go import GoASTAnalyzer, _TS_GO_AVAILABLE
 from vulnscanner.analyzers.ast_js import JSASTAnalyzer, TSASTAnalyzer, _TS_JS_AVAILABLE, _TS_TS_AVAILABLE
+from vulnscanner.analyzers.ast_ruby import RubyASTAnalyzer, _TS_RUBY_AVAILABLE
 
 _skip_no_tsjs = pytest.mark.skipif(not _TS_JS_AVAILABLE, reason="tree-sitter-javascript not installed")
 _skip_no_tsts = pytest.mark.skipif(not _TS_TS_AVAILABLE, reason="tree-sitter-typescript not installed")
 _skip_no_tsgo = pytest.mark.skipif(not _TS_GO_AVAILABLE, reason="tree-sitter-go not installed")
+_skip_no_tsrb = pytest.mark.skipif(not _TS_RUBY_AVAILABLE, reason="tree-sitter-ruby not installed")
 
 _skip_no_javalang = pytest.mark.skipif(not _HAS_JAVALANG, reason="javalang not installed")
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
@@ -2594,3 +2596,202 @@ func handler(w http.ResponseWriter, r *http.Request) {
         code = 'id := r.FormValue("id"); db.Query(id)'
         findings = _GOAST.analyze("main.py", code)
         assert not findings, "Non-.go file must not be analyzed by GoASTAnalyzer"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RubyASTAnalyzer tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RBAST = RubyASTAnalyzer()
+
+
+@_skip_no_tsrb
+class TestRubyASTAnalyzer:
+    """Tests for ast_ruby.py — Rails/Sinatra/Rack taint tracking."""
+
+    # ── SQL injection ─────────────────────────────────────────────────────────
+
+    def test_sql_direct_params(self):
+        code = """
+class UsersController < ApplicationController
+  def show
+    id = params[:id]
+    User.find_by_sql("SELECT * FROM users WHERE id = " + id)
+  end
+end
+"""
+        findings = _RBAST.analyze("app/controllers/users_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SQL-001" in rule_ids, "params[:id] → find_by_sql not detected"
+
+    def test_sql_interpolation(self):
+        code = """
+def search
+  q = params[:q]
+  results = ActiveRecord::Base.connection.execute("SELECT * FROM articles WHERE title LIKE '%#{q}%'")
+end
+"""
+        findings = _RBAST.analyze("app/models/article.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SQL-001" in rule_ids, "String interpolation into execute() not detected"
+
+    def test_sql_where_string(self):
+        code = """
+def filter
+  name = params["name"]
+  User.where("name = '" + name + "'")
+end
+"""
+        findings = _RBAST.analyze("app/controllers/users_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SQL-001" in rule_ids, "params → where(string) not detected"
+
+    def test_sql_multihop(self):
+        code = """
+def index
+  id = params[:id]
+  query = "SELECT * FROM users WHERE id = " + id
+  ActiveRecord::Base.connection.execute(query)
+end
+"""
+        findings = _RBAST.analyze("app/controllers/users_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SQL-001" in rule_ids, "Multi-hop params → query → execute not detected"
+
+    # ── Command injection ─────────────────────────────────────────────────────
+
+    def test_cmd_system(self):
+        code = """
+def run_cmd
+  file = params[:file]
+  system("ls " + file)
+end
+"""
+        findings = _RBAST.analyze("app/controllers/cmd_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-CMD-001" in rule_ids, "params → system() not detected"
+
+    def test_cmd_exec(self):
+        code = """
+def run
+  cmd = params[:cmd]
+  exec(cmd)
+end
+"""
+        findings = _RBAST.analyze("app/controllers/cmd_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-CMD-001" in rule_ids, "params → exec() not detected"
+
+    def test_cmd_io_popen(self):
+        code = """
+def pipe
+  name = params[:name]
+  IO.popen("cat " + name)
+end
+"""
+        findings = _RBAST.analyze("app/controllers/pipe_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-CMD-001" in rule_ids, "params → IO.popen() not detected"
+
+    # ── Path traversal ────────────────────────────────────────────────────────
+
+    def test_path_file_read(self):
+        code = """
+def download
+  path = params[:path]
+  content = File.read(path)
+  render plain: content
+end
+"""
+        findings = _RBAST.analyze("app/controllers/files_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-PATH-001" in rule_ids, "params → File.read() not detected"
+
+    def test_path_file_open(self):
+        code = """
+def view
+  fname = params[:name]
+  File.open(fname) { |f| f.read }
+end
+"""
+        findings = _RBAST.analyze("app/controllers/files_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-PATH-001" in rule_ids, "params → File.open() not detected"
+
+    # ── XSS ──────────────────────────────────────────────────────────────────
+
+    def test_xss_render_plain(self):
+        code = """
+def show
+  name = params[:name]
+  render plain: name
+end
+"""
+        findings = _RBAST.analyze("app/controllers/users_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-XSS-001" in rule_ids, "params → render plain: not detected"
+
+    def test_xss_render_html(self):
+        code = """
+def show
+  content = params[:html]
+  render html: content
+end
+"""
+        findings = _RBAST.analyze("app/controllers/users_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-XSS-001" in rule_ids, "params → render html: not detected"
+
+    # ── Open redirect ─────────────────────────────────────────────────────────
+
+    def test_open_redirect(self):
+        code = """
+def callback
+  url = params[:return_to]
+  redirect_to url
+end
+"""
+        findings = _RBAST.analyze("app/controllers/sessions_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-REDIR-001" in rule_ids, "params → redirect_to not detected"
+
+    # ── SSRF ─────────────────────────────────────────────────────────────────
+
+    def test_ssrf_uri_open(self):
+        code = """
+def fetch
+  url = params[:url]
+  URI.open(url)
+end
+"""
+        findings = _RBAST.analyze("app/controllers/proxy_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SSRF-001" in rule_ids, "params → URI.open() not detected"
+
+    # ── False positive suppression ────────────────────────────────────────────
+
+    def test_no_fp_constant_sql(self):
+        code = """
+def list_all
+  User.where("active = true")
+end
+"""
+        findings = _RBAST.analyze("app/models/user.rb", code)
+        sql = [f for f in findings if f.rule_id == "RBAST-SQL-001"]
+        assert not sql, "Constant string in where() must not produce FP"
+
+    def test_no_fp_safe_where_hash(self):
+        code = """
+def find_user
+  id = params[:id]
+  User.where(id: id)
+end
+"""
+        findings = _RBAST.analyze("app/models/user.rb", code)
+        sql = [f for f in findings if f.rule_id == "RBAST-SQL-001"]
+        assert not sql, "Hash argument in where() must not produce FP"
+
+    def test_no_fp_non_ruby_file(self):
+        code = 'id = params[:id]; User.find_by_sql("SELECT * FROM users WHERE id=" + id)'
+        findings = _RBAST.analyze("main.py", code)
+        assert not findings, "Non-.rb file must not be analyzed by RubyASTAnalyzer"
