@@ -1966,6 +1966,58 @@ def handle():
         active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
         assert not active, "re.match() guard must suppress SQL injection finding inside if-body"
 
+    def test_abort_early_exit_suppresses_sql(self):
+        code = """
+from flask import request, abort
+import sqlite3
+
+conn = sqlite3.connect(':memory:')
+
+def handle():
+    uid = request.args.get('id')
+    if not uid.isdigit():
+        abort(400)
+    conn.execute('SELECT * FROM users WHERE id=' + uid)
+"""
+        findings = AST.analyze("t.py", code, "")
+        active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert not active, "abort() early exit must suppress subsequent SQL injection finding"
+
+    def test_compiled_regex_var_guard_suppresses_sql(self):
+        code = """
+import re
+from flask import request
+import sqlite3
+
+conn = sqlite3.connect(':memory:')
+ID_PAT = re.compile(r'\\d+')
+
+def handle():
+    uid = request.args.get('id')
+    if ID_PAT.match(uid):
+        conn.execute('SELECT * FROM users WHERE id=' + uid)
+"""
+        findings = AST.analyze("t.py", code, "")
+        active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert not active, "pre-compiled regex var .match() guard must suppress SQL injection"
+
+    def test_inline_compile_match_guard_suppresses_sql(self):
+        code = """
+import re
+from flask import request
+import sqlite3
+
+conn = sqlite3.connect(':memory:')
+
+def handle():
+    uid = request.args.get('id')
+    if re.compile(r'\\d+').match(uid):
+        conn.execute('SELECT * FROM users WHERE id=' + uid)
+"""
+        findings = AST.analyze("t.py", code, "")
+        active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert not active, "inline re.compile().match() guard must suppress SQL injection"
+
     def test_unguarded_tainted_name_still_fires(self):
         code = """
 from flask import request
@@ -2140,6 +2192,35 @@ public class Controller {
         findings = self._analyze_with_context("Controller.java", target, {"Clean.java": helper})
         sql = [f for f in findings if f.rule_id == "JAST-SQL-001"]
         assert not sql, "Clean cross-file method must not produce SQL injection FP"
+
+    def test_spring_pathvariable_seeds_service_param(self):
+        """@PathVariable in controller flows into service method param — must detect SQLi."""
+        controller = """
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class UserController {
+    private UserService svc;
+
+    @GetMapping("/user/{id}")
+    public String get(@PathVariable String userId) {
+        return svc.findUser(userId);
+    }
+}"""
+        service = """
+import java.sql.*;
+public class UserService {
+    private Connection conn;
+    public String findUser(String id) throws Exception {
+        Statement st = conn.createStatement();
+        return st.executeQuery("SELECT * FROM users WHERE id='" + id + "'").toString();
+    }
+}"""
+        findings = self._analyze_with_context(
+            "UserService.java", service, {"UserController.java": controller}
+        )
+        sql = [f for f in findings if "SQL" in f.rule_id]
+        assert sql, "@PathVariable taint must propagate into service method param via cross-file seeding"
 
 
 _JSAST = JSASTAnalyzer()

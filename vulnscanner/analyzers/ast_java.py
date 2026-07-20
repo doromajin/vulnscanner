@@ -69,8 +69,14 @@ class JavaCrossFileCtx:
 
     remote_methods maps method_name → [(parsed_tree, file_path)] so that
     _analyze_remote_method() can call _analyze_local_method() on remote trees.
+
+    tainted_callee_params maps method_name → {arg_indices} for methods that
+    are called from Spring controllers with @RequestParam/@PathVariable args.
+    Used to pre-seed parameter taint in service classes that have no Spring
+    annotations of their own.
     """
     remote_methods: dict[str, list[tuple]] = field(default_factory=dict)
+    tainted_callee_params: dict[str, set[int]] = field(default_factory=dict)
 
 
 _java_cf_local = threading.local()
@@ -86,6 +92,8 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
         return JavaCrossFileCtx()
 
     remote_methods: dict[str, list] = {}
+    parsed_trees: list[tuple] = []  # (tree, fp) for second pass
+
     for fp, content in all_contents.items():
         if not fp.endswith(".java"):
             continue
@@ -96,9 +104,43 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                 if name not in remote_methods:
                     remote_methods[name] = []
                 remote_methods[name].append((tree, fp))
+            parsed_trees.append((tree, fp))
         except Exception:
             pass
-    return JavaCrossFileCtx(remote_methods=remote_methods)
+
+    # Second pass: find controller methods with Spring-annotated params,
+    # then record which callee methods are invoked with those tainted params.
+    tainted_callee_params: dict[str, set[int]] = {}
+    for tree, _fp in parsed_trees:
+        try:
+            for _, method in tree.filter(jt.MethodDeclaration):
+                # Collect Spring-annotated parameter names for this method
+                spring_params: set[str] = set()
+                for param in (method.parameters or []):
+                    for ann in (getattr(param, "annotations", None) or []):
+                        if getattr(ann, "name", "") in _SPRING_PARAM_ANNOTATIONS:
+                            pname = getattr(param, "name", "")
+                            if pname:
+                                spring_params.add(pname)
+                if not spring_params:
+                    continue
+                # Walk method body for calls where a Spring param is passed as argument
+                for _, invoc in method.filter(jt.MethodInvocation):
+                    callee = invoc.member
+                    if not callee:
+                        continue
+                    for idx, arg in enumerate(invoc.arguments or []):
+                        arg_name: str | None = None
+                        if isinstance(arg, jt.MemberReference) and not arg.qualifier:
+                            arg_name = arg.member
+                        if arg_name and arg_name in spring_params:
+                            if callee not in tainted_callee_params:
+                                tainted_callee_params[callee] = set()
+                            tainted_callee_params[callee].add(idx)
+        except Exception:
+            pass
+
+    return JavaCrossFileCtx(remote_methods=remote_methods, tainted_callee_params=tainted_callee_params)
 
 
 def set_java_cross_file_context(ctx: JavaCrossFileCtx | None) -> None:
@@ -748,6 +790,26 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                         break
     except Exception:
         pass
+
+    # Cross-file callee-param seeding: if this file's methods are called from
+    # Spring controllers with tainted args, pre-seed those params as tainted.
+    # Enables detection of SQL/CMD sinks in service classes that have no Spring
+    # annotations but receive user-controlled data from a controller.
+    _cf_ctx = _get_java_cf_ctx()
+    if _cf_ctx and _cf_ctx.tainted_callee_params:
+        try:
+            for _, method in tree.filter(jt.MethodDeclaration):
+                tainted_indices = _cf_ctx.tainted_callee_params.get(method.name)
+                if not tainted_indices:
+                    continue
+                params = method.parameters or []
+                for idx in tainted_indices:
+                    if idx < len(params):
+                        pname = getattr(params[idx], "name", "")
+                        if pname:
+                            tainted.add(pname)
+        except Exception:
+            pass
 
     for _ in range(6):
         changed = False

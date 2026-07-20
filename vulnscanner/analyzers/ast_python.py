@@ -3069,6 +3069,24 @@ def _extract_guard_var(test: ast.expr) -> str | None:
             and len(test.args) >= 2
             and isinstance(test.args[1], ast.Name)):
         return test.args[1].id
+    # compiled_re.match/fullmatch/search(var) — pre-assigned compiled regex object
+    # e.g. ID_RE = re.compile(r'\d+'); if ID_RE.match(uid): ...
+    if (isinstance(test, ast.Call)
+            and isinstance(test.func, ast.Attribute)
+            and test.func.attr in ("match", "fullmatch", "search")
+            and isinstance(test.func.value, ast.Name)
+            and test.func.value.id != "re"
+            and test.args
+            and isinstance(test.args[0], ast.Name)):
+        return test.args[0].id
+    # re.compile(pattern).match/fullmatch/search(var) — inline compiled regex validation
+    if (isinstance(test, ast.Call)
+            and isinstance(test.func, ast.Attribute)
+            and test.func.attr in ("match", "fullmatch", "search")
+            and isinstance(test.func.value, ast.Call)
+            and test.args
+            and isinstance(test.args[0], ast.Name)):
+        return test.args[0].id
     # var in [literal_list / tuple / set / named_constant] — allowlist membership check
     if (isinstance(test, ast.Compare)
             and len(test.ops) == 1
@@ -3197,11 +3215,34 @@ def _expr_apos_replaced(node: ast.expr, assignments: dict[str, ast.expr]) -> boo
     return False
 
 
+_EXIT_CALL_NAMES: frozenset[str] = frozenset({'abort', 'exit', 'quit'})
+_EXIT_ATTR_CALLS: frozenset[str] = frozenset({'sys.exit', 'os._exit'})
+
+
 def _is_always_exit(stmts: list[ast.stmt]) -> bool:
-    """True if the last statement in the block always exits the current scope."""
-    return bool(stmts) and isinstance(
-        stmts[-1], (ast.Return, ast.Raise, ast.Continue, ast.Break)
-    )
+    """True if the last statement in the block always exits the current scope.
+
+    Recognizes:
+      return / raise / continue / break  — Python control-flow exits
+      abort(code)                        — Flask / Werkzeug HTTP abort
+      sys.exit() / os._exit()            — process exits
+      exit() / quit()                    — interactive-session exits (rare in web code
+                                          but harmless to treat as exits)
+    """
+    if not stmts:
+        return False
+    last = stmts[-1]
+    if isinstance(last, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
+        return True
+    if isinstance(last, ast.Expr) and isinstance(last.value, ast.Call):
+        call = last.value
+        if isinstance(call.func, ast.Name) and call.func.id in _EXIT_CALL_NAMES:
+            return True
+        if (isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and f"{call.func.value.id}.{call.func.attr}" in _EXIT_ATTR_CALLS):
+            return True
+    return False
 
 
 def _iter_func_returns(
