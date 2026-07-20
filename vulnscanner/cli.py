@@ -28,6 +28,9 @@ def main() -> None:
 @click.option("--token", envvar="GITHUB_TOKEN", help="GitHub personal access token")
 @click.option("--output", "-o", default=None, help="Write JSON report to this file")
 @click.option("--sarif", default=None, help="Write SARIF 2.1.0 report to this file")
+@click.option("--html", "html_out", default=None, help="Write self-contained HTML report to this file")
+@click.option("--baseline", default=None, metavar="FILE",
+              help="Previous JSON scan: suppress known findings, report only NEW ones")
 @click.option("--detail", is_flag=True, help="Print code snippets for each finding")
 @click.option("--min-severity", default="INFO", type=_SEVERITY_CHOICES,
               help="Only show findings at or above this severity")
@@ -44,6 +47,8 @@ def scan(
     token: str | None,
     output: str | None,
     sarif: str | None,
+    html_out: str | None,
+    baseline: str | None,
     detail: bool,
     min_severity: str,
     fail_on: str | None,
@@ -100,6 +105,23 @@ def scan(
         if severity_order.index(f.severity) <= cutoff
     ]
 
+    # Baseline comparison: split into new vs. already-known findings
+    baseline_keys: set | None = None
+    new_finding_keys: set | None = None
+    if baseline:
+        from vulnscanner.reporters.baseline import load_baseline, split_findings
+        try:
+            baseline_keys = load_baseline(baseline)
+            new_findings, known_findings = split_findings(result.findings, baseline_keys)
+            new_finding_keys = {(f.file_path, f.line_number, f.rule_id) for f in new_findings}
+            n_known = len(known_findings)
+            console.print(
+                f"[dim]Baseline: {len(baseline_keys)} known finding(s) loaded from {baseline} "
+                f"— {n_known} suppressed, {len(new_findings)} new[/dim]"
+            )
+        except Exception as exc:
+            console.print(f"[yellow]Baseline load failed ({exc}); showing all findings.[/yellow]")
+
     # Load confirmed pattern keys from knowledge base for annotation
     try:
         from vulnscanner.knowledge import KnowledgeStore
@@ -116,16 +138,26 @@ def scan(
         write_sarif(result, sarif)
         console.print(f"[green]SARIF report written to {sarif}[/green]")
 
+    if html_out:
+        from vulnscanner.reporters.html_reporter import write_html
+        write_html(result, html_out, new_finding_keys=new_finding_keys)
+        console.print(f"[green]HTML report written to {html_out}[/green]")
+
     if detail:
         print_finding_detail(result)
     else:
         print_results(result, confirmed_keys=confirmed_keys)
 
+    # When baseline is active, fail-on only applies to NEW findings
     if fail_on:
         fail_sev = Severity(fail_on.upper())
         fail_cutoff = severity_order.index(fail_sev)
+        findings_for_fail = (
+            [f for f in result.findings if (f.file_path, f.line_number, f.rule_id) in new_finding_keys]
+            if new_finding_keys is not None else all_findings
+        )
         should_fail = any(
-            severity_order.index(f.severity) <= fail_cutoff for f in all_findings
+            severity_order.index(f.severity) <= fail_cutoff for f in findings_for_fail
         )
     else:
         should_fail = bool(all_findings)
@@ -628,6 +660,135 @@ def knowledge_stats() -> None:
             )
         rc.print(t)
     rc.print()
+
+
+# ── init ──────────────────────────────────────────────────────────────────────
+
+_GHA_WORKFLOW = """\
+name: VulnScanner
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # required to upload SARIF to GitHub Code Scanning
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install VulnScanner
+        run: pip install vulnscanner
+
+      - name: Run VulnScanner (baseline diff)
+        run: |
+          # First scan: save results as baseline on the default branch,
+          # then compare on every PR so only NEW findings fail the build.
+          vulnscan scan . \\
+            --output vulnscanner_results.json \\
+            --sarif  vulnscanner.sarif \\
+            --html   vulnscanner_report.html \\
+            --fail-on HIGH
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: vulnscanner.sarif
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnscanner-report
+          path: vulnscanner_report.html
+"""
+
+_CONFIG_YAML = """\
+# vulnscanner.yml — project-level configuration
+# See: https://github.com/doromajin/vulnscanner
+
+scan:
+  # Glob patterns to exclude from scanning (relative to repo root)
+  exclude:
+    - "tests/**"
+    - "vendor/**"
+    - "node_modules/**"
+    - "*.min.js"
+
+  # Minimum severity to report (INFO | LOW | MEDIUM | HIGH | CRITICAL)
+  min_severity: LOW
+
+  # Fail CI when any finding at or above this severity is found
+  fail_on: HIGH
+
+  # Worker threads (0 = auto-detect based on CPU count)
+  workers: 0
+"""
+
+
+@main.command("init")
+@click.option("--dir", "target_dir", default=".", help="Target directory (default: current directory)")
+@click.option("--force", is_flag=True, help="Overwrite existing files")
+def init(target_dir: str, force: bool) -> None:
+    """Scaffold GitHub Actions workflow and config file for VulnScanner.
+
+    Creates:\n
+      .github/workflows/vulnscanner.yml  — CI workflow\n
+      vulnscanner.yml                    — project config
+    """
+    import os
+    from pathlib import Path
+
+    base = Path(target_dir).resolve()
+
+    files = {
+        base / ".github" / "workflows" / "vulnscanner.yml": _GHA_WORKFLOW,
+        base / "vulnscanner.yml": _CONFIG_YAML,
+    }
+
+    created: list[str] = []
+    skipped: list[str] = []
+
+    for path, content in files.items():
+        rel = path.relative_to(base)
+        if path.exists() and not force:
+            skipped.append(str(rel))
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        created.append(str(rel))
+
+    if created:
+        console.print("\n[green]Created:[/green]")
+        for f in created:
+            console.print(f"  [cyan]{f}[/cyan]")
+    if skipped:
+        console.print("\n[yellow]Skipped (already exist — use --force to overwrite):[/yellow]")
+        for f in skipped:
+            console.print(f"  [dim]{f}[/dim]")
+
+    if not created and not skipped:
+        console.print("[yellow]Nothing to do.[/yellow]")
+        return
+
+    console.print(
+        "\n[dim]Next steps:\n"
+        "  1. Commit these files to your repository\n"
+        "  2. Push to GitHub — the workflow runs automatically on every push/PR\n"
+        "  3. Optionally: run `vulnscan scan . --output baseline.json` on your main branch\n"
+        "     and use `--baseline baseline.json` in CI to suppress pre-existing findings[/dim]\n"
+    )
 
 
 if __name__ == "__main__":
