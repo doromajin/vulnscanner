@@ -9,6 +9,8 @@ the file uses unsupported Java syntax.
 from __future__ import annotations
 
 import json
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
@@ -55,6 +57,58 @@ _REQUEST_OBJECTS = frozenset({
 # Methods that return user-controlled data regardless of what object they're called on.
 # Populated from custom_taint_sources.json — no hardcoded values here.
 _ANY_QUALIFIER_TAINT_METHODS = _load_custom_taint_sources()
+
+# ── cross-file taint context (thread-local) ────────────────────────────────────
+
+@dataclass
+class JavaCrossFileCtx:
+    """Indexed method declarations from all Java files in the repo.
+
+    Built once by build_java_cross_file_context() before parallel per-file
+    analysis starts, then injected per-worker via set_java_cross_file_context().
+
+    remote_methods maps method_name → [(parsed_tree, file_path)] so that
+    _analyze_remote_method() can call _analyze_local_method() on remote trees.
+    """
+    remote_methods: dict[str, list[tuple]] = field(default_factory=dict)
+
+
+_java_cf_local = threading.local()
+
+
+def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFileCtx:
+    """Pre-parse all .java files and index their MethodDeclarations by name.
+
+    Called once before the thread pool starts so each worker can share the
+    read-only context via set_java_cross_file_context().
+    """
+    if not _HAS_JAVALANG:
+        return JavaCrossFileCtx()
+
+    remote_methods: dict[str, list] = {}
+    for fp, content in all_contents.items():
+        if not fp.endswith(".java"):
+            continue
+        try:
+            tree = javalang.parse.parse(content)
+            for _, method in tree.filter(jt.MethodDeclaration):
+                name = method.name
+                if name not in remote_methods:
+                    remote_methods[name] = []
+                remote_methods[name].append((tree, fp))
+        except Exception:
+            pass
+    return JavaCrossFileCtx(remote_methods=remote_methods)
+
+
+def set_java_cross_file_context(ctx: JavaCrossFileCtx | None) -> None:
+    """Store Java cross-file context in thread-local for the current worker."""
+    _java_cf_local.ctx = ctx
+
+
+def _get_java_cf_ctx() -> JavaCrossFileCtx | None:
+    return getattr(_java_cf_local, "ctx", None)
+
 
 # ── sink sets ──────────────────────────────────────────────────────────────────
 
@@ -608,6 +662,37 @@ def _analyze_local_method(
     return None  # Method not found → fall back to arg-based propagation
 
 
+def _analyze_remote_method(
+    method_name: str,
+    call_args: list,
+    caller_tainted: "set[str]",
+    caller_ci: dict,
+) -> "bool | None":
+    """Analyze a method defined in another file using the cross-file context.
+
+    Returns True  → at least one remote candidate returns tainted data
+            False → all found candidates return safe data
+            None  → method not found in remote context (fall through to arg propagation)
+    """
+    ctx = _get_java_cf_ctx()
+    if ctx is None:
+        return None
+    entries = ctx.remote_methods.get(method_name)
+    if not entries:
+        return None
+
+    found_any = False
+    for (tree, _fp) in entries:
+        result = _analyze_local_method(tree, method_name, call_args, caller_tainted, caller_ci)
+        if result is True:
+            return True
+        if result is False:
+            found_any = True
+        # result is None → this tree has no matching method (shouldn't happen since we
+        # indexed by method name, but guard against parse/filter edge cases)
+    return False if found_any else None
+
+
 def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
     """Multi-pass fixed-point taint collector with dead-branch elimination.
 
@@ -691,6 +776,9 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                 tree, init.member, init.arguments or [],
                                 tainted, const_ints,
                             )
+                            if result is None:
+                                result = _analyze_remote_method(
+                                    init.member, init.arguments or [], tainted, const_ints)
                             if result is not None:
                                 if result:
                                     tainted.add(decl.name)
@@ -706,6 +794,10 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                     tree, _this_sel.member, _this_sel.arguments or [],
                                     tainted, const_ints,
                                 )
+                                if _this_result is None:
+                                    _this_result = _analyze_remote_method(
+                                        _this_sel.member, _this_sel.arguments or [],
+                                        tainted, const_ints)
                                 if _this_result is not None:
                                     if _this_result:
                                         tainted.add(decl.name)
@@ -731,6 +823,18 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                             tainted.add(decl.name)
                             changed = True
                             continue
+                        # Cross-file: qualified method call (obj.method() / Class.method())
+                        # where the qualifier itself isn't tainted (caught by _is_tainted below).
+                        if (isinstance(init, jt.MethodInvocation)
+                                and init.qualifier not in (None, "")
+                                and not _is_request_source(init)
+                                and str(init.qualifier) not in tainted):
+                            _rq = _analyze_remote_method(
+                                init.member, init.arguments or [], tainted, const_ints)
+                            if _rq is True:
+                                tainted.add(decl.name)
+                                changed = True
+                                continue
                         if _is_tainted(init, tainted, const_ints):
                             tainted.add(decl.name)
                             changed = True
@@ -800,6 +904,9 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                             tree, rhs.member, rhs.arguments or [],
                             tainted, const_ints,
                         )
+                        if result is None:
+                            result = _analyze_remote_method(
+                                rhs.member, rhs.arguments or [], tainted, const_ints)
                         if result is not None:
                             if result:
                                 tainted.add(_vname)
@@ -815,11 +922,26 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                 tree, _this_rhs.member, _this_rhs.arguments or [],
                                 tainted, const_ints,
                             )
+                            if _this_r is None:
+                                _this_r = _analyze_remote_method(
+                                    _this_rhs.member, _this_rhs.arguments or [],
+                                    tainted, const_ints)
                             if _this_r is not None:
                                 if _this_r:
                                     tainted.add(_vname)
                                     changed = True
                                 continue
+                    # Cross-file: qualified method call (obj.method() / Class.method())
+                    if (isinstance(rhs, jt.MethodInvocation)
+                            and rhs.qualifier not in (None, "")
+                            and not _is_request_source(rhs)
+                            and str(rhs.qualifier) not in tainted):
+                        _rq2 = _analyze_remote_method(
+                            rhs.member, rhs.arguments or [], tainted, const_ints)
+                        if _rq2 is True:
+                            tainted.add(_vname)
+                            changed = True
+                            continue
                     if _is_tainted(rhs, tainted, const_ints):
                         tainted.add(_vname)
                         changed = True

@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from vulnscanner.analyzers.ast_java import JavaASTAnalyzer, _HAS_JAVALANG
+from vulnscanner.analyzers.ast_java import (
+    JavaASTAnalyzer,
+    _HAS_JAVALANG,
+    build_java_cross_file_context,
+    set_java_cross_file_context,
+)
 
 _skip_no_javalang = pytest.mark.skipif(not _HAS_JAVALANG, reason="javalang not installed")
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
@@ -2044,3 +2049,84 @@ app.get('/user', async (req, res) => {
         content = "req.body.cmd; exec(cmd);"
         findings = _JS.analyze("notes.txt", content)
         assert not findings, "Non-JS extension must return no findings"
+
+
+@_skip_no_javalang
+class TestJavaCrossFileTaint:
+    """Java cross-file taint tracking via build_java_cross_file_context."""
+
+    def _analyze_with_context(self, target_path: str, target_code: str, extra_files: dict) -> list:
+        all_files = {target_path: target_code, **extra_files}
+        ctx = build_java_cross_file_context(all_files)
+        set_java_cross_file_context(ctx)
+        try:
+            return JavaASTAnalyzer().analyze(target_path, target_code)
+        finally:
+            set_java_cross_file_context(None)
+
+    def test_inherent_taint_source_in_remote_file(self):
+        """Helper in another file returns request.getParameter() — should propagate."""
+        helper = """
+import javax.servlet.http.HttpServletRequest;
+public class Helper {
+    private HttpServletRequest req;
+    public String getUserInput() { return req.getParameter("q"); }
+}"""
+        target = """
+import java.sql.Connection;
+import java.sql.Statement;
+public class Controller {
+    private Helper helper;
+    public void handle(Connection conn) throws Exception {
+        String val = helper.getUserInput();
+        Statement st = conn.createStatement();
+        st.executeQuery("SELECT * FROM t WHERE x='" + val + "'");
+    }
+}"""
+        findings = self._analyze_with_context("Controller.java", target, {"Helper.java": helper})
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SQL-001" in rule_ids, "Cross-file inherent taint source not propagated"
+
+    def test_passthrough_method_in_remote_file(self):
+        """Helper in another file passes its tainted arg through → should detect."""
+        helper = """
+public class Sanitizer {
+    public String passthrough(String x) { return x; }
+}"""
+        target = """
+import javax.servlet.http.HttpServletRequest;
+import java.sql.Connection;
+import java.sql.Statement;
+public class Controller {
+    private Sanitizer san;
+    public void handle(HttpServletRequest req, Connection conn) throws Exception {
+        String raw = req.getParameter("q");
+        String val = san.passthrough(raw);
+        Statement st = conn.createStatement();
+        st.executeQuery("SELECT * FROM t WHERE x='" + val + "'");
+    }
+}"""
+        findings = self._analyze_with_context("Controller.java", target, {"Sanitizer.java": helper})
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SQL-001" in rule_ids, "Cross-file passthrough taint not propagated"
+
+    def test_no_fp_for_clean_remote_method(self):
+        """Remote method that never touches request data must not produce FP."""
+        helper = """
+public class Clean {
+    public String getSafeValue() { return "constant"; }
+}"""
+        target = """
+import java.sql.Connection;
+import java.sql.Statement;
+public class Controller {
+    private Clean clean;
+    public void handle(Connection conn) throws Exception {
+        String val = clean.getSafeValue();
+        Statement st = conn.createStatement();
+        st.executeQuery("SELECT * FROM t WHERE x='" + val + "'");
+    }
+}"""
+        findings = self._analyze_with_context("Controller.java", target, {"Clean.java": helper})
+        sql = [f for f in findings if f.rule_id == "JAST-SQL-001"]
+        assert not sql, "Clean cross-file method must not produce SQL injection FP"

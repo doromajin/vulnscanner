@@ -14,6 +14,10 @@ from vulnscanner.analyzers.ast_python import (
     build_cross_file_summary,
     set_cross_file_context,
 )
+from vulnscanner.analyzers.ast_java import (
+    build_java_cross_file_context,
+    set_java_cross_file_context,
+)
 from vulnscanner.analyzers.file_context import (
     INCLUDE_TEST_FILES,
     INCLUDE_VENDOR_FILES,
@@ -175,6 +179,7 @@ class VulnScanner:
         # Phase B (module-global scanning) correctly resolves function-call chains like
         # ``config.ALLOWED_HOST = get_host()`` where get_host is in a transitive import.
         cf_summary = build_cross_file_summary(all_contents)
+        java_cf_ctx = build_java_cross_file_context(all_contents)
 
         start = time.perf_counter()
         with Progress(
@@ -188,7 +193,7 @@ class VulnScanner:
 
             with ThreadPoolExecutor(max_workers=self._workers) as pool:
                 futures = {
-                    pool.submit(self._analyze_file_pure, fp, content, directory, all_contents, cf_summary): fp
+                    pool.submit(self._analyze_file_pure, fp, content, directory, all_contents, cf_summary, java_cf_ctx): fp
                     for fp, content in files
                 }
                 for future in as_completed(futures):
@@ -208,12 +213,14 @@ class VulnScanner:
         self, file_path: str, content: str, source: str,
         all_contents: dict[str, str] | None = None,
         cf_summary=None,
+        java_cf_ctx=None,
     ) -> _FileResult:
         """Analyze a single file; returns results without mutating shared state."""
         # Provide cross-file content map and Phase C summary via thread-local storage.
         # cf_summary is built once before the pool and shared (read-only) across workers.
         if all_contents is not None:
             set_cross_file_context(all_contents, cf_summary)
+        set_java_cross_file_context(java_cf_ctx)
 
         partial = _FileResult(scanned_lines=content.count("\n") + 1)
         lines = content.splitlines()
