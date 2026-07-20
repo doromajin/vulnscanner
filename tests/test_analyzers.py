@@ -10,10 +10,12 @@ from vulnscanner.analyzers.ast_java import (
     build_java_cross_file_context,
     set_java_cross_file_context,
 )
+from vulnscanner.analyzers.ast_go import GoASTAnalyzer, _TS_GO_AVAILABLE
 from vulnscanner.analyzers.ast_js import JSASTAnalyzer, TSASTAnalyzer, _TS_JS_AVAILABLE, _TS_TS_AVAILABLE
 
 _skip_no_tsjs = pytest.mark.skipif(not _TS_JS_AVAILABLE, reason="tree-sitter-javascript not installed")
 _skip_no_tsts = pytest.mark.skipif(not _TS_TS_AVAILABLE, reason="tree-sitter-typescript not installed")
+_skip_no_tsgo = pytest.mark.skipif(not _TS_GO_AVAILABLE, reason="tree-sitter-go not installed")
 
 _skip_no_javalang = pytest.mark.skipif(not _HAS_JAVALANG, reason="javalang not installed")
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
@@ -2420,3 +2422,175 @@ app.get('/page', (req: Request, res: Response): void => {
         code = "const x = req.query.x; db.query(x);"
         findings = _TSAST.analyze("app.js", code)
         assert not findings, ".js files must not be analyzed by TSASTAnalyzer"
+
+
+_GOAST = GoASTAnalyzer()
+
+
+@_skip_no_tsgo
+class TestGoASTAnalyzer:
+    """Go AST taint analyzer (tree-sitter-go)."""
+
+    # ── direct taint sources → sinks ─────────────────────────────────────────
+
+    def test_sql_form_value(self):
+        code = """
+package main
+import ("database/sql"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    id := r.FormValue("id")
+    db.Query("SELECT * FROM t WHERE id='" + id + "'")
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-SQL-001" in rule_ids, "r.FormValue → SQL injection not detected"
+
+    def test_sql_url_query_get(self):
+        code = """
+package main
+import ("database/sql"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    name := r.URL.Query().Get("name")
+    db.QueryRow("SELECT id FROM users WHERE name='" + name + "'")
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-SQL-001" in rule_ids, "r.URL.Query().Get → SQL injection not detected"
+
+    def test_cmd_injection(self):
+        code = """
+package main
+import ("os/exec"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    cmd := r.FormValue("cmd")
+    exec.Command("sh", "-c", cmd)
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-CMD-001" in rule_ids, "exec.Command with tainted arg not detected"
+
+    def test_path_traversal_os_open(self):
+        code = """
+package main
+import ("os"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    filename := r.URL.Query().Get("file")
+    os.Open(filename)
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-PATH-001" in rule_ids, "os.Open with tainted path not detected"
+
+    def test_xss_fmt_fprintf(self):
+        code = """
+package main
+import ("fmt"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    name := r.FormValue("name")
+    fmt.Fprintf(w, "<h1>Hello " + name + "</h1>")
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-XSS-001" in rule_ids, "fmt.Fprintf with tainted format not detected"
+
+    def test_ssrf_http_get(self):
+        code = """
+package main
+import ("net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    url := r.URL.Query().Get("url")
+    http.Get(url)
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-SSRF-001" in rule_ids, "http.Get with tainted URL not detected"
+
+    # ── multi-hop taint ───────────────────────────────────────────────────────
+
+    def test_multihop_fmt_sprintf(self):
+        """fmt.Sprintf with tainted arg propagates taint to the result."""
+        code = """
+package main
+import ("database/sql"; "fmt"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    id := r.FormValue("id")
+    query := fmt.Sprintf("SELECT * FROM t WHERE id=%s", id)
+    db.Query(query)
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-SQL-001" in rule_ids, "fmt.Sprintf taint propagation not detected"
+
+    def test_multihop_string_concat(self):
+        """Taint propagates through string concatenation."""
+        code = """
+package main
+import ("database/sql"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    name := r.FormValue("name")
+    q := "SELECT * FROM t WHERE name='" + name + "'"
+    db.Query(q)
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-SQL-001" in rule_ids, "Multi-hop string concat taint not detected"
+
+    def test_interprocedural_function_return(self):
+        """Named function returning request data propagates taint to call site."""
+        code = """
+package main
+import ("database/sql"; "net/http")
+func getID(r *http.Request) string {
+    return r.FormValue("id")
+}
+func handler(w http.ResponseWriter, r *http.Request) {
+    id := getID(r)
+    db.Query("SELECT * FROM t WHERE id='" + id + "'")
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-SQL-001" in rule_ids, "Go interprocedural return taint not detected"
+
+    # ── framework sources ─────────────────────────────────────────────────────
+
+    def test_gin_query_param(self):
+        code = """
+package main
+import "github.com/gin-gonic/gin"
+func handler(c *gin.Context) {
+    id := c.Query("id")
+    db.Query("SELECT * FROM t WHERE id='" + id + "'")
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-SQL-001" in rule_ids, "Gin c.Query() taint source not detected"
+
+    # ── no false positives ────────────────────────────────────────────────────
+
+    def test_no_fp_safe_constant(self):
+        code = """
+package main
+import ("database/sql"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    id := "42"
+    db.Query("SELECT * FROM t WHERE id='" + id + "'")
+}
+"""
+        findings = _GOAST.analyze("main.go", code)
+        sql = [f for f in findings if f.rule_id == "GOAST-SQL-001"]
+        assert not sql, "Constant string assignment must not produce FP"
+
+    def test_no_fp_non_go_file(self):
+        code = 'id := r.FormValue("id"); db.Query(id)'
+        findings = _GOAST.analyze("main.py", code)
+        assert not findings, "Non-.go file must not be analyzed by GoASTAnalyzer"

@@ -1,3 +1,4 @@
+from vulnscanner.analyzers.ast_go import GoASTAnalyzer
 from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
 from vulnscanner.analyzers.ast_js import JSASTAnalyzer, TSASTAnalyzer
 from vulnscanner.analyzers.js_taint import JSTaintAnalyzer
@@ -50,6 +51,7 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     # Language-specific analyzers
     JavaASTAnalyzer(),
     JavaAnalyzer(),
+    GoASTAnalyzer(),
     GoAnalyzer(),
     # JS AST taint tracker (.js/.jsx/.mjs/.cjs — interprocedural, true AST)
     JSASTAnalyzer(),
