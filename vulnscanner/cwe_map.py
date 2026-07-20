@@ -32,12 +32,19 @@ _PREFIX: dict[str, int] = {
 }
 
 
+import re as _re
+
+_AST_PREFIX_RE = _re.compile(
+    r'^(?:AST|JAST|JSAST|TSAST|GOAST|RBAST|PHAST)-'
+)
+
+
 def get_cwe_id(rule_id: str) -> Optional[int]:
     """Return the CWE ID for *rule_id*, or None if unknown."""
     if rule_id in _SPECIFIC:
         return _SPECIFIC[rule_id]
-    # Strip AST-/JAST- prefix so e.g. AST-SQL-001 / JAST-SQL-001 → SQL-001
-    lookup = rule_id.removeprefix("AST-").removeprefix("JAST-")
+    # Strip language-specific AST prefixes: AST-SQL-001, PHAST-CMD-001, etc.
+    lookup = _AST_PREFIX_RE.sub('', rule_id)
     for prefix, cwe in _PREFIX.items():
         if lookup.startswith(prefix):
             return cwe

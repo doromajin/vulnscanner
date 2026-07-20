@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 from vulnscanner.models import ScanResult, Severity
+from vulnscanner.reporters.fix_suggestions import get_fix, get_cwe
 
 _VERSION = "0.2.0"
 
@@ -28,13 +29,20 @@ def write_sarif(result: ScanResult, output_path: str) -> None:
 
     for f in result.findings:
         if f.rule_id not in rule_registry:
+            fix = get_fix(f.vuln_type)
+            cwe = f.cwe_id or get_cwe(f.vuln_type)
             tags = [f.vuln_type.value]
-            if f.cwe_id:
-                tags.append(f"external/cwe/cwe-{f.cwe_id}")
+            if cwe:
+                tags.append(f"external/cwe/cwe-{cwe}")
             rule_registry[f.rule_id] = {
                 "id": f.rule_id,
                 "name": _pascal(f.vuln_type.value),
-                "shortDescription": {"text": f.description[:200]},
+                "shortDescription": {"text": f.vuln_type.value},
+                "fullDescription": {"text": fix["text"]},
+                "help": {
+                    "text": fix["text"],
+                    "markdown": fix["markdown"],
+                },
                 "defaultConfiguration": {
                     "level": _LEVEL.get(f.severity, "warning")
                 },
@@ -69,7 +77,10 @@ def write_sarif(result: ScanResult, output_path: str) -> None:
                         "uri": uri,
                         "uriBaseId": "%SRCROOT%",
                     },
-                    "region": {"startLine": max(f.line_number, 1)},
+                    "region": {
+                        "startLine": max(f.line_number, 1),
+                        **({"snippet": {"text": f.line_content}} if f.line_content else {}),
+                    },
                 }
             }],
         }

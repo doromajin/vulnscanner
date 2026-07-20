@@ -10,6 +10,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from vulnscanner.models import ScanResult, Severity
+from vulnscanner.reporters.fix_suggestions import get_fix
 
 # Ensure stdout uses UTF-8 so Unicode characters in finding descriptions (e.g. em
 # dashes) don't raise UnicodeEncodeError on Windows terminals with narrow encodings
@@ -91,7 +92,7 @@ def print_results(
 
 
 def print_finding_detail(result: ScanResult) -> None:
-    """Print each finding with its code snippet."""
+    """Print each finding with its code snippet and fix suggestion."""
     for finding in result.findings:
         color = _SEVERITY_COLORS[finding.severity]
         header = Text()
@@ -103,6 +104,10 @@ def print_finding_detail(result: ScanResult) -> None:
         body += f"File: {finding.file_path}:{finding.line_number}\n\n"
         if finding.snippet:
             body += finding.snippet
+
+        fix_text = get_fix(finding.vuln_type).get("text", "")
+        if fix_text:
+            body += f"\n\n[dim]Fix: {fix_text}[/dim]"
 
         console.print(Panel(body, title=header, border_style=color.replace("bold ", "")))
         console.print()
