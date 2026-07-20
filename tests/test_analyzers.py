@@ -13,11 +13,13 @@ from vulnscanner.analyzers.ast_java import (
 from vulnscanner.analyzers.ast_go import GoASTAnalyzer, _TS_GO_AVAILABLE
 from vulnscanner.analyzers.ast_js import JSASTAnalyzer, TSASTAnalyzer, _TS_JS_AVAILABLE, _TS_TS_AVAILABLE
 from vulnscanner.analyzers.ast_ruby import RubyASTAnalyzer, _TS_RUBY_AVAILABLE
+from vulnscanner.analyzers.ast_php import PhpASTAnalyzer, _TS_AVAILABLE as _TS_PHP_AVAILABLE
 
 _skip_no_tsjs = pytest.mark.skipif(not _TS_JS_AVAILABLE, reason="tree-sitter-javascript not installed")
 _skip_no_tsts = pytest.mark.skipif(not _TS_TS_AVAILABLE, reason="tree-sitter-typescript not installed")
 _skip_no_tsgo = pytest.mark.skipif(not _TS_GO_AVAILABLE, reason="tree-sitter-go not installed")
 _skip_no_tsrb = pytest.mark.skipif(not _TS_RUBY_AVAILABLE, reason="tree-sitter-ruby not installed")
+_skip_no_tsphp = pytest.mark.skipif(not _TS_PHP_AVAILABLE, reason="tree-sitter-php not installed")
 
 _skip_no_javalang = pytest.mark.skipif(not _HAS_JAVALANG, reason="javalang not installed")
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
@@ -2795,3 +2797,192 @@ end
         code = 'id = params[:id]; User.find_by_sql("SELECT * FROM users WHERE id=" + id)'
         findings = _RBAST.analyze("main.py", code)
         assert not findings, "Non-.rb file must not be analyzed by RubyASTAnalyzer"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PhpASTAnalyzer tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PHPAST = PhpASTAnalyzer()
+
+
+@_skip_no_tsphp
+class TestPhpASTAnalyzer:
+    """Tests for ast_php.py — multi-vuln, multi-hop taint tracking."""
+
+    # ── SQL injection ─────────────────────────────────────────────────────────
+
+    def test_sql_pdo_query_multihop(self):
+        code = """<?php
+$id = $_GET["id"];
+$sql = "SELECT * FROM users WHERE id = " . $id;
+$pdo->query($sql);
+"""
+        findings = _PHPAST.analyze("index.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-SQL-001" in rule_ids, "Multi-hop $_GET → $sql → $pdo->query() not detected"
+
+    def test_sql_mysql_query(self):
+        code = """<?php
+$name = $_POST["name"];
+mysql_query("SELECT * FROM users WHERE name='" . $name . "'");
+"""
+        findings = _PHPAST.analyze("db.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-SQL-001" in rule_ids, "$_POST → mysql_query() not detected"
+
+    def test_sql_mysqli_obj(self):
+        code = """<?php
+$id = $_REQUEST["id"];
+$q = "SELECT * FROM users WHERE id=" . $id;
+$mysqli->query($q);
+"""
+        findings = _PHPAST.analyze("db.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-SQL-001" in rule_ids, "$_REQUEST → $mysqli->query() not detected"
+
+    def test_sql_pdo_prepare(self):
+        code = """<?php
+$col = $_GET["col"];
+$stmt = $pdo->prepare("SELECT " . $col . " FROM users");
+"""
+        findings = _PHPAST.analyze("db.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-SQL-001" in rule_ids, "$_GET → $pdo->prepare() not detected"
+
+    def test_sql_interpolation(self):
+        code = '<?php\n$id = $_GET["id"];\n$pdo->query("SELECT * FROM t WHERE id=$id");\n'
+        findings = _PHPAST.analyze("db.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-SQL-001" in rule_ids, "String interpolation into $pdo->query() not detected"
+
+    # ── Command injection ─────────────────────────────────────────────────────
+
+    def test_cmd_system(self):
+        code = """<?php
+$cmd = $_GET["cmd"];
+system("ls " . $cmd);
+"""
+        findings = _PHPAST.analyze("exec.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-CMD-001" in rule_ids, "$_GET → system() not detected"
+
+    def test_cmd_exec(self):
+        code = """<?php
+$file = $_POST["file"];
+exec($file);
+"""
+        findings = _PHPAST.analyze("exec.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-CMD-001" in rule_ids, "$_POST → exec() not detected"
+
+    def test_cmd_shell_exec(self):
+        code = """<?php
+$arg = $_GET["arg"];
+$out = shell_exec("ping " . $arg);
+"""
+        findings = _PHPAST.analyze("exec.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-CMD-001" in rule_ids, "$_GET → shell_exec() not detected"
+
+    # ── Path traversal / LFI ─────────────────────────────────────────────────
+
+    def test_path_file_get_contents(self):
+        code = """<?php
+$path = $_GET["file"];
+$data = file_get_contents($path);
+echo $data;
+"""
+        findings = _PHPAST.analyze("files.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-PATH-001" in rule_ids, "$_GET → file_get_contents() not detected"
+
+    def test_path_include_lfi(self):
+        code = """<?php
+$page = $_GET["page"];
+include($page . ".php");
+"""
+        findings = _PHPAST.analyze("files.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-PATH-001" in rule_ids, "$_GET → include() not detected"
+
+    def test_path_fopen(self):
+        code = """<?php
+$fname = $_POST["name"];
+$f = fopen($fname, "r");
+"""
+        findings = _PHPAST.analyze("files.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-PATH-001" in rule_ids, "$_POST → fopen() not detected"
+
+    # ── XSS ──────────────────────────────────────────────────────────────────
+
+    def test_xss_echo_multihop(self):
+        code = """<?php
+$raw = $_GET["name"];
+$name = $raw;
+echo $name;
+"""
+        findings = _PHPAST.analyze("view.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-XSS-001" in rule_ids, "Multi-hop $_GET → $name → echo not detected"
+
+    def test_xss_no_fp_htmlspecialchars(self):
+        code = """<?php
+$name = $_GET["name"];
+$safe = htmlspecialchars($name);
+echo $safe;
+"""
+        findings = _PHPAST.analyze("view.php", code)
+        xss = [f for f in findings if f.rule_id == "PHAST-XSS-001"]
+        assert not xss, "htmlspecialchars() sanitized output must not produce XSS FP"
+
+    # ── SSRF ─────────────────────────────────────────────────────────────────
+
+    def test_ssrf_curl_setopt(self):
+        code = """<?php
+$url = $_GET["url"];
+$ch = curl_init();
+curl_setopt($ch, CURLOPT_URL, $url);
+curl_exec($ch);
+"""
+        findings = _PHPAST.analyze("proxy.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-SSRF-001" in rule_ids, "$_GET → curl_setopt(CURLOPT_URL) not detected"
+
+    # ── Open redirect ─────────────────────────────────────────────────────────
+
+    def test_open_redirect_header(self):
+        code = """<?php
+$url = $_GET["return_to"];
+header("Location: " . $url);
+"""
+        findings = _PHPAST.analyze("auth.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-REDIR-001" in rule_ids, "$_GET → header(Location:) not detected"
+
+    # ── False positive suppression ────────────────────────────────────────────
+
+    def test_no_fp_constant_sql(self):
+        code = """<?php
+$sql = "SELECT * FROM users WHERE active = 1";
+$pdo->query($sql);
+"""
+        findings = _PHPAST.analyze("db.php", code)
+        sql = [f for f in findings if f.rule_id == "PHAST-SQL-001"]
+        assert not sql, "Constant SQL must not produce FP"
+
+    def test_no_fp_sanitized_cmd(self):
+        code = """<?php
+$raw = $_GET["file"];
+$file = intval($raw);
+system("cat /proc/" . $file);
+"""
+        findings = _PHPAST.analyze("exec.php", code)
+        cmd = [f for f in findings if f.rule_id == "PHAST-CMD-001"]
+        assert not cmd, "intval() sanitized value must not trigger CMD FP"
+
+    def test_no_fp_non_php_file(self):
+        code = '<?php\n$id = $_GET["id"];\n$pdo->query("SELECT * FROM t WHERE id=" . $id);'
+        findings = _PHPAST.analyze("main.py", code)
+        assert not findings, "Non-.php file must not be analyzed by PhpASTAnalyzer"
