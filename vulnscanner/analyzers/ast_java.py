@@ -1675,4 +1675,40 @@ class JavaASTAnalyzer(BaseAnalyzer):
         except Exception:
             pass
 
+        # ── SSL/TLS hostname verification bypass ──────────────────────────────
+        # setHostnameVerifier(ALLOW_ALL_HOSTNAME_VERIFIER) or any all-trusting
+        # verifier completely disables hostname checks, enabling MITM attacks.
+        try:
+            for _, node in tree.filter(jt.MethodInvocation):
+                if node.member not in ("setHostnameVerifier", "setDefaultHostnameVerifier"):
+                    continue
+                args = node.arguments or []
+                if not args:
+                    continue
+                arg_text = ""
+                if isinstance(args[0], jt.MemberReference):
+                    arg_text = f"{args[0].qualifier}.{args[0].member}" if args[0].qualifier else args[0].member
+                elif isinstance(args[0], jt.ClassCreator):
+                    arg_text = _type_name(args[0].type)
+                # Flag known all-trusting verifier constants or anonymous/null implementations
+                _UNSAFE_VERIFIERS = frozenset({
+                    "ALLOW_ALL_HOSTNAME_VERIFIER",
+                    "AllowAllHostnameVerifier",
+                    "NoopHostnameVerifier",
+                    "NullHostnameVerifier",
+                    "TrustAllHostnameVerifier",
+                    "SSLSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER",
+                    "HttpsURLConnection.ALLOW_ALL_HOSTNAME_VERIFIER",
+                })
+                if any(u in arg_text for u in _UNSAFE_VERIFIERS) or (
+                    isinstance(args[0], jt.ClassCreator)
+                    and _type_name(args[0].type) in _UNSAFE_VERIFIERS
+                ):
+                    _add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "JAST-SSL-001",
+                         f"{node.member}() with all-trusting verifier disables hostname "
+                         "verification — allows any server to impersonate a legitimate host "
+                         "(MITM); remove the custom verifier or use the default strict verifier")
+        except Exception:
+            pass
+
         return findings

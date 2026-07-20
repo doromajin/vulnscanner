@@ -29,6 +29,10 @@ _PREFIX: dict[str, int] = {
     "IAC-K8S":  250,   # CWE-250:  Execution with Unnecessary Privileges
     "LOG":      117,   # CWE-117:  Improper Output Neutralization for Logs
     "TBV":      501,   # CWE-501:  Trust Boundary Violation
+    "SSL":      295,   # CWE-295:  Improper Certificate Validation
+    "RACE":     362,   # CWE-362:  Race Condition (TOCTOU)
+    "MISS":     306,   # CWE-306:  Missing Authentication for Critical Function
+    "DEBUG":    489,   # CWE-489:  Active Debug Code
 }
 
 

@@ -71,6 +71,17 @@ _YAML_SAFE_LOADERS = frozenset({
 _YAML_LOAD_FUNCS = frozenset({"yaml.load", "yaml.full_load"})
 _YAML_UNSAFE_FUNCS = frozenset({"yaml.unsafe_load"})
 
+# ── Flask debug / insecure config ─────────────────────────────────────────────
+
+# Flask class constructors
+_FLASK_CTOR_NAMES = frozenset({"Flask"})
+# SSL context attribute assignments that disable certificate validation
+_SSL_DISABLE_ATTRS = frozenset({"check_hostname"})   # = False → disables
+_SSL_CERT_NONE_NAMES = frozenset({"CERT_NONE", "ssl.CERT_NONE"})
+
+# insecure tempfile functions
+_INSECURE_TEMPFILE_FUNCS = frozenset({"tempfile.mktemp", "mktemp"})
+
 # ── SSRF ──────────────────────────────────────────────────────────────────────
 
 _HTTP_CLIENT_FUNCS = frozenset({
@@ -961,12 +972,16 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_email_header_injection(node)
         self._check_insecure_cookie(node)
         self._check_log_injection(node)
+        self._check_flask_debug(node)
+        self._check_jinja_autoescape(node)
+        self._check_insecure_tempfile(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         for target in node.targets:
             self._check_secret(target, node.value, node)
             self._check_insecure_rng(target, node.value, node)
+            self._check_ssl_ctx_assign(target, node.value, node)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
@@ -1853,6 +1868,74 @@ class _VulnVisitor(ast.NodeVisitor):
                   f"{full or f'.{attr}'}() logs tainted user input — enables log forging "
                   f"via newline injection; strip \\n/\\r or use structured logging: {taint.reason}",
                   taint)
+
+    # ── Flask debug mode ──────────────────────────────────────────────────────
+
+    def _check_flask_debug(self, node: ast.Call) -> None:
+        """Detect Flask app launched with debug=True — exposes Werkzeug RCE console."""
+        func_name = _attr_name(node.func)
+        full = _full_name(node.func)
+        is_flask_ctor = full in _FLASK_CTOR_NAMES or func_name in _FLASK_CTOR_NAMES
+        is_run = func_name == "run"
+        if not (is_flask_ctor or is_run):
+            return
+        for kw in node.keywords:
+            if kw.arg == "debug" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                self._add(node, VulnType.MISSING_AUTHORIZATION, Severity.CRITICAL,
+                          "AST-MISS-001",
+                          "Flask app running with debug=True — Werkzeug interactive debugger "
+                          "allows unauthenticated remote code execution in production; "
+                          "set debug=False or use FLASK_DEBUG=0 env var")
+                return
+
+    # ── Jinja2 autoescape disabled ─────────────────────────────────────────────
+
+    def _check_jinja_autoescape(self, node: ast.Call) -> None:
+        """Detect Jinja2 Environment(autoescape=False) — XSS via unescaped templates."""
+        full = _full_name(node.func)
+        attr = _attr_name(node.func)
+        if full not in ("jinja2.Environment", "Environment") and attr != "Environment":
+            return
+        for kw in node.keywords:
+            if kw.arg == "autoescape" and isinstance(kw.value, ast.Constant) and kw.value.value is False:
+                self._add(node, VulnType.XSS, Severity.HIGH, "AST-XSS-003",
+                          "Jinja2 Environment created with autoescape=False — all template "
+                          "variables are rendered unescaped; use autoescape=True or "
+                          "jinja2.select_autoescape([\"html\", \"xml\"])")
+                return
+
+    # ── Insecure tempfile ─────────────────────────────────────────────────────
+
+    def _check_insecure_tempfile(self, node: ast.Call) -> None:
+        """Detect tempfile.mktemp() — TOCTOU race condition in temp file creation."""
+        full = _full_name(node.func)
+        if full not in _INSECURE_TEMPFILE_FUNCS:
+            return
+        self._add(node, VulnType.RACE_CONDITION, Severity.MEDIUM, "AST-RACE-001",
+                  "tempfile.mktemp() returns a filename without opening it atomically — "
+                  "another process can create the file between mktemp() and open() (TOCTOU); "
+                  "use tempfile.mkstemp() or tempfile.NamedTemporaryFile() instead")
+
+    # ── SSL context attribute assignments ──────────────────────────────────────
+
+    def _check_ssl_ctx_assign(self, target: ast.expr, value: ast.expr, node: ast.AST) -> None:
+        """Detect ssl.SSLContext assignments that disable certificate validation."""
+        if not isinstance(target, ast.Attribute):
+            return
+        attr = target.attr
+        # ctx.check_hostname = False → disables hostname verification
+        if attr == "check_hostname" and isinstance(value, ast.Constant) and value.value is False:
+            self._add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "AST-SSL-001",
+                      "SSL context check_hostname set to False — disables hostname "
+                      "verification, allowing MITM attacks; keep check_hostname=True")
+        # ctx.verify_mode = ssl.CERT_NONE → disables cert verification entirely
+        if attr == "verify_mode":
+            val_name = _full_name(value) or ""
+            if val_name in _SSL_CERT_NONE_NAMES:
+                self._add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.CRITICAL, "AST-SSL-002",
+                          "SSL context verify_mode set to CERT_NONE — disables ALL certificate "
+                          "validation, allowing any server to be impersonated (MITM); "
+                          "use ssl.CERT_REQUIRED")
 
     # ── XSS: Flask/Django response body accumulation ───────────────────────────
 
