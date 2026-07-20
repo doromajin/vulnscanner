@@ -2223,6 +2223,69 @@ public class UserService {
         assert sql, "@PathVariable taint must propagate into service method param via cross-file seeding"
 
 
+# ── Java CFG guards ───────────────────────────────────────────────────────────
+
+@_skip_no_javalang
+class TestJavaCFGGuards:
+    """Early-exit validation guards suppress taint sinks in Java."""
+
+    _IMPORTS = (
+        "import javax.servlet.http.HttpServletRequest;\n"
+        "import java.sql.*;\n"
+    )
+
+    def _sql_findings(self, code: str) -> list:
+        return [f for f in JavaASTAnalyzer().analyze("C.java", code) if "SQL" in f.rule_id]
+
+    def test_regex_matches_guard_suppresses_sql(self):
+        code = self._IMPORTS + r"""
+public class C {
+    public void m(HttpServletRequest req, Connection conn) throws Exception {
+        String uid = req.getParameter("id");
+        if (!uid.matches("\d+")) { throw new IllegalArgumentException("bad"); }
+        Statement st = conn.createStatement();
+        st.executeQuery("SELECT * FROM t WHERE id=" + uid);
+    }
+}"""
+        assert not self._sql_findings(code), "regex matches() guard must suppress SQL injection FP"
+
+    def test_static_isnumeric_guard_suppresses_sql(self):
+        code = self._IMPORTS + r"""
+public class C {
+    public void m(HttpServletRequest req, Connection conn) throws Exception {
+        String page = req.getParameter("page");
+        if (!isNumeric(page)) { return; }
+        Statement st = conn.createStatement();
+        st.executeQuery("SELECT * FROM t LIMIT " + page);
+    }
+    private boolean isNumeric(String s) { return s.matches("-?\\d+"); }
+}"""
+        assert not self._sql_findings(code), "static isNumeric() guard must suppress SQL injection FP"
+
+    def test_null_only_guard_does_not_suppress_sql(self):
+        code = self._IMPORTS + r"""
+public class C {
+    public void m(HttpServletRequest req, Connection conn) throws Exception {
+        String uid = req.getParameter("id");
+        if (uid == null) { return; }
+        Statement st = conn.createStatement();
+        st.executeQuery("SELECT * FROM t WHERE id=" + uid);
+    }
+}"""
+        assert self._sql_findings(code), "null-only guard must NOT suppress SQL injection — content is still unsanitized"
+
+    def test_unguarded_tainted_still_fires(self):
+        code = self._IMPORTS + r"""
+public class C {
+    public void m(HttpServletRequest req, Connection conn) throws Exception {
+        String uid = req.getParameter("id");
+        Statement st = conn.createStatement();
+        st.executeQuery("SELECT * FROM t WHERE id=" + uid);
+    }
+}"""
+        assert self._sql_findings(code), "unguarded tainted variable must produce SQL injection finding"
+
+
 _JSAST = JSASTAnalyzer()
 
 

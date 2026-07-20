@@ -275,6 +275,20 @@ _SPRING_PARAM_ANNOTATIONS = frozenset({
     "ModelAttribute",
 })
 
+# String-format validation methods whose presence in an if-guard condition
+# (followed by throw/return) marks the variable as format-validated (CLEAN).
+# Null/empty checks are intentionally excluded: they prove non-null but do
+# not sanitize content against injection.
+_JAVA_GUARD_VALIDATION_METHODS = frozenset({
+    "matches",          # String.matches(regex) — whitelist regex guard
+    "isNumeric",        # Apache Commons StringUtils.isNumeric()
+    "isAlpha",          # Apache Commons StringUtils.isAlpha()
+    "isAlphanumeric",   # Apache Commons StringUtils.isAlphanumeric()
+    "isDigitsOnly",     # Android TextUtils.isDigitsOnly()
+    "isValid",          # Bean Validation / custom Validator.isValid()
+    "validate",         # Custom validation utility
+})
+
 # ── taint helpers ──────────────────────────────────────────────────────────────
 
 def _type_name(ref_type) -> str:
@@ -1178,6 +1192,62 @@ def _load_properties_files(file_path_str: str) -> dict:
 
 # ── analyzer ───────────────────────────────────────────────────────────────────
 
+def _collect_java_guards(tree) -> "set[str]":
+    """Return names of variables format-validated by early-exit IfStatement guards.
+
+    Recognized patterns (body must throw or return; no else allowed):
+      if (!var.matches("[a-zA-Z0-9]+"))  { throw ... }  — whitelist regex
+      if (!StringUtils.isNumeric(var))   { throw ... }  — numeric utility
+      if (var == null || !var.matches(r)) { return; }   — combined null+regex
+
+    Only format-validation methods from _JAVA_GUARD_VALIDATION_METHODS suppress
+    taint.  Null/empty-only checks do not count as sanitization.
+    """
+    if not _HAS_JAVALANG:
+        return set()
+    guarded: set = set()
+
+    def _has_exit(then_stmt) -> bool:
+        """True if then_stmt is or contains a throw or return."""
+        if then_stmt is None:
+            return False
+        stmts = getattr(then_stmt, "statements", None)
+        if stmts is not None:
+            return any(isinstance(s, (jt.ThrowStatement, jt.ReturnStatement)) for s in stmts)
+        return isinstance(then_stmt, (jt.ThrowStatement, jt.ReturnStatement))
+
+    def _vars_from_cond(cond) -> "set[str]":
+        """Recursively collect validated variable names from an IfStatement condition."""
+        if cond is None:
+            return set()
+        result: set = set()
+        if isinstance(cond, jt.MethodInvocation):
+            q = str(cond.qualifier or "")
+            if q and cond.member in _JAVA_GUARD_VALIDATION_METHODS:
+                result.add(q)
+            # Also check if the method itself is a static validator: isNumeric(var)
+            for arg in (cond.arguments or []):
+                if isinstance(arg, jt.MemberReference) and not arg.qualifier:
+                    if cond.member in _JAVA_GUARD_VALIDATION_METHODS:
+                        result.add(arg.member)
+        elif isinstance(cond, jt.BinaryOperation) and cond.operator in ("||", "&&"):
+            result.update(_vars_from_cond(cond.operandl))
+            result.update(_vars_from_cond(cond.operandr))
+        return result
+
+    try:
+        for _, if_node in tree.filter(jt.IfStatement):
+            if if_node.else_statement:
+                continue
+            if not _has_exit(if_node.then_statement):
+                continue
+            guarded.update(_vars_from_cond(if_node.condition))
+    except Exception:
+        pass
+
+    return guarded
+
+
 class JavaASTAnalyzer(BaseAnalyzer):
     """AST-level analyzer for .java files using javalang."""
 
@@ -1194,6 +1264,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
         lines = content.splitlines()
         _props = _load_properties_files(file_path)
         tainted, list_tainted_vars = _collect_tainted(tree)
+        # Remove format-validated variables (guarded by early-exit if-throw/return).
+        # These are provably safe after the guard; keeping them in tainted causes FP.
+        tainted -= _collect_java_guards(tree)
         writers = _collect_writers(tree)
         _, _const_strings = _collect_const_context(tree, _props)
         findings: list[Finding] = []
