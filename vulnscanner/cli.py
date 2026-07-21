@@ -820,5 +820,163 @@ def init(target_dir: str, force: bool) -> None:
     )
 
 
+# ── pr-comment ────────────────────────────────────────────────────────────────
+
+@main.command("pr-comment")
+@click.argument("repo", metavar="OWNER/REPO")
+@click.option("--pr", "pr_number", required=True, type=int, metavar="NUMBER",
+              envvar="GITHUB_PR_NUMBER",
+              help="Pull request number (or set GITHUB_PR_NUMBER env var)")
+@click.option("--token", envvar="GITHUB_TOKEN", help="GitHub personal access token")
+@click.option("--min-severity", default="MEDIUM", type=_SEVERITY_CHOICES,
+              help="Only comment on findings at or above this severity (default: MEDIUM)")
+@click.option("--fail-on", default=None, type=_SEVERITY_CHOICES,
+              help="Exit 1 if any finding at or above this severity exists in the PR")
+@click.option("--dry-run", is_flag=True,
+              help="Print what would be posted without actually posting")
+@click.option("--workers", "-w", default=0, type=int, metavar="N",
+              help="Parallel worker threads (0 = auto-detect)")
+def pr_comment(
+    repo: str,
+    pr_number: int,
+    token: str | None,
+    min_severity: str,
+    fail_on: str | None,
+    dry_run: bool,
+    workers: int,
+) -> None:
+    """Scan a GitHub PR and post inline review comments for security findings.
+
+    Requires the GitHub CLI (gh) with PR write permissions, or GITHUB_TOKEN
+    with repo scope.  Only findings in PR-changed files are posted.
+
+    Example (in CI):\n
+        vulnscan pr-comment owner/repo --pr $PR_NUMBER --fail-on HIGH
+    """
+    import json
+    import subprocess
+    from vulnscanner.models import Severity
+
+    severity_order = list(Severity)
+    min_sev = Severity(min_severity.upper())
+    cutoff = severity_order.index(min_sev)
+
+    # ── Step 1: get PR metadata (head SHA + changed file list) ────────────────
+    def _gh_api(path: str) -> dict | list:
+        env = os.environ.copy()
+        if token:
+            env["GITHUB_TOKEN"] = token
+        result = subprocess.run(
+            ["gh", "api", path],
+            capture_output=True, text=True, env=env,
+        )
+        if result.returncode != 0:
+            console.print(f"[red]gh api error ({path}): {result.stderr.strip()}[/red]")
+            sys.exit(1)
+        return json.loads(result.stdout)
+
+    console.print(f"[dim]Fetching PR #{pr_number} metadata from {repo}...[/dim]")
+    pr_meta = _gh_api(f"repos/{repo}/pulls/{pr_number}")
+    head_sha: str = pr_meta["head"]["sha"]
+
+    pr_files_raw = _gh_api(f"repos/{repo}/pulls/{pr_number}/files")
+    pr_changed: set[str] = {f["filename"] for f in pr_files_raw}
+    console.print(f"[dim]PR #{pr_number} — {len(pr_changed)} changed file(s), head SHA: {head_sha[:8]}[/dim]")
+
+    # ── Step 2: scan the repo, filter to PR-changed files ─────────────────────
+    console.print(f"[dim]Scanning {repo}...[/dim]")
+    scanner = VulnScanner(github_token=token, workers=workers)
+    result_obj = scanner.scan(repo)
+
+    findings = [
+        f for f in result_obj.findings
+        if (f.file_path in pr_changed
+            and severity_order.index(f.severity) <= cutoff)
+    ]
+    console.print(
+        f"[dim]Scan complete — {len(result_obj.findings)} total finding(s), "
+        f"{len(findings)} in PR-changed files at {min_severity}+[/dim]"
+    )
+
+    if not findings:
+        console.print("[green]No findings to post for this PR.[/green]")
+        sys.exit(0)
+
+    # ── Step 3: build review payload ─────────────────────────────────────────
+    sev_emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "⚪"}
+
+    def _finding_body(f) -> str:
+        emoji = sev_emoji.get(f.severity.value if hasattr(f.severity, "value") else f.severity, "⚠️")
+        sev = f.severity.value if hasattr(f.severity, "value") else f.severity
+        lines = [
+            f"{emoji} **{sev} — {f.rule_id}** {f.vuln_type.value if hasattr(f.vuln_type, 'value') else f.vuln_type}",
+            f"> {f.description}",
+        ]
+        if f.cwe_id:
+            lines.append(f"**CWE**: [CWE-{f.cwe_id}](https://cwe.mitre.org/data/definitions/{f.cwe_id}.html)")
+        return "\n".join(lines)
+
+    review_comments = [
+        {
+            "path": f.file_path,
+            "line": f.line_number,
+            "body": _finding_body(f),
+        }
+        for f in findings
+    ]
+
+    crit = sum(1 for f in findings if (f.severity.value if hasattr(f.severity, "value") else f.severity) == "CRITICAL")
+    high = sum(1 for f in findings if (f.severity.value if hasattr(f.severity, "value") else f.severity) == "HIGH")
+    summary_body = (
+        f"## VulnScanner found {len(findings)} finding(s) in this PR\n\n"
+        f"| Severity | Count |\n|----------|-------|\n"
+        + "\n".join(
+            f"| {sev_emoji.get(sev, '⚠️')} {sev} | {sum(1 for f in findings if (f.severity.value if hasattr(f.severity,'value') else f.severity)==sev)} |"
+            for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+            if any((f.severity.value if hasattr(f.severity, "value") else f.severity) == sev for f in findings)
+        )
+        + f"\n\n*Scanned by [VulnScanner](https://github.com/doromajin/vulnscanner) — "
+          f"`vulnscan pr-comment {repo} --pr {pr_number}`*"
+    )
+
+    # ── Step 4: post or dry-run ───────────────────────────────────────────────
+    if dry_run:
+        console.print("\n[yellow]Dry run — review that would be posted:[/yellow]")
+        console.print(f"\n[bold]Summary:[/bold]\n{summary_body}\n")
+        for c in review_comments:
+            console.print(f"  [cyan]{c['path']}:{c['line']}[/cyan] — {c['body'][:80]}...")
+    else:
+        payload = {
+            "commit_id": head_sha,
+            "body": summary_body,
+            "event": "COMMENT",
+            "comments": review_comments,
+        }
+        env = os.environ.copy()
+        if token:
+            env["GITHUB_TOKEN"] = token
+        post_result = subprocess.run(
+            ["gh", "api", "--method", "POST",
+             f"repos/{repo}/pulls/{pr_number}/reviews",
+             "--input", "-"],
+            input=json.dumps(payload),
+            capture_output=True, text=True, env=env,
+        )
+        if post_result.returncode != 0:
+            console.print(f"[red]Failed to post review: {post_result.stderr.strip()}[/red]")
+            sys.exit(1)
+        review_url = json.loads(post_result.stdout).get("html_url", "")
+        console.print(f"[green]Posted {len(review_comments)} inline comment(s) to PR #{pr_number}[/green]")
+        if review_url:
+            console.print(f"[dim]{review_url}[/dim]")
+
+    # ── Step 5: fail-on exit code ─────────────────────────────────────────────
+    if fail_on:
+        fail_sev = Severity(fail_on.upper())
+        fail_cutoff = severity_order.index(fail_sev)
+        if any(severity_order.index(f.severity) <= fail_cutoff for f in findings):
+            sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
