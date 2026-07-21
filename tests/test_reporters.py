@@ -213,40 +213,36 @@ class TestVulnscannerInit:
 # ── --stdout-json ─────────────────────────────────────────────────────────────
 
 class TestStdoutJson:
-    def test_stdout_json_outputs_valid_json(self, tmp_path):
-        from click.testing import CliRunner
-        from vulnscanner.cli import main
+    """Tests for --stdout-json flag using subprocess so stdout/stderr are always separate."""
 
-        # Write a trivially safe Python file so scan has something to process
+    def _run_stdout_json(self, tmp_path, extra_args=None):
+        import subprocess, sys
+        args = [sys.executable, "-m", "vulnscanner.cli", "scan", str(tmp_path), "--stdout-json"]
+        if extra_args:
+            args.extend(extra_args)
+        return subprocess.run(args, capture_output=True, text=True)
+
+    def test_stdout_json_outputs_valid_json(self, tmp_path):
         (tmp_path / "safe.py").write_text("x = 1\n")
-        runner = CliRunner(mix_stderr=False)
-        result = runner.invoke(main, ["scan", str(tmp_path), "--stdout-json"])
-        assert result.exit_code == 0, result.output
-        data = json.loads(result.output)
+        result = self._run_stdout_json(tmp_path)
+        assert result.returncode == 0, result.stderr
+        data = json.loads(result.stdout)
         assert "findings" in data
         assert "summary" in data
 
     def test_stdout_json_contains_findings_for_vuln_code(self, tmp_path):
-        from click.testing import CliRunner
-        from vulnscanner.cli import main
-
         (tmp_path / "vuln.py").write_text(
             "import os\ndef f(x): os.system(x)\n"
         )
-        runner = CliRunner(mix_stderr=False)
-        result = runner.invoke(main, ["scan", str(tmp_path), "--stdout-json"])
-        assert result.exit_code == 0
-        data = json.loads(result.output)
+        result = self._run_stdout_json(tmp_path)
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
         rule_ids = [f["rule_id"] for f in data["findings"]]
         assert any("CMD" in r for r in rule_ids)
 
     def test_stdout_json_no_rich_table_in_output(self, tmp_path):
-        from click.testing import CliRunner
-        from vulnscanner.cli import main
-
         (tmp_path / "safe.py").write_text("x = 1\n")
-        runner = CliRunner(mix_stderr=False)
-        result = runner.invoke(main, ["scan", str(tmp_path), "--stdout-json"])
-        # Rich table characters should not appear in stdout
-        assert "─" not in result.output
-        assert "Summary" not in result.output
+        result = self._run_stdout_json(tmp_path)
+        # Rich table characters must not appear in stdout (only stderr)
+        assert "─" not in result.stdout
+        assert "Summary" not in result.stdout
