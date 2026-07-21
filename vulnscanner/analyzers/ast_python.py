@@ -485,6 +485,7 @@ class CrossFileTaintSummary:
     global_taint_sources: frozenset[str] = field(default_factory=frozenset)
     tainted_globals: dict[str, frozenset[str]] = field(default_factory=dict)
     confirmed_tainted_params: dict[str, frozenset[int]] = field(default_factory=dict)
+    confirmed_clean_params: dict[str, frozenset[int]] = field(default_factory=dict)
 
 
 # ── interprocedural taint (per-file, single-threaded) ─────────────────────────
@@ -995,6 +996,19 @@ class _VulnVisitor(ast.NodeVisitor):
                             _pname = _params[_idx].arg
                             if _pname not in self._assignments:
                                 self._assignments[_pname] = _TAINTED_MODULE_SENTINEL
+
+                # Phase F: inject CLEAN sentinels for params confirmed to receive
+                # only CLI-originated (operator-controlled) input.  TAINTED takes
+                # precedence — only inject CLEAN if not already set to TAINTED.
+                _conf_clean = _cf_sum.confirmed_clean_params.get(node.name, frozenset())
+                if _conf_clean:
+                    _params_f = [a for a in node.args.args if a.arg != "self"]
+                    _clean_sentinel = ast.Constant(value=0)
+                    for _idx in _conf_clean:
+                        if _idx < len(_params_f):
+                            _pname = _params_f[_idx].arg
+                            if _pname not in self._assignments:
+                                self._assignments[_pname] = _clean_sentinel
 
         _cf_sum_web = getattr(_cross_file_local, "cf_summary", None)
         _has_confirmed_params = bool(
@@ -3521,6 +3535,10 @@ def _is_tainted_expr_quick(
         fn = _full_name(node.func)
         if fn in global_taint_sources or fn in _PY_ANY_QUALIFIER_TAINT_METHODS:
             return True
+        # Propagate through method calls: request.args.get() → tainted because receiver is tainted
+        if isinstance(node.func, ast.Attribute):
+            if _is_tainted_expr_quick(node.func.value, tainted_vars, global_taint_sources, depth + 1):
+                return True
         return any(
             _is_tainted_expr_quick(a, tainted_vars, global_taint_sources, depth + 1)
             for a in node.args
@@ -3561,6 +3579,98 @@ def _collect_tainted_vars_in_body(
                 if isinstance(stmt.target, ast.Name):
                     tainted.add(stmt.target.id)
     return tainted
+
+
+def _is_clean_expr_quick(node: ast.expr, clean_vars: set[str], depth: int = 0) -> bool:
+    """Lightweight CLEAN check for Phase F CLI-param propagation.
+
+    Conservative: only constants, names in clean_vars, attribute access on CLEAN
+    objects, and parse_args() returns qualify as CLEAN.  Arbitrary calls are not
+    trusted so taint introduced by network/user operations is never suppressed.
+    """
+    if depth > 4:
+        return False
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Name):
+        return node.id in clean_vars
+    if isinstance(node, ast.Attribute):
+        # e.g. args.target where args came from parse_args() → CLEAN
+        return _is_clean_expr_quick(node.value, clean_vars, depth + 1)
+    if isinstance(node, ast.Call):
+        attr = _attr_name(node.func)
+        return attr in _CLI_PARSE_METHODS
+    return False
+
+
+def _collect_clean_vars_in_body(stmts: list[ast.stmt], seed: set[str]) -> set[str]:
+    """Single-pass forward scan: return names assigned exclusively from CLEAN sources."""
+    clean = seed.copy()
+    for stmt in stmts:
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            val = stmt.value if isinstance(stmt, ast.Assign) else stmt.value
+            if val is None:
+                continue
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            if _is_clean_expr_quick(val, clean):
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        clean.add(t.id)
+    return clean
+
+
+def _build_confirmed_clean_params(
+    parsed_trees: dict[str, ast.Module],
+) -> dict[str, frozenset[int]]:
+    """Phase F: build {func_name: {param_idx}} for params confirmed CLEAN from CLI callers.
+
+    Mirrors _build_confirmed_tainted_params but seeds from CLI entry functions
+    (Click/Typer decorated) instead of web entry points.  Propagates transitively
+    so helper functions called from CLI entries suppress path-traversal FPs.
+    """
+    confirmed: dict[str, set[int]] = {}
+
+    func_bodies: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for tree in parsed_trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_bodies.setdefault(node.name, []).append(node)
+
+    changed = True
+    for _ in range(10):
+        if not changed:
+            break
+        changed = False
+        for _name, func_list in func_bodies.items():
+            for func_def in func_list:
+                params = [a.arg for a in func_def.args.args if a.arg != "self"]
+
+                # Seed: CLI entry params are CLEAN; confirmed clean from previous iters
+                clean_seed: set[str] = set()
+                if _func_is_cli_entry(func_def):
+                    clean_seed.update(params)
+                for idx in confirmed.get(_name, set()):
+                    if idx < len(params):
+                        clean_seed.add(params[idx])
+
+                if not clean_seed:
+                    continue
+
+                clean_vars = _collect_clean_vars_in_body(func_def.body, clean_seed)
+
+                for node in ast.walk(func_def):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    callee = _full_name(node.func) or _attr_name(node.func)
+                    if not callee:
+                        continue
+                    for i, arg in enumerate(node.args):
+                        if _is_clean_expr_quick(arg, clean_vars):
+                            if i not in confirmed.get(callee, set()):
+                                confirmed.setdefault(callee, set()).add(i)
+                                changed = True
+
+    return {k: frozenset(v) for k, v in confirmed.items()}
 
 
 def _build_confirmed_tainted_params(
@@ -3728,8 +3838,15 @@ def build_cross_file_summary(all_contents: dict[str, str]) -> CrossFileTaintSumm
     # sentinels, raising finding confidence from 0.3 (UNKNOWN/low_reach) to 0.9.
     conf_params = _build_confirmed_tainted_params(parsed_trees, global_sources)
 
+    # ── Step 5 (Phase F): confirmed-CLEAN parameter map ───────────────────────
+    # Build {func_name: {param_idx}} for parameters confirmed to receive only
+    # CLI-originated (operator-controlled) input.  These params are injected as
+    # CLEAN sentinels to suppress false positives for internal path operations.
+    conf_clean_params = _build_confirmed_clean_params(parsed_trees)
+
     return CrossFileTaintSummary(
         global_taint_sources=global_sources,
         tainted_globals=tainted_by_file,
         confirmed_tainted_params=conf_params,
+        confirmed_clean_params=conf_clean_params,
     )

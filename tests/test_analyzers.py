@@ -1884,6 +1884,68 @@ def process(q=None):
             )
 
 
+# ── Phase F: CLI CLEAN param propagation ─────────────────────────────────────
+
+class TestPhaseFCLICleanPropagation:
+    """Phase F: params confirmed to receive only CLI-originated input must suppress PATH FPs."""
+
+    def _scan_multi(self, files: dict[str, str]):
+        from vulnscanner.scanner import VulnScanner
+        import tempfile, os
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, content in files.items():
+                Path(os.path.join(tmp, name)).write_text(content)
+            return VulnScanner().scan(tmp)
+
+    def test_cli_callee_path_no_fp(self):
+        """Function called from Click CLI entry with CLI path arg must not produce PATH finding."""
+        result = self._scan_multi({
+            "cli.py": (
+                "import click\n"
+                "@click.command()\n"
+                "@click.argument('output_path')\n"
+                "def export(output_path):\n"
+                "    save_file(output_path)\n"
+            ),
+            "helper.py": (
+                "from pathlib import Path\n"
+                "def save_file(path):\n"
+                "    Path(path).write_text('data')\n"
+            ),
+        })
+        path_findings = [
+            f for f in result.findings
+            if "PATH" in f.rule_id and "helper.py" in f.file_path
+            and not f.suppression_reason
+        ]
+        assert not path_findings, (
+            f"CLI-callee path must not produce PATH finding, got: {path_findings}"
+        )
+
+    def test_web_callee_path_still_detected(self):
+        """Same helper called from a web entry with tainted arg must still produce finding."""
+        result = self._scan_multi({
+            "views.py": (
+                "from flask import request\n"
+                "def download(req):\n"
+                "    filename = request.args.get('file')\n"
+                "    save_file(filename)\n"
+            ),
+            "helper.py": (
+                "from pathlib import Path\n"
+                "def save_file(path):\n"
+                "    Path(path).write_text('data')\n"
+            ),
+        })
+        path_findings = [
+            f for f in result.findings
+            if "PATH" in f.rule_id and "helper.py" in f.file_path
+            and not f.suppression_reason
+        ]
+        assert path_findings, "Web-callee path with tainted arg must produce PATH finding"
+
+
 # ── NoSQL injection ───────────────────────────────────────────────────────────
 
 class TestNoSQLInjection:
@@ -2347,6 +2409,48 @@ public class UserService {
         )
         sql = [f for f in findings if "SQL" in f.rule_id]
         assert sql, "@PathVariable taint must propagate into service method param via cross-file seeding"
+
+    def test_3hop_spring_controller_to_dao(self):
+        """@RequestParam in Controller → Service → DAO — 3-hop cross-file chain must detect SQLi."""
+        controller = """
+import org.springframework.web.bind.annotation.*;
+@RestController
+public class UserController {
+    private UserService svc;
+    @GetMapping("/user")
+    public String get(@RequestParam String userId) {
+        return svc.findUser(userId);
+    }
+}"""
+        service = """
+public class UserService {
+    private UserDao dao;
+    public String findUser(String uid) {
+        return dao.queryUser(uid);
+    }
+}"""
+        dao = """
+import java.sql.*;
+public class UserDao {
+    private Connection conn;
+    public String queryUser(String id) throws Exception {
+        Statement st = conn.createStatement();
+        return st.executeQuery("SELECT * FROM users WHERE id='" + id + "'").toString();
+    }
+}"""
+        all_files = {
+            "UserController.java": controller,
+            "UserService.java": service,
+            "UserDao.java": dao,
+        }
+        ctx = build_java_cross_file_context(all_files)
+        set_java_cross_file_context(ctx)
+        try:
+            findings = JavaASTAnalyzer().analyze("UserDao.java", dao)
+        finally:
+            set_java_cross_file_context(None)
+        sql = [f for f in findings if "SQL" in f.rule_id]
+        assert sql, "3-hop @RequestParam→Service→DAO SQLi must be detected"
 
 
 # ── Java CFG guards ───────────────────────────────────────────────────────────

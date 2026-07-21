@@ -108,13 +108,40 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
         except Exception:
             pass
 
-    # Second pass: find controller methods with Spring-annotated params,
-    # then record which callee methods are invoked with those tainted params.
-    tainted_callee_params: dict[str, set[int]] = {}
+    # Build a name → [MethodDeclaration, ...] map for fixed-point propagation below.
+    method_nodes: dict[str, list] = {}
     for tree, _fp in parsed_trees:
         try:
             for _, method in tree.filter(jt.MethodDeclaration):
-                # Collect Spring-annotated parameter names for this method
+                method_nodes.setdefault(method.name, []).append(method)
+        except Exception:
+            pass
+
+    # Second pass: find controller methods with Spring-annotated params,
+    # then record which callee methods are invoked with those tainted params.
+    tainted_callee_params: dict[str, set[int]] = {}
+
+    def _propagate_from_method(method, tainted_pnames: set[str]) -> None:
+        """Record callee param indices whenever a tainted param is passed as an arg."""
+        try:
+            for _, invoc in method.filter(jt.MethodInvocation):
+                callee = invoc.member
+                if not callee:
+                    continue
+                for idx, arg in enumerate(invoc.arguments or []):
+                    arg_name: str | None = None
+                    if isinstance(arg, jt.MemberReference) and not arg.qualifier:
+                        arg_name = arg.member
+                    if arg_name and arg_name in tainted_pnames:
+                        if idx not in tainted_callee_params.get(callee, set()):
+                            tainted_callee_params.setdefault(callee, set()).add(idx)
+        except Exception:
+            pass
+
+    # Seed from Spring-annotated controller params (1-hop)
+    for tree, _fp in parsed_trees:
+        try:
+            for _, method in tree.filter(jt.MethodDeclaration):
                 spring_params: set[str] = set()
                 for param in (method.parameters or []):
                     for ann in (getattr(param, "annotations", None) or []):
@@ -122,23 +149,33 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                             pname = getattr(param, "name", "")
                             if pname:
                                 spring_params.add(pname)
-                if not spring_params:
-                    continue
-                # Walk method body for calls where a Spring param is passed as argument
-                for _, invoc in method.filter(jt.MethodInvocation):
-                    callee = invoc.member
-                    if not callee:
-                        continue
-                    for idx, arg in enumerate(invoc.arguments or []):
-                        arg_name: str | None = None
-                        if isinstance(arg, jt.MemberReference) and not arg.qualifier:
-                            arg_name = arg.member
-                        if arg_name and arg_name in spring_params:
-                            if callee not in tainted_callee_params:
-                                tainted_callee_params[callee] = set()
-                            tainted_callee_params[callee].add(idx)
+                if spring_params:
+                    _propagate_from_method(method, spring_params)
         except Exception:
             pass
+
+    # Fixed-point transitive propagation (up to 8 hops)
+    for _ in range(8):
+        changed = False
+        snapshot = {k: set(v) for k, v in tainted_callee_params.items()}
+        for mname, tainted_indices in snapshot.items():
+            for mnode in method_nodes.get(mname, []):
+                params = mnode.parameters or []
+                tainted_pnames: set[str] = set()
+                for idx in tainted_indices:
+                    if idx < len(params):
+                        pname = getattr(params[idx], "name", "")
+                        if pname:
+                            tainted_pnames.add(pname)
+                if not tainted_pnames:
+                    continue
+                before = sum(len(v) for v in tainted_callee_params.values())
+                _propagate_from_method(mnode, tainted_pnames)
+                after = sum(len(v) for v in tainted_callee_params.values())
+                if after > before:
+                    changed = True
+        if not changed:
+            break
 
     return JavaCrossFileCtx(remote_methods=remote_methods, tainted_callee_params=tainted_callee_params)
 
