@@ -228,6 +228,11 @@ _UNIVERSAL_SANITIZER_FUNCS = frozenset({"int", "float", "bool"})
 # their first argument.  URL-decoding (unquote*) makes encoded input *more* raw,
 # not safer.  JSON parsing preserves any injection payload in the underlying string.
 _TAINT_PASSTHROUGH_FUNCS = frozenset({
+    # Type coercions: str/bytes/repr propagate taint so that str(CLEAN) → CLEAN
+    # (enables isinstance/int() guard suppression) while str(TAINTED) → TAINTED.
+    "str",
+    "bytes",
+    "repr",
     "urllib.parse.unquote",
     "urllib.parse.unquote_plus",
     "urllib.parse.unquote_to_bytes",

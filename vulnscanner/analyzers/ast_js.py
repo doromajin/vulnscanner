@@ -62,6 +62,7 @@ def _member_chain(node) -> list[str]:
     """Return identifier names in a member expression chain, root first.
 
     E.g. ``req.body.name`` → ``['req', 'body', 'name']``.
+    ``require('fs')`` → ``['fs']`` (inline-require treated as its module name).
     """
     if node.type == "identifier":
         return [node.text.decode("utf-8", errors="replace")]
@@ -72,6 +73,20 @@ def _member_chain(node) -> list[str]:
         if prop is not None:
             chain.append(prop.text.decode("utf-8", errors="replace"))
         return chain
+    # require('module') → ['module'] so that require('fs').readFileSync() is
+    # treated the same as a variable named 'fs'.
+    if node.type == "call_expression":
+        func = node.child_by_field_name("function")
+        args = node.child_by_field_name("arguments")
+        if (func is not None and func.type == "identifier"
+                and func.text.decode("utf-8", errors="replace") == "require"
+                and args is not None):
+            for arg in args.named_children:
+                raw = arg.text.decode("utf-8", errors="replace").strip("'\"")
+                # Normalise 'node:fs', 'fs/promises', 'node:fs/promises' → 'fs'
+                mod = raw.replace("node:", "").split("/")[0]
+                if mod:
+                    return [mod]
     return []
 
 

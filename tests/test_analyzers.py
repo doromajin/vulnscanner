@@ -1946,6 +1946,59 @@ class TestPhaseFCLICleanPropagation:
         assert path_findings, "Web-callee path with tainted arg must produce PATH finding"
 
 
+class TestPythonStrPassthrough:
+    """str/bytes/repr must propagate taint so guard-validated CLEAN values don't FP."""
+
+    def _scan(self, code: str):
+        return PythonASTAnalyzer().analyze("app.py", code)
+
+    def test_str_of_tainted_still_detected(self):
+        """str(tainted) must remain TAINTED → SQL finding must fire."""
+        code = (
+            "from flask import request\n"
+            "def view():\n"
+            "    uid = request.args.get('id')\n"
+            "    import sqlite3; conn = sqlite3.connect(':memory:')\n"
+            "    conn.execute('SELECT * FROM t WHERE id=' + str(uid))\n"
+        )
+        findings = self._scan(code)
+        rule_ids = {f.rule_id for f in findings}
+        assert any("SQL" in r for r in rule_ids), "str(tainted) must still trigger SQL finding"
+
+    def test_str_of_isinstance_guarded_clean_no_fp(self):
+        """int() reassignment + isinstance guard → str(clean) must suppress SQL FP."""
+        code = (
+            "from flask import request\n"
+            "def view():\n"
+            "    uid = request.args.get('id')\n"
+            "    if not isinstance(uid, str):\n"
+            "        return\n"
+            "    uid = int(uid)\n"
+            "    import sqlite3; conn = sqlite3.connect(':memory:')\n"
+            "    conn.execute('SELECT * FROM t WHERE id=' + str(uid))\n"
+        )
+        findings = self._scan(code)
+        sql = [f for f in findings if "SQL" in f.rule_id and not f.suppression_reason]
+        assert not sql, f"str(int(uid)) after guard must not FP, got: {sql}"
+
+    def test_str_of_int_cast_no_fp(self):
+        """try/except int() cast → str(uid) downstream must suppress FP."""
+        code = (
+            "from flask import request\n"
+            "def view():\n"
+            "    raw = request.args.get('id')\n"
+            "    try:\n"
+            "        uid = int(raw)\n"
+            "    except ValueError:\n"
+            "        return 'bad'\n"
+            "    import sqlite3; conn = sqlite3.connect(':memory:')\n"
+            "    conn.execute('SELECT * FROM t WHERE id=' + str(uid))\n"
+        )
+        findings = self._scan(code)
+        sql = [f for f in findings if "SQL" in f.rule_id and not f.suppression_reason]
+        assert not sql, f"str(int(raw)) after try/except must not FP, got: {sql}"
+
+
 # ── NoSQL injection ───────────────────────────────────────────────────────────
 
 class TestNoSQLInjection:
@@ -2699,6 +2752,31 @@ app.get('/list', (req, res) => {
         code = "req.body.cmd; exec(cmd);"
         findings = _JSAST.analyze("notes.txt", code)
         assert not findings, "Non-JS extension must return no findings"
+
+    def test_inline_require_fs_path_detected(self):
+        """require('fs').readFileSync(tainted) must be detected as path traversal."""
+        code = """
+app.get('/file', (req, res) => {
+    const name = req.query.filename;
+    const data = require('fs').readFileSync(name, 'utf8');
+    res.send(data);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-PATH-001" in rule_ids, "require('fs').readFileSync(tainted) must fire PATH finding"
+
+    def test_inline_require_child_process_cmd_detected(self):
+        """require('child_process').exec(tainted) must be detected as cmd injection."""
+        code = """
+app.post('/run', (req, res) => {
+    const cmd = req.body.command;
+    require('child_process').exec(cmd);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-CMD-001" in rule_ids, "require('child_process').exec(tainted) must fire CMD finding"
 
 
 _TSAST = TSASTAnalyzer()
