@@ -140,6 +140,19 @@ def main() -> None:
                 msg   = f"$ {cmd}\n-> deny ルールで自動ブロック済み",
             )
 
+    elif mode == "stop":
+        # Fires when Claude finishes a turn (task complete / awaiting user input).
+        # stop_hook_active=True means we're already inside a stop hook chain — skip.
+        if payload.get("stop_hook_active"):
+            return
+        _send(
+            title    = "[done] Claude が完了しました",
+            msg      = "応答が終了しました。確認してください。",
+            priority = 0,
+        )
+        # Output empty JSON so Claude Code continues normally.
+        print("{}")
+
 
 if __name__ == "__main__":
     main()

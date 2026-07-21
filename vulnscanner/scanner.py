@@ -159,6 +159,7 @@ class VulnScanner:
                     _merge_into(result, partial)
 
         result.elapsed_seconds = time.perf_counter() - start
+        result.findings = _deduplicate_global(result.findings)
         return result
 
     def _scan_local(self, directory: str, changed_files: set[str] | None = None) -> ScanResult:
@@ -219,6 +220,11 @@ class VulnScanner:
                     _merge_into(result, partial)
 
         result.elapsed_seconds = time.perf_counter() - start
+
+        # Global dedup: cross-file analysis may attribute a finding to a callee file
+        # while both the callee and the caller are scanned independently, producing
+        # exact duplicates of (file_path, line_number, vuln_type, rule_id).
+        result.findings = _deduplicate_global(result.findings)
         return result
 
     def _analyze_file_pure(
@@ -326,6 +332,27 @@ def _is_suppressed(finding: Finding, lines: list[str]) -> bool:
 
 
 _AST_PREFIXES = ("JAST-", "AST-", "JSAST-", "GOAST-", "RBAST-", "PHAST-")
+
+
+def _deduplicate_global(findings: list) -> list:
+    """Global deduplication pass run after all files are merged.
+
+    Cross-file taint analysis can produce the same finding twice:
+    once when the callee file is analysed standalone (parameter UNKNOWN → flagged),
+    and once when the caller file is analysed with cross-file context (tainted arg
+    confirmed → callee finding re-attributed to callee file path).
+
+    Both produce identical (file_path, line_number, rule_id) tuples; keep only one.
+    Order is preserved (first occurrence wins).
+    """
+    seen: set[tuple] = set()
+    result: list = []
+    for f in findings:
+        key = (f.file_path, f.line_number, f.rule_id)
+        if key not in seen:
+            seen.add(key)
+            result.append(f)
+    return result
 
 
 def _deduplicate(findings: list) -> list:

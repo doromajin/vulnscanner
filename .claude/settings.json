@@ -106,6 +106,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "python C:/VulnScanner/.claude/notify_hook.py stop"
+          }
+        ]
+      }
     ]
   }
 }

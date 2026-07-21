@@ -8,9 +8,18 @@
   "engines": {
     "vscode": "^1.80.0"
   },
-  "categories": ["Linters"],
-  "keywords": ["security", "vulnerability", "sast", "python", "java", "javascript", "typescript"],
-  "icon": "icon.png",
+  "categories": [
+    "Linters"
+  ],
+  "keywords": [
+    "security",
+    "vulnerability",
+    "sast",
+    "python",
+    "java",
+    "javascript",
+    "typescript"
+  ],
   "activationEvents": [
     "onLanguage:python",
     "onLanguage:java",
@@ -49,7 +58,12 @@
         "vulnscanner.minSeverity": {
           "type": "string",
           "default": "MEDIUM",
-          "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+          "enum": [
+            "LOW",
+            "MEDIUM",
+            "HIGH",
+            "CRITICAL"
+          ],
           "enumDescriptions": [
             "Show all findings",
             "Show MEDIUM and above (default)",
@@ -75,6 +89,6 @@
     "package": "npx vsce package"
   },
   "devDependencies": {
-    "@vscode/vsce": "^2.0.0"
+    "@vscode/vsce": "^2.32.0"
   }
 }
