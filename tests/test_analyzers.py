@@ -1758,6 +1758,132 @@ def handler():
         assert not tainted_cmds, "constant-return function must not be promoted to TAINTED taint source"
 
 
+# ── Phase E: cross-file confirmed taint params ────────────────────────────────
+
+class TestPhaseEConfirmedTaintParams:
+    """Phase E: callee params confirmed tainted from caller → HIGH confidence findings."""
+
+    def _scan_multi(self, files: dict[str, str]):
+        from vulnscanner.scanner import VulnScanner
+        import tempfile, os
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, content in files.items():
+                Path(os.path.join(tmp, name)).write_text(content)
+            return VulnScanner().scan(tmp)
+
+    def test_3hop_chain_confidence_is_high(self):
+        result = self._scan_multi({
+            "dao.py": (
+                "def get_user(user_id):\n"
+                "    conn.execute('SELECT * FROM users WHERE id=' + user_id)\n"
+                "    return conn.fetchone()\n"
+            ),
+            "services.py": (
+                "from dao import get_user\n"
+                "def fetch_user(uid):\n"
+                "    return get_user(uid)\n"
+            ),
+            "views.py": (
+                "from services import fetch_user\n"
+                "def view(request):\n"
+                "    uid = request.args.get('uid')\n"
+                "    return fetch_user(uid)\n"
+            ),
+        })
+        sql = [f for f in result.findings if "SQL" in f.rule_id]
+        assert sql, "3-hop cross-file SQLi must be detected"
+        assert len(sql) == 1, f"must deduplicate to exactly 1 finding, got {len(sql)}"
+        assert sql[0].confidence >= 0.8, (
+            f"confirmed cross-file taint must give high confidence, got {sql[0].confidence}"
+        )
+
+    def test_callee_standalone_no_false_negative(self):
+        result = self._scan_multi({
+            "helper.py": (
+                "def run_query(val):\n"
+                "    conn.execute('SELECT * FROM t WHERE x=' + val)\n"
+            ),
+            "app.py": (
+                "from helper import run_query\n"
+                "def view(request):\n"
+                "    run_query(request.args.get('x'))\n"
+            ),
+        })
+        sql = [f for f in result.findings if "SQL" in f.rule_id]
+        assert sql, "callee with tainted arg must detect SQLi"
+
+
+# ── FastAPI parameter taint ───────────────────────────────────────────────────
+
+class TestFastAPIParams:
+    """FastAPI Query/Path/Body parameters must be treated as TAINTED."""
+
+    def test_query_param_taint_detected(self):
+        code = """
+from fastapi import FastAPI, Query
+app = FastAPI()
+
+@app.get('/search')
+async def search(q: str = Query(None)):
+    conn.execute('SELECT * FROM t WHERE name=' + q)
+"""
+        findings = [
+            f for f in AST.analyze("main.py", code, ".")
+            if "SQL" in f.rule_id and not f.suppression_reason
+        ]
+        assert findings, "FastAPI Query parameter must be treated as tainted"
+        assert findings[0].taint_status == "tainted"
+
+    def test_body_param_taint_detected(self):
+        code = """
+from fastapi import FastAPI, Body
+app = FastAPI()
+
+@app.post('/run')
+async def run(cmd: str = Body(...)):
+    import os
+    os.system(cmd)
+"""
+        findings = [
+            f for f in AST.analyze("main.py", code, ".")
+            if "CMD" in f.rule_id and not f.suppression_reason
+        ]
+        assert findings, "FastAPI Body parameter must be treated as tainted"
+
+    def test_path_param_taint_detected(self):
+        code = """
+from fastapi import FastAPI, Path
+app = FastAPI()
+
+@app.get('/files/{name}')
+async def get_file(name: str = Path(...)):
+    with open('/data/' + name) as f:
+        return f.read()
+"""
+        findings = [
+            f for f in AST.analyze("main.py", code, ".")
+            if "PATH" in f.rule_id and not f.suppression_reason
+        ]
+        assert findings, "FastAPI Path parameter must be treated as tainted"
+
+    def test_non_fastapi_decorator_not_affected(self):
+        # Regular function with default value that looks like Query() but isn't in a web handler
+        code = """
+def process(q=None):
+    conn.execute('SELECT * FROM t WHERE name=' + q)
+"""
+        findings = [
+            f for f in AST.analyze("main.py", code, ".")
+            if "SQL" in f.rule_id and not f.suppression_reason
+        ]
+        # Should detect but with UNKNOWN taint (low_reach), not TAINTED
+        for f in findings:
+            assert f.taint_status != "tainted", (
+                "Non-FastAPI default params must not be injected as TAINTED"
+            )
+
+
 # ── NoSQL injection ───────────────────────────────────────────────────────────
 
 class TestNoSQLInjection:

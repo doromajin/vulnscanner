@@ -130,6 +130,15 @@ _WEB_ROUTE_DECORATORS = frozenset({
     "login_required", "permission_required",
 })
 
+# FastAPI / Starlette dependency-injection parameter markers.
+# When used as default values in route function signatures, parameters are
+# user-controlled HTTP input (query string, path, request body, header, cookie).
+_FASTAPI_REQUEST_PARAMS = frozenset({
+    "Query", "Path", "Body", "Form", "Header", "Cookie",
+    "fastapi.Query", "fastapi.Path", "fastapi.Body",
+    "fastapi.Form", "fastapi.Header", "fastapi.Cookie",
+})
+
 # Decorator attribute names that identify a function as a CLI entry point.
 # Parameters of CLI functions come from the operator command line, not from
 # untrusted web input — treat them as CLEAN to avoid path-traversal FPs.
@@ -468,9 +477,14 @@ class CrossFileTaintSummary:
     global_taint_sources before Phase B (module-global scanning) runs, so
     function-call chains like ``config.HOST = get_host()`` are correctly resolved
     even when get_host() is defined in a transitively imported file.
+
+    Phase E improvement: confirmed_tainted_params tracks function parameters that are
+    confirmed to receive tainted input from callers, enabling HIGH-confidence findings
+    in callee functions even when analyzed without their calling context.
     """
     global_taint_sources: frozenset[str] = field(default_factory=frozenset)
     tainted_globals: dict[str, frozenset[str]] = field(default_factory=dict)
+    confirmed_tainted_params: dict[str, frozenset[int]] = field(default_factory=dict)
 
 
 # ── interprocedural taint (per-file, single-threaded) ─────────────────────────
@@ -940,8 +954,54 @@ class _VulnVisitor(ast.NodeVisitor):
             for arg in node.args.args:
                 if arg.arg not in self._assignments and arg.arg != "self":
                     self._assignments[arg.arg] = _clean
+        else:
+            # FastAPI / Starlette: inject TAINTED sentinels for params that use
+            # dependency-injection markers (Query(...), Path(...), Body(...), etc.).
+            # These parameters are user-controlled HTTP input even though they don't
+            # access `request.*` directly.
+            if _func_is_web_entry(node):
+                _defaults_map: dict[str, ast.expr | None] = {}
+                _args = node.args
+                # Positional args with defaults: last N args pair with last N defaults
+                _all_args = [a for a in _args.args if a.arg != "self"]
+                _n_defaults = len(_args.defaults)
+                for _ai, _arg in enumerate(_all_args):
+                    _def_idx = _ai - (len(_all_args) - _n_defaults)
+                    if _def_idx >= 0:
+                        _defaults_map[_arg.arg] = _args.defaults[_def_idx]
+                # kwonly args
+                for _kwa, _kwd in zip(_args.kwonlyargs, _args.kw_defaults):
+                    _defaults_map[_kwa.arg] = _kwd
+
+                for _pname, _default in _defaults_map.items():
+                    if _default is None or _pname in self._assignments:
+                        continue
+                    _dn = _full_name(_default.func) if isinstance(_default, ast.Call) else None
+                    if _dn in _FASTAPI_REQUEST_PARAMS:
+                        self._assignments[_pname] = _TAINTED_MODULE_SENTINEL
+
+            # Phase E: if cross-file summary confirms that this function's parameter(s)
+            # receive tainted input from callers, inject TAINTED sentinels so the
+            # standalone analysis of this function produces HIGH-confidence findings
+            # instead of low_reach (0.3).  Only inject for params NOT already
+            # assigned in the body (body assignments take precedence).
+            _cf_sum = getattr(_cross_file_local, "cf_summary", None)
+            if _cf_sum is not None:
+                _conf = _cf_sum.confirmed_tainted_params.get(node.name, frozenset())
+                if _conf:
+                    _params = [a for a in node.args.args if a.arg != "self"]
+                    for _idx in _conf:
+                        if _idx < len(_params):
+                            _pname = _params[_idx].arg
+                            if _pname not in self._assignments:
+                                self._assignments[_pname] = _TAINTED_MODULE_SENTINEL
+
+        _cf_sum_web = getattr(_cross_file_local, "cf_summary", None)
+        _has_confirmed_params = bool(
+            _cf_sum_web and _cf_sum_web.confirmed_tainted_params.get(node.name)
+        )
         self._canonicalized_paths = _find_canonicalized_paths(node)
-        self._current_func_is_web_entry = _func_is_web_entry(node)
+        self._current_func_is_web_entry = _func_is_web_entry(node) or _has_confirmed_params
         self._visit_stmts(node.body)
         self._assignments = saved
         self._canonicalized_paths = saved_canon
@@ -2127,37 +2187,67 @@ class _VulnVisitor(ast.NodeVisitor):
         For remote (cross-file) callees, file_path and lines are temporarily swapped
         so findings are attributed to the callee's source file at the correct line.
         Skips functions already on the call stack to prevent infinite recursion.
+
+        Handles both plain calls (func(arg)) and method calls (obj.method(arg)).
         """
         _rfd = getattr(_cross_file_local, "remote_func_defs", {})
+        _rcm = getattr(_cross_file_local, "remote_class_methods", {})
         _all = getattr(_cross_file_local, "all_contents", {}) or {}
         for node in ast.walk(stmt):
             if not isinstance(node, ast.Call):
                 continue
             func_name = _full_name(node.func)
-            if not func_name:
+            attr = _attr_name(node.func) if isinstance(node.func, ast.Attribute) else None
+
+            # Resolve callee: prefer full name match, then attribute-only match
+            callee_def: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+            src_path_override: str | None = None
+            skip_self = False
+
+            if func_name and func_name not in self._call_stack:
+                if func_name in _local_func_defs:
+                    callee_def = _local_func_defs[func_name]
+                elif func_name in _rfd:
+                    callee_def, src_path_override = _rfd[func_name]
+
+            # Method call fallback: obj.method(arg) where method is a local/remote class method
+            if callee_def is None and attr and attr not in self._call_stack:
+                if attr in _local_func_defs:
+                    callee_def = _local_func_defs[attr]
+                    skip_self = True
+                elif attr in _rcm and _rcm[attr]:
+                    callee_def = _rcm[attr][0]  # use first definition
+                    skip_self = True
+
+            if callee_def is None:
                 continue
-            if func_name in self._call_stack:
-                continue
-            is_local = func_name in _local_func_defs
-            is_remote = not is_local and func_name in _rfd
-            if not is_local and not is_remote:
-                continue
+
             arg_taints = [
                 _taint_of(arg, self._assignments, self._class_attrs)
                 for arg in node.args
             ]
             if not any(t.status == TaintStatus.TAINTED for t in arg_taints):
                 continue
-            if is_local:
-                self._analyze_with_tainted_params(_local_func_defs[func_name], arg_taints)
+
+            # For method calls, skip the implicit 'self' parameter when mapping args
+            effective_taints = arg_taints
+            if skip_self:
+                params = [p for p in callee_def.args.args if p.arg != "self"]
+                effective_taints_m: list[TaintInfo] = []
+                for _i, _p in enumerate(params):
+                    if _i < len(arg_taints):
+                        effective_taints_m.append(arg_taints[_i])
+                effective_taints = effective_taints_m
+
+            if src_path_override is None:
+                self._analyze_with_tainted_params(callee_def, effective_taints)
             else:
-                rfn, src_path = _rfd[func_name]
-                src_lines = _all.get(src_path, "").splitlines()
+                src_lines = _all.get(src_path_override, "").splitlines()
                 saved_fp = self.file_path
                 saved_lines = self.lines
-                self.file_path = src_path
+                self.file_path = src_path_override
                 self.lines = src_lines
-                self._analyze_with_tainted_params(rfn, arg_taints)
+                self._analyze_with_tainted_params(callee_def, effective_taints)
                 self.file_path = saved_fp
                 self.lines = saved_lines
 
@@ -3405,6 +3495,147 @@ def _find_taint_source_funcs(tree: ast.AST) -> frozenset[str]:
     return current
 
 
+def _is_tainted_expr_quick(
+    node: ast.expr,
+    tainted_vars: set[str],
+    global_taint_sources: frozenset[str],
+    depth: int = 0,
+) -> bool:
+    """Lightweight taint check for build_cross_file_summary Phase E.
+
+    Does NOT run the full _taint_of machinery — intentionally simpler to avoid
+    the recursive complexity of the main analyzer.  Handles the most common
+    patterns: direct taint sources, attribute chains, subscripts, and calls.
+    """
+    if depth > 6:
+        return False
+    if isinstance(node, ast.Name):
+        return node.id in tainted_vars or node.id in _TAINTED_NAME_SOURCES
+    if isinstance(node, ast.Attribute):
+        if node.attr in _TAINTED_ATTR_NAMES:
+            return True
+        return _is_tainted_expr_quick(node.value, tainted_vars, global_taint_sources, depth + 1)
+    if isinstance(node, ast.Subscript):
+        return _is_tainted_expr_quick(node.value, tainted_vars, global_taint_sources, depth + 1)
+    if isinstance(node, ast.Call):
+        fn = _full_name(node.func)
+        if fn in global_taint_sources or fn in _PY_ANY_QUALIFIER_TAINT_METHODS:
+            return True
+        return any(
+            _is_tainted_expr_quick(a, tainted_vars, global_taint_sources, depth + 1)
+            for a in node.args
+        )
+    if isinstance(node, ast.BinOp):
+        return (
+            _is_tainted_expr_quick(node.left, tainted_vars, global_taint_sources, depth + 1)
+            or _is_tainted_expr_quick(node.right, tainted_vars, global_taint_sources, depth + 1)
+        )
+    if isinstance(node, ast.JoinedStr):
+        return any(
+            _is_tainted_expr_quick(v, tainted_vars, global_taint_sources, depth + 1)
+            for v in node.values
+            if isinstance(v, ast.FormattedValue)
+        )
+    return False
+
+
+def _collect_tainted_vars_in_body(
+    stmts: list[ast.stmt],
+    seed: set[str],
+    global_taint_sources: frozenset[str],
+) -> set[str]:
+    """Single-pass forward scan: return names assigned from tainted sources in *stmts*."""
+    tainted = seed.copy()
+    for stmt in stmts:
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            val = stmt.value if isinstance(stmt, ast.Assign) else stmt.value
+            if val is None:
+                continue
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            if _is_tainted_expr_quick(val, tainted, global_taint_sources):
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        tainted.add(t.id)
+        elif isinstance(stmt, ast.AugAssign):
+            if _is_tainted_expr_quick(stmt.value, tainted, global_taint_sources):
+                if isinstance(stmt.target, ast.Name):
+                    tainted.add(stmt.target.id)
+    return tainted
+
+
+def _build_confirmed_tainted_params(
+    parsed_trees: dict[str, ast.Module],
+    global_taint_sources: frozenset[str],
+) -> dict[str, frozenset[int]]:
+    """Phase E: build {func_name: {param_idx}} for params confirmed tainted at call sites.
+
+    Two-phase fixed-point:
+    1. Seed from web-entry functions: if a function has a 'request' param or similar,
+       mark any downstream arg it passes as tainted.
+    2. Propagate transitively: if function F's param 0 is confirmed tainted and
+       F calls G(param0), then G's param 0 is also confirmed tainted.
+
+    This enables HIGH-confidence findings in callee functions (e.g. dao.get_user) even
+    when they are analyzed independently of their callers.
+    """
+    confirmed: dict[str, set[int]] = {}
+
+    # Collect all function defs keyed by name for body lookup
+    func_bodies: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for tree in parsed_trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_bodies.setdefault(node.name, []).append(node)
+
+    changed = True
+    max_iters = 10
+    for _ in range(max_iters):
+        if not changed:
+            break
+        changed = False
+        for _name, func_list in func_bodies.items():
+            for func_def in func_list:
+                params = [a.arg for a in func_def.args.args if a.arg != "self"]
+
+                # Seed tainted vars for this function's scope
+                seed: set[str] = set()
+                # Web entry: any param named 'request' or similar
+                for arg in func_def.args.args:
+                    if arg.arg in _TAINTED_NAME_SOURCES:
+                        seed.add(arg.arg)
+                # Confirmed tainted params from previous iterations
+                for idx in confirmed.get(_name, set()):
+                    if idx < len(params):
+                        seed.add(params[idx])
+
+                if not seed:
+                    continue
+
+                # Forward-propagate through the function body
+                tainted_vars = _collect_tainted_vars_in_body(
+                    func_def.body, seed, global_taint_sources
+                )
+
+                # Find calls that receive tainted args
+                for node in ast.walk(func_def):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    callee = _full_name(node.func) or _attr_name(node.func)
+                    if not callee or "." in callee:
+                        # Skip qualified calls like obj.method — focus on plain func names
+                        callee = _attr_name(node.func)
+                    if not callee:
+                        continue
+                    for i, arg in enumerate(node.args):
+                        if _is_tainted_expr_quick(arg, tainted_vars, global_taint_sources):
+                            prev = confirmed.get(callee, set())
+                            if i not in prev:
+                                confirmed.setdefault(callee, set()).add(i)
+                                changed = True
+
+    return {k: frozenset(v) for k, v in confirmed.items()}
+
+
 def build_cross_file_summary(all_contents: dict[str, str]) -> CrossFileTaintSummary:
     """Phase C pre-scan: build a global taint summary over *all_contents* before
     per-file analysis begins.
@@ -3491,7 +3722,14 @@ def build_cross_file_summary(all_contents: dict[str, str]) -> CrossFileTaintSumm
     # Restore to empty so it is cleanly set per-file during analyze()
     _interprocedural_taint_sources = frozenset()
 
+    # ── Step 4 (Phase E): confirmed-tainted parameter map ─────────────────────
+    # Build {func_name: {param_idx}} for parameters that are confirmed to receive
+    # tainted input from callers.  Used in visit_FunctionDef to inject TAINTED
+    # sentinels, raising finding confidence from 0.3 (UNKNOWN/low_reach) to 0.9.
+    conf_params = _build_confirmed_tainted_params(parsed_trees, global_sources)
+
     return CrossFileTaintSummary(
         global_taint_sources=global_sources,
         tainted_globals=tainted_by_file,
+        confirmed_tainted_params=conf_params,
     )
