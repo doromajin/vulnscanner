@@ -1946,6 +1946,55 @@ class TestPhaseFCLICleanPropagation:
         assert path_findings, "Web-callee path with tainted arg must produce PATH finding"
 
 
+class TestModuleLevelAssignments:
+    """Module-level assignments (BASE_DIR, os.environ) must not produce FPs."""
+
+    def _scan(self, code: str):
+        return PythonASTAnalyzer().analyze("tool.py", code)
+
+    def test_base_dir_from_file_no_fp(self):
+        """BASE_DIR = Path(__file__).parent → paths derived from it must be CLEAN."""
+        code = (
+            "from pathlib import Path\n"
+            "import os\n"
+            "BASE_DIR = Path(__file__).parent\n"
+            "def open_config():\n"
+            "    cfg = BASE_DIR / 'config.yaml'\n"
+            "    return open(cfg).read()\n"
+        )
+        findings = self._scan(code)
+        path = [f for f in findings if "PATH" in f.rule_id and not f.suppression_reason]
+        assert not path, f"Path derived from __file__ must not FP, got: {path}"
+
+    def test_os_environ_get_no_path_fp(self):
+        """os.environ.get() in path construction must not produce PATH FP."""
+        code = (
+            "import os\n"
+            "from pathlib import Path\n"
+            "def get_home():\n"
+            "    home = os.environ.get('HOME', '/tmp')\n"
+            "    p = Path(home) / 'config.ini'\n"
+            "    return p.read_text()\n"
+        )
+        findings = self._scan(code)
+        path = [f for f in findings if "PATH" in f.rule_id and not f.suppression_reason]
+        assert not path, f"os.environ.get() path must not FP, got: {path}"
+
+    def test_tainted_module_var_still_detected(self):
+        """Module-level var from taint source must still be flagged."""
+        code = (
+            "from flask import request\n"
+            "import sqlite3\n"
+            "SORT_FIELD = request.args.get('sort')\n"
+            "def query():\n"
+            "    conn = sqlite3.connect(':memory:')\n"
+            "    conn.execute('SELECT * FROM t ORDER BY ' + SORT_FIELD)\n"
+        )
+        findings = self._scan(code)
+        sql = [f for f in findings if "SQL" in f.rule_id]
+        assert sql, "Module-level tainted var must still be detected"
+
+
 class TestPythonStrPassthrough:
     """str/bytes/repr must propagate taint so guard-validated CLEAN values don't FP."""
 
@@ -3330,6 +3379,30 @@ end
         code = 'id = params[:id]; User.find_by_sql("SELECT * FROM users WHERE id=" + id)'
         findings = _RBAST.analyze("main.py", code)
         assert not findings, "Non-.rb file must not be analyzed by RubyASTAnalyzer"
+
+    def test_cookies_subscript_tainted(self):
+        """cookies[:key] is client-controlled — must fire SQL finding."""
+        code = """
+def show
+  token = cookies[:auth_token]
+  ActiveRecord::Base.connection.execute("SELECT * FROM sessions WHERE token='" + token + "'")
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SQL-001" in rule_ids, "cookies[:key] must be recognized as taint source"
+
+    def test_session_subscript_tainted(self):
+        """session[:key] can be client-controlled (cookie-backed) — must fire SQL."""
+        code = """
+def show
+  user_id = session[:user_id]
+  ActiveRecord::Base.connection.execute("SELECT * FROM users WHERE id=" + user_id)
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SQL-001" in rule_ids, "session[:key] must be recognized as taint source"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

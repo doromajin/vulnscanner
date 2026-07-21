@@ -931,6 +931,13 @@ class _VulnVisitor(ast.NodeVisitor):
 
     # ── scope tracking ─────────────────────────────────────────────────────────
 
+    def visit_Module(self, node: ast.Module) -> None:
+        assigns = _collect_module_level_assignments(node)
+        # Store in thread-local so _taint_of can use it as fallback inside functions.
+        _cross_file_local.module_level_assignments = assigns
+        self._assignments = assigns
+        self.generic_visit(node)
+
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         saved_attrs = self._class_attrs
         saved_enum = self._in_enum_class
@@ -2380,6 +2387,26 @@ def _resolve_self_ref(rhs: ast.expr, name: str, prev: ast.expr) -> ast.expr:
     return _Subst().visit(copy.deepcopy(rhs))
 
 
+def _collect_module_level_assignments(module: ast.Module) -> dict[str, ast.expr]:
+    """Return {name: rhs} for simple name assignments at module top level.
+
+    Only visits direct children of the module body (not nested scopes).
+    Used to seed self._assignments before visiting module-level statements so
+    that paths derived from __file__ (e.g. BASE_DIR = Path(__file__).parent)
+    are resolved as CLEAN instead of UNKNOWN.
+    """
+    result: dict[str, ast.expr] = {}
+    for stmt in module.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    result[target.id] = stmt.value
+        elif isinstance(stmt, ast.AnnAssign):
+            if isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                result[stmt.target.id] = stmt.value
+    return result
+
+
 def _collect_scope_assignments(
     func: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> dict[str, ast.expr]:
@@ -2845,12 +2872,24 @@ def _taint_of(
                 f"tainted module global '{name}' from {_rtg_b[name]}",
                 source=name,
             )
+        # Fallback: module-level assignments (e.g. BASE_DIR = Path(__file__).parent).
+        # Function-level params/assignments take precedence (checked above); this only
+        # fires when the name wasn't resolved locally at all.
+        _ml = getattr(_cross_file_local, "module_level_assignments", {})
+        if name in _ml:
+            val = _ml[name]
+            if val is not node:
+                return _taint_of(val, assignments, class_attrs, _depth + 1)
         return TaintInfo(TaintStatus.UNKNOWN,
                          f"untracked variable '{name}'", source=name)
 
     # ── Attribute access ────────────────────────────────────────────────────────
     if isinstance(node, ast.Attribute):
         attr = node.attr
+        # os.environ is server configuration, not user input (see CLAUDE.md).
+        if (isinstance(node.value, ast.Name) and node.value.id == "os"
+                and attr == "environ"):
+            return CLEAN_LITERAL
         if attr in _TAINTED_ATTR_NAMES:
             return TaintInfo(TaintStatus.TAINTED,
                              f"user-input attribute '.{attr}'", source=f"*.{attr}")
@@ -3013,6 +3052,12 @@ def _taint_of(
 
         # os.walk() yields (dirpath, dirnames, filenames) tuples from the OS filesystem.
         if full == "os.walk":
+            return CLEAN_LITERAL
+
+        # os.environ.get() / os.getenv(): server-configured environment variables,
+        # not user-supplied input (per project policy — see CLAUDE.md).
+        if full in {"os.environ.get", "os.getenv", "os.environ.__getitem__",
+                    "os.environ.setdefault"}:
             return CLEAN_LITERAL
 
         # Path construction: taint propagates from any argument to the resulting path.

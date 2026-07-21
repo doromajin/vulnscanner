@@ -291,11 +291,21 @@ class TestTaintUnknown:
         assert result.status == TaintStatus.UNKNOWN
 
     def test_os_environ_attr(self):
-        # os.environ is not a tainted attr (it's an Attribute with obj=Name("os"))
+        # os.environ is server configuration (per CLAUDE.md) → CLEAN, not user input
         node = _expr("os.environ")
         result = _taint_of(node)
-        # os is UNKNOWN (not a tainted name source), .environ is not in _TAINTED_ATTR_NAMES
-        assert result.status == TaintStatus.UNKNOWN
+        assert result.status == TaintStatus.CLEAN
+
+    def test_os_environ_get_clean(self):
+        # os.environ.get("KEY", "") must also be CLEAN
+        node = _expr('os.environ.get("APPDATA", "")')
+        result = _taint_of(node)
+        assert result.status == TaintStatus.CLEAN
+
+    def test_os_getenv_clean(self):
+        node = _expr('os.getenv("HOME")')
+        result = _taint_of(node)
+        assert result.status == TaintStatus.CLEAN
 
     def test_data_param_subscript_is_unknown(self):
         # data['config_file'] where data is a function param → UNKNOWN

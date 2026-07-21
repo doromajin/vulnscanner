@@ -42,7 +42,8 @@ _REQUEST_METHODS = frozenset({
     "url", "fullpath", "body", "env", "cookies",
 })
 # Root identifiers that represent the request/params object
-_PARAM_ROOTS = frozenset({"params", "request", "env"})
+# cookies/session are client-controlled (cookie store) → taint sources
+_PARAM_ROOTS = frozenset({"params", "request", "env", "cookies", "session"})
 
 # Sinatra DSL helpers that yield user data
 _SINATRA_HELPERS = frozenset({"params", "env", "request"})
