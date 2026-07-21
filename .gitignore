@@ -20,6 +20,7 @@ htmlcov/
 !tests/fixtures/**/*.json
 !custom_taint_sources.json
 !.claude/settings.json
+!vscode-vulnscanner/package.json
 *.sarif
 !benchmark_python/results/*.sarif
 

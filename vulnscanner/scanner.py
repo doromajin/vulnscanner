@@ -7,7 +7,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
+from rich.console import Console as _RichConsole
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+
+_progress_console = _RichConsole(stderr=True)
 
 from vulnscanner.analyzers import ALL_ANALYZERS, BaseAnalyzer
 from vulnscanner.analyzers.ast_python import (
@@ -122,6 +125,7 @@ class VulnScanner:
             BarColumn(),
             TaskProgressColumn(),
             redirect_stderr=False,
+            console=_progress_console,
         ) as progress:
             task = progress.add_task(f"Scanning {repo.full_name}...", total=None)
 
@@ -188,6 +192,7 @@ class VulnScanner:
             BarColumn(),
             TaskProgressColumn(),
             redirect_stderr=False,
+            console=_progress_console,
         ) as progress:
             task = progress.add_task(f"Scanning {directory}...", total=len(files))
 

@@ -1,0 +1,80 @@
+{
+  "name": "vulnscanner",
+  "displayName": "VulnScanner",
+  "description": "Static security vulnerability scanner for Python, Java, JavaScript, TypeScript, Go, Ruby, and PHP",
+  "version": "0.1.0",
+  "publisher": "vulnscanner",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Linters"],
+  "keywords": ["security", "vulnerability", "sast", "python", "java", "javascript", "typescript"],
+  "icon": "icon.png",
+  "activationEvents": [
+    "onLanguage:python",
+    "onLanguage:java",
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescriptreact",
+    "onLanguage:go",
+    "onLanguage:ruby",
+    "onLanguage:php"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vulnscanner.scanFile",
+        "title": "VulnScanner: Scan Current File"
+      },
+      {
+        "command": "vulnscanner.scanWorkspace",
+        "title": "VulnScanner: Scan Workspace"
+      },
+      {
+        "command": "vulnscanner.clearDiagnostics",
+        "title": "VulnScanner: Clear Diagnostics"
+      }
+    ],
+    "configuration": {
+      "title": "VulnScanner",
+      "properties": {
+        "vulnscanner.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Path to the Python interpreter where vulnscanner is installed (e.g. /usr/bin/python3 or C:\\Python311\\python.exe)"
+        },
+        "vulnscanner.minSeverity": {
+          "type": "string",
+          "default": "MEDIUM",
+          "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+          "enumDescriptions": [
+            "Show all findings",
+            "Show MEDIUM and above (default)",
+            "Show HIGH and CRITICAL only",
+            "Show CRITICAL only"
+          ],
+          "description": "Minimum severity level to show as diagnostics"
+        },
+        "vulnscanner.scanOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically scan the current file when it is saved"
+        },
+        "vulnscanner.timeoutSeconds": {
+          "type": "number",
+          "default": 30,
+          "description": "Maximum seconds to wait for a file scan before cancelling"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "npx vsce package"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^2.0.0"
+  }
+}

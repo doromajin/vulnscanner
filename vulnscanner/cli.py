@@ -5,7 +5,7 @@ import click
 from rich.console import Console
 
 from vulnscanner.reporters.console import print_results, print_finding_detail, print_rank_table
-from vulnscanner.reporters.json_reporter import write_json
+from vulnscanner.reporters.json_reporter import write_json, to_json_str
 from vulnscanner.reporters.sarif import write_sarif
 from vulnscanner.scanner import VulnScanner
 
@@ -42,6 +42,8 @@ def main() -> None:
               help="Parallel worker threads (0 = auto-detect)")
 @click.option("--since", default=None, metavar="REF",
               help="Incremental scan: only analyse files changed since this git ref (e.g. HEAD~1, main)")
+@click.option("--stdout-json", "stdout_json", is_flag=True, default=False,
+              help="Print JSON to stdout instead of the rich table (for IDE integrations)")
 def scan(
     target: str,
     token: str | None,
@@ -55,6 +57,7 @@ def scan(
     exclude: tuple[str, ...],
     workers: int,
     since: str | None,
+    stdout_json: bool,
 ) -> None:
     """Scan a single GitHub repository or local directory.
 
@@ -128,6 +131,11 @@ def scan(
         confirmed_keys = KnowledgeStore().get_confirmed_pattern_keys()
     except Exception:
         confirmed_keys = set()
+
+    # --stdout-json: emit JSON to stdout and exit (used by IDE integrations)
+    if stdout_json:
+        print(to_json_str(result))
+        sys.exit(0)
 
     # Write persistent artifacts first so they exist even if display crashes
     if output:
