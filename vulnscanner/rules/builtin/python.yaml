@@ -1,0 +1,57 @@
+# VulnScanner built-in rules — Python
+
+- id: PY-DESER-001
+  message: "yaml.load() without SafeLoader deserializes arbitrary Python objects — use yaml.safe_load() instead"
+  severity: HIGH
+  vuln_type: INSECURE_DESERIALIZATION
+  cwe: 502
+  languages: [python]
+  regex: "yaml\\.load\\s*\\([^)]*\\)"
+
+- id: PY-DESER-002
+  message: "marshal.loads() deserializes untrusted data — marshal format provides no security guarantees"
+  severity: HIGH
+  vuln_type: INSECURE_DESERIALIZATION
+  cwe: 502
+  languages: [python]
+  pattern: "marshal.loads($X)"
+
+- id: PY-EXEC-001
+  message: "exec() with a non-literal argument may execute attacker-controlled code"
+  severity: HIGH
+  vuln_type: COMMAND_INJECTION
+  cwe: 94
+  languages: [python]
+  regex: "\\bexec\\s*\\(\\s*[^\"'\\n)]"
+
+- id: PY-HASH-001
+  message: "hashlib.md5() produces a cryptographically broken digest — use hashlib.sha256() or better"
+  severity: MEDIUM
+  vuln_type: WEAK_CRYPTOGRAPHY
+  cwe: 328
+  languages: [python]
+  regex: "hashlib\\.md5\\s*\\("
+
+- id: PY-HASH-002
+  message: "hashlib.sha1() is cryptographically weak for security purposes — use hashlib.sha256() or better"
+  severity: MEDIUM
+  vuln_type: WEAK_CRYPTOGRAPHY
+  cwe: 328
+  languages: [python]
+  regex: "hashlib\\.sha1\\s*\\("
+
+- id: PY-RAND-001
+  message: "random module is not cryptographically secure — use secrets module for security-sensitive values"
+  severity: MEDIUM
+  vuln_type: WEAK_CRYPTOGRAPHY
+  cwe: 338
+  languages: [python]
+  regex: "\\brandom\\.(random|randint|choice|choices|randrange|shuffle|sample)\\s*\\("
+
+- id: PY-ASSERT-001
+  message: "assert statements are removed by Python optimizer (-O flag) — do not use for security checks"
+  severity: LOW
+  vuln_type: MISSING_AUTHORIZATION
+  cwe: 617
+  languages: [python]
+  regex: "^\\s*assert\\s+.*(auth|permission|role|admin|user|password|token|secret)"

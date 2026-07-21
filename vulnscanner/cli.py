@@ -44,6 +44,11 @@ def main() -> None:
               help="Incremental scan: only analyse files changed since this git ref (e.g. HEAD~1, main)")
 @click.option("--stdout-json", "stdout_json", is_flag=True, default=False,
               help="Print JSON to stdout instead of the rich table (for IDE integrations)")
+@click.option("--rules", "-r", multiple=True, metavar="PATH",
+              help="Custom rule file or directory (YAML). Can be repeated. "
+                   "Use --rules builtin to load only built-in rules.")
+@click.option("--no-builtin-rules", is_flag=True, default=False,
+              help="Disable built-in YAML rules (custom rules only)")
 def scan(
     target: str,
     token: str | None,
@@ -58,6 +63,8 @@ def scan(
     workers: int,
     since: str | None,
     stdout_json: bool,
+    rules: tuple[str, ...],
+    no_builtin_rules: bool,
 ) -> None:
     """Scan a single GitHub repository or local directory.
 
@@ -94,7 +101,21 @@ def scan(
             except subprocess.CalledProcessError as exc:
                 console.print(f"[yellow]--since failed ({exc.stderr.strip()}); scanning all files.[/yellow]")
 
-    scanner = VulnScanner(github_token=token, exclude=exclude, workers=workers)
+    # Load custom / built-in YAML rules
+    from vulnscanner.rules.loader import load_rules
+    from pathlib import Path as _Path
+    rule_paths: list[str] = []
+    if not no_builtin_rules:
+        _builtin_dir = _Path(__file__).parent / "rules" / "builtin"
+        rule_paths.append(str(_builtin_dir))
+    for r in rules:
+        rule_paths.append(r)
+    custom_rules = load_rules(rule_paths) if rule_paths else []
+    if custom_rules and not stdout_json:
+        console.print(f"[dim]Custom rules: {len(custom_rules)} rule(s) loaded[/dim]")
+
+    scanner = VulnScanner(github_token=token, exclude=exclude, workers=workers,
+                          custom_rules=custom_rules)
 
     try:
         result = scanner.scan(target, changed_files=changed_files)

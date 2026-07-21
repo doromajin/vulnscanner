@@ -1,0 +1,57 @@
+# VulnScanner built-in rules — JavaScript / TypeScript
+
+- id: JS-XSS-001
+  message: "innerHTML assignment with dynamic value — XSS risk if content is user-controlled"
+  severity: HIGH
+  vuln_type: XSS
+  cwe: 79
+  languages: [javascript, typescript]
+  regex: "\\.innerHTML\\s*="
+
+- id: JS-XSS-002
+  message: "document.write() with dynamic content — XSS risk; prefer DOM manipulation methods"
+  severity: HIGH
+  vuln_type: XSS
+  cwe: 79
+  languages: [javascript, typescript]
+  regex: "document\\.write\\s*\\("
+
+- id: JS-XSS-003
+  message: "outerHTML assignment — XSS risk if content is user-controlled"
+  severity: HIGH
+  vuln_type: XSS
+  cwe: 79
+  languages: [javascript, typescript]
+  regex: "\\.outerHTML\\s*="
+
+- id: JS-REDIR-001
+  message: "window.location assignment — open redirect risk if URL is user-controlled"
+  severity: MEDIUM
+  vuln_type: OPEN_REDIRECT
+  cwe: 601
+  languages: [javascript, typescript]
+  regex: "window\\.location\\s*="
+
+- id: JS-STORAGE-001
+  message: "Storing sensitive data in localStorage — data persists in plaintext accessible to any script on the page"
+  severity: LOW
+  vuln_type: HARDCODED_SECRET
+  cwe: 312
+  languages: [javascript, typescript]
+  regex: "localStorage\\.setItem\\s*\\(\\s*[\"'](token|password|secret|key|auth|session)[\"']"
+
+- id: JS-PROTO-001
+  message: "Property assignment to __proto__ — prototype pollution risk"
+  severity: HIGH
+  vuln_type: PROTOTYPE_POLLUTION
+  cwe: 1321
+  languages: [javascript, typescript]
+  regex: "\\[\"__proto__\"\\]|\\['__proto__'\\]"
+
+- id: JS-CSRF-001
+  message: "new XMLHttpRequest() — verify CSRF token is included for state-changing requests"
+  severity: LOW
+  vuln_type: CSRF
+  cwe: 352
+  languages: [javascript, typescript]
+  regex: "new\\s+XMLHttpRequest\\s*\\(\\s*\\)"

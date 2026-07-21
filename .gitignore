@@ -48,9 +48,11 @@ nightly_runs/
 benchmark_python/
 owasp_benchmark/
 
-# 一時デバッグスクリプト
+# 一時デバッグスクリプト（vulnscanner/ 内の正規ファイルは除外）
 _*.py
 _*.txt
+!vulnscanner/**/__init__.py
+!vulnscanner/**/loader.py
 
 # OS
 .DS_Store

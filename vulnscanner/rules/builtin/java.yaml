@@ -1,0 +1,57 @@
+# VulnScanner built-in rules — Java
+
+- id: JAVA-SERIAL-001
+  message: "ObjectInputStream.readObject() deserializes untrusted data — use validated deserialization or avoid Java serialization"
+  severity: CRITICAL
+  vuln_type: INSECURE_DESERIALIZATION
+  cwe: 502
+  languages: [java]
+  regex: "\\.readObject\\s*\\(\\s*\\)"
+
+- id: JAVA-REFLECT-001
+  message: "Class.forName() with dynamic argument — may load arbitrary classes if user-controlled"
+  severity: HIGH
+  vuln_type: COMMAND_INJECTION
+  cwe: 470
+  languages: [java]
+  regex: "Class\\.forName\\s*\\(\\s*[^\"'\\n)]"
+
+- id: JAVA-RAND-001
+  message: "java.util.Random is not cryptographically secure — use java.security.SecureRandom for security-sensitive values"
+  severity: MEDIUM
+  vuln_type: WEAK_CRYPTOGRAPHY
+  cwe: 338
+  languages: [java]
+  regex: "new\\s+Random\\s*\\(\\s*\\)"
+
+- id: JAVA-HASH-001
+  message: "MD5 message digest is cryptographically broken — use SHA-256 or better"
+  severity: MEDIUM
+  vuln_type: WEAK_CRYPTOGRAPHY
+  cwe: 328
+  languages: [java]
+  regex: "MessageDigest\\.getInstance\\s*\\(\\s*\"MD5\"\\s*\\)"
+
+- id: JAVA-HASH-002
+  message: "SHA-1 is cryptographically weak for security purposes — use SHA-256 or better"
+  severity: MEDIUM
+  vuln_type: WEAK_CRYPTOGRAPHY
+  cwe: 328
+  languages: [java]
+  regex: "MessageDigest\\.getInstance\\s*\\(\\s*\"SHA-?1\"\\s*\\)"
+
+- id: JAVA-XXE-001
+  message: "DocumentBuilderFactory without XXE mitigations — external entity injection risk; disable external entities"
+  severity: HIGH
+  vuln_type: XXE
+  cwe: 611
+  languages: [java]
+  regex: "DocumentBuilderFactory\\.newInstance\\s*\\(\\s*\\)"
+
+- id: JAVA-LOG-001
+  message: "Logging user-controlled data may cause log injection (CRLF injection)"
+  severity: LOW
+  vuln_type: LOG_INJECTION
+  cwe: 117
+  languages: [java]
+  regex: "(?:logger|log|LOG)\\s*\\.\\s*(?:info|warn|error|debug|trace)\\s*\\(.*(?:request|param|input|getParameter)"

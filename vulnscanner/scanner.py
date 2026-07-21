@@ -85,11 +85,18 @@ class VulnScanner:
         analyzers: list[BaseAnalyzer] | None = None,
         exclude: tuple[str, ...] | list[str] = (),
         workers: int = 0,
+        custom_rules: list | None = None,
     ) -> None:
         self._github_token = github_token
-        self._analyzers = analyzers or ALL_ANALYZERS
         self._cli_excludes = tuple(exclude)
         self._workers = workers if workers > 0 else DEFAULT_WORKERS
+
+        base_analyzers = analyzers or ALL_ANALYZERS
+        if custom_rules:
+            from vulnscanner.analyzers.custom_rule_analyzer import CustomRuleAnalyzer
+            self._analyzers = list(base_analyzers) + [CustomRuleAnalyzer(custom_rules)]
+        else:
+            self._analyzers = list(base_analyzers)
 
     def scan(self, target: str, changed_files: set[str] | None = None) -> ScanResult:
         """Scan a GitHub repo URL/slug or a local directory path.
