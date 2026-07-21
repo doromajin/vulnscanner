@@ -19,6 +19,9 @@ Rule IDs (GOAST-*):
 """
 from __future__ import annotations
 
+import threading
+from dataclasses import dataclass, field
+
 try:
     import tree_sitter_go as _tsgo
     from tree_sitter import Language, Parser as _TSParser
@@ -30,6 +33,25 @@ except Exception:
 
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
+
+
+# ── Cross-file taint context ──────────────────────────────────────────────────
+
+@dataclass
+class GoCrossFileContext:
+    """Which Go function params receive tainted HTTP input from cross-file callers."""
+    confirmed_tainted_params: dict[str, frozenset[int]] = field(default_factory=dict)
+
+
+_go_cf_local = threading.local()
+
+
+def set_go_cross_file_context(ctx: GoCrossFileContext | None) -> None:
+    _go_cf_local.ctx = ctx
+
+
+def _get_go_cf_ctx() -> GoCrossFileContext | None:
+    return getattr(_go_cf_local, "ctx", None)
 
 _GO_EXTS = (".go",)
 
@@ -303,6 +325,141 @@ def _build_taint(root) -> tuple[set[str], set[str]]:
     return tainted, tainted_funcs
 
 
+# ── Cross-file helpers ────────────────────────────────────────────────────────
+
+_HTTP_HANDLER_TYPE_MARKERS = (
+    "http.Request", "gin.Context", "echo.Context",
+    "fiber.Ctx", "fasthttp.RequestCtx",
+)
+
+
+def _is_http_handler_decl(func_node) -> bool:
+    """True if this function has a *http.Request or framework context parameter."""
+    params_node = func_node.child_by_field_name("parameters")
+    if params_node is None:
+        return False
+    for param in params_node.named_children:
+        if param.type != "parameter_declaration":
+            continue
+        type_node = param.child_by_field_name("type")
+        if type_node is None:
+            continue
+        type_text = type_node.text.decode("utf-8", errors="replace")
+        if any(m in type_text for m in _HTTP_HANDLER_TYPE_MARKERS):
+            return True
+    return False
+
+
+def _get_param_names(func_node) -> list[str]:
+    """Return positional parameter names of a function_declaration, in order."""
+    params_node = func_node.child_by_field_name("parameters")
+    if params_node is None:
+        return []
+    result: list[str] = []
+    for param in params_node.named_children:
+        if param.type != "parameter_declaration":
+            continue
+        name_node = param.child_by_field_name("name")
+        result.append(
+            name_node.text.decode("utf-8", errors="replace")
+            if name_node and name_node.type == "identifier"
+            else ""
+        )
+    return result
+
+
+def build_go_cross_file_context(all_contents: dict[str, str]) -> GoCrossFileContext:
+    """Build cross-file taint context: which function params receive HTTP taint.
+
+    Strategy (fixed-point, up to 12 hops):
+      1. HTTP handler functions seed their request-named params as taint sources.
+      2. For each seeded/confirmed-tainted function, propagate taint within its
+         body and find direct (unqualified) calls to project-local functions with
+         tainted args → mark those callee params as confirmed_tainted_params.
+      3. Repeat until stable.
+    """
+    if not _TS_GO_AVAILABLE:
+        return GoCrossFileContext()
+
+    # Parse all Go files and collect function declarations by name.
+    func_bodies: dict[str, list] = {}
+    for path, content in all_contents.items():
+        if not path.endswith(".go"):
+            continue
+        try:
+            tree = _go_parser.parse(content.encode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        for node in _walk(tree.root_node):
+            if node.type == "function_declaration":
+                name_node = node.child_by_field_name("name")
+                if name_node:
+                    fname = name_node.text.decode("utf-8", errors="replace")
+                    func_bodies.setdefault(fname, []).append(node)
+
+    confirmed: dict[str, set[int]] = {}
+
+    for _pass in range(12):
+        changed = False
+
+        for fname, func_list in func_bodies.items():
+            for func_def in func_list:
+                params = _get_param_names(func_def)
+                local_tainted: set[str] = set()
+
+                # Seed 1: HTTP handler — request-named params are taint sources.
+                if _is_http_handler_decl(func_def):
+                    for p in params:
+                        if p in _REQ_NAMES or p in _CTX_NAMES:
+                            local_tainted.add(p)
+
+                # Seed 2: confirmed cross-file tainted params.
+                for i in confirmed.get(fname, set()):
+                    if i < len(params) and params[i]:
+                        local_tainted.add(params[i])
+
+                if not local_tainted:
+                    continue
+
+                body = func_def.child_by_field_name("body")
+                if body is None:
+                    continue
+
+                # Propagate taint within the function body.
+                tainted = local_tainted.copy()
+                tainted_funcs: set[str] = set(confirmed.keys())
+                for _ in range(8):
+                    if not _collect_pass(body, tainted, tainted_funcs):
+                        break
+
+                # Find unqualified calls to project-local functions with tainted args.
+                for node in _walk(body):
+                    if node.type != "call_expression":
+                        continue
+                    fn_node = node.child_by_field_name("function")
+                    args_node = node.child_by_field_name("arguments")
+                    if fn_node is None or args_node is None:
+                        continue
+                    chain = _selector_chain(fn_node)
+                    if len(chain) != 1:
+                        continue  # skip pkg.Func() — external package calls
+                    callee = chain[0]
+                    if callee not in func_bodies:
+                        continue
+                    for i, arg in enumerate(args_node.named_children):
+                        if _is_tainted(arg, tainted, tainted_funcs):
+                            if i not in confirmed.get(callee, set()):
+                                confirmed.setdefault(callee, set()).add(i)
+                                changed = True
+
+        if not changed:
+            break
+
+    return GoCrossFileContext(
+        confirmed_tainted_params={k: frozenset(v) for k, v in confirmed.items()}
+    )
+
+
 # ── Sink checking ─────────────────────────────────────────────────────────────
 
 def _emit(
@@ -436,6 +593,54 @@ def _check_sinks(
     return findings
 
 
+def _check_cross_file_sinks(
+    root,
+    global_tainted: set[str],
+    global_tainted_funcs: set[str],
+    cf_ctx: GoCrossFileContext,
+    file_path: str,
+    lines: list[str],
+    repo_url: str,
+) -> list[Finding]:
+    """Detect sinks in functions whose params are tainted by cross-file callers."""
+    findings: list[Finding] = []
+
+    for node in _walk(root):
+        if node.type != "function_declaration":
+            continue
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            continue
+        fname = name_node.text.decode("utf-8", errors="replace")
+        if fname not in cf_ctx.confirmed_tainted_params:
+            continue
+
+        params = _get_param_names(node)
+        local_tainted = global_tainted.copy()
+        added = False
+        for i in cf_ctx.confirmed_tainted_params[fname]:
+            if i < len(params) and params[i] and params[i] not in local_tainted:
+                local_tainted.add(params[i])
+                added = True
+
+        if not added:
+            continue
+
+        body = node.child_by_field_name("body")
+        if body is None:
+            continue
+
+        for _ in range(8):
+            if not _collect_pass(body, local_tainted, global_tainted_funcs):
+                break
+
+        findings.extend(
+            _check_sinks(body, local_tainted, global_tainted_funcs, file_path, lines, repo_url)
+        )
+
+    return findings
+
+
 # ── Analyzer ──────────────────────────────────────────────────────────────────
 
 class GoASTAnalyzer(BaseAnalyzer):
@@ -458,7 +663,19 @@ class GoASTAnalyzer(BaseAnalyzer):
 
         lines = content.splitlines()
         tainted, tainted_funcs = _build_taint(tree.root_node)
-        if not tainted and not tainted_funcs:
-            return []
 
-        return _check_sinks(tree.root_node, tainted, tainted_funcs, file_path, lines, repo_url)
+        findings: list[Finding] = []
+        if tainted or tainted_funcs:
+            findings.extend(
+                _check_sinks(tree.root_node, tainted, tainted_funcs, file_path, lines, repo_url)
+            )
+
+        cf_ctx = _get_go_cf_ctx()
+        if cf_ctx and cf_ctx.confirmed_tainted_params:
+            findings.extend(
+                _check_cross_file_sinks(
+                    tree.root_node, tainted, tainted_funcs, cf_ctx, file_path, lines, repo_url
+                )
+            )
+
+        return findings

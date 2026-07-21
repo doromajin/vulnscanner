@@ -3052,6 +3052,87 @@ func handler(w http.ResponseWriter, r *http.Request) {
         assert not findings, "Non-.go file must not be analyzed by GoASTAnalyzer"
 
 
+@_skip_no_tsgo
+class TestGoCrossFileTaint:
+    """Go cross-file taint: handler → helper → sink must be detected."""
+
+    def _scan_multi(self, files: dict[str, str]):
+        from vulnscanner.scanner import VulnScanner
+        import tempfile, os
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, content in files.items():
+                Path(os.path.join(tmp, name)).write_text(content)
+            return VulnScanner().scan(tmp)
+
+    def test_handler_to_helper_sql(self):
+        """Handler passes r.FormValue to a helper in a separate file — must fire SQL."""
+        result = self._scan_multi({
+            "handler.go": (
+                "package main\n"
+                "import \"net/http\"\n"
+                "func handler(w http.ResponseWriter, r *http.Request) {\n"
+                "    id := r.FormValue(\"id\")\n"
+                "    runQuery(id)\n"
+                "}\n"
+            ),
+            "queries.go": (
+                "package main\n"
+                "func runQuery(query string) {\n"
+                "    db.Query(\"SELECT * FROM t WHERE id=\" + query)\n"
+                "}\n"
+            ),
+        })
+        sql = [f for f in result.findings if f.rule_id == "GOAST-SQL-001"]
+        assert sql, "Cross-file taint handler→helper must produce GOAST-SQL-001"
+
+    def test_cross_file_helper_no_fp_without_taint(self):
+        """Helper function called only with constants must NOT fire."""
+        result = self._scan_multi({
+            "main.go": (
+                "package main\n"
+                "func main() {\n"
+                "    runQuery(\"admin\")\n"  # constant arg — not tainted
+                "}\n"
+            ),
+            "queries.go": (
+                "package main\n"
+                "func runQuery(query string) {\n"
+                "    db.Query(\"SELECT * FROM t WHERE role=\" + query)\n"
+                "}\n"
+            ),
+        })
+        sql = [f for f in result.findings if f.rule_id == "GOAST-SQL-001"]
+        assert not sql, "Helper with only constant args must not produce FP"
+
+    def test_two_hop_chain_detected(self):
+        """handler → intermediate → sink (3 files) must be detected."""
+        result = self._scan_multi({
+            "handler.go": (
+                "package main\n"
+                "import \"net/http\"\n"
+                "func handler(w http.ResponseWriter, r *http.Request) {\n"
+                "    name := r.FormValue(\"name\")\n"
+                "    intermediate(name)\n"
+                "}\n"
+            ),
+            "service.go": (
+                "package main\n"
+                "func intermediate(val string) {\n"
+                "    runQuery(val)\n"
+                "}\n"
+            ),
+            "queries.go": (
+                "package main\n"
+                "func runQuery(q string) {\n"
+                "    db.Exec(\"DELETE FROM t WHERE name=\" + q)\n"
+                "}\n"
+            ),
+        })
+        sql = [f for f in result.findings if f.rule_id == "GOAST-SQL-001"]
+        assert sql, "2-hop cross-file chain must be detected"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RubyASTAnalyzer tests
 # ─────────────────────────────────────────────────────────────────────────────
