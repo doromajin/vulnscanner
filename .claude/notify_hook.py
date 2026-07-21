@@ -8,8 +8,13 @@ Modes (pass as first argument):
         * command not in ALLOW/DENY      -> "approval prompt" alert
         * command matches ALLOW          -> no notification (auto-approved)
 
-  post  PostToolUse -- fires after execution (may fire for blocked tools too)
+  post  PostToolUse -- fires after execution
         * response indicates blocked     -> "was blocked" confirmation
+        * response OK                    -> sets work-done flag for stop mode
+
+  stop  Stop -- fires when Claude finishes a turn
+        * work-done flag present -> "implementation complete" notification
+        * no tool work this turn  -> silent (pure Q&A, no notification)
 
 Setup:
   1. Create .claude/pushover_config.json (already gitignored via *.json rule):
@@ -22,12 +27,17 @@ from __future__ import annotations
 import fnmatch
 import json
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 # ── Credentials ───────────────────────────────────────────────────────────────
 _CFG = Path(__file__).parent / "pushover_config.json"
+
+# Flag file written by post mode when real tool work completes;
+# consumed and deleted by stop mode to suppress Q&A-only notifications.
+_WORK_FLAG = Path(tempfile.gettempdir()) / "vulnscanner_claude_work_done"
 
 
 def _creds() -> tuple[str, str]:
@@ -125,7 +135,6 @@ def main() -> None:
             )
 
     elif mode == "post":
-        # Confirmation if PostToolUse fires for denied tools (behavior may vary by Claude Code version)
         resp = payload.get("tool_response", {})
         text = (str(resp.get("content", "")) + str(resp.get("error", ""))).lower()
         blocked = (
@@ -139,17 +148,29 @@ def main() -> None:
                 title = f"[blocked] ブロックされました ({tool})",
                 msg   = f"$ {cmd}\n-> deny ルールで自動ブロック済み",
             )
+        else:
+            # Mark that real tool work happened this turn (consumed by stop mode)
+            try:
+                _WORK_FLAG.touch()
+            except Exception:
+                pass
 
     elif mode == "stop":
         # Fires when Claude finishes a turn (task complete / awaiting user input).
         # stop_hook_active=True means we're already inside a stop hook chain — skip.
         if payload.get("stop_hook_active"):
             return
-        _send(
-            title    = "[done] Claude が完了しました",
-            msg      = "応答が終了しました。確認してください。",
-            priority = 0,
-        )
+        # Only notify if actual tool work was done this turn (not a pure Q&A response)
+        if _WORK_FLAG.exists():
+            try:
+                _WORK_FLAG.unlink()
+            except Exception:
+                pass
+            _send(
+                title    = "[done] 実装が完了しました",
+                msg      = "作業が終了しました。確認してください。",
+                priority = 0,
+            )
         # Output empty JSON so Claude Code continues normally.
         print("{}")
 
