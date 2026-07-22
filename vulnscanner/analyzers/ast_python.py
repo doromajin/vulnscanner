@@ -293,6 +293,10 @@ _SQLALCHEMY_TEXT_FUNCS = frozenset({"text", "sqlalchemy.text"})
 _PATH_CONSTRUCTION_FUNCS = frozenset({
     "os.path.join", "os.path.abspath", "os.path.realpath",
     "os.path.normpath", "os.path.expanduser",
+    # dirname/basename/split propagate taint: dirname(user_path) is still attacker-controlled.
+    # When applied to CLEAN input (e.g. __file__), the result is also CLEAN.
+    "os.path.dirname", "os.path.basename",
+    "os.path.split", "os.path.splitext", "os.path.commonpath",
     "pathlib.Path", "Path",
 })
 
@@ -442,6 +446,8 @@ _CLEAN_SERVER_FUNCS = frozenset({
     "tempfile.gettempdir", "tempfile.mkdtemp", "tempfile.mkstemp",
     "os.getpid", "os.getuid", "os.getgid", "os.getcwd",
     "os.cpu_count",
+    # pathlib — home directory is operator-configured, never from web input
+    "Path.home", "home",
 })
 
 # ── XXE ───────────────────────────────────────────────────────────────────────
@@ -812,7 +818,7 @@ def _func_is_web_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
 
 
 def _func_is_cli_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """Return True if *node* is a CLI entry point (Click/Typer decorated).
+    """Return True if *node* is a CLI entry point (Click/Typer decorated or argparse-using).
 
     Parameters of CLI functions come from the operator command line, not from
     untrusted web input, so they should be treated as CLEAN.
@@ -831,6 +837,13 @@ def _func_is_cli_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
                 name = inner.id
         if name in _CLI_ENTRY_DECORATORS:
             return True
+    # Also detect argparse-based entry functions: body contains parse_args() call.
+    # Web frameworks never use parse_args(), so false positives in web code are unlikely.
+    for subnode in ast.walk(node):
+        if isinstance(subnode, ast.Call):
+            attr = _attr_name(subnode.func)
+            if attr in _CLI_PARSE_METHODS:
+                return True
     return False
 
 
@@ -3661,32 +3674,94 @@ def _collect_tainted_vars_in_body(
     return tainted
 
 
-def _is_clean_expr_quick(node: ast.expr, clean_vars: set[str], depth: int = 0) -> bool:
+def _is_clean_expr_quick(
+    node: ast.expr,
+    clean_vars: set[str],
+    module_clean: frozenset[str] = frozenset(),
+    depth: int = 0,
+) -> bool:
     """Lightweight CLEAN check for Phase F CLI-param propagation.
 
-    Conservative: only constants, names in clean_vars, attribute access on CLEAN
-    objects, and parse_args() returns qualify as CLEAN.  Arbitrary calls are not
-    trusted so taint introduced by network/user operations is never suppressed.
+    Conservative: only constants, names in clean_vars/module_clean, attribute
+    access on CLEAN objects, parse_args() and server-function returns, and
+    arithmetic/BinOp on CLEAN operands qualify as CLEAN.
     """
-    if depth > 4:
+    if depth > 5:
         return False
     if isinstance(node, ast.Constant):
         return True
     if isinstance(node, ast.Name):
-        return node.id in clean_vars
+        return (node.id in clean_vars
+                or node.id in module_clean
+                or node.id in _CLEAN_DUNDER_NAMES
+                or node.id in ("True", "False", "None"))
     if isinstance(node, ast.Attribute):
         # e.g. args.target where args came from parse_args() → CLEAN
-        return _is_clean_expr_quick(node.value, clean_vars, depth + 1)
+        return _is_clean_expr_quick(node.value, clean_vars, module_clean, depth + 1)
     if isinstance(node, ast.Call):
         attr = _attr_name(node.func)
-        return attr in _CLI_PARSE_METHODS
+        full = _full_name(node.func) or ""
+        if attr in _CLI_PARSE_METHODS:
+            return True
+        if full in _CLEAN_SERVER_FUNCS or attr in _CLEAN_SERVER_FUNCS:
+            return True
+        # Path construction: CLEAN if all args are CLEAN
+        if full in _PATH_CONSTRUCTION_FUNCS or attr in {"Path"}:
+            return all(
+                _is_clean_expr_quick(a, clean_vars, module_clean, depth + 1)
+                for a in node.args
+            )
+        return False
+    if isinstance(node, ast.BinOp):
+        return (
+            _is_clean_expr_quick(node.left, clean_vars, module_clean, depth + 1)
+            and _is_clean_expr_quick(node.right, clean_vars, module_clean, depth + 1)
+        )
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(
+            _is_clean_expr_quick(e, clean_vars, module_clean, depth + 1)
+            for e in node.elts
+        )
+    if isinstance(node, ast.JoinedStr):  # f-string
+        return all(
+            _is_clean_expr_quick(v.value, clean_vars, module_clean, depth + 1)
+            if isinstance(v, ast.FormattedValue) else True
+            for v in node.values
+        )
     return False
 
 
-def _collect_clean_vars_in_body(stmts: list[ast.stmt], seed: set[str]) -> set[str]:
+def _collect_clean_vars_in_body(
+    stmts: list[ast.stmt],
+    seed: set[str],
+    module_clean: frozenset[str] = frozenset(),
+) -> set[str]:
     """Single-pass forward scan: return names assigned exclusively from CLEAN sources."""
     clean = seed.copy()
     for stmt in stmts:
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            val = stmt.value if isinstance(stmt, ast.Assign) else stmt.value
+            if val is None:
+                continue
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            if _is_clean_expr_quick(val, clean, module_clean):
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        clean.add(t.id)
+    return clean
+
+
+def _module_level_clean_names(tree: ast.Module) -> frozenset[str]:
+    """Return names of module-level variables provably assigned from CLEAN sources.
+
+    Uses _is_clean_expr_quick (without module_clean recursion to avoid cycles).
+    Handles common patterns like:
+        BASE = os.path.dirname(os.path.abspath(__file__))
+        BENCH_DIR = Path(__file__).parent / "owasp_benchmark"
+        EXPECTED = BENCH_DIR / "expectedresults.csv"
+    """
+    clean: set[str] = set()
+    for stmt in tree.body:
         if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             val = stmt.value if isinstance(stmt, ast.Assign) else stmt.value
             if val is None:
@@ -3696,7 +3771,7 @@ def _collect_clean_vars_in_body(stmts: list[ast.stmt], seed: set[str]) -> set[st
                 for t in targets:
                     if isinstance(t, ast.Name):
                         clean.add(t.id)
-    return clean
+    return frozenset(clean)
 
 
 def _build_confirmed_clean_params(
@@ -3710,11 +3785,20 @@ def _build_confirmed_clean_params(
     """
     confirmed: dict[str, set[int]] = {}
 
+    # Pre-compute module-level CLEAN names per file.  These are passed as
+    # module_clean to _is_clean_expr_quick so that module globals like
+    # BENCH_DIR = Path(__file__).parent / "benchmark" are recognized as CLEAN
+    # when they appear as call arguments inside function bodies.
+    module_clean_by_fp: dict[str, frozenset[str]] = {}
+    func_to_fp: dict[int, str] = {}
+
     func_bodies: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
-    for tree in parsed_trees.values():
+    for fp, tree in parsed_trees.items():
+        module_clean_by_fp[fp] = _module_level_clean_names(tree)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 func_bodies.setdefault(node.name, []).append(node)
+                func_to_fp[id(node)] = fp
 
     changed = True
     for _ in range(10):
@@ -3724,28 +3808,37 @@ def _build_confirmed_clean_params(
         for _name, func_list in func_bodies.items():
             for func_def in func_list:
                 params = [a.arg for a in func_def.args.args if a.arg != "self"]
+                module_clean = module_clean_by_fp.get(func_to_fp.get(id(func_def), ""), frozenset())
 
                 # Seed: CLI entry params are CLEAN; confirmed clean from previous iters
+                is_cli = _func_is_cli_entry(func_def)
                 clean_seed: set[str] = set()
-                if _func_is_cli_entry(func_def):
+                if is_cli:
                     clean_seed.update(params)
                 for idx in confirmed.get(_name, set()):
                     if idx < len(params):
                         clean_seed.add(params[idx])
 
-                if not clean_seed:
+                # Allow processing even when no CLEAN params, if the function IS a CLI
+                # entry — its body may contain parse_args() calls that seed CLEAN vars
+                # (e.g. main() with no params that calls parser.parse_args()).
+                if not clean_seed and not is_cli:
                     continue
 
-                clean_vars = _collect_clean_vars_in_body(func_def.body, clean_seed)
+                clean_vars = _collect_clean_vars_in_body(func_def.body, clean_seed, module_clean)
 
                 for node in ast.walk(func_def):
                     if not isinstance(node, ast.Call):
                         continue
                     callee = _full_name(node.func) or _attr_name(node.func)
+                    # Mirror Phase E: qualified names like 'scanner.scan' won't match
+                    # func_bodies keyed by plain name 'scan'; fall back to attr name.
+                    if not callee or "." in callee:
+                        callee = _attr_name(node.func)
                     if not callee:
                         continue
                     for i, arg in enumerate(node.args):
-                        if _is_clean_expr_quick(arg, clean_vars):
+                        if _is_clean_expr_quick(arg, clean_vars, module_clean):
                             if i not in confirmed.get(callee, set()):
                                 confirmed.setdefault(callee, set()).add(i)
                                 changed = True
