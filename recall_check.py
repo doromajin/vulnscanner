@@ -55,15 +55,17 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     # -- JavaScript ---------------------------------------------------------------
     ("XSS-001",       "js/xss.js",                    "HIGH",     "innerHTML XSS"),
 
-    # -- PHP ----------------------------------------------------------------------
+    # -- PHP: PHAST-* are AST findings; DESER-004/SQL-004 are regex rules --------
     ("DESER-004",     "php/deser.php",                "CRITICAL", "PHP unserialize() RCE"),
     ("SQL-004",       "php/sqli.php",                 "HIGH",     "PHP SQL string concatenation"),
-    ("XSS-005",       "php/xss.php",                  "HIGH",     "PHP echo $_GET / $_POST"),
-    ("XSS-008",       "php/xss_1hop.php",             "HIGH",     "PHP XSS 1-hop"),
-    # PHP AST: multi-hop taint patterns (tree-sitter-php)
-    ("PHP-XSS-010",   "php/xss_2hop.php",             "HIGH",     "PHP XSS 2-hop taint propagation"),
-    ("PHP-XSS-011",   "php/xss_nullcoalesce.php",     "HIGH",     "PHP XSS null-coalescing taint propagation"),
-    ("PHP-XSS-012",   "php/xss_func.php",             "HIGH",     "PHP XSS function return taint"),
+    ("PHAST-SQL-001", "php/sqli.php",                 "HIGH",     "PHP AST: tainted arg in mysqli_query()"),
+    # PHAST-XSS-001 is produced by the PHP AST analyzer and supersedes XSS-005/008
+    # because _deduplicate() keeps AST findings over regex at the same (file,line,vuln_type).
+    ("PHAST-XSS-001", "php/xss.php",                  "HIGH",     "PHP echo $_GET / $_POST"),
+    ("PHAST-XSS-001", "php/xss_1hop.php",             "HIGH",     "PHP XSS 1-hop"),
+    ("PHAST-XSS-001", "php/xss_2hop.php",             "HIGH",     "PHP XSS 2-hop taint propagation"),
+    ("PHAST-XSS-001", "php/xss_nullcoalesce.php",     "HIGH",     "PHP XSS null-coalescing taint propagation"),
+    ("PHAST-XSS-001", "php/xss_func.php",             "HIGH",     "PHP XSS function return taint"),
 
     # -- Python: command injection ------------------------------------------------
     ("AST-CMD-001",   "python/command_injection.py",  "HIGH",     "os.system() with tainted arg"),
