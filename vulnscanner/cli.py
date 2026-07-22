@@ -49,6 +49,9 @@ def main() -> None:
                    "Use --rules builtin to load only built-in rules.")
 @click.option("--no-builtin-rules", is_flag=True, default=False,
               help="Disable built-in YAML rules (custom rules only)")
+@click.option("--filter", "filter_mode", default=None,
+              type=click.Choice(["exploitable"], case_sensitive=False),
+              help="'exploitable': show only findings with confirmed taint path from user input")
 def scan(
     target: str,
     token: str | None,
@@ -65,6 +68,7 @@ def scan(
     stdout_json: bool,
     rules: tuple[str, ...],
     no_builtin_rules: bool,
+    filter_mode: str | None,
 ) -> None:
     """Scan a single GitHub repository or local directory.
 
@@ -128,6 +132,16 @@ def scan(
         f for f in all_findings
         if severity_order.index(f.severity) <= cutoff
     ]
+
+    # Exploitability filter: keep only findings with a confirmed taint path.
+    # Drops UNKNOWN-taint findings (taint_status == "unknown") which represent
+    # unverified "needs_review" / "low_reach" cases.
+    # Findings with no taint tracking (secrets, YAML, unconditional sinks) are kept.
+    if filter_mode == "exploitable":
+        result.findings = [
+            f for f in result.findings
+            if f.taint_status != "unknown"
+        ]
 
     # Baseline comparison: split into new vs. already-known findings
     baseline_keys: set | None = None

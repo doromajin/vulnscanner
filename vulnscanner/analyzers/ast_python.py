@@ -425,6 +425,20 @@ _SECURITY_SENSITIVE_RNG_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Functions that return server-side or OS-controlled values — never user input.
+# Covers datetime/time (server clock) and OS-path helpers (system dirs, PID, etc.)
+_CLEAN_SERVER_FUNCS = frozenset({
+    # datetime / date / time — system clock values
+    "datetime.now", "datetime.utcnow", "datetime.today",
+    "date.today",
+    "time.time", "time.monotonic", "time.perf_counter",
+    "time.monotonic_ns", "time.perf_counter_ns",
+    # OS / tempfile — system-determined paths and identifiers
+    "tempfile.gettempdir", "tempfile.mkdtemp", "tempfile.mkstemp",
+    "os.getpid", "os.getuid", "os.getgid", "os.getcwd",
+    "os.cpu_count",
+})
+
 # ── XXE ───────────────────────────────────────────────────────────────────────
 # xml.dom.minidom / xml.etree.ElementTree parse functions that accept a custom
 # parser object.  XXE is only exploitable when external entity expansion is
@@ -3060,6 +3074,10 @@ def _taint_of(
                     "os.environ.setdefault"}:
             return CLEAN_LITERAL
 
+        # Server/OS functions: system clock, temp dir, PID — never user-controlled.
+        if full in _CLEAN_SERVER_FUNCS:
+            return CLEAN_LITERAL
+
         # Path construction: taint propagates from any argument to the resulting path.
         # os.path.join(safe_base, user_input) must remain TAINTED for open() to fire HIGH.
         if full in _PATH_CONSTRUCTION_FUNCS:
@@ -3123,6 +3141,13 @@ def _taint_of(
                 if lookup in assignments:
                     return _taint_of(assignments[lookup], assignments, class_attrs, _depth + 1)
                 # Key was never stored via conf.set() in this scope → not user-controlled
+                return CLEAN_LITERAL
+
+            # Catch-all: any remaining method call on a provably-CLEAN object stays CLEAN.
+            # Template methods (format/join/replace) propagate taint from args and are handled
+            # above; everything else (strftime, isoformat, encode, etc.) is a transform of
+            # a clean value and cannot introduce user-controlled content.
+            if obj_taint.status == TaintStatus.CLEAN:
                 return CLEAN_LITERAL
 
         # Cross-file class method resolution: evaluate all known class implementations of

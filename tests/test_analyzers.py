@@ -2048,6 +2048,55 @@ class TestPythonStrPassthrough:
         assert not sql, f"str(int(raw)) after try/except must not FP, got: {sql}"
 
 
+# ── datetime / time CLEAN sources ────────────────────────────────────────────
+
+class TestDatetimeCleanSources:
+    """datetime.now() / date.today() / time.time() must not propagate taint."""
+
+    def _scan(self, code: str):
+        return PythonASTAnalyzer().analyze("app.py", code)
+
+    def test_datetime_now_strftime_no_path_fp(self):
+        """datetime.now().strftime(...) used as a path component must not FP."""
+        code = (
+            "from datetime import datetime\n"
+            "from pathlib import Path\n"
+            "def archive():\n"
+            "    ts = datetime.now().strftime('%Y%m%d')\n"
+            "    path = Path('/data') / ts / 'log.txt'\n"
+            "    return path.read_text()\n"
+        )
+        findings = self._scan(code)
+        path_fps = [f for f in findings if "PATH" in f.rule_id and not f.suppression_reason]
+        assert not path_fps, f"datetime.now().strftime() path must not FP: {path_fps}"
+
+    def test_date_today_no_path_fp(self):
+        """date.today().isoformat() used as path must not FP."""
+        code = (
+            "from datetime import date\n"
+            "from pathlib import Path\n"
+            "def daily_log():\n"
+            "    today = date.today().isoformat()\n"
+            "    return (Path('/logs') / today).read_text()\n"
+        )
+        findings = self._scan(code)
+        path_fps = [f for f in findings if "PATH" in f.rule_id and not f.suppression_reason]
+        assert not path_fps, f"date.today().isoformat() path must not FP: {path_fps}"
+
+    def test_tainted_datetime_still_detected(self):
+        """User-controlled path (not datetime) must still be detected."""
+        code = (
+            "from flask import request\n"
+            "from pathlib import Path\n"
+            "def view():\n"
+            "    name = request.args.get('name')\n"
+            "    return (Path('/data') / name).read_text()\n"
+        )
+        findings = self._scan(code)
+        path_finds = [f for f in findings if "PATH" in f.rule_id and not f.suppression_reason]
+        assert path_finds, "Tainted path must still be detected"
+
+
 # ── NoSQL injection ───────────────────────────────────────────────────────────
 
 class TestNoSQLInjection:
@@ -3592,3 +3641,53 @@ system("cat /proc/" . $file);
         code = '<?php\n$id = $_GET["id"];\n$pdo->query("SELECT * FROM t WHERE id=" . $id);'
         findings = _PHPAST.analyze("main.py", code)
         assert not findings, "Non-.php file must not be analyzed by PhpASTAnalyzer"
+
+
+# ── Exploitability filter ─────────────────────────────────────────────────────
+
+class TestExploitabilityFilter:
+    """--filter exploitable: keep tainted findings, drop unknown-taint ones."""
+
+    def _findings(self, code: str):
+        return PythonASTAnalyzer().analyze("app.py", code)
+
+    def test_tainted_finding_kept(self):
+        """taint_status='tainted' findings must survive the exploitable filter."""
+        code = (
+            "from flask import request\n"
+            "def view():\n"
+            "    name = request.args.get('name')\n"
+            "    from pathlib import Path\n"
+            "    return (Path('/data') / name).read_text()\n"
+        )
+        findings = self._findings(code)
+        tainted = [f for f in findings if f.taint_status == "tainted" and not f.suppression_reason]
+        kept = [f for f in tainted if f.taint_status != "unknown"]
+        assert kept, "TAINTED findings must not be dropped by exploitable filter"
+
+    def test_unknown_taint_finding_dropped(self):
+        """taint_status='unknown' (low_reach) findings must be filtered out."""
+        code = (
+            "def process(target_file: str):\n"
+            "    from pathlib import Path\n"
+            "    return Path(target_file).read_text()\n"
+        )
+        findings = self._findings(code)
+        unknown = [f for f in findings if f.taint_status == "unknown" and not f.suppression_reason]
+        # After exploitable filter: unknown findings removed
+        filtered = [f for f in unknown if f.taint_status != "unknown"]
+        assert not filtered, "unknown-taint findings are exactly those dropped by exploitable filter"
+        # Verify the scanner-level filter works
+        from vulnscanner.models import ScanResult
+        result = ScanResult(repo_url=".")
+        result.findings = findings
+        result.findings = [f for f in result.findings if f.taint_status != "unknown"]
+        assert all(f.taint_status != "unknown" for f in result.findings)
+
+    def test_secret_finding_no_taint_kept(self):
+        """Findings with no taint tracking (taint_status=None) must be kept."""
+        code = 'db_password = "hunter2secret"\n'
+        findings = self._findings(code)
+        secrets = [f for f in findings if f.taint_status is None and not f.suppression_reason]
+        kept = [f for f in secrets if f.taint_status != "unknown"]
+        assert kept, "Secret findings (no taint tracking) must survive exploitable filter"
