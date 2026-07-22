@@ -3231,6 +3231,79 @@ class TestGoCrossFileTaint:
         assert sql, "2-hop cross-file chain must be detected"
 
 
+# ── Go Gin ShouldBindJSON struct binding ─────────────────────────────────────
+
+@_skip_no_tsgo
+class TestGoGinBinding:
+    """Gin c.ShouldBindJSON(&req) / c.Bind(&req) must mark struct fields tainted."""
+
+    def _scan(self, code: str):
+        return GoASTAnalyzer().analyze("handler.go", code)
+
+    def test_should_bind_json_sql_detected(self):
+        """c.ShouldBindJSON(&req) → req.Name in SQL → must fire GOAST-SQL-001."""
+        code = (
+            'package main\n'
+            'import "github.com/gin-gonic/gin"\n'
+            'type LoginReq struct { Name string `json:"name"` }\n'
+            'func handler(c *gin.Context) {\n'
+            '    var req LoginReq\n'
+            '    c.ShouldBindJSON(&req)\n'
+            '    db.Exec("SELECT * FROM users WHERE name=\'" + req.Name + "\'")\n'
+            '}\n'
+        )
+        findings = self._scan(code)
+        sql = [f for f in findings if f.rule_id == "GOAST-SQL-001"]
+        assert sql, "c.ShouldBindJSON → req.Name in SQL must fire"
+
+    def test_bind_json_cmd_detected(self):
+        """c.BindJSON(&req) → req.Cmd in exec → must fire GOAST-CMD-001."""
+        code = (
+            'package main\n'
+            'import "github.com/gin-gonic/gin"\n'
+            'type CmdReq struct { Cmd string `json:"cmd"` }\n'
+            'func handler(c *gin.Context) {\n'
+            '    var req CmdReq\n'
+            '    c.BindJSON(&req)\n'
+            '    exec.Command("sh", "-c", req.Cmd).Run()\n'
+            '}\n'
+        )
+        findings = self._scan(code)
+        cmd = [f for f in findings if f.rule_id == "GOAST-CMD-001"]
+        assert cmd, "c.BindJSON → req.Cmd in exec must fire"
+
+    def test_should_bind_query_detected(self):
+        """c.ShouldBindQuery(&req) → req.Search in SQL → must fire."""
+        code = (
+            'package main\n'
+            'import "github.com/gin-gonic/gin"\n'
+            'type SearchReq struct { Search string `form:"q"` }\n'
+            'func handler(c *gin.Context) {\n'
+            '    var req SearchReq\n'
+            '    c.ShouldBindQuery(&req)\n'
+            '    db.Query("SELECT * FROM items WHERE name LIKE %" + req.Search + "%")\n'
+            '}\n'
+        )
+        findings = self._scan(code)
+        sql = [f for f in findings if f.rule_id == "GOAST-SQL-001"]
+        assert sql, "c.ShouldBindQuery → req.Search in SQL must fire"
+
+    def test_no_fp_constant_struct(self):
+        """Struct populated with literals must NOT fire."""
+        code = (
+            'package main\n'
+            'import "github.com/gin-gonic/gin"\n'
+            'type Req struct { Name string }\n'
+            'func handler(c *gin.Context) {\n'
+            '    req := Req{Name: "admin"}\n'
+            '    db.Exec("SELECT * FROM users WHERE name=\'" + req.Name + "\'")\n'
+            '}\n'
+        )
+        findings = self._scan(code)
+        sql = [f for f in findings if f.rule_id == "GOAST-SQL-001"]
+        assert not sql, "Struct with constant fields must not FP"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RubyASTAnalyzer tests
 # ─────────────────────────────────────────────────────────────────────────────

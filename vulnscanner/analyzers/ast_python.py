@@ -246,6 +246,11 @@ _TAINT_PASSTHROUGH_FUNCS = frozenset({
     "base64.urlsafe_b64encode",
     "base64.b16decode",
     "base64.b32decode",
+    # urllib Request wrapper: taint flows from the URL argument (first positional arg).
+    # urllib.request.Request("https://hardcoded_url", ...) → CLEAN (URL is literal).
+    # urllib.request.Request(tainted_url, ...) → TAINTED (URL is user-controlled).
+    "urllib.request.Request",
+    "Request",
 })
 
 # Context-specific sanitizers: protect ONLY their own sink context.

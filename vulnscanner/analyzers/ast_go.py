@@ -75,6 +75,16 @@ _FRAMEWORK_METHODS = frozenset({
 })
 # Methods on sub-objects (r.Header, r.URL) that return user data
 _HEADER_URL_METHODS = frozenset({"Get", "Values"})
+# Gin / Echo / Fiber struct-binding methods: c.ShouldBindJSON(&req) marks req as tainted
+_GIN_BIND_METHODS = frozenset({
+    "Bind", "BindJSON", "BindXML", "BindYAML", "BindQuery", "BindHeader",
+    "BindUri", "BindForm",
+    "ShouldBind", "ShouldBindJSON", "ShouldBindXML", "ShouldBindYAML",
+    "ShouldBindQuery", "ShouldBindHeader", "ShouldBindUri", "ShouldBindForm",
+    "ShouldBindBodyWith",
+    # fasthttp/fiber
+    "BodyParser",
+})
 
 # ── Taint-propagating calls (not sinks, but result is tainted if args are) ───
 
@@ -278,6 +288,30 @@ def _collect_pass(root, tainted: set[str], tainted_funcs: set[str]) -> bool:
                 if rhs and _is_tainted(rhs, tainted, tainted_funcs):
                     tainted.add(name)
                     changed = True
+
+        # Gin/Echo/Fiber struct binding: c.ShouldBindJSON(&req) / c.Bind(&req)
+        # The struct pointed to by &req is populated from the request body/query —
+        # mark the struct variable itself as tainted so req.Field accesses propagate.
+        elif node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn is not None and fn.type == "selector_expression":
+                chain = _selector_chain(fn)
+                if (len(chain) == 2
+                        and chain[0] in _CTX_NAMES
+                        and chain[1] in _GIN_BIND_METHODS):
+                    args = node.child_by_field_name("arguments")
+                    if args:
+                        for arg in args.named_children:
+                            # &req → unary_expression with & operator
+                            if (arg.type == "unary_expression"
+                                    and arg.named_children
+                                    and arg.named_children[0].type == "identifier"):
+                                var_name = arg.named_children[0].text.decode(
+                                    "utf-8", errors="replace"
+                                )
+                                if var_name not in tainted:
+                                    tainted.add(var_name)
+                                    changed = True
 
     return changed
 
