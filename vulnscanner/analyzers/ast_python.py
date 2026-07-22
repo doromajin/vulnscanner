@@ -2332,6 +2332,20 @@ class _VulnVisitor(ast.NodeVisitor):
                     self._visit_stmts(stmts[i + 1:])
                     self._assignments = saved
                     return
+            elif isinstance(stmt, ast.Assert):
+                # assert guard(x)  →  x is CLEAN for all subsequent statements.
+                # Semantically identical to `if not guard(x): raise AssertionError`.
+                assert_vars = _extract_guard_vars(stmt.test)
+                self.visit(stmt)
+                if assert_vars:
+                    saved = self._assignments
+                    patched = dict(saved)
+                    for v in assert_vars:
+                        patched[v] = ast.Constant(value=0)
+                    self._assignments = patched
+                    self._visit_stmts(stmts[i + 1:])
+                    self._assignments = saved
+                    return
             elif isinstance(stmt, ast.Try):
                 # Process the try body with sequential guard propagation so that
                 # guards like `if "'" in bar: return` inside try blocks suppress

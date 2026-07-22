@@ -2357,6 +2357,36 @@ def handle():
         active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
         assert not active, "inline re.compile().match() guard must suppress SQL injection"
 
+    def test_assert_guard_suppresses_sql(self):
+        code = """
+from flask import request
+import sqlite3
+
+conn = sqlite3.connect(':memory:')
+
+def handle():
+    uid = request.args.get('id')
+    assert uid.isdigit(), "must be numeric"
+    conn.execute('SELECT * FROM users WHERE id=' + uid)
+"""
+        findings = AST.analyze("t.py", code, "")
+        active = [f for f in findings if "SQL" in f.rule_id and f.suppression_reason is None]
+        assert not active, "assert guard must suppress subsequent SQL injection finding"
+
+    def test_assert_isinstance_guard_suppresses_cmd(self):
+        code = """
+from flask import request
+import os
+
+def handle():
+    port = request.args.get('port')
+    assert isinstance(port, int)
+    os.system(f'ping {port}')
+"""
+        findings = AST.analyze("t.py", code, "")
+        active = [f for f in findings if "CMD" in f.rule_id and f.suppression_reason is None]
+        assert not active, "assert isinstance() guard must suppress subsequent CMD injection"
+
     def test_unguarded_tainted_name_still_fires(self):
         code = """
 from flask import request
