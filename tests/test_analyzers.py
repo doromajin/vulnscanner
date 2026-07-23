@@ -2949,6 +2949,140 @@ app.post('/login', (req, res) => {
         redir = [f for f in findings if f.rule_id == "JSAST-REDIR-001"]
         assert not redir, "Literal URL in res.redirect must not FP"
 
+    # ── SSTI ─────────────────────────────────────────────────────────────────
+
+    def test_ssti_ejs_render(self):
+        code = """
+app.get('/page', (req, res) => {
+    const tmpl = req.query.template;
+    res.send(ejs.render(tmpl, {}));
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SSTI-001" in rule_ids, "ejs.render(tainted) SSTI not detected"
+
+    def test_ssti_pug_render(self):
+        code = """
+app.post('/render', (req, res) => {
+    const src = req.body.src;
+    const html = pug.render(src);
+    res.send(html);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SSTI-001" in rule_ids, "pug.render(tainted) SSTI not detected"
+
+    def test_ssti_nunjucks_renderstring(self):
+        code = """
+app.get('/tmpl', (req, res) => {
+    const t = req.query.t;
+    res.send(nunjucks.renderString(t, {}));
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SSTI-001" in rule_ids, "nunjucks.renderString(tainted) SSTI not detected"
+
+    def test_no_fp_ssti_literal_template(self):
+        """ejs.render with string literal template must not fire."""
+        code = "ejs.render('<h1>Hello</h1>', {});"
+        findings = _JSAST.analyze("app.js", code)
+        ssti = [f for f in findings if f.rule_id == "JSAST-SSTI-001"]
+        assert not ssti, "Literal template in ejs.render must not FP"
+
+    # ── Prototype pollution ───────────────────────────────────────────────────
+
+    def test_proto_pollution_merge_global(self):
+        code = """
+app.post('/config', (req, res) => {
+    const userConf = req.body;
+    merge(config, userConf);
+    res.sendStatus(200);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-PROTO-001" in rule_ids, "merge(target, tainted) prototype pollution not detected"
+
+    def test_proto_pollution_lodash_merge(self):
+        code = """
+app.post('/update', (req, res) => {
+    const patch = req.body.patch;
+    _.merge(baseObj, patch);
+    res.json(baseObj);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-PROTO-001" in rule_ids, "_.merge(target, tainted) prototype pollution not detected"
+
+    def test_proto_pollution_object_assign(self):
+        code = """
+app.put('/settings', (req, res) => {
+    const updates = req.body;
+    Object.assign(settings, updates);
+    res.json(settings);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-PROTO-001" in rule_ids, "Object.assign(target, tainted) prototype pollution not detected"
+
+    def test_no_fp_proto_object_assign_literals(self):
+        """Object.assign({}, {a: 1}) must not fire."""
+        code = "const x = Object.assign({}, {a: 1, b: 2});"
+        findings = _JSAST.analyze("app.js", code)
+        proto = [f for f in findings if f.rule_id == "JSAST-PROTO-001"]
+        assert not proto, "Object.assign with literals must not FP"
+
+    # ── Class field taint ─────────────────────────────────────────────────────
+
+    def test_class_field_taint_sql(self):
+        """this.userId = req.body.id in constructor → db.query(this.userId) in method."""
+        code = """
+class UserService {
+    constructor(req) {
+        this.userId = req.body.id;
+    }
+    fetchUser() {
+        return db.query("SELECT * FROM users WHERE id=" + this.userId);
+    }
+}
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "this.userId taint not propagated to db.query"
+
+    def test_class_field_taint_xss(self):
+        """this.name = req.query.name in one method → res.send(this.name) in another."""
+        code = """
+class PageController {
+    init(req) {
+        this.name = req.query.name;
+    }
+    render(res) {
+        res.send("<h1>" + this.name + "</h1>");
+    }
+}
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-XSS-001" in rule_ids, "this.name taint not propagated to res.send"
+
+    def test_no_fp_class_field_literal(self):
+        """this.name = 'admin' must not taint."""
+        code = """
+class Ctrl {
+    init() { this.name = 'admin'; }
+    show(res) { res.send(this.name); }
+}
+"""
+        findings = _JSAST.analyze("app.js", code)
+        xss = [f for f in findings if f.rule_id == "JSAST-XSS-001"]
+        assert not xss, "this.name assigned from literal must not FP"
+
 
 _TSAST = TSASTAnalyzer()
 

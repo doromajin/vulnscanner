@@ -15,6 +15,12 @@ Rule IDs (JSAST-*):
   JSAST-XSS-001   Reflected XSS (res.send/write/end)
   JSAST-EVAL-001  Code injection (eval / new Function)
   JSAST-SSRF-001  SSRF (fetch / axios / http)
+  JSAST-REDIR-001 Open redirect (res.redirect with user-controlled URL)
+  JSAST-NOSQL-001 NoSQL injection (MongoDB find/findOne/updateOne …)
+  JSAST-LOG-001   Log injection (console.log / logger.error …)
+  JSAST-SSTI-001  SSTI (ejs/pug/handlebars/nunjucks render/compile)
+  JSAST-PROTO-001 Prototype pollution (_.merge / Object.assign …)
+  Class field taint: this.x = req.body.x propagated to sinks in other methods
 
 Analyzers:
   JSASTAnalyzer  — .js / .jsx / .mjs / .cjs  (tree-sitter-javascript)
@@ -166,11 +172,12 @@ def _unwrap(node):
 class _JSTaintState:
     """Accumulates taint for a single JS file across multiple passes."""
 
-    __slots__ = ("tainted", "tainted_funcs")
+    __slots__ = ("tainted", "tainted_funcs", "tainted_attrs")
 
     def __init__(self) -> None:
         self.tainted: dict[str, tuple[int, str]] = {}    # var → (line, desc)
         self.tainted_funcs: set[str] = set()              # function names
+        self.tainted_attrs: set[str] = set()              # this.x attribute names
 
     def mark(self, var: str, line: int, desc: str) -> bool:
         if var not in self.tainted:
@@ -189,6 +196,14 @@ class _JSTaintState:
             if _is_request_source(node):
                 return True
             obj = node.child_by_field_name("object")
+            # this.attr — check if attr was previously tainted via assignment
+            if obj is not None and obj.type == "this":
+                prop = node.child_by_field_name("property")
+                if prop is not None:
+                    attr = prop.text.decode("utf-8", errors="replace")
+                    if attr in self.tainted_attrs:
+                        return True
+                return False
             return obj is not None and self.is_tainted_node(obj)
 
         if node.type == "template_string":
@@ -276,16 +291,31 @@ def _collect_declarations(root, state: _JSTaintState) -> bool:
             rhs = node.child_by_field_name("right")
             if lhs is None or rhs is None:
                 continue
+            rhs_unwrapped = _unwrap(rhs)
             if lhs.type == "identifier":
                 var = lhs.text.decode()
                 line = lhs.start_point[0] + 1
-                rhs = _unwrap(rhs)
-                if _is_sanitizer(rhs):
+                if _is_sanitizer(rhs_unwrapped):
                     state.tainted.pop(var, None)
-                elif var not in state.tainted and state.is_tainted_node(rhs):
-                    short = rhs.text.decode("utf-8", errors="replace")[:60]
+                elif var not in state.tainted and state.is_tainted_node(rhs_unwrapped):
+                    short = rhs_unwrapped.text.decode("utf-8", errors="replace")[:60]
                     if state.mark(var, line, f"reassigned from: {short}"):
                         changed = True
+
+            # this.attr = tainted — class field assignment; attr becomes tainted
+            elif lhs.type == "member_expression":
+                obj = lhs.child_by_field_name("object")
+                prop = lhs.child_by_field_name("property")
+                if (obj is not None and obj.type == "this"
+                        and prop is not None
+                        and not _is_sanitizer(rhs_unwrapped)):
+                    attr = prop.text.decode("utf-8", errors="replace")
+                    if (attr not in state.tainted_attrs
+                            and (state.is_tainted_node(rhs_unwrapped)
+                                 or _is_request_source(rhs_unwrapped))):
+                        state.tainted_attrs.add(attr)
+                        changed = True
+
     return changed
 
 
@@ -382,6 +412,24 @@ _NOSQL_METHOD_SINKS = frozenset({
 # Log injection: logging frameworks that render the first arg as-is
 _LOG_ROOTS = frozenset({"console", "logger", "log", "winston", "pino", "bunyan"})
 _LOG_METHODS = frozenset({"log", "warn", "error", "info", "debug", "trace", "fatal"})
+# SSTI: template engine objects and their render/compile methods
+_SSTI_ROOTS = frozenset({
+    "ejs", "pug", "jade", "nunjucks", "handlebars", "Handlebars",
+    "mustache", "Mustache", "swig", "eta", "Eta",
+})
+_SSTI_RENDER_METHODS = frozenset({
+    "render", "renderFile", "renderString", "renderToString",
+    "compile", "template",
+})
+# Prototype pollution: merge / extend style functions (arg[1+] merges into arg[0])
+_MERGE_GLOBAL_FUNCS = frozenset({
+    "merge", "extend", "deepMerge", "deepExtend", "mergeWith",
+    "defaults", "defaultsDeep", "mixin",
+})
+_MERGE_ROOTS = frozenset({"_", "lodash", "$", "jQuery", "deepmerge"})
+_MERGE_METHODS = frozenset({
+    "merge", "extend", "mergeWith", "defaults", "defaultsDeep", "assign", "mixin",
+})
 
 
 def _emit(
@@ -478,6 +526,15 @@ def _check_sinks(
                       VulnType.SSRF, Severity.HIGH,
                       "JSAST-SSRF-001",
                       "User-controlled URL flows into fetch() — SSRF risk")
+
+            # Prototype pollution: merge(target, tainted), deepMerge(obj, tainted)
+            elif fname in _MERGE_GLOBAL_FUNCS:
+                arg_list = list(args_node.named_children)
+                if len(arg_list) >= 2 and any(state.is_tainted_node(a) for a in arg_list[1:]):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.PROTOTYPE_POLLUTION, Severity.HIGH,
+                          "JSAST-PROTO-001",
+                          f"User-controlled data flows into {fname}() — prototype pollution risk")
 
         # ── Member call expressions ───────────────────────────────────────
         elif func_node.type == "member_expression":
@@ -576,6 +633,24 @@ def _check_sinks(
                       "JSAST-CMD-001",
                       f"User-controlled data flows into .{prop}() — OS command injection risk")
 
+            # SSTI: ejs.render(tainted), pug.render(tainted), _.template(tainted), …
+            elif obj_root in _SSTI_ROOTS and prop in _SSTI_RENDER_METHODS:
+                if tainted_args(args_node):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.SSTI, Severity.CRITICAL,
+                          "JSAST-SSTI-001",
+                          f"User-controlled data flows into {obj_root}.{prop}() — SSTI risk")
+
+            # Prototype pollution: _.merge(target, tainted), Object.assign(target, tainted)
+            elif ((obj_root in _MERGE_ROOTS and prop in _MERGE_METHODS)
+                  or (obj_root == "Object" and prop == "assign")):
+                arg_list = list(args_node.named_children)
+                if len(arg_list) >= 2 and any(state.is_tainted_node(a) for a in arg_list[1:]):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.PROTOTYPE_POLLUTION, Severity.HIGH,
+                          "JSAST-PROTO-001",
+                          f"User-controlled data flows into {obj_root}.{prop}() — prototype pollution risk")
+
     return findings
 
 
@@ -591,7 +666,7 @@ def _analyze_with_parser(
         return []
     lines = content.splitlines()
     state = _build_taint_state(tree.root_node)
-    if not state.tainted and not state.tainted_funcs:
+    if not state.tainted and not state.tainted_funcs and not state.tainted_attrs:
         return []
     return _check_sinks(tree.root_node, state, file_path, lines, repo_url)
 
