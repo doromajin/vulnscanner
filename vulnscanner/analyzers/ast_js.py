@@ -21,8 +21,11 @@ Rule IDs (JSAST-*):
   JSAST-SSTI-001  SSTI (ejs/pug/handlebars/nunjucks render/compile)
   JSAST-PROTO-001 Prototype pollution (_.merge / Object.assign …)
   JSAST-REDOS-001 ReDoS — nested quantifiers / ambiguous alternation in regex literals
+  JSAST-DOMXSS-001 DOM XSS — innerHTML/outerHTML/document.write with user-controlled data
+  JSAST-DOMXSS-002 Client-side open redirect — location.href = tainted URL
   Class field taint: this.x = req.body.x propagated to sinks in other methods
   Promise chain taint: promise.then(x => sink(x)) propagates taint to callback param
+  Client-side sources: location.search/hash, document.URL/referrer, localStorage.getItem
 
 Analyzers:
   JSASTAnalyzer  — .js / .jsx / .mjs / .cjs  (tree-sitter-javascript)
@@ -67,6 +70,15 @@ _SOURCE_PROPS = frozenset({
     "files",
 })
 
+# ── Client-side (DOM) taint sources ──────────────────────────────────────────
+# Browser APIs that return attacker-controlled strings
+_DOM_SOURCE_ROOTS = frozenset({"location", "document", "window"})
+_DOM_LOCATION_PROPS = frozenset({"search", "hash", "href", "pathname", "host", "hostname"})
+_DOM_DOCUMENT_PROPS = frozenset({"URL", "documentURI", "referrer", "cookie"})
+_DOM_WINDOW_PROPS = frozenset({"name"})
+# Methods that retrieve user-controlled values from browser storage / URL params
+_DOM_GET_METHODS = frozenset({"get", "getItem", "getAll"})
+
 
 def _member_chain(node) -> list[str]:
     """Return identifier names in a member expression chain, root first.
@@ -101,17 +113,39 @@ def _member_chain(node) -> list[str]:
 
 
 def _is_request_source(node) -> bool:
-    """True when node accesses a known HTTP request taint property."""
+    """True when node accesses a known HTTP request taint property (server or client)."""
+    # call_expression: localStorage.getItem(k), URLSearchParams.get(k) — recurse on .function
+    # Must check BEFORE the chain-length guard since _member_chain returns [] for calls.
+    if node.type == "call_expression":
+        fn = node.child_by_field_name("function")
+        if fn is not None:
+            return _is_request_source(fn)
+        return False
+
     chain = _member_chain(node)
     if len(chain) < 2:
         return False
     root, prop = chain[0], chain[1]
-    if root not in _SOURCE_ROOTS:
-        return False
-    # ctx.request.body, ctx.request.query, …
-    if root == "ctx" and prop == "request" and len(chain) >= 3:
-        return chain[2] in _SOURCE_PROPS
-    return prop in _SOURCE_PROPS
+
+    # ── Server-side sources (req/request/ctx/event) ───────────────────────────
+    if root in _SOURCE_ROOTS:
+        if root == "ctx" and prop == "request" and len(chain) >= 3:
+            return chain[2] in _SOURCE_PROPS
+        return prop in _SOURCE_PROPS
+
+    # ── Client-side DOM sources ───────────────────────────────────────────────
+    if root == "location" and prop in _DOM_LOCATION_PROPS:
+        return True
+    if root == "document" and prop in _DOM_DOCUMENT_PROPS:
+        return True
+    if root == "window" and prop in _DOM_WINDOW_PROPS:
+        return True
+    # URLSearchParams.get("key"), localStorage.getItem("key"), sessionStorage.getItem()
+    if root in ("URLSearchParams", "searchParams", "localStorage", "sessionStorage"):
+        if prop in _DOM_GET_METHODS:
+            return True
+
+    return False
 
 
 # ── Sanitizer detection ───────────────────────────────────────────────────────
@@ -222,6 +256,9 @@ class _JSTaintState:
             return any(self.is_tainted_node(c) for c in node.named_children)
 
         if node.type == "call_expression":
+            # DOM source calls: localStorage.getItem(), URLSearchParams.get(), etc.
+            if _is_request_source(node):
+                return True
             func = node.child_by_field_name("function")
             if func is not None and func.type == "identifier":
                 fname = func.text.decode("utf-8", errors="replace")
@@ -433,9 +470,72 @@ def _analyze_functions(root, state: _JSTaintState) -> bool:
     return changed
 
 
+_NESTJS_PARAM_DECORATORS = frozenset({
+    "Body", "Query", "Param", "Headers", "Req", "Request",
+    "UploadedFile", "UploadedFiles",
+})
+
+
+def _collect_nestjs_params(root, state: _JSTaintState) -> bool:
+    """Mark Nest.js / Next.js controller method parameters as tainted.
+
+    Patterns detected:
+      @Get() async findAll(@Query() query: QueryDto) { ... }
+      @Post() async create(@Body() dto: CreateDto) { ... }
+      @Get(':id') async find(@Param('id') id: string) { ... }
+
+    The decorator-annotated parameter variable is added to state.tainted so that
+    any downstream sink receives taint from it.
+    """
+    changed = False
+    for node in _walk(root):
+        # Look for method definitions (class methods) in TypeScript/JavaScript
+        if node.type not in ("method_definition", "public_field_definition"):
+            continue
+        # Find the formal parameter list
+        params_node = node.child_by_field_name("parameters") or node.child_by_field_name("value")
+        if params_node is None:
+            continue
+        for param in params_node.named_children:
+            # A decorated parameter looks like: decorator+ identifier/pattern
+            decorators = [c for c in param.children if c.type == "decorator"]
+            if not decorators:
+                continue
+            for dec in decorators:
+                # decorator → @ call_expression  or  @ identifier
+                dec_body = dec.named_children[0] if dec.named_children else None
+                if dec_body is None:
+                    continue
+                # Get the decorator name (may be a call like @Body() or identifier @Body)
+                if dec_body.type == "call_expression":
+                    fn = dec_body.child_by_field_name("function")
+                    dec_name = fn.text.decode("utf-8", errors="replace") if fn else ""
+                elif dec_body.type == "identifier":
+                    dec_name = dec_body.text.decode("utf-8", errors="replace")
+                else:
+                    dec_name = ""
+                if dec_name not in _NESTJS_PARAM_DECORATORS:
+                    continue
+                # Find the parameter identifier
+                for child in param.children:
+                    if child.type in ("identifier", "required_parameter",
+                                      "optional_parameter"):
+                        name_node = child if child.type == "identifier" else \
+                            child.child_by_field_name("pattern") or child.child_by_field_name("name")
+                        if name_node and name_node.type == "identifier":
+                            pname = name_node.text.decode("utf-8", errors="replace")
+                            if pname not in state.tainted:
+                                line = name_node.start_point[0] + 1
+                                if state.mark(pname, line, f"Nest.js @{dec_name}() parameter"):
+                                    changed = True
+                        break
+    return changed
+
+
 def _build_taint_state(root) -> _JSTaintState:
     """Fixed-point taint collection with at most 8 passes."""
     state = _JSTaintState()
+    _collect_nestjs_params(root, state)  # Nest.js decorators — one-shot, no iteration needed
     for _ in range(8):
         c1 = _collect_declarations(root, state)
         c2 = _analyze_functions(root, state)
@@ -489,6 +589,12 @@ _MERGE_ROOTS = frozenset({"_", "lodash", "$", "jQuery", "deepmerge"})
 _MERGE_METHODS = frozenset({
     "merge", "extend", "mergeWith", "defaults", "defaultsDeep", "assign", "mixin",
 })
+# DOM XSS: assignment sinks where LHS property causes script execution
+_DOM_ASSIGN_SINKS = frozenset({"innerHTML", "outerHTML", "srcdoc"})
+# DOM redirect: assignment to location.href / location causes navigation
+_DOM_LOCATION_ASSIGN = frozenset({"href", "replace"})
+# DOM write call sinks
+_DOM_WRITE_METHODS = frozenset({"write", "writeln"})
 
 # ── ReDoS detection ────────────────────────────────────────────────────────────
 # Detect nested quantifiers: a group containing a quantifier wrapped in an outer
@@ -622,6 +728,34 @@ def _check_sinks(
 
     for node in _walk(root):
         line = node.start_point[0] + 1
+
+        # ── DOM XSS: el.innerHTML = tainted, location.href = tainted ─────────
+        if node.type == "assignment_expression":
+            lhs = node.child_by_field_name("left")
+            rhs = node.child_by_field_name("right")
+            if lhs is not None and rhs is not None and lhs.type == "member_expression":
+                prop_n = lhs.child_by_field_name("property")
+                obj_n = lhs.child_by_field_name("object")
+                if prop_n is not None:
+                    prop = prop_n.text.decode("utf-8", errors="replace")
+                    rhs_u = _unwrap(rhs)
+                    if prop in _DOM_ASSIGN_SINKS and (
+                        state.is_tainted_node(rhs_u) or _is_request_source(rhs_u)
+                    ):
+                        _emit(findings, seen, file_path, line, lines, repo_url,
+                              VulnType.XSS, Severity.CRITICAL,
+                              "JSAST-DOMXSS-001",
+                              f"User-controlled data assigned to .{prop} — DOM-based XSS risk")
+                    elif prop in _DOM_LOCATION_ASSIGN:
+                        obj_chain = _member_chain(obj_n) if obj_n else []
+                        if obj_chain and obj_chain[0] == "location" and (
+                            state.is_tainted_node(rhs_u) or _is_request_source(rhs_u)
+                        ):
+                            _emit(findings, seen, file_path, line, lines, repo_url,
+                                  VulnType.OPEN_REDIRECT, Severity.MEDIUM,
+                                  "JSAST-DOMXSS-002",
+                                  "User-controlled URL assigned to location.href — client-side open redirect")
+            continue
 
         # ── new Function(tainted) ───────────────────────────────────────────
         if node.type == "new_expression":
@@ -793,6 +927,14 @@ def _check_sinks(
                           VulnType.PROTOTYPE_POLLUTION, Severity.HIGH,
                           "JSAST-PROTO-001",
                           f"User-controlled data flows into {obj_root}.{prop}() — prototype pollution risk")
+
+            # DOM XSS: document.write(tainted), document.writeln(tainted)
+            elif obj_root == "document" and prop in _DOM_WRITE_METHODS:
+                if tainted_args(args_node):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.XSS, Severity.CRITICAL,
+                          "JSAST-DOMXSS-001",
+                          f"User-controlled data flows into document.{prop}() — DOM-based XSS risk")
 
     return findings
 

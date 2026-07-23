@@ -19,6 +19,7 @@ Rule IDs (GOAST-*):
   GOAST-REDIR-001 Open redirect (http.Redirect with user-controlled URL)
   GOAST-TMPL-001  XSS via template.HTML() type conversion (escaping bypass)
   GOAST-LOG-001   Log injection (log.Printf/Println with user-controlled data)
+  GOAST-SSTI-001  SSTI via template.New("").Parse(tainted) — user-controlled template
 """
 from __future__ import annotations
 
@@ -651,6 +652,14 @@ def _check_sinks(
                       VulnType.XSS, Severity.HIGH,
                       "GOAST-TMPL-001",
                       "User-controlled data cast to template.HTML() — XSS bypass, escaping suppressed")
+
+        # ── SSTI: .Parse(tainted) — user-controlled template string ──────
+        # template.New("name").Parse(userInput) evaluates user-supplied template
+        elif method == "Parse" and arg_nodes and taint_check(arg_nodes[0]):
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.SSTI, Severity.CRITICAL,
+                  "GOAST-SSTI-001",
+                  "User-controlled data flows into .Parse() — Go template SSTI / code execution risk")
 
         # ── Log injection: log.Printf(tainted), log.Println(tainted) ─────
         elif pkg in _LOG_PKGS and method in _LOG_METHODS:

@@ -20,6 +20,7 @@ Rule IDs (RBAST-*):
   RBAST-DESER-001 Insecure deserialization (Marshal.load/restore with user input)
   RBAST-EVAL-001  Code execution (eval/instance_eval/class_eval with user input)
   RBAST-MASS-001  Mass assignment (create/update with raw params hash)
+  RBAST-SSTI-001  SSTI (ERB.new/Haml::Engine.new/Liquid::Template.parse with user input)
 """
 from __future__ import annotations
 
@@ -255,6 +256,11 @@ _HTTP_METHODS = frozenset({
 _RENDER_UNSAFE_KEYS = frozenset({"plain", "html", "text", "body", "inline", "xml", "json"})
 # Code eval methods that execute arbitrary Ruby
 _EVAL_METHODS = frozenset({"eval", "instance_eval", "class_eval", "module_eval", "binding_eval"})
+# SSTI: template engines that evaluate the template string itself
+# ERB.new(tainted) — first arg is the template; .result evaluates it
+# Haml::Engine.new(tainted), Liquid::Template.parse(tainted)
+_SSTI_RECEIVERS = frozenset({"ERB", "Haml::Engine"})
+_SSTI_PARSE_RECEIVERS = frozenset({"Liquid::Template", "Mustache"})
 # Mass assignment sinks: AR/Mongoid methods that accept a hash of attributes
 _MASS_ASSIGN_METHODS = frozenset({
     "create", "create!", "update", "update!", "update_all",
@@ -419,6 +425,23 @@ def _check_sinks(
                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                   "RBAST-EVAL-001",
                   f"User-controlled data flows into {meth_text}() — arbitrary code execution risk")
+
+        # ── SSTI: ERB.new(tainted), Haml::Engine.new(tainted) ────────────
+        # Checked BEFORE mass-assignment since "new" appears in both and SSTI is more specific.
+        elif recv_text in _SSTI_RECEIVERS and meth_text == "new":
+            if arg_nodes and taint(arg_nodes[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.SSTI, Severity.CRITICAL,
+                      "RBAST-SSTI-001",
+                      f"User-controlled data flows into {recv_text}.new() — SSTI/code execution risk")
+
+        # ── SSTI: Liquid::Template.parse(tainted) ────────────────────────
+        elif recv_text in _SSTI_PARSE_RECEIVERS and meth_text == "parse":
+            if arg_nodes and taint(arg_nodes[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.SSTI, Severity.CRITICAL,
+                      "RBAST-SSTI-001",
+                      f"User-controlled data flows into {recv_text}.parse() — SSTI risk")
 
         # ── Mass assignment: Model.create(params) / model.update(params) ─
         elif meth_text in _MASS_ASSIGN_METHODS and arg_nodes and taint(arg_nodes[0]):

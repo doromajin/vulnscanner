@@ -3170,6 +3170,45 @@ app.post('/run', (req, res) => {
         redos = [f for f in findings if f.rule_id == "JSAST-REDOS-001"]
         assert not redos, 'Standard escape-aware string regex must not FP'
 
+    # ── DOM-based XSS ─────────────────────────────────────────────────────────
+
+    def test_dom_xss_innerhtml_location(self):
+        """location.search → innerHTML assignment — DOM XSS."""
+        code = """
+const q = location.search;
+document.getElementById('out').innerHTML = q;
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-DOMXSS-001" in rule_ids, "location.search → innerHTML DOM XSS not detected"
+
+    def test_dom_xss_document_write(self):
+        """document.URL → document.write() — DOM XSS."""
+        code = """
+const url = document.URL;
+document.write('<p>' + url + '</p>');
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-DOMXSS-001" in rule_ids, "document.URL → document.write DOM XSS not detected"
+
+    def test_dom_xss_location_href_redirect(self):
+        """localStorage.getItem() → location.href assignment — client-side redirect."""
+        code = """
+const target = localStorage.getItem('redirect');
+location.href = target;
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-DOMXSS-002" in rule_ids, "localStorage → location.href redirect not detected"
+
+    def test_no_fp_dom_xss_literal(self):
+        """Literal string assigned to innerHTML must not fire."""
+        code = "document.getElementById('out').innerHTML = '<b>Hello</b>';"
+        findings = _JSAST.analyze("app.js", code)
+        dom = [f for f in findings if f.rule_id == "JSAST-DOMXSS-001"]
+        assert not dom, "Literal innerHTML assignment must not FP"
+
 
 _TSAST = TSASTAnalyzer()
 
@@ -3270,6 +3309,40 @@ app.get('/page', (req: Request, res: Response): void => {
         code = "const x = req.query.x; db.query(x);"
         findings = _TSAST.analyze("app.js", code)
         assert not findings, ".js files must not be analyzed by TSASTAnalyzer"
+
+    # ── Nest.js @Body / @Query decorator sources ──────────────────────────────
+
+    def test_nestjs_body_decorator_sql(self):
+        """@Body() decorated parameter must flow to SQL sink."""
+        code = """
+import { Controller, Post, Body } from '@nestjs/common';
+@Controller('users')
+export class UserController {
+  @Post()
+  async create(@Body() createUserDto: CreateUserDto) {
+    return db.query('INSERT INTO users SET name=' + createUserDto.name);
+  }
+}
+"""
+        findings = _TSAST.analyze("user.controller.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "@Body() param not recognized as taint source"
+
+    def test_nestjs_query_decorator_xss(self):
+        """@Query() decorated parameter must flow to XSS sink."""
+        code = """
+import { Controller, Get, Query, Res } from '@nestjs/common';
+@Controller('search')
+export class SearchController {
+  @Get()
+  async search(@Query('q') q: string, @Res() res: Response) {
+    res.send('<h1>Results for: ' + q + '</h1>');
+  }
+}
+"""
+        findings = _TSAST.analyze("search.controller.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-XSS-001" in rule_ids, "@Query() param not recognized as taint source"
 
 
 _GOAST = GoASTAnalyzer()
@@ -3652,6 +3725,37 @@ func handler(w http.ResponseWriter, r *http.Request) {
         redir = [f for f in findings if f.rule_id == "GOAST-REDIR-001"]
         assert not redir, "Literal URL in http.Redirect must not FP"
 
+    # ── SSTI ─────────────────────────────────────────────────────────────────
+
+    def test_template_parse_ssti(self):
+        """template.New("").Parse(tainted) — user-controlled template string."""
+        code = """
+package main
+import ("html/template"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    src := r.FormValue("tmpl")
+    t, _ := template.New("page").Parse(src)
+    t.Execute(w, nil)
+}
+"""
+        findings = self._scan(code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-SSTI-001" in rule_ids, "template.New().Parse(tainted) SSTI not detected"
+
+    def test_no_fp_template_parse_literal(self):
+        """template.New("").Parse("literal") must not fire."""
+        code = """
+package main
+import ("html/template"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    t, _ := template.New("page").Parse("<h1>Hello</h1>")
+    t.Execute(w, nil)
+}
+"""
+        findings = self._scan(code)
+        ssti = [f for f in findings if f.rule_id == "GOAST-SSTI-001"]
+        assert not ssti, "template.Parse(literal) must not FP"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RubyASTAnalyzer tests
@@ -3916,6 +4020,37 @@ end
         deser = [f for f in findings if f.rule_id == "RBAST-DESER-001"]
         assert not deser, "Marshal.load(literal) must not trigger FP"
 
+    # ── SSTI ─────────────────────────────────────────────────────────────────
+
+    def test_erb_new_tainted(self):
+        code = """
+def render_template
+  tmpl = params[:template]
+  ERB.new(tmpl).result
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SSTI-001" in rule_ids, "ERB.new(tainted) SSTI not detected"
+
+    def test_liquid_parse_tainted(self):
+        code = """
+def render_page
+  src = params[:src]
+  Liquid::Template.parse(src).render({})
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SSTI-001" in rule_ids, "Liquid::Template.parse(tainted) SSTI not detected"
+
+    def test_no_fp_erb_literal(self):
+        """ERB.new with string literal must not fire."""
+        code = 'ERB.new("<h1>Hello</h1>").result'
+        findings = _RBAST.analyze("app.rb", code)
+        ssti = [f for f in findings if f.rule_id == "RBAST-SSTI-001"]
+        assert not ssti, "ERB.new(literal) must not FP"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PhpASTAnalyzer tests
@@ -4130,6 +4265,27 @@ system("cat /proc/" . $file);
         findings = _PHPAST.analyze("index.php", code)
         deser = [f for f in findings if f.rule_id == "PHAST-DESER-001"]
         assert not deser, "Literal string in unserialize() must not trigger FP"
+
+    # ── SSTI / eval ──────────────────────────────────────────────────────────
+
+    def test_eval_code_injection(self):
+        code = "<?php\n$code = $_GET['code'];\neval($code);\n"
+        findings = _PHPAST.analyze("index.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-EVAL-001" in rule_ids, "eval(tainted) code injection not detected"
+
+    def test_twig_create_template_ssti(self):
+        code = "<?php\n$t = $_POST['tmpl'];\n$result = $twig->createTemplate($t)->render([]);\n"
+        findings = _PHPAST.analyze("index.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-SSTI-001" in rule_ids, "Twig->createTemplate(tainted) SSTI not detected"
+
+    def test_no_fp_eval_literal(self):
+        """eval with string literal must not fire."""
+        code = "<?php\neval('echo 42;');\n"
+        findings = _PHPAST.analyze("index.php", code)
+        ssti = [f for f in findings if f.rule_id == "PHAST-EVAL-001"]
+        assert not ssti, "eval(literal) must not FP"
 
 
 # ── Exploitability filter ─────────────────────────────────────────────────────

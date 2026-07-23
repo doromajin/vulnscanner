@@ -17,6 +17,8 @@ Rule IDs (PHAST-*):
   PHAST-DESER-001 Insecure deserialization (unserialize with user input)
   PHAST-LDAP-001  LDAP injection (ldap_search filter arg is user-controlled)
   PHAST-LOG-001   Log injection (error_log with user input)
+  PHAST-EVAL-001  Code injection (eval() with user input)
+  PHAST-SSTI-001  SSTI (Twig createTemplate, Smarty fetch with tainted template)
 """
 from __future__ import annotations
 
@@ -439,20 +441,46 @@ def _check_sinks(root, tainted, tainted_funcs, file_path, lines, repo_url) -> li
                       VulnType.LOG_INJECTION, Severity.LOW, 'PHAST-LOG-001',
                       "User-controlled data flows into error_log() — log injection risk")
 
+            # Code injection: eval(tainted) — arbitrary PHP execution
+            elif fname == 'eval' and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.SSTI, Severity.CRITICAL, 'PHAST-EVAL-001',
+                      "User-controlled data flows into eval() — arbitrary PHP code execution")
+
+            # SSTI: Smarty->fetch(tainted), Smarty->display(tainted)
+            elif fname in ('smarty_fetch', 'fetch', 'display') and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.SSTI, Severity.HIGH, 'PHAST-SSTI-001',
+                      f"User-controlled data flows into {fname}() — template injection risk")
+
             # XSS: print_r($var, false) — only if output goes to browser
             # Covered by echo_statement below; skip here to avoid FPs
 
         # ── Method call sinks: $pdo->query($sql) ─────────────────────────────
         elif node.type == 'member_call_expression':
             mname = _method_name(node)
-            if not mname or mname not in _SQL_METHOD_SINKS:
+            if not mname:
                 continue
             args = _member_args(node)
             line = node.start_point[0] + 1
-            if args and taint(args[0]):
+
+            if mname in _SQL_METHOD_SINKS:
+                if args and taint(args[0]):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.SQL_INJECTION, Severity.HIGH, 'PHAST-SQL-001',
+                          f"User-controlled data flows into ->{mname}() — SQL injection risk")
+
+            # SSTI: $twig->createTemplate($userInput) — Twig evaluates template string
+            elif mname == 'createTemplate' and args and taint(args[0]):
                 _emit(findings, seen, file_path, line, lines, repo_url,
-                      VulnType.SQL_INJECTION, Severity.HIGH, 'PHAST-SQL-001',
-                      f"User-controlled data flows into ->{mname}() — SQL injection risk")
+                      VulnType.SSTI, Severity.CRITICAL, 'PHAST-SSTI-001',
+                      "User-controlled data flows into ->createTemplate() — Twig SSTI risk")
+
+            # Smarty method: $smarty->fetch($tainted), $smarty->display($tainted)
+            elif mname in ('fetch', 'display') and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.SSTI, Severity.HIGH, 'PHAST-SSTI-001',
+                      f"User-controlled data flows into ->{mname}() — Smarty template injection risk")
 
         # ── Echo / print sinks ────────────────────────────────────────────────
         elif node.type in ('echo_statement', 'print_intrinsic'):
