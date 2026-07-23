@@ -115,13 +115,19 @@ _STRING_METHODS = frozenset({
 
 # ── Taint state helpers ───────────────────────────────────────────────────────
 
-def _is_tainted(node, tainted: set[str], tainted_methods: set[str]) -> bool:
+def _is_tainted(node, tainted: set[str], tainted_methods: set[str],
+                tainted_ivars: "frozenset | set" = frozenset()) -> bool:
     """Return True if this node carries taint."""
     if node is None:
         return False
 
     if node.type == "identifier":
         return node.text.decode("utf-8", errors="replace") in tainted
+
+    # @instance_variable taint — Rails controllers use @var = params[:x]
+    if node.type == "instance_variable":
+        name = node.text.decode("utf-8", errors="replace").lstrip("@")
+        return name in tainted_ivars
 
     if _is_request_source(node):
         return True
@@ -131,13 +137,14 @@ def _is_tainted(node, tainted: set[str], tainted_methods: set[str]) -> bool:
         for child in node.children:
             if child.type == "interpolation":
                 for expr in child.named_children:
-                    if _is_tainted(expr, tainted, tainted_methods):
+                    if _is_tainted(expr, tainted, tainted_methods, tainted_ivars):
                         return True
         return False
 
     # "a" + b — binary concatenation
     if node.type == "binary":
-        return any(_is_tainted(c, tainted, tainted_methods) for c in node.named_children)
+        return any(_is_tainted(c, tainted, tainted_methods, tainted_ivars)
+                   for c in node.named_children)
 
     # tainted_var.some_method  (propagates taint through most string methods)
     if node.type == "call":
@@ -146,7 +153,7 @@ def _is_tainted(node, tainted: set[str], tainted_methods: set[str]) -> bool:
         recv = node.child_by_field_name("receiver")
         meth = node.child_by_field_name("method")
         # Method on tainted receiver propagates (e.g. id.to_s, name.strip)
-        if recv is not None and _is_tainted(recv, tainted, tainted_methods):
+        if recv is not None and _is_tainted(recv, tainted, tainted_methods, tainted_ivars):
             return True
         # Named method whose body returns tainted data
         if meth is not None:
@@ -160,18 +167,19 @@ def _is_tainted(node, tainted: set[str], tainted_methods: set[str]) -> bool:
         if _is_request_source(node):
             return True
         nc = node.named_children
-        return bool(nc) and _is_tainted(nc[0], tainted, tainted_methods)
+        return bool(nc) and _is_tainted(nc[0], tainted, tainted_methods, tainted_ivars)
 
     # Parenthesized / grouped expression
     if node.type == "parenthesized_statements" and node.named_children:
-        return _is_tainted(node.named_children[0], tainted, tainted_methods)
+        return _is_tainted(node.named_children[0], tainted, tainted_methods, tainted_ivars)
 
     return False
 
 
 # ── Taint collection ──────────────────────────────────────────────────────────
 
-def _collect_assignments(root, tainted: set[str], tainted_methods: set[str]) -> bool:
+def _collect_assignments(root, tainted: set[str], tainted_methods: set[str],
+                          tainted_ivars: set[str]) -> bool:
     """Walk assignment nodes and mark tainted variables. Returns True if changed."""
     changed = False
     for node in _walk(root):
@@ -183,13 +191,20 @@ def _collect_assignments(root, tainted: set[str], tainted_methods: set[str]) -> 
             continue
         if lhs.type == "identifier":
             var = lhs.text.decode("utf-8", errors="replace")
-            if var not in tainted and _is_tainted(rhs, tainted, tainted_methods):
+            if var not in tainted and _is_tainted(rhs, tainted, tainted_methods, tainted_ivars):
                 tainted.add(var)
+                changed = True
+        # @var = tainted — instance variable assignment (Rails controllers)
+        elif lhs.type == "instance_variable":
+            ivar = lhs.text.decode("utf-8", errors="replace").lstrip("@")
+            if ivar not in tainted_ivars and _is_tainted(rhs, tainted, tainted_methods, tainted_ivars):
+                tainted_ivars.add(ivar)
                 changed = True
     return changed
 
 
-def _collect_method_taint(root, tainted: set[str], tainted_methods: set[str]) -> bool:
+def _collect_method_taint(root, tainted: set[str], tainted_methods: set[str],
+                           tainted_ivars: set[str]) -> bool:
     """Find method defs that return tainted data. Returns True if changed."""
     changed = False
     for node in _walk(root):
@@ -208,23 +223,24 @@ def _collect_method_taint(root, tainted: set[str], tainted_methods: set[str]) ->
         for sub in _walk(body):
             if sub.type == "return":
                 for child in sub.named_children:
-                    if _is_tainted(child, tainted, tainted_methods):
+                    if _is_tainted(child, tainted, tainted_methods, tainted_ivars):
                         tainted_methods.add(mname)
                         changed = True
                         break
     return changed
 
 
-def _build_taint(root) -> tuple[set[str], set[str]]:
+def _build_taint(root) -> tuple[set[str], set[str], set[str]]:
     """Fixed-point taint collection, max 8 passes."""
     tainted: set[str] = set()
     tainted_methods: set[str] = set()
+    tainted_ivars: set[str] = set()
     for _ in range(8):
-        c1 = _collect_assignments(root, tainted, tainted_methods)
-        c2 = _collect_method_taint(root, tainted, tainted_methods)
+        c1 = _collect_assignments(root, tainted, tainted_methods, tainted_ivars)
+        c2 = _collect_method_taint(root, tainted, tainted_methods, tainted_ivars)
         if not c1 and not c2:
             break
-    return tainted, tainted_methods
+    return tainted, tainted_methods, tainted_ivars
 
 
 # ── Sink definitions ──────────────────────────────────────────────────────────
@@ -314,6 +330,7 @@ def _check_sinks(
     root,
     tainted: set[str],
     tainted_methods: set[str],
+    tainted_ivars: set[str],
     file_path: str,
     lines: list[str],
     repo_url: str,
@@ -322,9 +339,22 @@ def _check_sinks(
     seen: set[tuple] = set()
 
     def taint(n):
-        return _is_tainted(n, tainted, tainted_methods)
+        return _is_tainted(n, tainted, tainted_methods, tainted_ivars)
 
     for node in _walk(root):
+        # ── Backtick / subshell execution: `ls #{user_input}` ────────────────
+        if node.type == "subshell":
+            line = node.start_point[0] + 1
+            for child in node.children:
+                if child.type == "interpolation":
+                    for expr in child.named_children:
+                        if taint(expr):
+                            _emit(findings, seen, file_path, line, lines, repo_url,
+                                  VulnType.COMMAND_INJECTION, Severity.CRITICAL,
+                                  "RBAST-CMD-001",
+                                  "User-controlled data in backtick execution — OS command injection risk")
+                            break
+
         if node.type != "call":
             continue
 
@@ -443,12 +473,36 @@ def _check_sinks(
                       "RBAST-SSTI-001",
                       f"User-controlled data flows into {recv_text}.parse() — SSTI risk")
 
+        # ── ReDoS: Regexp.new(tainted) — user-controlled regex pattern ────
+        # Checked BEFORE mass-assignment since "new" appears in _MASS_ASSIGN_METHODS.
+        elif recv_text == "Regexp" and meth_text == "new" and arg_nodes and taint(arg_nodes[0]):
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.REDOS, Severity.HIGH,
+                  "RBAST-REDOS-001",
+                  "User-controlled data flows into Regexp.new() — ReDoS / regex injection risk")
+
+        # ── ReDoS: str.match(tainted_pattern) — receiver-less or tainted arg ─
+        elif meth_text == "match" and arg_nodes and taint(arg_nodes[0]) and not recv_text:
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.REDOS, Severity.MEDIUM,
+                  "RBAST-REDOS-001",
+                  "User-controlled regex pattern in .match() — ReDoS risk")
+
         # ── Mass assignment: Model.create(params) / model.update(params) ─
         elif meth_text in _MASS_ASSIGN_METHODS and arg_nodes and taint(arg_nodes[0]):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.SQL_INJECTION, Severity.MEDIUM,
                   "RBAST-MASS-001",
                   f"User-controlled hash flows into .{meth_text}() — mass assignment risk")
+
+        # ── XXE: Nokogiri::XML.parse(tainted) without NOENT option ──────────
+        elif recv_text in ("Nokogiri::XML", "Nokogiri::HTML", "Nokogiri") \
+                and meth_text in ("parse", "read", "from_memory") \
+                and arg_nodes and taint(arg_nodes[0]):
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.XXE, Severity.HIGH,
+                  "RBAST-XXE-001",
+                  f"User-controlled XML input to {recv_text}.{meth_text}() — XXE risk if external entities enabled")
 
     return findings
 
@@ -474,10 +528,10 @@ class RubyASTAnalyzer(BaseAnalyzer):
             return []
 
         lines = content.splitlines()
-        tainted, tainted_methods = _build_taint(tree.root_node)
+        tainted, tainted_methods, tainted_ivars = _build_taint(tree.root_node)
         # Do not bail out when tainted is empty — direct request-source-to-sink flows
         # (e.g. User.create(params[:user])) are still detected by _is_request_source
         # inside _is_tainted, so _check_sinks must run even with no variable assignments.
         return _check_sinks(
-            tree.root_node, tainted, tainted_methods, file_path, lines, repo_url
+            tree.root_node, tainted, tainted_methods, tainted_ivars, file_path, lines, repo_url
         )

@@ -3344,6 +3344,41 @@ export class SearchController {
         rule_ids = {f.rule_id for f in findings}
         assert "JSAST-XSS-001" in rule_ids, "@Query() param not recognized as taint source"
 
+    # ── Sanitizer suppression ─────────────────────────────────────────────────
+
+    def test_dompurify_sanitize_suppresses_xss(self):
+        """DOMPurify.sanitize() must clear taint and suppress XSS."""
+        code = """
+const raw = req.body.html;
+const clean = DOMPurify.sanitize(raw);
+document.getElementById('content').innerHTML = clean;
+"""
+        findings = _JSAST.analyze("client.js", code)
+        xss = [f for f in findings if f.rule_id == "JSAST-DOMXSS-001"]
+        assert not xss, "DOMPurify.sanitize() must suppress DOM XSS"
+
+    def test_parseint_suppresses_sqli(self):
+        """parseInt() must clear numeric taint and suppress SQL injection."""
+        code = """
+const id = req.query.id;
+const safeId = parseInt(id, 10);
+db.query('SELECT * FROM users WHERE id = ' + safeId);
+"""
+        findings = _JSAST.analyze("app.js", code)
+        sql = [f for f in findings if f.rule_id == "JSAST-SQL-001"]
+        assert not sql, "parseInt() must suppress SQL injection"
+
+    def test_encodeuricomponent_suppresses_redirect(self):
+        """encodeURIComponent() must clear taint for open redirect."""
+        code = """
+const url = req.query.next;
+const safe = encodeURIComponent(url);
+res.redirect('/login?next=' + safe);
+"""
+        findings = _JSAST.analyze("app.js", code)
+        redir = [f for f in findings if f.rule_id == "JSAST-REDIR-001"]
+        assert not redir, "encodeURIComponent() must suppress open redirect"
+
 
 _GOAST = GoASTAnalyzer()
 
@@ -3756,6 +3791,57 @@ func handler(w http.ResponseWriter, r *http.Request) {
         ssti = [f for f in findings if f.rule_id == "GOAST-SSTI-001"]
         assert not ssti, "template.Parse(literal) must not FP"
 
+    # ── r.Body / json.Decode struct field taint ───────────────────────────────
+
+    def test_json_unmarshal_struct_sqli(self):
+        """json.Unmarshal(r.Body data, &req) → req.Name flows to SQL query."""
+        code = """
+package main
+import ("database/sql"; "encoding/json"; "io"; "net/http")
+type Req struct { Name string }
+func handler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+    body, _ := io.ReadAll(r.Body)
+    var req Req
+    json.Unmarshal(body, &req)
+    db.Query("SELECT * FROM users WHERE name = " + req.Name)
+}
+"""
+        findings = self._scan(code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-SQL-001" in rule_ids, "json.Unmarshal(r.Body, &req) → req.Name → SQL not detected"
+
+    def test_json_decoder_struct_sqli(self):
+        """json.NewDecoder(r.Body).Decode(&req) → req.Name flows to SQL."""
+        code = """
+package main
+import ("database/sql"; "encoding/json"; "net/http")
+type Req struct { Name string }
+func handler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+    var req Req
+    json.NewDecoder(r.Body).Decode(&req)
+    db.Query("SELECT * FROM users WHERE name = " + req.Name)
+}
+"""
+        findings = self._scan(code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-SQL-001" in rule_ids, "json.NewDecoder(r.Body).Decode(&req) → SQL not detected"
+
+    def test_no_fp_json_unmarshal_literal(self):
+        """json.Unmarshal with literal bytes must not taint struct."""
+        code = """
+package main
+import ("database/sql"; "encoding/json")
+type Req struct { Name string }
+func query(db *sql.DB) {
+    var req Req
+    json.Unmarshal([]byte(`{"name":"alice"}`), &req)
+    db.Query("SELECT * FROM users WHERE name = " + req.Name)
+}
+"""
+        findings = self._scan(code)
+        sql = [f for f in findings if f.rule_id == "GOAST-SQL-001"]
+        assert not sql, "json.Unmarshal(literal, &req) must not trigger SQL FP"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RubyASTAnalyzer tests
@@ -4051,6 +4137,112 @@ end
         ssti = [f for f in findings if f.rule_id == "RBAST-SSTI-001"]
         assert not ssti, "ERB.new(literal) must not FP"
 
+    # ── @instance_variable taint ──────────────────────────────────────────────
+
+    def test_ivar_sql(self):
+        """@user_id = params[:id] flows into SQL query."""
+        code = """
+class UsersController < ApplicationController
+  def show
+    @user_id = params[:id]
+    User.find_by_sql("SELECT * FROM users WHERE id = #{@user_id}")
+  end
+end
+"""
+        findings = _RBAST.analyze("app/controllers/users_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SQL-001" in rule_ids, "@ivar from params flows into SQL not detected"
+
+    def test_ivar_xss(self):
+        """@name from params flows into render plain: — XSS."""
+        code = """
+class PagesController < ApplicationController
+  def show
+    @title = params[:title]
+    render plain: @title
+  end
+end
+"""
+        findings = _RBAST.analyze("app/controllers/pages_controller.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-XSS-001" in rule_ids, "@ivar from params into render plain: not detected"
+
+    def test_no_fp_ivar_clean(self):
+        """@title set from literal must not taint."""
+        code = """
+class PagesController < ApplicationController
+  def show
+    @title = "Welcome"
+    render plain: @title
+  end
+end
+"""
+        findings = _RBAST.analyze("app/controllers/pages_controller.rb", code)
+        xss = [f for f in findings if f.rule_id == "RBAST-XSS-001"]
+        assert not xss, "@ivar from literal must not trigger XSS FP"
+
+    # ── Backtick execution ────────────────────────────────────────────────────
+
+    def test_backtick_cmd(self):
+        """Backtick execution with tainted interpolation — command injection."""
+        code = """
+def run
+  file = params[:file]
+  result = `ls #{file}`
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-CMD-001" in rule_ids, "Backtick execution with tainted interpolation not detected"
+
+    # ── ReDoS ─────────────────────────────────────────────────────────────────
+
+    def test_redos_regexp_new(self):
+        """Regexp.new(user_input) — ReDoS risk."""
+        code = """
+def search
+  pattern = params[:pattern]
+  re = Regexp.new(pattern)
+  text.scan(re)
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-REDOS-001" in rule_ids, "Regexp.new(tainted) ReDoS not detected"
+
+    def test_no_fp_regexp_literal(self):
+        """Regexp.new with string literal must not fire."""
+        code = """
+def validate
+  re = Regexp.new("^[a-z]+$")
+  text.scan(re)
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        redos = [f for f in findings if f.rule_id == "RBAST-REDOS-001"]
+        assert not redos, "Regexp.new(literal) must not FP"
+
+    # ── XXE ───────────────────────────────────────────────────────────────────
+
+    def test_xxe_nokogiri(self):
+        """Nokogiri::XML.parse(tainted) — XXE risk."""
+        code = """
+def parse_xml
+  xml_data = params[:xml]
+  doc = Nokogiri::XML.parse(xml_data)
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-XXE-001" in rule_ids, "Nokogiri::XML.parse(tainted) XXE not detected"
+
+    def test_no_fp_nokogiri_literal(self):
+        """Nokogiri::XML.parse with literal must not fire."""
+        code = "doc = Nokogiri::XML.parse('<root/>')"
+        findings = _RBAST.analyze("app.rb", code)
+        xxe = [f for f in findings if f.rule_id == "RBAST-XXE-001"]
+        assert not xxe, "Nokogiri::XML.parse(literal) must not FP"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PhpASTAnalyzer tests
@@ -4286,6 +4478,94 @@ system("cat /proc/" . $file);
         findings = _PHPAST.analyze("index.php", code)
         ssti = [f for f in findings if f.rule_id == "PHAST-EVAL-001"]
         assert not ssti, "eval(literal) must not FP"
+
+    # ── $this->property taint ─────────────────────────────────────────────────
+
+    def test_this_prop_sql(self):
+        """$this->userId from $_GET flows into SQL query."""
+        code = """<?php
+class UserController {
+    public function show() {
+        $this->userId = $_GET['id'];
+        $result = $pdo->query("SELECT * FROM users WHERE id = " . $this->userId);
+    }
+}
+"""
+        findings = _PHPAST.analyze("controller.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-SQL-001" in rule_ids, "$this->prop taint flow to SQL not detected"
+
+    def test_this_prop_multihop(self):
+        """$this->name from $_POST → multi-hop → echo XSS."""
+        code = """<?php
+class App {
+    public function handle() {
+        $this->name = $_POST['name'];
+        $val = $this->name;
+        echo $val;
+    }
+}
+"""
+        findings = _PHPAST.analyze("app.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-XSS-001" in rule_ids, "$this->prop multi-hop to echo XSS not detected"
+
+    def test_no_fp_this_prop_clean(self):
+        """$this->prop set from literal must not taint."""
+        code = """<?php
+class App {
+    public function setup() {
+        $this->tableName = "users";
+        $pdo->query("SELECT * FROM " . $this->tableName);
+    }
+}
+"""
+        findings = _PHPAST.analyze("app.php", code)
+        sql = [f for f in findings if f.rule_id == "PHAST-SQL-001"]
+        assert not sql, "$this->prop from literal must not trigger SQL FP"
+
+    # ── ReDoS ─────────────────────────────────────────────────────────────────
+
+    def test_redos_user_pattern(self):
+        """User-controlled preg_match pattern — ReDoS risk."""
+        code = "<?php\n$pat = $_GET['pattern'];\npreg_match($pat, $input);\n"
+        findings = _PHPAST.analyze("search.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-REDOS-001" in rule_ids, "preg_match(tainted_pattern) ReDoS not detected"
+
+    def test_no_fp_redos_literal_pattern(self):
+        """Literal preg_match pattern must not trigger ReDoS."""
+        code = "<?php\n$input = $_GET['q'];\npreg_match('/^[a-z]+$/', $input);\n"
+        findings = _PHPAST.analyze("search.php", code)
+        redos = [f for f in findings if f.rule_id == "PHAST-REDOS-001"]
+        assert not redos, "preg_match with literal pattern must not FP"
+
+    # ── XXE ───────────────────────────────────────────────────────────────────
+
+    def test_xxe_simplexml_load_string(self):
+        """simplexml_load_string(tainted) — XXE risk."""
+        code = "<?php\n$xml = $_POST['xml'];\n$obj = simplexml_load_string($xml);\n"
+        findings = _PHPAST.analyze("api.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-XXE-001" in rule_ids, "simplexml_load_string(tainted) XXE not detected"
+
+    def test_xxe_dom_loadxml(self):
+        """DOMDocument->loadXML(tainted) — XXE risk."""
+        code = """<?php
+$xml = $_POST['xml'];
+$dom = new DOMDocument();
+$dom->loadXML($xml);
+"""
+        findings = _PHPAST.analyze("api.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-XXE-001" in rule_ids, "DOMDocument->loadXML(tainted) XXE not detected"
+
+    def test_no_fp_xxe_literal_xml(self):
+        """simplexml_load_string with literal must not trigger XXE."""
+        code = "<?php\n$obj = simplexml_load_string('<root/>');\n"
+        findings = _PHPAST.analyze("api.php", code)
+        xxe = [f for f in findings if f.rule_id == "PHAST-XXE-001"]
+        assert not xxe, "simplexml_load_string(literal) must not FP"
 
 
 # ── Exploitability filter ─────────────────────────────────────────────────────

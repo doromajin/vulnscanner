@@ -129,6 +129,24 @@ def _is_sanitizer_call(node) -> bool:
     return fname_node.text.decode('utf-8', errors='replace').lower() in _ALL_SANITIZERS
 
 
+def _member_prop_name(node) -> str | None:
+    """Return property name from a $obj->prop member access expression, or None."""
+    if node.type != 'member_access_expression':
+        return None
+    for child in reversed(node.children):
+        if child.type == 'name':
+            return child.text.decode('utf-8', errors='replace')
+    return None
+
+
+def _member_obj_is_this(node) -> bool:
+    """True if the member access expression object is $this."""
+    if node.type != 'member_access_expression':
+        return False
+    obj = node.children[0] if node.children else None
+    return obj is not None and obj.type == 'variable_name' and _var_name(obj) == 'this'
+
+
 def _call_name(node) -> str:
     """Return the function name from a function_call_expression, or ''."""
     if node.type == 'function_call_expression' and node.children:
@@ -186,7 +204,8 @@ def _member_args(node) -> list:
 
 # ── Taint propagation ─────────────────────────────────────────────────────────
 
-def _is_tainted_node(node, tainted: dict, tainted_funcs: set) -> bool:
+def _is_tainted_node(node, tainted: dict, tainted_funcs: set,
+                      tainted_props: "frozenset | set" = frozenset()) -> bool:
     """Return True if this AST node carries user-controlled data."""
     if node is None:
         return False
@@ -210,7 +229,7 @@ def _is_tainted_node(node, tainted: dict, tainted_funcs: set) -> bool:
     # String concatenation / null-coalescing
     if t == 'binary_expression':
         return any(
-            _is_tainted_node(c, tainted, tainted_funcs)
+            _is_tainted_node(c, tainted, tainted_funcs, tainted_props)
             for c in node.children
             if c.type not in ('.', '??', '+', '-', '*', '/', '%', 'and', 'or',
                               'xor', '&&', '||', '==', '!=', '<', '>', '<=', '>=')
@@ -221,14 +240,14 @@ def _is_tainted_node(node, tainted: dict, tainted_funcs: set) -> bool:
         for child in node.children:
             if child.type in ('variable_name', 'subscript_expression',
                                'member_access_expression', 'variable'):
-                if _is_tainted_node(child, tainted, tainted_funcs):
+                if _is_tainted_node(child, tainted, tainted_funcs, tainted_props):
                     return True
         return False
 
     # Parenthesized
     if t == 'parenthesized_expression':
         for child in node.named_children:
-            if _is_tainted_node(child, tainted, tainted_funcs):
+            if _is_tainted_node(child, tainted, tainted_funcs, tainted_props):
                 return True
         return False
 
@@ -244,8 +263,16 @@ def _is_tainted_node(node, tainted: dict, tainted_funcs: set) -> bool:
             if child.type in ('integer_cast', 'float_cast', 'boolean_cast'):
                 return False
         for child in node.children:
-            if _is_tainted_node(child, tainted, tainted_funcs):
+            if _is_tainted_node(child, tainted, tainted_funcs, tainted_props):
                 return True
+
+    # $this->property taint: $this->userId flows from $_GET['id']
+    if t == 'member_access_expression':
+        if _member_obj_is_this(node):
+            prop = _member_prop_name(node)
+            return prop is not None and prop in tainted_props
+        obj = node.children[0] if node.children else None
+        return obj is not None and _is_tainted_node(obj, tainted, tainted_funcs, tainted_props)
 
     return False
 
@@ -256,7 +283,7 @@ def _taint_source_desc(node) -> str:
     return text
 
 
-def _collect_pass(root, tainted: dict, tainted_funcs: set) -> bool:
+def _collect_pass(root, tainted: dict, tainted_funcs: set, tainted_props: set) -> bool:
     """Walk all assignments and function defs; update taint. Returns True if changed."""
     changed = False
     for node in _walk(root):
@@ -274,6 +301,15 @@ def _collect_pass(root, tainted: dict, tainted_funcs: set) -> bool:
             rhs = children[eq_idx + 1]
             compound = children[eq_idx].type == '.='
 
+            # $this->prop = tainted — class property taint
+            if lhs.type == 'member_access_expression' and _member_obj_is_this(lhs):
+                prop = _member_prop_name(lhs)
+                if prop and prop not in tainted_props:
+                    if _is_tainted_node(rhs, tainted, tainted_funcs, tainted_props):
+                        tainted_props.add(prop)
+                        changed = True
+                continue
+
             if lhs.type != 'variable_name':
                 continue
             var = _var_name(lhs)
@@ -286,7 +322,7 @@ def _collect_pass(root, tainted: dict, tainted_funcs: set) -> bool:
                 if var in tainted:
                     tainted.pop(var)
                     changed = True
-            elif _is_tainted_node(rhs, tainted, tainted_funcs):
+            elif _is_tainted_node(rhs, tainted, tainted_funcs, tainted_props):
                 # compound .= preserves existing taint; simple = replaces
                 if var not in tainted:
                     tainted[var] = (line, _taint_source_desc(rhs))
@@ -312,7 +348,7 @@ def _collect_pass(root, tainted: dict, tainted_funcs: set) -> bool:
                 if sub.type == 'return_statement':
                     for child in sub.children:
                         if child.type not in ('return', ';') and _is_tainted_node(
-                                child, tainted, tainted_funcs):
+                                child, tainted, tainted_funcs, tainted_props):
                             tainted_funcs.add(fname)
                             changed = True
                             break
@@ -320,14 +356,15 @@ def _collect_pass(root, tainted: dict, tainted_funcs: set) -> bool:
     return changed
 
 
-def _build_taint(root) -> tuple[dict, set]:
+def _build_taint(root) -> tuple[dict, set, set]:
     """Fixed-point taint propagation, max 8 passes."""
     tainted: dict[str, tuple[int, str]] = {}
     tainted_funcs: set[str] = set()
+    tainted_props: set[str] = set()
     for _ in range(8):
-        if not _collect_pass(root, tainted, tainted_funcs):
+        if not _collect_pass(root, tainted, tainted_funcs, tainted_props):
             break
-    return tainted, tainted_funcs
+    return tainted, tainted_funcs, tainted_props
 
 
 # ── Emit helper ───────────────────────────────────────────────────────────────
@@ -364,12 +401,12 @@ def _emit(
 
 # ── Sink checker ─────────────────────────────────────────────────────────────
 
-def _check_sinks(root, tainted, tainted_funcs, file_path, lines, repo_url) -> list:
+def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, repo_url) -> list:
     findings: list[Finding] = []
     seen: set = set()
 
     def taint(n):
-        return _is_tainted_node(n, tainted, tainted_funcs)
+        return _is_tainted_node(n, tainted, tainted_funcs, tainted_props)
 
     for node in _walk(root):
         # ── Function call sinks ───────────────────────────────────────────────
@@ -453,6 +490,21 @@ def _check_sinks(root, tainted, tainted_funcs, file_path, lines, repo_url) -> li
                       VulnType.SSTI, Severity.HIGH, 'PHAST-SSTI-001',
                       f"User-controlled data flows into {fname}() — template injection risk")
 
+            # ReDoS: user-controlled regex pattern in preg_* functions
+            elif fname in ('preg_match', 'preg_match_all', 'preg_replace',
+                           'preg_split', 'preg_replace_callback') \
+                    and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.REDOS, Severity.HIGH, 'PHAST-REDOS-001',
+                      f"User-controlled regex pattern in {fname}() — ReDoS / regex injection risk")
+
+            # XXE: simplexml_load_string / simplexml_load_file with tainted XML
+            elif fname in ('simplexml_load_string', 'simplexml_load_file') \
+                    and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.XXE, Severity.HIGH, 'PHAST-XXE-001',
+                      f"User-controlled XML input to {fname}() — XXE if external entities not disabled")
+
             # XSS: print_r($var, false) — only if output goes to browser
             # Covered by echo_statement below; skip here to avoid FPs
 
@@ -481,6 +533,12 @@ def _check_sinks(root, tainted, tainted_funcs, file_path, lines, repo_url) -> li
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.SSTI, Severity.HIGH, 'PHAST-SSTI-001',
                       f"User-controlled data flows into ->{mname}() — Smarty template injection risk")
+
+            # XXE: $dom->loadXML($tainted) / $dom->load($tainted)
+            elif mname in ('loadXML', 'load', 'loadHTML') and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.XXE, Severity.HIGH, 'PHAST-XXE-001',
+                      f"User-controlled XML in ->{mname}() — XXE risk if external entities not disabled")
 
         # ── Echo / print sinks ────────────────────────────────────────────────
         elif node.type in ('echo_statement', 'print_intrinsic'):
@@ -549,8 +607,8 @@ class PhpASTAnalyzer(BaseAnalyzer):
             return []
 
         lines = content.splitlines()
-        tainted, tainted_funcs = _build_taint(tree.root_node)
+        tainted, tainted_funcs, tainted_props = _build_taint(tree.root_node)
 
         return _check_sinks(
-            tree.root_node, tainted, tainted_funcs, file_path, lines, repo_url
+            tree.root_node, tainted, tainted_funcs, tainted_props, file_path, lines, repo_url
         )

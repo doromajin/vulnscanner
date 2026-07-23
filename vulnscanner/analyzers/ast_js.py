@@ -151,13 +151,25 @@ def _is_request_source(node) -> bool:
 # ── Sanitizer detection ───────────────────────────────────────────────────────
 
 _SANITIZER_FUNCS = frozenset({
+    # Numeric casts — safe for SQL when result is used as number
     "parseInt", "parseFloat", "Number", "Boolean", "BigInt",
+    "Math.floor", "Math.ceil", "Math.round", "Math.abs",
+    # URL encoding — XSS-safe for attribute/URL contexts
     "encodeURIComponent", "encodeURI", "escape",
+    # HTML escape libraries
+    "escapeHtml", "sanitizeHtml", "filterXSS",
+    # xss library: xss(str)
+    "xss",
 })
 _SANITIZER_METHODS = frozenset({
-    "sanitize",  # DOMPurify.sanitize
-    "escape",    # validator.escape
-    "stringify", # JSON.stringify
+    "sanitize",      # DOMPurify.sanitize / sanitizer.sanitize
+    "clean",         # DOMPurify.clean
+    "escape",        # validator.escape / _.escape / he.escape
+    "encode",        # he.encode / htmlencode
+    "stringify",     # JSON.stringify (converts to safe JSON string)
+    "escapeHtml",    # various libraries
+    "sanitizeHtml",  # sanitize-html library
+    "stripTags",     # striptags library
 })
 
 

@@ -92,13 +92,22 @@ _GIN_BIND_METHODS = frozenset({
 
 # ── Taint-propagating calls (not sinks, but result is tainted if args are) ───
 
-_PROPAGATING_PKGS = frozenset({"fmt", "strings", "strconv", "path", "filepath"})
+_PROPAGATING_PKGS = frozenset({
+    "fmt", "strings", "strconv", "path", "filepath",
+    # io.ReadAll(r.Body) / io.ReadFull(r.Body) → result is tainted
+    "io",
+    # json.NewDecoder(r.Body) / xml.NewDecoder(r.Body) → decoder is tainted
+    "json", "xml", "yaml", "toml",
+})
 _PROPAGATING_METHODS = frozenset({
     "Sprintf", "Errorf",
     "Join", "Replace", "ReplaceAll", "TrimSpace", "Trim", "TrimPrefix",
     "TrimSuffix", "ToLower", "ToUpper", "Title",
     "Itoa", "FormatInt", "FormatFloat",
-    "Join",  # filepath.Join, path.Join, strings.Join
+    # io helpers that read from a tainted reader
+    "ReadAll", "ReadFull",
+    # json/xml/yaml NewDecoder(tainted) — creates a tainted decoder
+    "NewDecoder",
 })
 
 # ── Sink definitions ──────────────────────────────────────────────────────────
@@ -187,10 +196,10 @@ def _is_request_source_node(node) -> bool:
         return operand is not None and _is_request_source_node(operand)
 
     if node.type == "selector_expression":
-        # r.URL.Path, r.URL.RawPath, r.URL.RawQuery, r.RequestURI
+        # r.URL.Path, r.URL.RawPath, r.URL.RawQuery, r.RequestURI, r.Body
         chain = _selector_chain(node)
         if (chain and chain[0] in _REQ_NAMES and len(chain) >= 2
-                and chain[1] in ("URL", "RequestURI", "Host", "RemoteAddr")):
+                and chain[1] in ("URL", "RequestURI", "Host", "RemoteAddr", "Body")):
             return True
 
     return False
@@ -306,24 +315,58 @@ def _collect_pass(root, tainted: set[str], tainted_funcs: set[str]) -> bool:
         # mark the struct variable itself as tainted so req.Field accesses propagate.
         elif node.type == "call_expression":
             fn = node.child_by_field_name("function")
-            if fn is not None and fn.type == "selector_expression":
-                chain = _selector_chain(fn)
-                if (len(chain) == 2
-                        and chain[0] in _CTX_NAMES
-                        and chain[1] in _GIN_BIND_METHODS):
-                    args = node.child_by_field_name("arguments")
-                    if args:
-                        for arg in args.named_children:
-                            # &req → unary_expression with & operator
-                            if (arg.type == "unary_expression"
-                                    and arg.named_children
-                                    and arg.named_children[0].type == "identifier"):
-                                var_name = arg.named_children[0].text.decode(
-                                    "utf-8", errors="replace"
-                                )
-                                if var_name not in tainted:
-                                    tainted.add(var_name)
-                                    changed = True
+            if fn is None:
+                continue
+            chain = _selector_chain(fn)
+            args_node = node.child_by_field_name("arguments")
+
+            # Gin/Echo bind methods on context: c.ShouldBindJSON(&req)
+            if (fn.type == "selector_expression"
+                    and len(chain) == 2
+                    and chain[0] in _CTX_NAMES
+                    and chain[1] in _GIN_BIND_METHODS):
+                if args_node:
+                    for arg in args_node.named_children:
+                        if (arg.type == "unary_expression"
+                                and arg.named_children
+                                and arg.named_children[0].type == "identifier"):
+                            var_name = arg.named_children[0].text.decode(
+                                "utf-8", errors="replace"
+                            )
+                            if var_name not in tainted:
+                                tainted.add(var_name)
+                                changed = True
+
+            # json.Unmarshal(tainted, &req) / xml.Unmarshal / yaml.Unmarshal
+            elif (len(chain) == 2
+                    and chain[0] in ("json", "xml", "yaml", "toml")
+                    and chain[1] == "Unmarshal"
+                    and args_node):
+                arg_list = list(args_node.named_children)
+                if len(arg_list) >= 2 and _is_tainted(arg_list[0], tainted, tainted_funcs):
+                    target = arg_list[1]
+                    if (target.type == "unary_expression"
+                            and target.named_children
+                            and target.named_children[0].type == "identifier"):
+                        vname = target.named_children[0].text.decode("utf-8", errors="replace")
+                        if vname not in tainted:
+                            tainted.add(vname)
+                            changed = True
+
+            # decoder.Decode(&req) — decoder is tainted when created from r.Body
+            elif (fn.type == "selector_expression"
+                    and chain and chain[-1] in ("Decode", "DecodeElement")
+                    and args_node):
+                recv = fn.child_by_field_name("operand")
+                if recv is not None and _is_tainted(recv, tainted, tainted_funcs):
+                    for arg in args_node.named_children:
+                        if (arg.type == "unary_expression"
+                                and arg.named_children
+                                and arg.named_children[0].type == "identifier"):
+                            vname = arg.named_children[0].text.decode("utf-8", errors="replace")
+                            if vname not in tainted:
+                                tainted.add(vname)
+                                changed = True
 
     return changed
 
