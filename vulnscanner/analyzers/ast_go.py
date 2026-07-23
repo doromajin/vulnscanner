@@ -16,6 +16,9 @@ Rule IDs (GOAST-*):
   GOAST-PATH-001  Path traversal (os.Open/ReadFile/Create, filepath.Join)
   GOAST-XSS-001   Reflected XSS (fmt.Fprintf/Fprintln to ResponseWriter)
   GOAST-SSRF-001  SSRF (http.Get/Post/NewRequest, client.Do)
+  GOAST-REDIR-001 Open redirect (http.Redirect with user-controlled URL)
+  GOAST-TMPL-001  XSS via template.HTML() type conversion (escaping bypass)
+  GOAST-LOG-001   Log injection (log.Printf/Println with user-controlled data)
 """
 from __future__ import annotations
 
@@ -111,6 +114,14 @@ _OS_SINKS = frozenset({
 })
 _FILEPATH_SINKS = frozenset({"Join", "Abs", "EvalSymlinks"})
 _HTTP_SSRF_METHODS = frozenset({"Get", "Post", "Head", "PostForm"})
+# Log injection: standard library and common third-party log packages
+_LOG_PKGS = frozenset({"log", "slog", "zap", "zerolog", "logrus", "logging"})
+_LOG_METHODS = frozenset({
+    "Print", "Printf", "Println",
+    "Fatal", "Fatalf", "Fatalln",
+    "Panic", "Panicf", "Panicln",
+    "Warn", "Warnf", "Error", "Errorf", "Info", "Infof", "Debug", "Debugf",
+})
 
 
 # ── AST helpers ───────────────────────────────────────────────────────────────
@@ -623,6 +634,31 @@ def _check_sinks(
                   VulnType.SSRF, Severity.HIGH,
                   "GOAST-SSRF-001",
                   f"User-controlled data flows into .{method}() — SSRF risk")
+
+        # ── Open redirect: http.Redirect(w, r, tainted_url, code) ────────
+        # arg[2] is the URL; arg[0] is ResponseWriter, arg[1] is *Request
+        elif pkg == "http" and method == "Redirect":
+            if len(arg_nodes) >= 3 and taint_check(arg_nodes[2]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.OPEN_REDIRECT, Severity.MEDIUM,
+                      "GOAST-REDIR-001",
+                      "User-controlled URL flows into http.Redirect() — open redirect risk")
+
+        # ── XSS via unsafe HTML conversion: template.HTML(tainted) ───────
+        elif pkg == "template" and method == "HTML":
+            if arg_nodes and taint_check(arg_nodes[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.XSS, Severity.HIGH,
+                      "GOAST-TMPL-001",
+                      "User-controlled data cast to template.HTML() — XSS bypass, escaping suppressed")
+
+        # ── Log injection: log.Printf(tainted), log.Println(tainted) ─────
+        elif pkg in _LOG_PKGS and method in _LOG_METHODS:
+            if arg_nodes and taint_check(arg_nodes[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.LOG_INJECTION, Severity.LOW,
+                      "GOAST-LOG-001",
+                      f"User-controlled data flows into {pkg}.{method}() — log injection risk")
 
     return findings
 

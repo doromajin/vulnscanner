@@ -14,6 +14,9 @@ Rule IDs (PHAST-*):
   PHAST-XSS-001   Reflected XSS (echo, print with unsanitized user input)
   PHAST-SSRF-001  SSRF (curl_setopt CURLOPT_URL, file_get_contents with URL)
   PHAST-REDIR-001 Open redirect (header("Location: " . $url))
+  PHAST-DESER-001 Insecure deserialization (unserialize with user input)
+  PHAST-LDAP-001  LDAP injection (ldap_search filter arg is user-controlled)
+  PHAST-LOG-001   Log injection (error_log with user input)
 """
 from __future__ import annotations
 
@@ -417,6 +420,24 @@ def _check_sinks(root, tainted, tainted_funcs, file_path, lines, repo_url) -> li
                     _emit(findings, seen, file_path, line, lines, repo_url,
                           VulnType.OPEN_REDIRECT, Severity.MEDIUM, 'PHAST-REDIR-001',
                           "User-controlled value in Location header — open redirect risk")
+
+            # Deserialization: unserialize(tainted) — CRITICAL gadget chain risk
+            elif fname == 'unserialize' and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL, 'PHAST-DESER-001',
+                      "User-controlled data flows into unserialize() — object injection / RCE risk")
+
+            # LDAP injection: ldap_search($conn, $base, $filter) — arg[2] is the filter
+            elif fname == 'ldap_search' and len(args) >= 3 and taint(args[2]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.LDAP_INJECTION, Severity.HIGH, 'PHAST-LDAP-001',
+                      "User-controlled data flows into ldap_search() filter — LDAP injection risk")
+
+            # Log injection: error_log(tainted) — newlines in log can forge entries
+            elif fname == 'error_log' and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.LOG_INJECTION, Severity.LOW, 'PHAST-LOG-001',
+                      "User-controlled data flows into error_log() — log injection risk")
 
             # XSS: print_r($var, false) — only if output goes to browser
             # Covered by echo_statement below; skip here to avoid FPs

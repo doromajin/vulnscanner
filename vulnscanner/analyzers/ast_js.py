@@ -210,6 +210,15 @@ class _JSTaintState:
                     return True
             return False
 
+        # Object literal {key: taintedVal} — common in NoSQL queries like find({name: x})
+        if node.type == "object":
+            for pair in node.named_children:
+                if pair.type == "pair":
+                    val = pair.child_by_field_name("value")
+                    if val is not None and self.is_tainted_node(val):
+                        return True
+            return False
+
         return False
 
 
@@ -364,6 +373,15 @@ _SSRF_GLOBAL = frozenset({"fetch"})
 _SSRF_OBJS = frozenset({"axios", "superagent", "got", "needle", "request"})
 _HTTP_OBJS = frozenset({"http", "https"})
 _SSRF_METHODS = frozenset({"get", "post", "put", "delete", "patch", "request"})
+# NoSQL injection: MongoDB driver methods where the filter/query arg is user-controlled
+_NOSQL_METHOD_SINKS = frozenset({
+    "find", "findOne", "findOneAndUpdate", "findOneAndReplace", "findOneAndDelete",
+    "aggregate", "count", "countDocuments", "distinct", "deleteOne", "deleteMany",
+    "updateOne", "updateMany", "replaceOne",
+})
+# Log injection: logging frameworks that render the first arg as-is
+_LOG_ROOTS = frozenset({"console", "logger", "log", "winston", "pino", "bunyan"})
+_LOG_METHODS = frozenset({"log", "warn", "error", "info", "debug", "trace", "fatal"})
 
 
 def _emit(
@@ -516,6 +534,29 @@ def _check_sinks(
                           VulnType.XSS, Severity.HIGH,
                           "JSAST-XSS-001",
                           f"User-controlled data in res.{prop}() — XSS risk if Content-Type is text/html")
+
+            # Open redirect: res.redirect(tainted_url)
+            elif obj_root in ("res", "response") and prop == "redirect":
+                if tainted_args(args_node):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.OPEN_REDIRECT, Severity.MEDIUM,
+                          "JSAST-REDIR-001",
+                          "User-controlled URL in res.redirect() — open redirect risk")
+
+            # NoSQL injection: collection.find(tainted), db.users.findOne(tainted)
+            elif prop in _NOSQL_METHOD_SINKS and tainted_args(args_node):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.NOSQL_INJECTION, Severity.HIGH,
+                      "JSAST-NOSQL-001",
+                      f"User-controlled data flows into .{prop}() — NoSQL injection risk")
+
+            # Log injection: console.log(tainted), logger.error(tainted)
+            elif obj_root in _LOG_ROOTS and prop in _LOG_METHODS:
+                if tainted_args(args_node):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.LOG_INJECTION, Severity.LOW,
+                          "JSAST-LOG-001",
+                          f"User-controlled data flows into {obj_root}.{prop}() — log injection risk")
 
             # SSRF via axios / http / superagent / etc.
             elif (

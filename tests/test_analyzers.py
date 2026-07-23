@@ -2906,6 +2906,49 @@ app.post('/run', (req, res) => {
         rule_ids = {f.rule_id for f in findings}
         assert "JSAST-CMD-001" in rule_ids, "require('child_process').exec(tainted) must fire CMD finding"
 
+    # ── New rules: REDIR / NOSQL / LOG ───────────────────────────────────────
+
+    def test_open_redirect(self):
+        code = """
+app.get('/go', (req, res) => {
+    const url = req.query.url;
+    res.redirect(url);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-REDIR-001" in rule_ids, "res.redirect(tainted) open redirect not detected"
+
+    def test_nosql_injection_find(self):
+        code = """
+app.get('/users', async (req, res) => {
+    const name = req.query.name;
+    const users = await db.collection('users').find({name: name});
+    res.json(users);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-NOSQL-001" in rule_ids, "collection.find({tainted}) NoSQL injection not detected"
+
+    def test_log_injection_console(self):
+        code = """
+app.post('/login', (req, res) => {
+    const user = req.body.username;
+    console.log(user);
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-LOG-001" in rule_ids, "console.log(tainted) log injection not detected"
+
+    def test_no_fp_redirect_constant(self):
+        """res.redirect('/home') must not fire."""
+        code = "res.redirect('/home');"
+        findings = _JSAST.analyze("app.js", code)
+        redir = [f for f in findings if f.rule_id == "JSAST-REDIR-001"]
+        assert not redir, "Literal URL in res.redirect must not FP"
+
 
 _TSAST = TSASTAnalyzer()
 
@@ -3333,6 +3376,61 @@ class TestGoGinBinding:
         sql = [f for f in findings if f.rule_id == "GOAST-SQL-001"]
         assert not sql, "Struct with constant fields must not FP"
 
+    # ── New rules: REDIR / TMPL / LOG ─────────────────────────────────────────
+
+    def test_open_redirect(self):
+        code = """
+package main
+import "net/http"
+func handler(w http.ResponseWriter, r *http.Request) {
+    url := r.FormValue("url")
+    http.Redirect(w, r, url, http.StatusFound)
+}
+"""
+        findings = self._scan(code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-REDIR-001" in rule_ids, "http.Redirect(w, r, tainted) not detected"
+
+    def test_template_html_bypass(self):
+        code = """
+package main
+import ("html/template"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    name := r.FormValue("name")
+    safe := template.HTML(name)
+    _ = safe
+}
+"""
+        findings = self._scan(code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-TMPL-001" in rule_ids, "template.HTML(tainted) XSS bypass not detected"
+
+    def test_log_injection(self):
+        code = """
+package main
+import ("log"; "net/http")
+func handler(w http.ResponseWriter, r *http.Request) {
+    msg := r.FormValue("msg")
+    log.Printf(msg)
+}
+"""
+        findings = self._scan(code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "GOAST-LOG-001" in rule_ids, "log.Printf(tainted) log injection not detected"
+
+    def test_no_fp_redirect_constant(self):
+        """http.Redirect with literal URL must not fire."""
+        code = """
+package main
+import "net/http"
+func handler(w http.ResponseWriter, r *http.Request) {
+    http.Redirect(w, r, "/login", http.StatusFound)
+}
+"""
+        findings = self._scan(code)
+        redir = [f for f in findings if f.rule_id == "GOAST-REDIR-001"]
+        assert not redir, "Literal URL in http.Redirect must not FP"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RubyASTAnalyzer tests
@@ -3556,6 +3654,47 @@ end
         rule_ids = {f.rule_id for f in findings}
         assert "RBAST-SQL-001" in rule_ids, "session[:key] must be recognized as taint source"
 
+    # ── New rules: DESER / EVAL / MASS-ASSIGN ────────────────────────────────
+
+    def test_marshal_load_tainted(self):
+        code = """
+def load_object
+  data = params[:payload]
+  obj = Marshal.load(data)
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-DESER-001" in rule_ids, "Marshal.load(tainted) not detected"
+
+    def test_eval_tainted(self):
+        code = """
+def run_code
+  expr = params[:expr]
+  eval(expr)
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-EVAL-001" in rule_ids, "eval(tainted) not detected"
+
+    def test_mass_assign_create(self):
+        code = """
+def create
+  User.create(params[:user])
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-MASS-001" in rule_ids, "User.create(params) mass assignment not detected"
+
+    def test_no_fp_marshal_literal(self):
+        """Marshal.load of a literal must not fire."""
+        code = 'obj = Marshal.load("\x04\x08i\x06")'
+        findings = _RBAST.analyze("app.rb", code)
+        deser = [f for f in findings if f.rule_id == "RBAST-DESER-001"]
+        assert not deser, "Marshal.load(literal) must not trigger FP"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PhpASTAnalyzer tests
@@ -3744,6 +3883,32 @@ system("cat /proc/" . $file);
         code = '<?php\n$id = $_GET["id"];\n$pdo->query("SELECT * FROM t WHERE id=" . $id);'
         findings = _PHPAST.analyze("main.py", code)
         assert not findings, "Non-.php file must not be analyzed by PhpASTAnalyzer"
+
+    # ── New rules: DESER / LDAP / LOG ────────────────────────────────────────
+
+    def test_deser_unserialize(self):
+        code = "<?php\n$data = $_POST['data'];\n$obj = unserialize($data);\n"
+        findings = _PHPAST.analyze("index.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-DESER-001" in rule_ids, "unserialize(tainted) not detected"
+
+    def test_ldap_injection(self):
+        code = "<?php\n$q = $_GET['q'];\nldap_search($conn, 'dc=example,dc=com', $q);\n"
+        findings = _PHPAST.analyze("index.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-LDAP-001" in rule_ids, "ldap_search() filter injection not detected"
+
+    def test_log_injection(self):
+        code = "<?php\n$msg = $_GET['msg'];\nerror_log($msg);\n"
+        findings = _PHPAST.analyze("index.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-LOG-001" in rule_ids, "error_log(tainted) log injection not detected"
+
+    def test_no_fp_deser_clean(self):
+        code = "<?php\n$data = 'O:4:\"Test\":0:{}';\n$obj = unserialize($data);\n"
+        findings = _PHPAST.analyze("index.php", code)
+        deser = [f for f in findings if f.rule_id == "PHAST-DESER-001"]
+        assert not deser, "Literal string in unserialize() must not trigger FP"
 
 
 # ── Exploitability filter ─────────────────────────────────────────────────────

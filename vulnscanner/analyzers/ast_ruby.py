@@ -17,6 +17,9 @@ Rule IDs (RBAST-*):
   RBAST-XSS-001   Reflected XSS (render plain:/html:/text:)
   RBAST-SSRF-001  SSRF (URI.open, Net::HTTP, HTTParty, open())
   RBAST-REDIR-001 Open redirect (redirect_to tainted)
+  RBAST-DESER-001 Insecure deserialization (Marshal.load/restore with user input)
+  RBAST-EVAL-001  Code execution (eval/instance_eval/class_eval with user input)
+  RBAST-MASS-001  Mass assignment (create/update with raw params hash)
 """
 from __future__ import annotations
 
@@ -250,6 +253,13 @@ _HTTP_METHODS = frozenset({
 })
 # XSS: render hash keys indicating unescaped output
 _RENDER_UNSAFE_KEYS = frozenset({"plain", "html", "text", "body", "inline", "xml", "json"})
+# Code eval methods that execute arbitrary Ruby
+_EVAL_METHODS = frozenset({"eval", "instance_eval", "class_eval", "module_eval", "binding_eval"})
+# Mass assignment sinks: AR/Mongoid methods that accept a hash of attributes
+_MASS_ASSIGN_METHODS = frozenset({
+    "create", "create!", "update", "update!", "update_all",
+    "new", "build", "assign_attributes", "attributes=",
+})
 
 
 # ── Emit helper ──────────────────────────────────────────────────────────────
@@ -395,6 +405,28 @@ def _check_sinks(
                       "RBAST-SSRF-001",
                       f"User-controlled URL flows into {recv_text or ''}.{meth_text}() — SSRF risk")
 
+        # ── Insecure deserialization: Marshal.load / Marshal.restore ─────
+        elif recv_text == "Marshal" and meth_text in ("load", "restore"):
+            if arg_nodes and taint(arg_nodes[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
+                      "RBAST-DESER-001",
+                      "User-controlled data flows into Marshal.load() — deserialization / RCE risk")
+
+        # ── Code execution: eval(tainted) ─────────────────────────────────
+        elif meth_text in _EVAL_METHODS and arg_nodes and taint(arg_nodes[0]):
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.COMMAND_INJECTION, Severity.CRITICAL,
+                  "RBAST-EVAL-001",
+                  f"User-controlled data flows into {meth_text}() — arbitrary code execution risk")
+
+        # ── Mass assignment: Model.create(params) / model.update(params) ─
+        elif meth_text in _MASS_ASSIGN_METHODS and arg_nodes and taint(arg_nodes[0]):
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.SQL_INJECTION, Severity.MEDIUM,
+                  "RBAST-MASS-001",
+                  f"User-controlled hash flows into .{meth_text}() — mass assignment risk")
+
     return findings
 
 
@@ -420,9 +452,9 @@ class RubyASTAnalyzer(BaseAnalyzer):
 
         lines = content.splitlines()
         tainted, tainted_methods = _build_taint(tree.root_node)
-        if not tainted and not tainted_methods:
-            return []
-
+        # Do not bail out when tainted is empty — direct request-source-to-sink flows
+        # (e.g. User.create(params[:user])) are still detected by _is_request_source
+        # inside _is_tainted, so _check_sinks must run even with no variable assignments.
         return _check_sinks(
             tree.root_node, tainted, tainted_methods, file_path, lines, repo_url
         )
