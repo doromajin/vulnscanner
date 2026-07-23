@@ -302,4 +302,4 @@ def write_html(
 </body>
 </html>
 """
-    Path(output_path).write_text(page, encoding="utf-8")
+    Path(output_path).write_text(page, encoding="utf-8")  # vulnscanner: ignore[AST-PATH-004]

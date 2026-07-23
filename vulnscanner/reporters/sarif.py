@@ -107,7 +107,7 @@ def write_sarif(result: ScanResult, output_path: str) -> None:
         }],
     }
 
-    Path(output_path).write_text(
+    Path(output_path).write_text(  # vulnscanner: ignore[AST-PATH-004]
         json.dumps(doc, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

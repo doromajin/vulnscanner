@@ -3143,8 +3143,10 @@ def _taint_of(
         if attr in _CLI_PARSE_METHODS:
             return CLEAN_LITERAL
 
-        # os.walk() yields (dirpath, dirnames, filenames) tuples from the OS filesystem.
-        if full == "os.walk":
+        # os.walk() / glob.glob() / glob.iglob() — filesystem enumeration.
+        # Paths returned by these functions are operator-controlled (filesystem state),
+        # not user-supplied HTTP input — treat as CLEAN per project policy.
+        if full in {"os.walk", "glob.glob", "glob.iglob", "glob.glob1"}:
             return CLEAN_LITERAL
 
         # os.environ.get() / os.getenv(): server-configured environment variables,

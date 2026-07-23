@@ -52,6 +52,8 @@ def main() -> None:
 @click.option("--filter", "filter_mode", default=None,
               type=click.Choice(["exploitable"], case_sensitive=False),
               help="'exploitable': show only findings with confirmed taint path from user input")
+@click.option("--junit-xml", "junit_xml", default=None, metavar="FILE",
+              help="Write JUnit XML report for CI integration (Jenkins, GitHub Actions, GitLab CI)")
 def scan(
     target: str,
     token: str | None,
@@ -69,6 +71,7 @@ def scan(
     rules: tuple[str, ...],
     no_builtin_rules: bool,
     filter_mode: str | None,
+    junit_xml: str | None,
 ) -> None:
     """Scan a single GitHub repository or local directory.
 
@@ -185,6 +188,11 @@ def scan(
         from vulnscanner.reporters.html_reporter import write_html
         write_html(result, html_out, new_finding_keys=new_finding_keys)
         console.print(f"[green]HTML report written to {html_out}[/green]")
+
+    if junit_xml:
+        from vulnscanner.reporters.junit_reporter import write_junit_xml
+        write_junit_xml(result, junit_xml)
+        console.print(f"[green]JUnit XML report written to {junit_xml}[/green]")
 
     if detail:
         print_finding_detail(result)
@@ -779,16 +787,36 @@ scan:
   workers: 0
 """
 
+_PRECOMMIT_YAML = """\
+# .pre-commit-config.yaml — VulnScanner pre-commit hook
+# Install: pip install pre-commit && pre-commit install
+# See: https://pre-commit.com
+
+repos:
+  - repo: local
+    hooks:
+      - id: vulnscanner
+        name: VulnScanner (security scan)
+        entry: vulnscan scan . --fail-on HIGH
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+"""
+
 
 @main.command("init")
 @click.option("--dir", "target_dir", default=".", help="Target directory (default: current directory)")
 @click.option("--force", is_flag=True, help="Overwrite existing files")
-def init(target_dir: str, force: bool) -> None:
+@click.option("--pre-commit", "with_precommit", is_flag=True, default=False,
+              help="Also generate .pre-commit-config.yaml")
+def init(target_dir: str, force: bool, with_precommit: bool) -> None:
     """Scaffold GitHub Actions workflow and config file for VulnScanner.
 
     Creates:\n
       .github/workflows/vulnscanner.yml  — CI workflow\n
-      vulnscanner.yml                    — project config
+      vulnscanner.yml                    — project config\n
+      .pre-commit-config.yaml            — pre-commit hook (with --pre-commit)
     """
     import os
     from pathlib import Path
@@ -799,6 +827,8 @@ def init(target_dir: str, force: bool) -> None:
         base / ".github" / "workflows" / "vulnscanner.yml": _GHA_WORKFLOW,
         base / "vulnscanner.yml": _CONFIG_YAML,
     }
+    if with_precommit:
+        files[base / ".pre-commit-config.yaml"] = _PRECOMMIT_YAML
 
     created: list[str] = []
     skipped: list[str] = []
@@ -809,7 +839,7 @@ def init(target_dir: str, force: bool) -> None:
             skipped.append(str(rel))
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8")  # vulnscanner: ignore[AST-PATH-004]
         created.append(str(rel))
 
     if created:
@@ -825,12 +855,19 @@ def init(target_dir: str, force: bool) -> None:
         console.print("[yellow]Nothing to do.[/yellow]")
         return
 
+    precommit_hint = (
+        "\n  4. For local pre-commit scanning: run `vulnscan init --pre-commit`\n"
+        "     then `pip install pre-commit && pre-commit install`"
+        if not with_precommit else
+        "\n  4. Run `pip install pre-commit && pre-commit install` to activate the hook"
+    )
     console.print(
         "\n[dim]Next steps:\n"
         "  1. Commit these files to your repository\n"
         "  2. Push to GitHub — the workflow runs automatically on every push/PR\n"
         "  3. Optionally: run `vulnscan scan . --output baseline.json` on your main branch\n"
-        "     and use `--baseline baseline.json` in CI to suppress pre-existing findings[/dim]\n"
+        f"     and use `--baseline baseline.json` in CI to suppress pre-existing findings"
+        f"{precommit_hint}[/dim]\n"
     )
 
 

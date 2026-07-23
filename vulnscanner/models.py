@@ -38,6 +38,8 @@ class VulnType(str, Enum):
     TRUST_BOUNDARY_VIOLATION = "Trust Boundary Violation"
     NOSQL_INJECTION = "NoSQL Injection"
     EMAIL_INJECTION = "Email Header Injection"
+    CORS_MISCONFIGURATION = "CORS Misconfiguration"
+    JWT_MISCONFIGURATION = "JWT Misconfiguration"
 
 
 @dataclass

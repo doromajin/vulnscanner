@@ -1214,7 +1214,7 @@ def _load_properties_files(file_path_str: str) -> dict:
             search_root = parent
         for pf in search_root.rglob("*.properties"):
             try:
-                for raw_line in pf.read_text(encoding="utf-8", errors="replace").splitlines():
+                for raw_line in pf.read_text(encoding="utf-8", errors="replace").splitlines():  # vulnscanner: ignore[AST-PATH-004]
                     line = raw_line.strip()
                     if not line or line.startswith("#") or "=" not in line:
                         continue

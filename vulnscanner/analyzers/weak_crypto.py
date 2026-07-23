@@ -85,6 +85,19 @@ _RULES = [
         "MD5/SHA-1 MessageDigest is cryptographically broken — use SHA-256+ for checksums; bcrypt/PBKDF2 for passwords",
         Severity.MEDIUM, _WC, (".java",),
     ),
+    # Python: random module used for security-sensitive values
+    (
+        "WCRYPTO-009",
+        re.compile(
+            r'(?:token|secret|nonce|salt|csrf|api[_.\-]?key|password|pin|otp)[^=\n]{0,30}='
+            r'[^;\n]*\brandom\.(?:choice|randint|random|getrandbits|uniform|sample)\s*\('
+            r'|\brandom\.(?:choice|randint|random|getrandbits|uniform|sample)\s*\([^;\n]{0,100}'
+            r'(?:token|secret|nonce|salt|csrf|api[_.\-]?key|password|pin|otp)',
+            re.IGNORECASE,
+        ),
+        "Python random module is not cryptographically secure — use secrets.choice(), secrets.token_hex(), or secrets.token_bytes() for security-sensitive values",
+        Severity.HIGH, _WC, (".py",),
+    ),
     # Math.random() on a line that also mentions a security-sensitive term
     (
         "WCRYPTO-008",
@@ -106,7 +119,8 @@ _GUARD = re.compile(
     r'|hashlib\.(?:md5|sha1)'
     r'|crypto\.createHash\s*\(["\'](?:md5|sha1)'
     r'|MessageDigest\.getInstance'
-    r'|Math\.random\s*\(\s*\)',
+    r'|Math\.random\s*\(\s*\)'
+    r'|\brandom\.(?:choice|randint|random|getrandbits|uniform|sample)\s*\(',
     re.IGNORECASE,
 )
 

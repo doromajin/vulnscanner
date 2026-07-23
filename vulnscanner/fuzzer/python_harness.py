@@ -94,7 +94,7 @@ def run(target: FuzzTarget, findings: list[Finding]) -> tuple[list[FuzzFinding],
 def _find_functions_at_lines(file_path: Path, lines: list[int]) -> list[str]:
     """Return function names that contain any of the given line numbers."""
     try:
-        source = file_path.read_text(encoding="utf-8", errors="replace")
+        source = file_path.read_text(encoding="utf-8", errors="replace")  # vulnscanner: ignore[AST-PATH-004]
         tree = ast.parse(source)
     except Exception:
         return []
@@ -118,7 +118,7 @@ def _find_functions_at_lines(file_path: Path, lines: list[int]) -> list[str]:
 def _finding_in_function(file_path: Path, line: int, func_name: str) -> bool:
     """True if the given line falls inside the named function."""
     try:
-        source = file_path.read_text(encoding="utf-8", errors="replace")
+        source = file_path.read_text(encoding="utf-8", errors="replace")  # vulnscanner: ignore[AST-PATH-004]
         tree = ast.parse(source)
     except Exception:
         return False

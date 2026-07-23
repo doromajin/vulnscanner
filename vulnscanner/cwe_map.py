@@ -33,6 +33,8 @@ _PREFIX: dict[str, int] = {
     "RACE":     362,   # CWE-362:  Race Condition (TOCTOU)
     "MISS":     306,   # CWE-306:  Missing Authentication for Critical Function
     "DEBUG":    489,   # CWE-489:  Active Debug Code
+    "JWT":      347,   # CWE-347:  Improper Verification of Cryptographic Signature
+    "CORS":     346,   # CWE-346:  Origin Validation Error
 }
 
 
