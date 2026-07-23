@@ -687,6 +687,11 @@ def _analyze_local_method(
             if method.name != method_name or not method.body:
                 continue
 
+            # @sanitizer Javadoc tag marks the method as a sanitizer — always clean output.
+            doc = getattr(method, "documentation", None) or ""
+            if "@sanitizer" in doc:
+                return False
+
             # Map caller args' taint to method formal params
             params = method.parameters or []
             m_tainted: set = set()
@@ -1013,6 +1018,20 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                             tainted.add(decl.name)
                             changed = True
                             continue
+                        # Bare (no-qualifier) local method call: try intra-file analysis first.
+                        # This handles @sanitizer-annotated helpers and similar wrappers.
+                        if (isinstance(init, jt.MethodInvocation)
+                                and init.qualifier == ""
+                                and not _is_request_source(init)):
+                            _loc_r = _analyze_local_method(
+                                tree, init.member, init.arguments or [], tainted, const_ints)
+                            if _loc_r is None:
+                                _loc_r = _analyze_remote_method(
+                                    init.member, init.arguments or [], tainted, const_ints)
+                            if _loc_r is not None:
+                                if _loc_r:
+                                    tainted.add(decl.name); changed = True
+                                continue  # analysis was definitive
                         # Cross-file: qualified method call (obj.method() / Class.method())
                         # where the qualifier itself isn't tainted (caught by _is_tainted below).
                         if (isinstance(init, jt.MethodInvocation)
@@ -1034,8 +1053,12 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
         # ForControl uses VariableDeclaration (not LocalVariableDeclaration) for loop vars.
         # e.g.: for(Iterator iter = ll.iterator(); ...) { Object o = iter.next(); }
         # Once the collection is tainted, ll.iterator() is tainted so iter is tainted.
+        # Skip LocalVariableDeclaration (subclass of VariableDeclaration) — handled above
+        # with the bare-method-call fix; re-processing them here would bypass that fix.
         try:
             for _, node in tree.filter(jt.VariableDeclaration):
+                if isinstance(node, jt.LocalVariableDeclaration):
+                    continue
                 if _line_of(node) in dead_lines:
                     continue
                 for decl in (node.declarators or []):
@@ -1346,7 +1369,7 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
 
 
 def _collect_writers(tree) -> set[str]:
-    """Find PrintWriter variable names from response.getWriter() declarations."""
+    """Find PrintWriter variable names from response.getWriter() assignments."""
     writers: set[str] = set()
     try:
         for _, node in tree.filter(jt.LocalVariableDeclaration):
@@ -1355,6 +1378,21 @@ def _collect_writers(tree) -> set[str]:
                 if isinstance(init, jt.MethodInvocation):
                     if init.member == "getWriter" and str(init.qualifier or "") in _RESPONSE_OBJECTS:
                         writers.add(decl.name)
+    except Exception:
+        pass
+    # Also catch instance field assignments: writer = resp.getWriter();
+    try:
+        for _, se in tree.filter(jt.StatementExpression):
+            expr = getattr(se, "expression", None)
+            if not isinstance(expr, jt.Assignment):
+                continue
+            lhs = expr.expressionl
+            rhs = expr.value
+            if not isinstance(lhs, jt.MemberReference) or str(lhs.qualifier or ""):
+                continue  # only simple bare names (no qualifier = not this.field explicitly)
+            if isinstance(rhs, jt.MethodInvocation):
+                if rhs.member == "getWriter" and str(rhs.qualifier or "") in _RESPONSE_OBJECTS:
+                    writers.add(lhs.member)
     except Exception:
         pass
     return writers
