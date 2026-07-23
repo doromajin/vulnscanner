@@ -497,6 +497,39 @@ def _collect_const_context(tree, properties: "dict | None" = None):
                             const_strings[decl.name] = _resolved
     except Exception:
         pass
+    # Track SE-level mutations: x++, x--, x = lit, x += lit, x -= lit, x *= lit.
+    # Processed in AST order so increments accumulated after the initial declaration.
+    try:
+        for _, se in tree.filter(jt.StatementExpression):
+            expr = getattr(se, "expression", None)
+            if expr is None:
+                continue
+            if (isinstance(expr, jt.MemberReference)
+                    and not (expr.qualifier or "")
+                    and expr.member in const_ints):
+                ops = (getattr(expr, "postfix_operators", None) or []) + \
+                      (getattr(expr, "prefix_operators", None) or [])
+                if "++" in ops:
+                    const_ints[expr.member] += 1
+                elif "--" in ops:
+                    const_ints[expr.member] -= 1
+            elif (isinstance(expr, jt.Assignment)
+                  and isinstance(expr.expressionl, jt.MemberReference)
+                  and not (expr.expressionl.qualifier or "")):
+                vname = expr.expressionl.member
+                rhs_val = _eval_const_expr(expr.value, const_ints, const_strings)
+                if rhs_val is not None:
+                    op = getattr(expr, "type", "=")
+                    if op == "=":
+                        const_ints[vname] = rhs_val
+                    elif op == "+=" and vname in const_ints:
+                        const_ints[vname] += rhs_val
+                    elif op == "-=" and vname in const_ints:
+                        const_ints[vname] -= rhs_val
+                    elif op == "*=" and vname in const_ints:
+                        const_ints[vname] *= rhs_val
+    except Exception:
+        pass
     return const_ints, const_strings
 
 

@@ -36,7 +36,7 @@ _RULES = [
         "PATH-005",
         re.compile(r'\.\./|\.\.\\\\', re.IGNORECASE),
         "Literal path traversal sequence in source code",
-        Severity.INFO, _PT, None,
+        Severity.INFO, _PT, (".py", ".rb", ".php", ".js", ".ts"),
     ),
     (
         "PATH-006",
