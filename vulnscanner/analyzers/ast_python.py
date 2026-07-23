@@ -442,6 +442,8 @@ _CLEAN_SERVER_FUNCS = frozenset({
     "date.today",
     "time.time", "time.monotonic", "time.perf_counter",
     "time.monotonic_ns", "time.perf_counter_ns",
+    # datetime formatting — returns a CLEAN string derived from a datetime value
+    "strftime", "isoformat",
     # OS / tempfile — system-determined paths and identifiers
     "tempfile.gettempdir", "tempfile.mkdtemp", "tempfile.mkstemp",
     "os.getpid", "os.getuid", "os.getgid", "os.getcwd",
@@ -861,7 +863,6 @@ class PythonASTAnalyzer(BaseAnalyzer):
     supported_extensions = (".py",)
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        global _interprocedural_taint_sources, _local_func_defs
         try:
             tree = ast.parse(content, filename=file_path)
         except SyntaxError:
@@ -869,24 +870,27 @@ class PythonASTAnalyzer(BaseAnalyzer):
 
         lines = content.splitlines()
         # Build per-file function definition map for interprocedural call-site injection.
-        _local_func_defs = {
+        # Stored in thread-local (_cross_file_local) to avoid race conditions when
+        # multiple files are analyzed in parallel — a module global would be clobbered
+        # by another thread, breaking Phase 3-CLEAN and other per-file analyses.
+        _cross_file_local.local_func_defs = {
             node.name: node
             for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
 
-        # Phase C: pre-seed _interprocedural_taint_sources from global pre-scan summary.
+        # Phase C: pre-seed interprocedural_taint_sources from global pre-scan summary.
         # This MUST happen before _build_remote_func_defs so Phase B (module-global
         # scanning inside _collect_module) can see globally-known taint source functions.
         # Without this, Phase B evaluates "ALLOWED_HOST = get_host()" but get_host is not
-        # in _interprocedural_taint_sources yet → assignment falsely returns UNKNOWN.
+        # in interprocedural_taint_sources yet → assignment falsely returns UNKNOWN.
         _cf_summary: CrossFileTaintSummary | None = getattr(
             _cross_file_local, "cf_summary", None
         )
         _global_sources: frozenset[str] = (
             _cf_summary.global_taint_sources if _cf_summary else frozenset()
         )
-        _interprocedural_taint_sources = _global_sources
+        _cross_file_local.interprocedural_taint_sources = _global_sources
 
         # Cross-file taint: build remote function defs from thread-local context.
         # set_cross_file_context() is called by the scanner before parallel analysis.
@@ -915,18 +919,18 @@ class PythonASTAnalyzer(BaseAnalyzer):
                 #   Pass 1: utils.get_user_id() → request.args.get() → TAINTED
                 #   Pass 2: helpers.fetch_user() → get_user_id() (now in sources) → TAINTED
                 _all_func_nodes = (
-                    list(_local_func_defs.values())
+                    list(_cross_file_local.local_func_defs.values())
                     + [_n for _n, _ in _rfd.values()]
                 )
                 _fake_combined = ast.Module(body=_all_func_nodes, type_ignores=[])
                 _per_file_sources = _find_taint_source_funcs(_fake_combined)
-                _interprocedural_taint_sources = _global_sources | _per_file_sources
+                _cross_file_local.interprocedural_taint_sources = _global_sources | _per_file_sources
             else:
                 _per_file_sources = _find_taint_source_funcs(tree)
-                _interprocedural_taint_sources = _global_sources | _per_file_sources
+                _cross_file_local.interprocedural_taint_sources = _global_sources | _per_file_sources
         else:
             _per_file_sources = _find_taint_source_funcs(tree)
-            _interprocedural_taint_sources = _global_sources | _per_file_sources
+            _cross_file_local.interprocedural_taint_sources = _global_sources | _per_file_sources
             _cross_file_local.remote_func_defs = {}
             _cross_file_local.remote_class_methods = {}
             _cross_file_local.remote_tainted_globals = {}
@@ -2262,16 +2266,17 @@ class _VulnVisitor(ast.NodeVisitor):
             src_path_override: str | None = None
             skip_self = False
 
+            _vlfd = getattr(_cross_file_local, 'local_func_defs', {})
             if func_name and func_name not in self._call_stack:
-                if func_name in _local_func_defs:
-                    callee_def = _local_func_defs[func_name]
+                if func_name in _vlfd:
+                    callee_def = _vlfd[func_name]
                 elif func_name in _rfd:
                     callee_def, src_path_override = _rfd[func_name]
 
             # Method call fallback: obj.method(arg) where method is a local/remote class method
             if callee_def is None and attr and attr not in self._call_stack:
-                if attr in _local_func_defs:
-                    callee_def = _local_func_defs[attr]
+                if attr in _vlfd:
+                    callee_def = _vlfd[attr]
                     skip_self = True
                 elif attr in _rcm and _rcm[attr]:
                     callee_def = _rcm[attr][0]  # use first definition
@@ -2627,13 +2632,31 @@ def _collect_scope_assignments(
 
     # Second pass: AugAssign (x += expr) — synthesise BinOp so taint propagates
     # from the augmented operand even when the prior assignment was CLEAN.
+    # Fold constant-integer chains in-place (e.g. loop counters: iteration += 1,
+    # repeated N times) so the resulting value stays a Constant(int) instead of
+    # a depth-N BinOp that would exceed _taint_of's recursion limit.
     for node in ast.walk(func):
         if (isinstance(node, ast.AugAssign)
                 and isinstance(node.target, ast.Name)):
             var = node.target.id
             prev = result.get(var)
             if prev is not None:
-                result[var] = ast.BinOp(left=prev, op=node.op, right=node.value)
+                # Constant-integer arithmetic fold to avoid deep BinOp chains.
+                if (isinstance(prev, ast.Constant) and isinstance(prev.value, int)
+                        and isinstance(node.value, ast.Constant)
+                        and isinstance(node.value.value, int)):
+                    op = node.op
+                    lv, rv = prev.value, node.value.value
+                    if isinstance(op, ast.Add):
+                        result[var] = ast.Constant(value=lv + rv)
+                    elif isinstance(op, ast.Sub):
+                        result[var] = ast.Constant(value=lv - rv)
+                    elif isinstance(op, ast.Mult):
+                        result[var] = ast.Constant(value=lv * rv)
+                    else:
+                        result[var] = ast.BinOp(left=prev, op=op, right=node.value)
+                else:
+                    result[var] = ast.BinOp(left=prev, op=node.op, right=node.value)
             else:
                 result[var] = node.value
 
@@ -2985,15 +3008,20 @@ def _taint_of(
                 return _taint_of(node.args[0], assignments, class_attrs, _depth + 1)
             return UNKNOWN_UNRESOLVED
 
+        # Thread-local reads: use per-thread values to avoid race conditions in parallel
+        # analysis — the module-level globals would be overwritten by concurrent threads.
+        _lfd = getattr(_cross_file_local, 'local_func_defs', {})
+        _its = getattr(_cross_file_local, 'interprocedural_taint_sources', frozenset())
+
         # Interprocedural taint: call to a function identified as a taint source in pre-pass.
-        if full in _interprocedural_taint_sources:
+        if full in _its:
             return TaintInfo(TaintStatus.TAINTED,
                              f"return of taint-source function '{full}'", source=full)
 
         # Phase 3a: self.method() / obj.method() where the short method name is a local
-        # taint source.  _full_name returns "self.foo" which won't match _local_func_defs
+        # taint source.  _full_name returns "self.foo" which won't match local_func_defs
         # keys (stored as "foo"), so we check attr separately.
-        if attr and isinstance(node.func, ast.Attribute) and attr in _interprocedural_taint_sources:
+        if attr and isinstance(node.func, ast.Attribute) and attr in _its:
             return TaintInfo(TaintStatus.TAINTED,
                              f"return of taint-source method '.{attr}()'", source=attr)
 
@@ -3001,12 +3029,12 @@ def _taint_of(
         # If the callee is a local function and any arg is TAINTED, check whether the tainted
         # parameter flows to a return value inside the callee. If so, the call expression itself
         # is TAINTED in the caller's context (e.g. val = process(request.args.get('q'))).
-        if full and full in _local_func_defs and _depth <= 12:
+        if full and full in _lfd and _depth <= 12:
+            _fd = _lfd[full]
             _arg_taints = [
                 _taint_of(a, assignments, class_attrs, _depth + 1) for a in node.args
             ]
             if any(t.status == TaintStatus.TAINTED for t in _arg_taints):
-                _fd = _local_func_defs[full]
                 _param_assigns: dict[str, ast.expr] = {}
                 for _i, _param in enumerate(_fd.args.args):
                     if _i < len(_arg_taints) and _arg_taints[_i].status == TaintStatus.TAINTED:
@@ -3014,13 +3042,23 @@ def _taint_of(
                 if _param_assigns and _callee_returns_tainted(_fd, _param_assigns, _depth + 1):
                     return TaintInfo(TaintStatus.TAINTED,
                                      f"tainted arg flows through '{full}' return", source=full)
+            elif _depth <= 11:
+                # Phase 3-CLEAN: no TAINTED args — check if callee always returns CLEAN.
+                # Handles patterns like `run_dir = get_run_dir(datetime.now())` where the
+                # callee derives its return purely from module constants and CLEAN params.
+                _pm_c: dict[str, ast.expr] = {}
+                for _i, _param in enumerate(_fd.args.args):
+                    if _i < len(_arg_taints) and _arg_taints[_i].status == TaintStatus.CLEAN:
+                        _pm_c[_param.arg] = ast.Constant(value=0)
+                if _callee_return_taint_status(_fd, _pm_c, _depth + 1) == TaintStatus.CLEAN:
+                    return CLEAN_LITERAL
 
         # Phase 3b: self.method(tainted_arg) — attr call where the short method name is
-        # in _local_func_defs but full ("self.foo") is not.  Skips 'self' when mapping params.
+        # in local_func_defs but full ("self.foo") is not.  Skips 'self' when mapping params.
         if (attr and isinstance(node.func, ast.Attribute)
-                and attr in _local_func_defs and _depth <= 12
-                and (not full or full not in _local_func_defs)):
-            _fd_m = _local_func_defs[attr]
+                and attr in _lfd and _depth <= 12
+                and (not full or full not in _lfd)):
+            _fd_m = _lfd[attr]
             _arg_taints_m = [_taint_of(a, assignments, class_attrs, _depth + 1) for a in node.args]
             if any(t.status == TaintStatus.TAINTED for t in _arg_taints_m):
                 _params_m = [p for p in _fd_m.args.args if p.arg != "self"]
@@ -3031,13 +3069,22 @@ def _taint_of(
                 if _pm_m and _callee_returns_tainted(_fd_m, _pm_m, _depth + 1):
                     return TaintInfo(TaintStatus.TAINTED,
                                      f"tainted arg flows through .{attr}() return", source=attr)
+            elif _depth <= 11:
+                # Phase 3b-CLEAN: self.method() with no TAINTED args — check if always CLEAN.
+                _params_mc = [p for p in _fd_m.args.args if p.arg != "self"]
+                _pm_mc: dict[str, ast.expr] = {}
+                for _i, _param in enumerate(_params_mc):
+                    if _i < len(_arg_taints_m) and _arg_taints_m[_i].status == TaintStatus.CLEAN:
+                        _pm_mc[_param.arg] = ast.Constant(value=0)
+                if _callee_return_taint_status(_fd_m, _pm_mc, _depth + 1) == TaintStatus.CLEAN:
+                    return CLEAN_LITERAL
 
         # Phase 4: cross-file taint propagation.
         # If the called function is imported from another project-local file, check
         # whether a tainted argument flows through its return value.
         # (Remote taint-source functions — those that read request data directly —
-        # are already merged into _interprocedural_taint_sources in analyze(), so the
-        # check above at line ~1786 handles them. Phase 4 only needs to cover
+        # are already merged into interprocedural_taint_sources in analyze(), so the
+        # check above handles them. Phase 4 only needs to cover
         # the passthrough case: remote func receives a tainted arg and returns it.)
         # Skip Phase 4 for known sanitizer functions: the sanitizer handler below records
         # the sanitizer metadata correctly and must not be bypassed by Phase 4's TAINTED return.
@@ -3045,7 +3092,7 @@ def _taint_of(
             full in _HTML_SANITIZER_FUNCS | _URL_SANITIZER_FUNCS | _CMD_SANITIZER_FUNCS
             or attr in _HTML_SANITIZER_METHODS | _URL_SANITIZER_METHODS
         )
-        if full and full not in _local_func_defs and _depth <= 11 and not _phase4_is_sanitizer:
+        if full and full not in _lfd and _depth <= 11 and not _phase4_is_sanitizer:
             _rfd_x = getattr(_cross_file_local, "remote_func_defs", {})
             if full in _rfd_x:
                 _rfn, _rsrc = _rfd_x[full]
@@ -3571,8 +3618,6 @@ def _find_taint_source_funcs(tree: ast.AST) -> frozenset[str]:
     Security-first: if any code path can return a tainted value the function is
     marked as a taint source, even if other paths return a clean sentinel.
     """
-    global _interprocedural_taint_sources
-
     func_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
         node.name: node
         for node in ast.walk(tree)
@@ -3594,7 +3639,8 @@ def _find_taint_source_funcs(tree: ast.AST) -> frozenset[str]:
     current: frozenset[str] = frozenset()
     for _ in range(min(len(func_nodes) + 1, 8)):
         # Expose current known sources to _taint_of so transitive calls resolve.
-        _interprocedural_taint_sources = current
+        # Use thread-local to avoid clobbering parallel analysis of other files.
+        _cross_file_local.interprocedural_taint_sources = current
         added: set[str] = set()
         for name in func_nodes:
             if name in current:
@@ -3693,12 +3739,14 @@ def _is_clean_expr_quick(
     clean_vars: set[str],
     module_clean: frozenset[str] = frozenset(),
     depth: int = 0,
+    clean_return_funcs: frozenset[str] = frozenset(),
 ) -> bool:
     """Lightweight CLEAN check for Phase F CLI-param propagation.
 
     Conservative: only constants, names in clean_vars/module_clean, attribute
     access on CLEAN objects, parse_args() and server-function returns, and
     arithmetic/BinOp on CLEAN operands qualify as CLEAN.
+    clean_return_funcs (Phase F-2): user-defined functions whose return is always CLEAN.
     """
     if depth > 5:
         return False
@@ -3711,7 +3759,7 @@ def _is_clean_expr_quick(
                 or node.id in ("True", "False", "None"))
     if isinstance(node, ast.Attribute):
         # e.g. args.target where args came from parse_args() → CLEAN
-        return _is_clean_expr_quick(node.value, clean_vars, module_clean, depth + 1)
+        return _is_clean_expr_quick(node.value, clean_vars, module_clean, depth + 1, clean_return_funcs)
     if isinstance(node, ast.Call):
         attr = _attr_name(node.func)
         full = _full_name(node.func) or ""
@@ -3719,29 +3767,39 @@ def _is_clean_expr_quick(
             return True
         if full in _CLEAN_SERVER_FUNCS or attr in _CLEAN_SERVER_FUNCS:
             return True
+        # Phase F-2: user-defined functions known to always return CLEAN values.
+        # Require all args to also be CLEAN so tainted-arg passthrough is not missed.
+        if clean_return_funcs and (attr in clean_return_funcs or full in clean_return_funcs):
+            return all(
+                _is_clean_expr_quick(a, clean_vars, module_clean, depth + 1, clean_return_funcs)
+                for a in node.args
+            )
         # Path construction: CLEAN if all args are CLEAN
         if full in _PATH_CONSTRUCTION_FUNCS or attr in {"Path"}:
             return all(
-                _is_clean_expr_quick(a, clean_vars, module_clean, depth + 1)
+                _is_clean_expr_quick(a, clean_vars, module_clean, depth + 1, clean_return_funcs)
                 for a in node.args
             )
         return False
     if isinstance(node, ast.BinOp):
         return (
-            _is_clean_expr_quick(node.left, clean_vars, module_clean, depth + 1)
-            and _is_clean_expr_quick(node.right, clean_vars, module_clean, depth + 1)
+            _is_clean_expr_quick(node.left, clean_vars, module_clean, depth + 1, clean_return_funcs)
+            and _is_clean_expr_quick(node.right, clean_vars, module_clean, depth + 1, clean_return_funcs)
         )
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         return all(
-            _is_clean_expr_quick(e, clean_vars, module_clean, depth + 1)
+            _is_clean_expr_quick(e, clean_vars, module_clean, depth + 1, clean_return_funcs)
             for e in node.elts
         )
     if isinstance(node, ast.JoinedStr):  # f-string
         return all(
-            _is_clean_expr_quick(v.value, clean_vars, module_clean, depth + 1)
+            _is_clean_expr_quick(v.value, clean_vars, module_clean, depth + 1, clean_return_funcs)
             if isinstance(v, ast.FormattedValue) else True
             for v in node.values
         )
+    if isinstance(node, ast.Subscript):
+        # Indexing into a CLEAN collection (e.g. SAFE_LIST[i]) yields CLEAN.
+        return _is_clean_expr_quick(node.value, clean_vars, module_clean, depth + 1, clean_return_funcs)
     return False
 
 
@@ -3749,8 +3807,13 @@ def _collect_clean_vars_in_body(
     stmts: list[ast.stmt],
     seed: set[str],
     module_clean: frozenset[str] = frozenset(),
+    clean_return_funcs: frozenset[str] = frozenset(),
 ) -> set[str]:
-    """Single-pass forward scan: return names assigned exclusively from CLEAN sources."""
+    """Forward scan of a statement list: return names assigned exclusively from CLEAN sources.
+
+    Handles nested if-else (intersects branches), for/while/with (unions loop body),
+    and AugAssign (removes from CLEAN if the RHS is not CLEAN).
+    """
     clean = seed.copy()
     for stmt in stmts:
         if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
@@ -3758,10 +3821,30 @@ def _collect_clean_vars_in_body(
             if val is None:
                 continue
             targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-            if _is_clean_expr_quick(val, clean, module_clean):
+            if _is_clean_expr_quick(val, clean, module_clean, 0, clean_return_funcs):
                 for t in targets:
                     if isinstance(t, ast.Name):
                         clean.add(t.id)
+        elif isinstance(stmt, ast.AugAssign):
+            # x += tainted_expr → x is no longer CLEAN
+            if (isinstance(stmt.target, ast.Name)
+                    and not _is_clean_expr_quick(stmt.value, clean, module_clean, 0, clean_return_funcs)):
+                clean.discard(stmt.target.id)
+        elif isinstance(stmt, ast.If):
+            # A var is CLEAN after if-else only if CLEAN in ALL branches.
+            then_clean = _collect_clean_vars_in_body(stmt.body, clean.copy(), module_clean, clean_return_funcs)
+            if stmt.orelse:
+                else_clean = _collect_clean_vars_in_body(stmt.orelse, clean.copy(), module_clean, clean_return_funcs)
+                clean.update(then_clean & else_clean)
+            # No else branch: don't add vars that might not be assigned
+        elif isinstance(stmt, (ast.For, ast.While)):
+            # Conservatively: vars assigned CLEAN inside the loop body may be CLEAN
+            # at call sites inside the loop (e.g. target_file assigned inside for-loop).
+            loop_clean = _collect_clean_vars_in_body(stmt.body, clean.copy(), module_clean, clean_return_funcs)
+            clean.update(loop_clean)
+        elif isinstance(stmt, ast.With):
+            with_clean = _collect_clean_vars_in_body(stmt.body, clean.copy(), module_clean, clean_return_funcs)
+            clean.update(with_clean)
     return clean
 
 
@@ -3786,6 +3869,50 @@ def _module_level_clean_names(tree: ast.Module) -> frozenset[str]:
                     if isinstance(t, ast.Name):
                         clean.add(t.id)
     return frozenset(clean)
+
+
+def _compute_clean_return_funcs(
+    func_bodies: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]],
+    module_clean_by_fp: dict[str, frozenset[str]],
+    func_to_fp: dict[int, str],
+    seed: frozenset[str] = frozenset(),
+) -> frozenset[str]:
+    """Phase F-2: identify user-defined functions that return CLEAN when called with CLEAN args.
+
+    Fixed-point iteration so that function A calling CLEAN-return function B and
+    returning its result is also recognized as CLEAN-return.
+    """
+    result: set[str] = set(seed)
+    for _ in range(5):
+        prev_size = len(result)
+        current_crf = frozenset(result)
+        for name, func_list in func_bodies.items():
+            if name in result:
+                continue
+            for func_def in func_list:
+                params = [a.arg for a in func_def.args.args if a.arg != "self"]
+                module_clean = module_clean_by_fp.get(func_to_fp.get(id(func_def), ""), frozenset())
+                # Treat ALL params as CLEAN to determine if the return is always CLEAN.
+                clean_seed = set(params)
+                clean_vars = _collect_clean_vars_in_body(
+                    func_def.body, clean_seed, module_clean, current_crf
+                )
+                has_return = False
+                all_clean = True
+                for node in ast.walk(func_def):
+                    if isinstance(node, ast.Return) and node.value is not None:
+                        has_return = True
+                        if not _is_clean_expr_quick(
+                            node.value, clean_vars, module_clean, 0, current_crf
+                        ):
+                            all_clean = False
+                            break
+                if has_return and all_clean:
+                    result.add(name)
+                    break  # one definition is sufficient
+        if len(result) == prev_size:
+            break
+    return frozenset(result)
 
 
 def _build_confirmed_clean_params(
@@ -3856,6 +3983,52 @@ def _build_confirmed_clean_params(
                             if i not in confirmed.get(callee, set()):
                                 confirmed.setdefault(callee, set()).add(i)
                                 changed = True
+
+    # Phase F-2: find user-defined CLEAN-return functions, then re-propagate.
+    # This handles patterns like run_dir = get_run_dir(datetime.now()) where
+    # the callee is not a known stdlib function but always returns a CLEAN path.
+    clean_return_funcs = _compute_clean_return_funcs(
+        func_bodies, module_clean_by_fp, func_to_fp
+    )
+    if clean_return_funcs:
+        changed = True
+        for _ in range(5):
+            if not changed:
+                break
+            changed = False
+            for _name, func_list in func_bodies.items():
+                for func_def in func_list:
+                    params = [a.arg for a in func_def.args.args if a.arg != "self"]
+                    module_clean = module_clean_by_fp.get(
+                        func_to_fp.get(id(func_def), ""), frozenset()
+                    )
+                    is_cli = _func_is_cli_entry(func_def)
+                    clean_seed_f2: set[str] = set()
+                    if is_cli:
+                        clean_seed_f2.update(params)
+                    for idx in confirmed.get(_name, set()):
+                        if idx < len(params):
+                            clean_seed_f2.add(params[idx])
+                    if not clean_seed_f2 and not is_cli:
+                        continue
+                    clean_vars = _collect_clean_vars_in_body(
+                        func_def.body, clean_seed_f2, module_clean, clean_return_funcs
+                    )
+                    for node in ast.walk(func_def):
+                        if not isinstance(node, ast.Call):
+                            continue
+                        callee = _full_name(node.func) or _attr_name(node.func)
+                        if not callee or "." in callee:
+                            callee = _attr_name(node.func)
+                        if not callee:
+                            continue
+                        for i, arg in enumerate(node.args):
+                            if _is_clean_expr_quick(
+                                arg, clean_vars, module_clean, 0, clean_return_funcs
+                            ):
+                                if i not in confirmed.get(callee, set()):
+                                    confirmed.setdefault(callee, set()).add(i)
+                                    changed = True
 
     return {k: frozenset(v) for k, v in confirmed.items()}
 
