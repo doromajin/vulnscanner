@@ -11,6 +11,7 @@ from vulnscanner.models import Finding, Severity, VulnType
 _JS_HTML_EXTS = (".js", ".ts", ".jsx", ".tsx", ".html")
 # Rule IDs restricted to JS/HTML only (DOM APIs absent from Python)
 _JS_HTML_ONLY = frozenset({"XSS-002", "XSS-006"})
+_PHP_ONLY     = frozenset({"XSS-005"})  # "echo $_GET" pattern — PHP syntax only
 
 _SIMPLE_RULES = [
     (
@@ -199,10 +200,12 @@ class XSSAnalyzer(BaseAnalyzer):
         # XSS-002 to XSS-007: simple per-line regex rules (single-pass, pre-compiled)
         if _SIMPLE_GUARD.search(content):
             is_js_html = file_path.endswith(_JS_HTML_EXTS)
+            is_php = file_path.endswith(".php")
             simple_rules = [
                 (rid, pat, desc, sev)
                 for rid, pat, desc, sev in _SIMPLE_RULES
-                if rid not in _JS_HTML_ONLY or is_js_html
+                if (rid not in _JS_HTML_ONLY or is_js_html)
+                and (rid not in _PHP_ONLY or is_php)
             ]
             for lineno, line in enumerate(lines, 1):
                 if self._is_comment(line):

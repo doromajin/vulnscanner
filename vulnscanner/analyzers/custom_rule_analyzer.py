@@ -39,10 +39,17 @@ class CustomRuleAnalyzer(BaseAnalyzer):
             return []
 
         lines = content.splitlines()
+        # For Python files, mask string literal interiors so that rule description
+        # strings (e.g. "yaml.load()" or "exec(x)") don't match their own patterns.
+        scan_lines = (
+            self._mask_python_strings(content).splitlines()
+            if file_path.endswith(".py")
+            else lines
+        )
         findings: list[Finding] = []
         seen: set[tuple] = set()
 
-        for lineno, line in enumerate(lines, 1):
+        for lineno, (line, scan_line) in enumerate(zip(lines, scan_lines), 1):
             stripped = line.strip()
 
             # Honour inline suppression annotation
@@ -54,7 +61,7 @@ class CustomRuleAnalyzer(BaseAnalyzer):
                 continue
 
             for rule in applicable:
-                if not rule.matches(line):
+                if not rule.matches(scan_line):
                     continue
                 key = (rule.id, lineno)
                 if key in seen:

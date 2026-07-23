@@ -5,6 +5,10 @@ from vulnscanner.models import Finding, Severity, VulnType
 
 _LDAP = VulnType.LDAP_INJECTION
 
+# LDAP-001 skip: exclude lines where .search() is called on Python's re module or
+# a compiled regex pattern — these are regex operations, not LDAP searches.
+_RE_SEARCH_SKIP = re.compile(r'\bre(?:_obj|_[a-z]+)?\s*\.\s*search\s*\(|\bpattern\s*\.\s*search\s*\(', re.IGNORECASE)
+
 _RULES = [
     # Python python-ldap: ldap.search_s(base, scope, "(uid=" + user_input + ")")
     (
@@ -16,6 +20,7 @@ _RULES = [
         ),
         "LDAP search filter built with string concatenation/interpolation — LDAP injection allows authentication bypass",
         Severity.HIGH, _LDAP, (".py",),
+        _RE_SEARCH_SKIP,
     ),
     # Python ldap3: conn.search(search_base, search_filter=f"(uid={user_input})")
     (
@@ -88,11 +93,16 @@ class LDAPInjectionAnalyzer(BaseAnalyzer):
         if not _GUARD.search(content):
             return []
 
-        applicable = [
-            (rid, re_obj, desc, sev, vt)
-            for rid, re_obj, desc, sev, vt, exts in _RULES
-            if exts is None or file_path.endswith(exts)
-        ]
+        applicable = []
+        for rule in _RULES:
+            rid, re_obj, desc, sev, vt, exts = rule[:6]
+            if exts is not None and not file_path.endswith(exts):
+                continue
+            skip_re = rule[6] if len(rule) > 6 else None
+            if skip_re is not None:
+                applicable.append((rid, re_obj, desc, sev, vt, skip_re))
+            else:
+                applicable.append((rid, re_obj, desc, sev, vt))
         if not applicable:
             return []
-        return self._scan_lines(file_path, content, repo_url, applicable, guard=None)
+        return self._scan_lines(file_path, content, repo_url, applicable, guard=None, mask_strings_py=True)
