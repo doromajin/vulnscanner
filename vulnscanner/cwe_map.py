@@ -19,6 +19,8 @@ _PREFIX: dict[str, int] = {
     "REDIR":    601,   # CWE-601:  URL Redirection to Untrusted Site
     "SSTI":     94,    # CWE-94:   Code Injection
     "PP":       1321,  # CWE-1321: Prototype Pollution
+    "PROTO":    1321,  # CWE-1321: Prototype Pollution (JSAST-PROTO-*)
+    "REDOS":    1333,  # CWE-1333: Inefficient Regular Expression Complexity
     "SEC":      798,   # CWE-798:  Use of Hard-coded Credentials
     "XXE":      611,   # CWE-611:  Improper Restriction of XML External Entity Reference
     "LDAP":     90,    # CWE-90:   LDAP Injection

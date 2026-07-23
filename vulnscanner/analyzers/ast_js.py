@@ -20,13 +20,17 @@ Rule IDs (JSAST-*):
   JSAST-LOG-001   Log injection (console.log / logger.error …)
   JSAST-SSTI-001  SSTI (ejs/pug/handlebars/nunjucks render/compile)
   JSAST-PROTO-001 Prototype pollution (_.merge / Object.assign …)
+  JSAST-REDOS-001 ReDoS — nested quantifiers / ambiguous alternation in regex literals
   Class field taint: this.x = req.body.x propagated to sinks in other methods
+  Promise chain taint: promise.then(x => sink(x)) propagates taint to callback param
 
 Analyzers:
   JSASTAnalyzer  — .js / .jsx / .mjs / .cjs  (tree-sitter-javascript)
   TSASTAnalyzer  — .ts / .tsx                 (tree-sitter-typescript)
 """
 from __future__ import annotations
+
+import re as _re
 
 try:
     import tree_sitter_javascript as _tsjs
@@ -316,6 +320,61 @@ def _collect_declarations(root, state: _JSTaintState) -> bool:
                         state.tainted_attrs.add(attr)
                         changed = True
 
+        # Promise chain: taintedPromise.then(param => ...) / .catch(param => ...)
+        # The first parameter of the callback receives the resolved/rejected value.
+        # Mark it as tainted when the receiver produces tainted output.
+        elif node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            args = node.child_by_field_name("arguments")
+            if fn is None or args is None or fn.type != "member_expression":
+                continue
+            prop_node = fn.child_by_field_name("property")
+            if prop_node is None:
+                continue
+            method = prop_node.text.decode("utf-8", errors="replace")
+            if method not in ("then", "catch", "finally"):
+                continue
+            recv = fn.child_by_field_name("object")
+            if recv is None:
+                continue
+            # Receiver is tainted if: directly tainted, request source, a tainted function
+            # call, or a call wrapping tainted args (e.g. Promise.resolve(tainted))
+            recv_tainted = state.is_tainted_node(recv) or _is_request_source(recv)
+            if not recv_tainted and recv.type == "call_expression":
+                recv_args = recv.child_by_field_name("arguments")
+                if recv_args is not None and any(
+                    state.is_tainted_node(a) or _is_request_source(a)
+                    for a in recv_args.named_children
+                ):
+                    recv_tainted = True
+            if not recv_tainted:
+                continue
+            # Extract first parameter of the callback arrow/function
+            for cb in args.named_children:
+                cb = _unwrap(cb)
+                if cb.type in ("arrow_function", "function_expression", "function"):
+                    params = cb.child_by_field_name("parameters") or cb.child_by_field_name("parameter")
+                    if params is None:
+                        break
+                    # arrow_function with single identifier param: x => ...
+                    if params.type == "identifier":
+                        pname = params.text.decode("utf-8", errors="replace")
+                        if pname not in state.tainted:
+                            line = cb.start_point[0] + 1
+                            if state.mark(pname, line, f"promise .{method}() callback parameter"):
+                                changed = True
+                    else:
+                        # (x, y) => ... — take first named param
+                        for p in params.named_children:
+                            if p.type == "identifier":
+                                pname = p.text.decode("utf-8", errors="replace")
+                                if pname not in state.tainted:
+                                    line = p.start_point[0] + 1
+                                    if state.mark(pname, line, f"promise .{method}() callback parameter"):
+                                        changed = True
+                                break
+                break
+
     return changed
 
 
@@ -431,6 +490,55 @@ _MERGE_METHODS = frozenset({
     "merge", "extend", "mergeWith", "defaults", "defaultsDeep", "assign", "mixin",
 })
 
+# ── ReDoS detection ────────────────────────────────────────────────────────────
+# Detect nested quantifiers: a group containing a quantifier wrapped in an outer
+# quantifier — the classic exponential-backtracking pattern e.g. (a+)+ or (a*b*)+
+# We match on the raw regex source string (not the AST), which is simpler and safe.
+
+# Pattern 1: group with inner quantifier, followed by outer quantifier
+#   e.g.  (a+)+  ([a-z]+\s*)+  (\w*:\w*)+
+_REDOS_NESTED = _re.compile(
+    r'(?<![\\])'      # not escaped
+    r'\('             # open group
+    r'(?:[^()\\]|\\.)*'  # group content (non-nested, handles escape seqs)
+    r'(?:[+*]|\{[0-9]+,[0-9]*\})'  # inner quantifier
+    r'(?:[^()\\]|\\.)*'
+    r'\)'             # close group
+    r'(?:[+*?]|\{[0-9]+,[0-9]*\})'  # outer quantifier
+)
+
+# Pattern 2: alternation inside a group with outer quantifier AND overlapping alternatives
+#   e.g.  (a|ab)+  (ab|b)+  (\d|\d\d)+
+_REDOS_ALTERNATION = _re.compile(
+    r'\('
+    r'([^()|\\]+)'    # first alternative (simple, no nesting)
+    r'\|'
+    r'([^()|\\]+)'    # second alternative
+    r'\)'
+    r'[+*]'
+)
+
+
+def _is_redos_pattern(pattern_src: str) -> str | None:
+    """Return a short description if *pattern_src* has a ReDoS-risky construct, else None.
+
+    Checks nested quantifiers (highest confidence) and ambiguous alternation.
+    Returns the matched snippet so the finding description is concrete.
+    """
+    m = _REDOS_NESTED.search(pattern_src)
+    if m:
+        return f"nested quantifier: {m.group()!r}"
+
+    m = _REDOS_ALTERNATION.search(pattern_src)
+    if m:
+        a1, a2 = m.group(1), m.group(2)
+        # Only flag when alternatives share a common prefix (overlap) or one contains the other
+        min_len = min(len(a1), len(a2))
+        if min_len > 0 and (a1[:min_len] == a2[:min_len] or a1 in a2 or a2 in a1):
+            return f"ambiguous alternation: {m.group()!r}"
+
+    return None
+
 
 def _emit(
     findings: list[Finding],
@@ -462,6 +570,41 @@ def _emit(
             lines[max(0, line - 3): min(len(lines), line + 2)]
         ),
     ))
+
+
+def _check_redos(
+    root,
+    file_path: str,
+    lines: list[str],
+    repo_url: str,
+) -> list[Finding]:
+    """Scan all regex literals for catastrophic backtracking patterns (no taint needed)."""
+    findings: list[Finding] = []
+    seen: set[tuple] = set()
+    for node in _walk(root):
+        if node.type != "regex":
+            continue
+        # Extract pattern text from /pattern/flags — strip leading/trailing slashes + flags
+        full = node.text.decode("utf-8", errors="replace") if node.text else ""
+        if full.startswith("/") and full.count("/") >= 2:
+            last_slash = full.rfind("/")
+            src = full[1:last_slash]
+        else:
+            # Fallback: try pattern field or first named child
+            pn = node.child_by_field_name("pattern")
+            if pn is None and node.named_children:
+                pn = node.named_children[0]
+            src = pn.text.decode("utf-8", errors="replace") if pn else ""
+        if not src:
+            continue
+        issue = _is_redos_pattern(src)
+        if issue:
+            line = node.start_point[0] + 1
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.REDOS, Severity.MEDIUM,
+                  "JSAST-REDOS-001",
+                  f"Regex with catastrophic backtracking risk — {issue}")
+    return findings
 
 
 def _check_sinks(
@@ -665,10 +808,13 @@ def _analyze_with_parser(
     except Exception:
         return []
     lines = content.splitlines()
+    # ReDoS: pure structural analysis — runs even when file has no request sources
+    results = _check_redos(tree.root_node, file_path, lines, repo_url)
     state = _build_taint_state(tree.root_node)
     if not state.tainted and not state.tainted_funcs and not state.tainted_attrs:
-        return []
-    return _check_sinks(tree.root_node, state, file_path, lines, repo_url)
+        return results
+    results += _check_sinks(tree.root_node, state, file_path, lines, repo_url)
+    return results
 
 
 class JSASTAnalyzer(BaseAnalyzer):

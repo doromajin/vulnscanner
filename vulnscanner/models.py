@@ -40,6 +40,7 @@ class VulnType(str, Enum):
     EMAIL_INJECTION = "Email Header Injection"
     CORS_MISCONFIGURATION = "CORS Misconfiguration"
     JWT_MISCONFIGURATION = "JWT Misconfiguration"
+    REDOS = "Regular Expression Denial of Service (ReDoS)"
 
 
 @dataclass

@@ -3083,6 +3083,93 @@ class Ctrl {
         xss = [f for f in findings if f.rule_id == "JSAST-XSS-001"]
         assert not xss, "this.name assigned from literal must not FP"
 
+    # ── Promise chain taint ───────────────────────────────────────────────────
+
+    def test_promise_then_sql_injection(self):
+        """Promise.then(data => db.query(data)) where promise carries tainted data."""
+        code = """
+function getInput(req) {
+    return req.body.userId;
+}
+app.post('/user', (req, res) => {
+    getInput(req)
+        .then(userId => db.query("SELECT * FROM users WHERE id=" + userId));
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "Promise .then() callback param taint not propagated"
+
+    def test_promise_then_xss(self):
+        """req.body.data flowing through .then() into res.send()."""
+        code = """
+app.get('/page', (req, res) => {
+    const data = req.query.data;
+    Promise.resolve(data)
+        .then(val => res.send(val));
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-XSS-001" in rule_ids, "Promise .then(val => res.send(val)) XSS not detected"
+
+    def test_promise_catch_taint(self):
+        """Error message from tainted source propagating through .catch()."""
+        code = """
+app.post('/run', (req, res) => {
+    const input = req.body.cmd;
+    doSomething(input)
+        .catch(err => res.send(err.message));
+});
+"""
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-XSS-001" in rule_ids, "Promise .catch(err => res.send()) not detected"
+
+    def test_no_fp_promise_then_literal(self):
+        """Promise.resolve('safe').then(v => res.send(v)) must not fire."""
+        code = "Promise.resolve('safe').then(v => res.send(v));"
+        findings = _JSAST.analyze("app.js", code)
+        xss = [f for f in findings if f.rule_id == "JSAST-XSS-001"]
+        assert not xss, "Promise.resolve(literal).then must not FP"
+
+    # ── ReDoS ─────────────────────────────────────────────────────────────────
+
+    def test_redos_nested_quantifier(self):
+        """(a+)+ is a classic ReDoS pattern."""
+        code = "const re = /(a+)+/;"
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-REDOS-001" in rule_ids, "Nested quantifier (a+)+ not detected"
+
+    def test_redos_complex_nested(self):
+        """([a-z]+\\s*)+ — complex nested quantifier common in email/URL validators."""
+        code = r"const emailRe = /([a-z0-9]+\.?)+@[a-z]+\.[a-z]+/;"
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-REDOS-001" in rule_ids, "Complex nested quantifier not detected"
+
+    def test_redos_star_star(self):
+        """(a*)* — double star nested pattern."""
+        code = "const re = /(a*)*$/;"
+        findings = _JSAST.analyze("app.js", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-REDOS-001" in rule_ids, "Nested (a*)* not detected"
+
+    def test_no_fp_redos_simple_regex(self):
+        """Simple regex without nested quantifiers must not fire."""
+        code = r"const re = /^[a-z0-9]+$/i;"
+        findings = _JSAST.analyze("app.js", code)
+        redos = [f for f in findings if f.rule_id == "JSAST-REDOS-001"]
+        assert not redos, "Simple character class regex must not FP"
+
+    def test_no_fp_redos_safe_pattern(self):
+        """([^\"\\\\]|\\\\.)* is a standard safe string-matching pattern — must not fire."""
+        code = r'const strRe = /^"([^"\\]|\\.)*"$/;'
+        findings = _JSAST.analyze("app.js", code)
+        redos = [f for f in findings if f.rule_id == "JSAST-REDOS-001"]
+        assert not redos, 'Standard escape-aware string regex must not FP'
+
 
 _TSAST = TSASTAnalyzer()
 
