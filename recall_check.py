@@ -100,6 +100,10 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     ("AST-SQL-002",   "python/interprocedural.py",    "HIGH",     "Phase 3a: self._get_id() inherent taint source"),
     ("AST-CMD-001",   "python/interprocedural.py",    "HIGH",     "Phase 3b: self._wrap(tainted) passthrough"),
 
+    # -- Python: cross-file taint -------------------------------------------------
+    ("AST-SQL-002",   "python/cross_file_main.py",    "HIGH",     "cross-file: imported function returns user input → SQL sink"),
+    ("AST-CMD-002",   "python/cross_file_main.py",    "HIGH",     "cross-file: tainted arg through imported passthrough → cmd sink"),
+
     # -- Python: log injection ----------------------------------------------------
     ("AST-LOG-001",   "python/log_injection.py",     "MEDIUM",   "stdlib logging with tainted arg"),
     ("AST-LOG-001",   "python/log_injection.py",     "MEDIUM",   "logger instance method with tainted arg"),
