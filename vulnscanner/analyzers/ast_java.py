@@ -522,21 +522,19 @@ def _collect_dead_lines(tree, const_ints: dict, const_strings: dict) -> "set[int
             return
         # Handle single-statement else/then without braces: the block IS a StatementExpression
         if isinstance(block, jt.StatementExpression):
-            if isinstance(getattr(block, "expression", None), jt.Assignment):
-                ln = _pos_line(block)
-                if ln > 0:
-                    dead.add(ln)
+            ln = _pos_line(block)
+            if ln > 0:
+                dead.add(ln)
         elif isinstance(block, jt.LocalVariableDeclaration):
             ln = _pos_line(block)
             if ln > 0:
                 dead.add(ln)
-        # Recurse: find all nested StatementExpression(Assignment) nodes
+        # Recurse: find all nested StatementExpression nodes (assignments AND method calls)
         try:
             for _, se in block.filter(jt.StatementExpression):
-                if isinstance(getattr(se, "expression", None), jt.Assignment):
-                    ln = _pos_line(se)
-                    if ln > 0:
-                        dead.add(ln)
+                ln = _pos_line(se)
+                if ln > 0:
+                    dead.add(ln)
         except Exception:
             pass
         try:
@@ -600,6 +598,21 @@ def _collect_dead_lines(tree, const_ints: dict, const_strings: dict) -> "set[int
 
 # ── taint propagation ──────────────────────────────────────────────────────────
 
+# Methods on Collection/Map objects whose return value is a boolean/integer meta-query
+# and does NOT expose the underlying data.  Even when called on a tainted collection,
+# these do not propagate taint to their result.
+_TAINT_SAFE_QUERY_METHODS = frozenset({
+    "size", "length", "isEmpty", "contains", "containsKey", "containsValue",
+    "hashCode", "indexOf", "lastIndexOf", "equals", "compareTo",
+})
+
+# List-mutation methods that add elements (treated like "add" for taint tracking).
+_LIST_ADD_METHODS = frozenset({
+    "add", "addLast", "addFirst", "push", "offer",
+    "offerLast", "offerFirst",
+})
+
+
 def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> bool:
     """Recursively check whether a javalang expression node carries taint."""
     if node is None:
@@ -609,6 +622,9 @@ def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> 
             return True
         # Known XSS sanitizers: taint is neutralized, do not propagate
         if node.member in _XSS_SANITIZER_METHODS:
+            return False
+        # Boolean/numeric query methods never expose underlying collection data
+        if node.member in _TAINT_SAFE_QUERY_METHODS:
             return False
         q = str(node.qualifier or "")
         # Propagate through qualifier chain: taintedVar.getValue(), nextElement(), etc.
@@ -1090,7 +1106,7 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
             pass
 
         # Rebuild list_contents from scratch so indices stay correct across rounds.
-        # Reset each tracked list, then replay all add/remove/set calls in document order.
+        # Reset each tracked list, then replay all mutation calls in document order.
         try:
             _old_lists = {k: list(v) for k, v in list_contents.items()}
             for k in list_contents:
@@ -1106,14 +1122,25 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                     continue
                 lst = list_contents[q]
                 args = expr.arguments or []
-                if expr.member == "add":
+                if expr.member in _LIST_ADD_METHODS:
                     if len(args) == 1:
-                        if len(lst) <= 32:  # guard against unbounded growth
+                        if len(lst) <= 32:
                             lst.append(_is_tainted(args[0], tainted, const_ints))
-                    elif len(args) == 2:
+                    elif len(args) == 2 and expr.member == "add":
+                        # add(index, element)
                         idx = _eval_const_expr(args[0], const_ints, const_strings)
                         if idx is not None and 0 <= idx <= len(lst) <= 32:
                             lst.insert(idx, _is_tainted(args[1], tainted, const_ints))
+                elif expr.member == "addAll":
+                    # addAll(otherColl): propagate if source collection is tainted
+                    if args:
+                        src_name = args[0].member if isinstance(args[0], jt.MemberReference) else ""
+                        src_tainted = (
+                            _is_tainted(args[0], tainted, const_ints)
+                            or (src_name and any(list_contents.get(src_name, [])))
+                        )
+                        if src_tainted and len(lst) <= 32:
+                            lst.append(True)
                 elif expr.member == "remove":
                     if len(args) == 1:
                         idx = _eval_const_expr(args[0], const_ints, const_strings)
@@ -1148,10 +1175,60 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
         except Exception:
             pass
 
+        # Merge collection vars that contain any tainted element into the main tainted set.
+        # This enables _is_tainted to propagate through coll.getLast(), coll.iterator(),
+        # coll.toArray(), etc. in subsequent iterations and inline sink argument checks.
+        for k, v in list_contents.items():
+            if any(v) and k not in tainted:
+                tainted.add(k)
+                changed = True
+
         if not changed:
             break
+
     list_tainted_vars: set = {k for k, v in list_contents.items() if any(v)}
-    return tainted, list_tainted_vars
+
+    # Strong update cleanup: if a LOCAL variable's last recorded assignment is a clean
+    # literal, it is no longer tainted.  Only applies to local variables — instance
+    # fields may be concurrently written by other threads so we never clean them.
+    try:
+        local_vars: set = set()
+        last_taint_line: dict = {}
+        last_clean_line: dict = {}
+        for _, lvd in tree.filter(jt.LocalVariableDeclaration):
+            ln = _line_of(lvd)
+            for decl in lvd.declarators:
+                vn = decl.name
+                local_vars.add(vn)
+                if vn in tainted:
+                    last_taint_line[vn] = ln
+        for _, se in tree.filter(jt.StatementExpression):
+            if not isinstance(getattr(se, "expression", None), jt.Assignment):
+                continue
+            assign = se.expression
+            lhs = assign.expressionl
+            if not isinstance(lhs, jt.MemberReference):
+                continue
+            vn = lhs.member
+            if vn not in local_vars:
+                continue  # Only apply strong update to local variables
+            ln = _line_of(se)
+            if isinstance(assign.value, jt.Literal):
+                last_clean_line[vn] = max(last_clean_line.get(vn, 0), ln)
+            elif not _is_tainted(assign.value, tainted, const_ints):
+                # RHS is provably clean (e.g. iter = cleanColl.iterator())
+                last_clean_line[vn] = max(last_clean_line.get(vn, 0), ln)
+            else:
+                last_taint_line[vn] = max(last_taint_line.get(vn, 0), ln)
+        for vn in list(tainted):
+            if vn not in local_vars:
+                continue
+            if last_clean_line.get(vn, -1) > last_taint_line.get(vn, -1):
+                tainted.discard(vn)
+    except Exception:
+        pass
+
+    return tainted, list_tainted_vars, dead_lines
 
 
 def _collect_writers(tree) -> set[str]:
@@ -1300,7 +1377,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
 
         lines = content.splitlines()
         _props = _load_properties_files(file_path)
-        tainted, list_tainted_vars = _collect_tainted(tree)
+        tainted, list_tainted_vars, dead_lines = _collect_tainted(tree)
         # Remove format-validated variables (guarded by early-exit if-throw/return).
         # These are provably safe after the guard; keeping them in tainted causes FP.
         tainted -= _collect_java_guards(tree)
@@ -1325,6 +1402,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # ── SQL injection ──────────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
                 q = str(node.qualifier or "")
                 if node.member in _JDBC_EXEC_METHODS:
                     # Case 1: any tainted arg  (executeQuery(sql), prepareStatement(sql), addBatch(sql))
@@ -1358,6 +1437,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # ── XSS ───────────────────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
                 # Pattern 1: response.getWriter().println(tainted)
                 if node.member == "getWriter" and str(node.qualifier or "") in _RESPONSE_OBJECTS:
                     for sel in (node.selectors or []):
@@ -1391,6 +1472,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                           "logging", "log4j"})
         try:
             for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
                 if node.member not in _LOG_SINK_METHODS:
                     continue
                 q = str(node.qualifier or "")
@@ -1410,6 +1493,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # session.setAttribute(key, tainted) — untrusted request data stored in session.
         try:
             for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
                 if node.member not in _SESSION_SET_METHODS:
                     continue
                 q = str(node.qualifier or "")
@@ -1427,6 +1512,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # ── Command injection ──────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
                 if node.member == "exec":
                     for arg in (node.arguments or []):
                         if _is_tainted(arg, tainted):
@@ -1460,6 +1547,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # ── Path traversal ────────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.ClassCreator):
+                if _node_line(node) in dead_lines:
+                    continue
                 class_name = _type_name(node.type)
                 if class_name in _FILE_CLASSES:
                     for arg in (node.arguments or []):
@@ -1469,6 +1558,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                  "path traversal; canonicalize and validate within allowed root")
                             break
             for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
                 _pq = str(node.qualifier or "")
                 if (node.member in ("get", "of")
                         and (_pq in ("Paths", "Path")
@@ -1549,6 +1640,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         if _is_ldap_file:
             try:
                 for _, node in tree.filter(jt.MethodInvocation):
+                    if _node_line(node) in dead_lines:
+                        continue
                     if node.member not in _LDAP_SEARCH_METHODS:
                         continue
                     for arg in (node.arguments or []):
@@ -1563,6 +1656,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # ── SSRF ──────────────────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.ClassCreator):
+                if _node_line(node) in dead_lines:
+                    continue
                 ctype = _type_name(node.type)
                 if ctype == "URL":
                     for arg in (node.arguments or []):
@@ -1583,6 +1678,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # Spring RestTemplate / WebClient: first arg is the URL.
         try:
             for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
                 if node.member not in _SPRING_REST_URL_METHODS:
                     continue
                 q = str(node.qualifier or "")
@@ -1650,6 +1747,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # ── JNDI injection ────────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
                 if node.member == "lookup":
                     for arg in (node.arguments or []):
                         if _is_tainted(arg, tainted):
@@ -1663,6 +1762,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # ── SpEL injection ────────────────────────────────────────────────────
         try:
             for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
                 if node.member in _SPEL_METHODS:
                     for arg in (node.arguments or []):
                         if _is_tainted(arg, tainted):
@@ -1679,6 +1780,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
         try:
             if any(hint in content for hint in _XPATH_FILE_HINTS):
                 for _, node in tree.filter(jt.MethodInvocation):
+                    if _node_line(node) in dead_lines:
+                        continue
                     if node.member not in _XPATH_SINK_METHODS:
                         continue
                     args = node.arguments or []
