@@ -1648,6 +1648,22 @@ class JavaASTAnalyzer(BaseAnalyzer):
         except Exception:
             pass
 
+        # ── Open Redirect ─────────────────────────────────────────────────────
+        # resp.sendRedirect(tainted) / resp.setHeader("Location", tainted)
+        try:
+            for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
+                q = str(node.qualifier or "")
+                if node.member == "sendRedirect" and q in _RESPONSE_OBJECTS:
+                    args = node.arguments or []
+                    if args and _is_tainted(args[0], tainted):
+                        _add(node, VulnType.OPEN_REDIRECT, Severity.HIGH, "JAST-REDIRECT-001",
+                             "response.sendRedirect() with user-controlled URL — open redirect; "
+                             "validate against a whitelist of allowed destinations")
+        except Exception:
+            pass
+
         # ── Log injection ──────────────────────────────────────────────────────
         # Covers SLF4J (logger.info/warn/error/debug), java.util.logging (log.info),
         # Log4j, and common logger variable names.
