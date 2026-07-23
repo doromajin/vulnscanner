@@ -980,8 +980,9 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                         tainted.add(decl.name)
                                         changed = True
                                     continue
-                        # Ordered list.get(idx) taint propagation — always continue so the
-                        # general _is_tainted fallback cannot over-taint via qualifier-in-tainted.
+                        # Ordered list.get(idx) taint propagation.  If the collection
+                        # itself is in tainted (has any tainted element), fall through so
+                        # qualifier-in-tainted can fire (over-approximation).
                         _li_inner = init.expression if isinstance(init, jt.Cast) else init
                         if (isinstance(_li_inner, jt.MethodInvocation)
                                 and _li_inner.member == "get"
@@ -994,8 +995,20 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                         and 0 <= _lii < len(list_contents[_liq])
                                         and list_contents[_liq][_lii]):
                                     tainted.add(decl.name); changed = True
-                                continue  # skip general propagation for tracked list.get
-                        # Key-matched HashMap.get: (Type) map.get("key") where key is tainted
+                            if _liq not in tainted:
+                                continue  # skip general propagation for tracked clean list
+                        # Key-matched HashMap.get: (Type) map.get("key").
+                        # For literal-key access on a tracked map, key-specific result is
+                        # final — do not allow qualifier-in-tainted to override clean keys.
+                        _init_mi2 = init.expression if isinstance(init, jt.Cast) else init
+                        if (isinstance(_init_mi2, jt.MethodInvocation)
+                                and _init_mi2.member in ("get", "getOrDefault")
+                                and str(_init_mi2.qualifier or "") in map_tainted_keys):
+                            _margs2 = _init_mi2.arguments or []
+                            if _margs2 and _literal_str(_margs2[0]) is not None:
+                                if _map_get_tainted(init, map_tainted_keys):
+                                    tainted.add(decl.name); changed = True
+                                continue  # literal-key result is definitive
                         if _map_get_tainted(init, map_tainted_keys):
                             tainted.add(decl.name)
                             changed = True
@@ -1015,6 +1028,22 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                         if _is_tainted(init, tainted, const_ints):
                             tainted.add(decl.name)
                             changed = True
+        except Exception:
+            pass
+
+        # ForControl uses VariableDeclaration (not LocalVariableDeclaration) for loop vars.
+        # e.g.: for(Iterator iter = ll.iterator(); ...) { Object o = iter.next(); }
+        # Once the collection is tainted, ll.iterator() is tainted so iter is tainted.
+        try:
+            for _, node in tree.filter(jt.VariableDeclaration):
+                if _line_of(node) in dead_lines:
+                    continue
+                for decl in (node.declarators or []):
+                    if decl.name in tainted or decl.initializer is None:
+                        continue
+                    if _is_tainted(decl.initializer, tainted, const_ints):
+                        tainted.add(decl.name)
+                        changed = True
         except Exception:
             pass
 
@@ -1057,8 +1086,7 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
 
                 # General propagation: only add taint (never remove).
                 if _vname not in tainted:
-                    # Ordered list.get(idx) taint propagation — always continue so the
-                    # general _is_tainted fallback cannot over-taint via qualifier-in-tainted.
+                    # Ordered list.get(idx) taint propagation (see LVD section above).
                     _li_rhs = rhs.expression if isinstance(rhs, jt.Cast) else rhs
                     if (isinstance(_li_rhs, jt.MethodInvocation)
                             and _li_rhs.member == "get"
@@ -1071,7 +1099,8 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                     and 0 <= _lii2 < len(list_contents[_liq2])
                                     and list_contents[_liq2][_lii2]):
                                 tainted.add(_vname); changed = True
-                            continue  # skip general propagation for tracked list.get
+                        if _liq2 not in tainted:
+                            continue  # skip general propagation for tracked clean list
                     # For bare (no-qualifier) static calls, try intra-file return analysis.
                     # qualifier='' → bare call; qualifier=None → new X().m() chain → skip.
                     if (isinstance(rhs, jt.MethodInvocation)
@@ -1260,6 +1289,12 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
         for obj_var, fields in obj_field_tainted.items():
             if fields and obj_var not in tainted:
                 tainted.add(obj_var)
+                changed = True
+
+        # Merge maps with any tainted value into tainted so m.entrySet().iterator() propagates.
+        for m_var, m_keys in map_tainted_keys.items():
+            if m_keys and m_var not in tainted:
+                tainted.add(m_var)
                 changed = True
 
         if not changed:
