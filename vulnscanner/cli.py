@@ -787,6 +787,28 @@ scan:
   workers: 0
 """
 
+_GITLAB_CI = """\
+# .gitlab-ci.yml — VulnScanner GitLab CI/CD integration
+# See: https://github.com/doromajin/vulnscanner
+
+stages:
+  - test
+
+vulnscan:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install vulnscanner
+    - vulnscan scan . --junit-xml vulnscan-report.xml --fail-on HIGH
+  artifacts:
+    when: always
+    reports:
+      junit: vulnscan-report.xml
+    paths:
+      - vulnscan-report.xml
+  allow_failure: false
+"""
+
 _PRECOMMIT_YAML = """\
 # .pre-commit-config.yaml — VulnScanner pre-commit hook
 # Install: pip install pre-commit && pre-commit install
@@ -810,13 +832,16 @@ repos:
 @click.option("--force", is_flag=True, help="Overwrite existing files")
 @click.option("--pre-commit", "with_precommit", is_flag=True, default=False,
               help="Also generate .pre-commit-config.yaml")
-def init(target_dir: str, force: bool, with_precommit: bool) -> None:
-    """Scaffold GitHub Actions workflow and config file for VulnScanner.
+@click.option("--gitlab", "with_gitlab", is_flag=True, default=False,
+              help="Also generate .gitlab-ci.yml for GitLab CI/CD")
+def init(target_dir: str, force: bool, with_precommit: bool, with_gitlab: bool) -> None:
+    """Scaffold CI workflow and config file for VulnScanner.
 
     Creates:\n
-      .github/workflows/vulnscanner.yml  — CI workflow\n
+      .github/workflows/vulnscanner.yml  — GitHub Actions workflow\n
       vulnscanner.yml                    — project config\n
-      .pre-commit-config.yaml            — pre-commit hook (with --pre-commit)
+      .pre-commit-config.yaml            — pre-commit hook (with --pre-commit)\n
+      .gitlab-ci.yml                     — GitLab CI/CD pipeline (with --gitlab)
     """
     import os
     from pathlib import Path
@@ -829,6 +854,8 @@ def init(target_dir: str, force: bool, with_precommit: bool) -> None:
     }
     if with_precommit:
         files[base / ".pre-commit-config.yaml"] = _PRECOMMIT_YAML
+    if with_gitlab:
+        files[base / ".gitlab-ci.yml"] = _GITLAB_CI
 
     created: list[str] = []
     skipped: list[str] = []
@@ -861,14 +888,124 @@ def init(target_dir: str, force: bool, with_precommit: bool) -> None:
         if not with_precommit else
         "\n  4. Run `pip install pre-commit && pre-commit install` to activate the hook"
     )
+    gitlab_hint = (
+        "\n  5. For GitLab CI: run `vulnscan init --gitlab` to generate .gitlab-ci.yml"
+        if not with_gitlab else ""
+    )
     console.print(
         "\n[dim]Next steps:\n"
         "  1. Commit these files to your repository\n"
-        "  2. Push to GitHub — the workflow runs automatically on every push/PR\n"
+        "  2. Push — the workflow runs automatically on every push/PR\n"
         "  3. Optionally: run `vulnscan scan . --output baseline.json` on your main branch\n"
         f"     and use `--baseline baseline.json` in CI to suppress pre-existing findings"
-        f"{precommit_hint}[/dim]\n"
+        f"{precommit_hint}{gitlab_hint}[/dim]\n"
     )
+
+
+# ── diff ──────────────────────────────────────────────────────────────────────
+
+@main.command("diff")
+@click.argument("baseline_json", metavar="BASELINE_JSON")
+@click.argument("current_json", metavar="CURRENT_JSON")
+@click.option("--format", "fmt", default="text", type=click.Choice(["text", "json"]),
+              help="Output format (default: text)")
+@click.option("--min-severity", default="INFO", type=_SEVERITY_CHOICES,
+              help="Only show findings at or above this severity")
+@click.option("--fail-on-new", is_flag=True,
+              help="Exit 1 if there are any new findings")
+def diff(
+    baseline_json: str,
+    current_json: str,
+    fmt: str,
+    min_severity: str,
+    fail_on_new: bool,
+) -> None:
+    """Compare two JSON scan results and show new and resolved findings.
+
+    BASELINE_JSON: Previous scan output (vulnscan scan . -o baseline.json)\n
+    CURRENT_JSON:  Current scan output to compare against the baseline
+
+    Example (CI usage):\n
+        vulnscan scan . -o baseline.json  # save on main branch\n
+        vulnscan diff baseline.json current.json --fail-on-new
+    """
+    import json as _json
+    from pathlib import Path
+
+    _SEV_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    _min_idx = _SEV_ORDER.index(min_severity.upper())
+
+    def _load(path: str) -> list[dict]:
+        raw = Path(path).read_text(encoding="utf-8")  # vulnscanner: ignore[AST-PATH-004]
+        return _json.loads(raw).get("findings", [])
+
+    def _key(f: dict) -> tuple:
+        return (f.get("file_path", ""), f.get("line_number", 0), f.get("rule_id", ""))
+
+    def _sev(f: dict) -> str:
+        s = f.get("severity", "INFO")
+        return (s.get("value", "INFO") if isinstance(s, dict) else s).upper()
+
+    def _above_min(f: dict) -> bool:
+        try:
+            return _SEV_ORDER.index(_sev(f)) <= _min_idx
+        except ValueError:
+            return True
+
+    baseline = _load(baseline_json)
+    current = _load(current_json)
+
+    baseline_keys = {_key(f) for f in baseline}
+    current_keys = {_key(f) for f in current}
+
+    new_findings = [f for f in current if _key(f) not in baseline_keys and _above_min(f)]
+    resolved_findings = [f for f in baseline if _key(f) not in current_keys and _above_min(f)]
+
+    if fmt == "json":
+        click.echo(_json.dumps({
+            "new": new_findings,
+            "resolved": resolved_findings,
+            "summary": {
+                "new_count": len(new_findings),
+                "resolved_count": len(resolved_findings),
+                "net_change": len(new_findings) - len(resolved_findings),
+            },
+        }, indent=2, ensure_ascii=False))
+    else:
+        _SEV_COLOR = {"CRITICAL": "red bold", "HIGH": "red", "MEDIUM": "yellow",
+                      "LOW": "blue", "INFO": "dim"}
+        if new_findings:
+            console.print(f"\n[red bold]New findings ({len(new_findings)}):[/red bold]")
+            for f in new_findings:
+                s = _sev(f)
+                col = _SEV_COLOR.get(s, "white")
+                desc = str(f.get("description", ""))[:80]
+                console.print(
+                    f"  [{col}]{s}[/{col}] [{f.get('rule_id','?')}] "
+                    f"{f.get('file_path','?')}:{f.get('line_number',0)} — {desc}"
+                )
+        else:
+            console.print("\n[green]No new findings.[/green]")
+
+        if resolved_findings:
+            console.print(f"\n[green]Resolved findings ({len(resolved_findings)}):[/green]")
+            for f in resolved_findings:
+                s = _sev(f)
+                console.print(
+                    f"  [dim]{s} [{f.get('rule_id','?')}] "
+                    f"{f.get('file_path','?')}:{f.get('line_number',0)}[/dim]"
+                )
+
+        net = len(new_findings) - len(resolved_findings)
+        net_col = "red" if net > 0 else "green" if net < 0 else "yellow"
+        net_str = f"+{net}" if net > 0 else str(net)
+        console.print(
+            f"\n[bold]Summary:[/bold] {len(new_findings)} new, "
+            f"{len(resolved_findings)} resolved, net [{net_col}]{net_str}[/{net_col}]"
+        )
+
+    if fail_on_new and new_findings:
+        sys.exit(1)
 
 
 # ── pr-comment ────────────────────────────────────────────────────────────────

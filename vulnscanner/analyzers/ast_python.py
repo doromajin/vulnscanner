@@ -2727,6 +2727,27 @@ def _collect_scope_assignments(
                 lookup_key = (conf_name, str(section_arg.value), str(key_arg.value))
                 result[lookup_key] = val_arg
 
+    # Sixth pass: walrus operator (x := expr) — NamedExpr. Python 3.8+.
+    # Pattern: `if (uid := request.GET.get('id')): cursor.execute(uid)`
+    for node in ast.walk(func):
+        if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+            result[node.target.id] = node.value
+
+    # Seventh pass: with statement targets — `with expr as var`.
+    # Pattern: `with get_db() as db: db.execute(user_input)`
+    for node in ast.walk(func):
+        if isinstance(node, ast.With):
+            for _wi in node.items:
+                if _wi.optional_vars is None:
+                    continue
+                _wt = _wi.optional_vars
+                if isinstance(_wt, ast.Name):
+                    result[_wt.id] = _wi.context_expr
+                elif isinstance(_wt, ast.Tuple):
+                    for _elt in _wt.elts:
+                        if isinstance(_elt, ast.Name):
+                            result[_elt.id] = _wi.context_expr
+
     # Corrective pass: fix stale Name references introduced by the BFS second pass for
     # AugAssign.  Pattern that causes FPs:
     #   copy = var        # copy aliases var when var is clean (Constant)
@@ -2786,7 +2807,12 @@ def _collect_scope_assignments(
 
 
 def _collect_class_attrs(cls: ast.ClassDef) -> dict[str, ast.expr]:
-    """Return {attr: rhs} for class-level assignments and self.xxx = ... in __init__."""
+    """Return {attr: rhs} for class-level assignments and self.xxx = ... in any method.
+
+    Scanning all methods (not just __init__) enables cross-method taint tracking:
+    e.g., Django CBV `self.user_id = request.GET.get('id')` in `get()` is visible
+    when `_process()` evaluates `cursor.execute(self.user_id)`.
+    """
     result: dict[str, ast.expr] = {}
     for item in cls.body:
         if isinstance(item, ast.Assign):
@@ -2797,8 +2823,7 @@ def _collect_class_attrs(cls: ast.ClassDef) -> dict[str, ast.expr]:
               and isinstance(item.target, ast.Name)
               and item.value is not None):
             result[item.target.id] = item.value
-        elif (isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-              and item.name == "__init__"):
+        elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for stmt in ast.walk(item):
                 if (isinstance(stmt, ast.Assign)
                         and len(stmt.targets) == 1

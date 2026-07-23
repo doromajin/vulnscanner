@@ -358,17 +358,18 @@ class TestCollectClassAttrs:
         assert "TABLE" in attrs
         assert "LIMIT" in attrs
 
-    def test_ignores_other_method_self_assignments(self):
+    def test_collects_all_method_self_assignments(self):
+        # All methods are now scanned so cross-method taint (Django CBV pattern) works.
         src = (
             "class Service:\n"
             "    def __init__(self):\n"
             '        self.name = "service"\n'
             "    def update(self):\n"
-            '        self.runtime = "now"  # NOT collected\n'
+            '        self.runtime = "now"\n'
         )
         attrs = _class_attrs(src)
         assert "name" in attrs
-        assert "runtime" not in attrs  # only __init__ is scanned
+        assert "runtime" in attrs  # collected from non-__init__ method
 
 
 # ── Integration: AST analyzer using 3-state taint ─────────────────────────────
