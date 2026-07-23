@@ -634,7 +634,14 @@ def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> 
             return True
         return False
     if isinstance(node, jt.MemberReference):
-        return node.member in tainted
+        if node.member in tainted:
+            return True
+        # Propagate through chained field access: taintedObj.field1.field2
+        # Only triggers when qualifier has a dot (avoids simple obj.field over-tainting).
+        q = str(node.qualifier or "")
+        if q and "." in q and q.split(".")[0] in tainted:
+            return True
+        return False
     if isinstance(node, jt.BinaryOperation):
         return _is_tainted(node.operandl, tainted, const_ints) or _is_tainted(node.operandr, tainted, const_ints)
     if isinstance(node, jt.Literal):
@@ -802,6 +809,42 @@ def _analyze_remote_method(
     return False if found_any else None
 
 
+def _find_setter_field(tree, method_name: str) -> "str | None":
+    """Return the instance field name assigned in a single-arg setter, or None.
+
+    Matches the pattern: void methodName(Type p) { this.field = p; }
+    In javalang, `this.field = p` has LHS as This{selectors=[MemberReference{field}]}.
+    """
+    try:
+        for _, method in tree.filter(jt.MethodDeclaration):
+            if method.name != method_name:
+                continue
+            params = method.parameters or []
+            if len(params) != 1:
+                continue
+            param_name = getattr(params[0], "name", None)
+            if not param_name:
+                continue
+            if not method.body:
+                continue
+            for _, stmt in method.filter(jt.StatementExpression):
+                expr = getattr(stmt, "expression", None)
+                if not isinstance(expr, jt.Assignment):
+                    continue
+                lhs = expr.expressionl
+                rhs = expr.value
+                # javalang represents `this.field = p` as This{selectors=[MemberRef{field}]}
+                if isinstance(lhs, jt.This):
+                    sels = getattr(lhs, "selectors", None) or []
+                    if len(sels) == 1 and isinstance(sels[0], jt.MemberReference):
+                        field_name = sels[0].member
+                        if isinstance(rhs, jt.MemberReference) and rhs.member == param_name:
+                            return field_name
+    except Exception:
+        pass
+    return None
+
+
 def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
     """Multi-pass fixed-point taint collector with dead-branch elimination.
 
@@ -825,6 +868,11 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
     # Ordered list state tracking: {list_var → [is_tainted_at_index_0, ...]}
     # Populated by list.add/remove/set SE calls; read by list.get checks.
     list_contents: dict = {}
+
+    # Getter/setter object field taint: {obj_var → set_of_tainted_field_names}
+    # When obj.setX(tainted) matches a setter pattern this.field = param, record field.
+    # Objects with any tainted field are merged into tainted so obj.getX() propagates.
+    obj_field_tainted: dict = {}
 
     def _line_of(node) -> int:
         pos = getattr(node, "position", None)
@@ -1105,6 +1153,31 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
         except Exception:
             pass
 
+        # Track obj.setX(tainted_arg) → obj_field_tainted when setX is a setter pattern.
+        try:
+            for _, se in tree.filter(jt.StatementExpression):
+                if _line_of(se) in dead_lines:
+                    continue
+                expr = getattr(se, "expression", None)
+                if not isinstance(expr, jt.MethodInvocation):
+                    continue
+                q = str(expr.qualifier or "")
+                if not q:
+                    continue
+                args = expr.arguments or []
+                if len(args) != 1:
+                    continue
+                if not _is_tainted(args[0], tainted, const_ints):
+                    continue
+                field = _find_setter_field(tree, expr.member)
+                if field is not None:
+                    obj_fields = obj_field_tainted.setdefault(q, set())
+                    if field not in obj_fields:
+                        obj_fields.add(field)
+                        changed = True
+        except Exception:
+            pass
+
         # Rebuild list_contents from scratch so indices stay correct across rounds.
         # Reset each tracked list, then replay all mutation calls in document order.
         try:
@@ -1181,6 +1254,12 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
         for k, v in list_contents.items():
             if any(v) and k not in tainted:
                 tainted.add(k)
+                changed = True
+
+        # Merge objects with any tainted field into tainted so obj.getX() propagates.
+        for obj_var, fields in obj_field_tainted.items():
+            if fields and obj_var not in tainted:
+                tainted.add(obj_var)
                 changed = True
 
         if not changed:
