@@ -51,7 +51,7 @@ _REQUEST_METHODS = frozenset({
 
 _REQUEST_OBJECTS = frozenset({
     "request", "req", "httpRequest", "servletRequest",
-    "httpServletRequest", "hreq",
+    "httpServletRequest", "hreq", "mreq",
 })
 
 # Methods that return user-controlled data regardless of what object they're called on.
