@@ -1779,8 +1779,16 @@ class JavaASTAnalyzer(BaseAnalyzer):
 
         # ── Path traversal ────────────────────────────────────────────────────
         try:
-            for _, node in tree.filter(jt.ClassCreator):
-                if _node_line(node) in dead_lines:
+            for _cc_path, node in tree.filter(jt.ClassCreator):
+                # javalang ClassCreator nodes often have position=None; fall back to
+                # the nearest ancestor that carries a line number.
+                _cc_line = _node_line(node)
+                if not _cc_line:
+                    for _anc in reversed(_cc_path):
+                        _cc_line = _node_line(_anc)
+                        if _cc_line:
+                            break
+                if _cc_line in dead_lines:
                     continue
                 class_name = _type_name(node.type)
                 if class_name in _FILE_CLASSES:
@@ -1788,7 +1796,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         if _is_tainted(arg, tainted):
                             _add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, "JAST-PATH-001",
                                  f"new {class_name}() with user-controlled path — "
-                                 "path traversal; canonicalize and validate within allowed root")
+                                 "path traversal; canonicalize and validate within allowed root",
+                                 line_override=_cc_line)
                             break
             for _, node in tree.filter(jt.MethodInvocation):
                 if _node_line(node) in dead_lines:

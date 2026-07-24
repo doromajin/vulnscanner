@@ -4,6 +4,14 @@
     {
       "method": "getTheParameter",
       "description": "OWASP Benchmark SeparateClassRequest wrapper — delegates to HttpServletRequest.getParameter() and returns user-controlled data regardless of the object it is called on. Add similar entries for your own request-wrapper classes."
+    },
+    {
+      "method": "readLine",
+      "description": "BufferedReader.readLine() reads one line from the underlying stream. When wrapping a network socket (Socket.getInputStream / ServerSocket.accept) or console (System.in), the data is user-controlled. Also covers reading from URLConnection and file-based streams that carry external input. Widely treated as a taint source by SAST tools (Checkmarx, SpotBugs, etc.)."
+    },
+    {
+      "method": "getString",
+      "description": "ResultSet.getString(col) exposes database-stored values that may originate from prior user input (second-order/stored injection). Also covers JSONObject.getString() from HTTP response bodies and Android cursor/intent results. Recognized as a taint source for second-order injection by Checkmarx and FindBugs/SpotBugs."
     }
   ],
   "python_any_qualifier_taint_methods": [
