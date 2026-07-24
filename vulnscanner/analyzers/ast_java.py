@@ -669,11 +669,15 @@ def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> 
     if isinstance(node, jt.MemberReference):
         if node.member in tainted:
             return True
-        # Propagate through chained field access: taintedObj.field1.field2
-        # Only triggers when qualifier has a dot (avoids simple obj.field over-tainting).
         q = str(node.qualifier or "")
-        if q and "." in q and q.split(".")[0] in tainted:
-            return True
+        if q:
+            # obj.field virtual variable: "obj::field" added by post-fixpoint field pass
+            if "." not in q and f"{q}::{node.member}" in tainted:
+                return True
+            # Propagate through chained field access: taintedObj.field1.field2
+            # Only triggers when qualifier has a dot (avoids simple obj.field over-tainting).
+            if "." in q and q.split(".")[0] in tainted:
+                return True
         return False
     if isinstance(node, jt.BinaryOperation):
         return _is_tainted(node.operandl, tainted, const_ints) or _is_tainted(node.operandr, tainted, const_ints)
@@ -1116,6 +1120,8 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                 lhs = node.expressionl
                 if not isinstance(lhs, jt.MemberReference):
                     continue
+                if str(lhs.qualifier or ""):
+                    continue  # skip field assignments (w.value = x); only track bare locals
                 _vname = lhs.member
                 rhs = node.value
 
@@ -1567,7 +1573,33 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # These are provably safe after the guard; keeping them in tainted causes FP.
         tainted -= _collect_java_guards(tree)
         writers = _collect_writers(tree)
-        _, _const_strings = _collect_const_context(tree, _props)
+        _const_ints, _const_strings = _collect_const_context(tree, _props)
+
+        # ── Post-fixpoint: field-level taint with strong updates ──────────────
+        # Process obj.field = expr in AST (source) order so that
+        # "w.value = tainted; w.value = clean" nets out as clean.
+        # Uses "obj::field" virtual names in tainted — matched by _is_tainted.
+        try:
+            for _, _se in tree.filter(jt.StatementExpression):
+                if _node_line(_se) in dead_lines:
+                    continue
+                _fexpr = getattr(_se, "expression", None)
+                if not isinstance(_fexpr, jt.Assignment):
+                    continue
+                _flhs = _fexpr.expressionl
+                if not isinstance(_flhs, jt.MemberReference):
+                    continue
+                _fq = str(_flhs.qualifier or "")
+                if not _fq or "." in _fq:
+                    continue  # only simple one-level obj.field
+                _vkey = f"{_fq}::{_flhs.member}"
+                if _is_tainted(_fexpr.value, tainted, _const_ints):
+                    tainted.add(_vkey)
+                elif _vkey in tainted:
+                    tainted.discard(_vkey)  # strong update: overwritten with clean value
+        except Exception:
+            pass
+
         findings: list[Finding] = []
 
         def _add(node, vuln_type, severity, rule_id, desc, *, line_override: int = 0):
