@@ -755,7 +755,7 @@ def _check_sinks(
                         state.is_tainted_node(rhs_u) or _is_request_source(rhs_u)
                     ):
                         _emit(findings, seen, file_path, line, lines, repo_url,
-                              VulnType.XSS, Severity.CRITICAL,
+                              VulnType.XSS, Severity.HIGH,
                               "JSAST-DOMXSS-001",
                               f"User-controlled data assigned to .{prop} — DOM-based XSS risk")
                     elif prop in _DOM_LOCATION_ASSIGN:
@@ -944,7 +944,7 @@ def _check_sinks(
             elif obj_root == "document" and prop in _DOM_WRITE_METHODS:
                 if tainted_args(args_node):
                     _emit(findings, seen, file_path, line, lines, repo_url,
-                          VulnType.XSS, Severity.CRITICAL,
+                          VulnType.XSS, Severity.HIGH,
                           "JSAST-DOMXSS-001",
                           f"User-controlled data flows into document.{prop}() — DOM-based XSS risk")
 

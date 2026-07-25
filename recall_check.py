@@ -53,10 +53,12 @@ REAL_FP_DIR  = os.path.join(RECALL_DIR, "real_fp")
 
 EXPECTED: list[tuple[str, str, str, str]] = [
     # -- JavaScript ---------------------------------------------------------------
-    ("XSS-001",       "js/xss.js",                    "HIGH",     "innerHTML XSS"),
+    # JSAST-DOMXSS-001 (JS taint analyzer) supersedes XSS-001 (regex) at the same line
+    ("JSAST-DOMXSS-001", "js/xss.js",                "HIGH",     "innerHTML XSS"),
 
     # -- PHP: PHAST-* are AST findings; DESER-004/SQL-004 are regex rules --------
-    ("DESER-004",     "php/deser.php",                "CRITICAL", "PHP unserialize() RCE"),
+    # PHAST-DESER-001 (PHP AST) supersedes DESER-004 (regex) at the same line
+    ("PHAST-DESER-001", "php/deser.php",              "CRITICAL", "PHP unserialize() RCE"),
     ("SQL-004",       "php/sqli.php",                 "HIGH",     "PHP SQL string concatenation"),
     ("PHAST-SQL-001", "php/sqli.php",                 "HIGH",     "PHP AST: tainted arg in mysqli_query()"),
     # PHAST-XSS-001 is produced by the PHP AST analyzer and supersedes XSS-005/008
