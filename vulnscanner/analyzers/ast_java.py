@@ -1367,6 +1367,29 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
     # Strong update cleanup: if a LOCAL variable's last recorded assignment is a clean
     # literal, it is no longer tainted.  Only applies to local variables — instance
     # fields may be concurrently written by other threads so we never clean them.
+    #
+    # Cross-method guard: only discard when the clean assignment and the taint
+    # assignment are in the same method scope.  A clean `data = "foo"` in good()
+    # must not cancel taint established by `data = request.getParameter()` in bad().
+    try:
+        _su_mstarts = sorted(
+            pos.line
+            for _, _m in tree.filter(jt.MethodDeclaration)
+            if (pos := getattr(_m, "position", None)) is not None
+        )
+    except Exception:
+        _su_mstarts = []
+
+    def _su_method_idx(ln: int) -> int:
+        """Return which method (0-based index) the given line falls in."""
+        idx = -1
+        for i, s in enumerate(_su_mstarts):
+            if ln >= s:
+                idx = i
+            else:
+                break
+        return idx
+
     try:
         local_vars: set = set()
         last_taint_line: dict = {}
@@ -1376,7 +1399,13 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
             for decl in lvd.declarators:
                 vn = decl.name
                 local_vars.add(vn)
-                if vn in tainted:
+                # Only count as a taint line when the LVD has a tainted initializer.
+                # A bare `String data;` with no init is NOT a taint assignment; treating
+                # it as one causes scope-insensitive contamination to poison last_taint_line
+                # with the declaration line of the good()-method variable, which then
+                # makes the strong update incorrectly discard taint from bad().
+                if (vn in tainted and decl.initializer is not None
+                        and _is_tainted(decl.initializer, tainted, const_ints)):
                     last_taint_line[vn] = ln
         for _, se in tree.filter(jt.StatementExpression):
             if not isinstance(getattr(se, "expression", None), jt.Assignment):
@@ -1399,7 +1428,10 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
         for vn in list(tainted):
             if vn not in local_vars:
                 continue
-            if last_clean_line.get(vn, -1) > last_taint_line.get(vn, -1):
+            c_line = last_clean_line.get(vn, -1)
+            t_line = last_taint_line.get(vn, -1)
+            # Apply strong update only when both assignments are in the same method scope.
+            if c_line > t_line and _su_method_idx(c_line) == _su_method_idx(t_line):
                 tainted.discard(vn)
     except Exception:
         pass
