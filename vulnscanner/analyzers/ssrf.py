@@ -21,8 +21,8 @@ _RULES = [
     ),
     (
         "SSRF-003",
-        re.compile(r'new\s+URL\s*\(\s*(?![\'"]\s*[\'"]\s*\))', re.IGNORECASE),
-        "Java URL instantiation with non-literal - verify URL cannot be user-controlled",
+        re.compile(r'new\s+URL\s*\(\s*(?![\'"][^\'"\n]*[\'"][ \t]*\))', re.IGNORECASE),
+        "Java URL instantiation with non-literal argument - verify URL cannot be user-controlled",
         Severity.MEDIUM, _SR, (".java",),
     ),
     (

@@ -287,6 +287,8 @@ class VulnScanner:
                 return partial
 
         deduped = _deduplicate(raw)
+        # Strip internal suppression sentinels (JAST-*-SAFE) used by dedup
+        deduped = [f for f in deduped if not f.rule_id.endswith("-SAFE")]
         for f in deduped:
             if f.cwe_id is None:
                 f.cwe_id = get_cwe_id(f.rule_id)

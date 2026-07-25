@@ -1439,6 +1439,154 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
     return tainted, list_tainted_vars, dead_lines
 
 
+def _compute_method_local_clean(
+    tree, tainted: set, const_ints: dict, dead_lines: set
+) -> "tuple[dict[int, set[str]], list[int]]":
+    """Compute per-method local clean status for globally tainted variables.
+
+    Returns (method_local_clean, mstarts) where:
+      method_local_clean[method_idx] = set of var names that are locally clean
+        in that method — meaning all local assignments to them are clean literals
+        (or provably non-tainted) with NO taint assignment anywhere in the method.
+
+    A variable is locally clean in method M when:
+    - It is in the global tainted set (due to scope contamination from another method)
+    - But within M, every assignment is a literal or provably-clean value
+    - AND M has no taint assignment (request source, readLine, etc.) for that variable
+
+    This handles the Juliet goodG2B() pattern: `data = "foo"` after scope contamination
+    from bad()'s `data = request.getParameter("name")`.  The per-method check suppresses
+    the sink finding in goodG2B() while keeping the TP in bad().
+    """
+    try:
+        mstarts: list = sorted(
+            pos.line
+            for _, m in tree.filter(jt.MethodDeclaration)
+            if (pos := getattr(m, "position", None)) is not None
+        )
+    except Exception:
+        return {}, []
+
+    if not mstarts:
+        return {}, []
+
+    def _midx(ln: int) -> int:
+        idx = -1
+        for i, s in enumerate(mstarts):
+            if ln >= s:
+                idx = i
+            else:
+                break
+        return idx
+
+    _has_literal_pm: dict = {}   # (vn, midx) -> True if any literal assignment
+    _has_taint_pm: dict = {}     # (vn, midx) -> True if any taint assignment
+    _taint_inits: dict = {}      # (vn, midx) -> list[node] — init nodes that triggered taint
+
+    try:
+        for _, lvd in tree.filter(jt.LocalVariableDeclaration):
+            ln = getattr(getattr(lvd, "position", None), "line", -1)
+            if ln < 0 or ln in dead_lines:
+                continue
+            m = _midx(ln)
+            if m < 0:
+                continue
+            for decl in lvd.declarators:
+                vn = decl.name
+                if vn not in tainted:
+                    continue
+                init = decl.initializer
+                if init is None:
+                    continue
+                if isinstance(init, jt.Literal):
+                    _has_literal_pm[(vn, m)] = True
+                elif _is_tainted(init, tainted, const_ints):
+                    _has_taint_pm[(vn, m)] = True
+                    _taint_inits.setdefault((vn, m), []).append(init)
+    except Exception:
+        pass
+
+    try:
+        for _, se in tree.filter(jt.StatementExpression):
+            if not isinstance(getattr(se, "expression", None), jt.Assignment):
+                continue
+            ln = getattr(getattr(se, "position", None), "line", -1)
+            if ln < 0 or ln in dead_lines:
+                continue
+            m = _midx(ln)
+            if m < 0:
+                continue
+            assign = se.expression
+            lhs = assign.expressionl
+            if not isinstance(lhs, jt.MemberReference) or str(lhs.qualifier or ""):
+                continue
+            vn = lhs.member
+            if vn not in tainted:
+                continue
+            rhs = assign.value
+            if isinstance(rhs, jt.Literal):
+                _has_literal_pm[(vn, m)] = True
+            elif _is_tainted(rhs, tainted, const_ints):
+                _has_taint_pm[(vn, m)] = True
+                _taint_inits.setdefault((vn, m), []).append(rhs)
+    except Exception:
+        pass
+
+    # Spring @RequestParam / @PathVariable: treat the method's own annotation-seeded
+    # params as having a taint source in that method.
+    try:
+        for _, method in tree.filter(jt.MethodDeclaration):
+            m_ln = getattr(getattr(method, "position", None), "line", -1)
+            if m_ln < 0:
+                continue
+            m = _midx(m_ln)
+            if m < 0:
+                continue
+            for param in (method.parameters or []):
+                for ann in (getattr(param, "annotations", None) or []):
+                    if getattr(ann, "name", "") in _SPRING_PARAM_ANNOTATIONS:
+                        pname = getattr(param, "name", "")
+                        if pname and pname in tainted:
+                            _has_taint_pm[(pname, m)] = True
+                            # No _taint_inits entry → direct source, never re-classifiable
+                        break
+    except Exception:
+        pass
+
+    method_local_clean: dict = {}
+    all_keys = set(_has_literal_pm) | set(_has_taint_pm)
+    for (vn, m) in all_keys:
+        if _has_taint_pm.get((vn, m)):
+            continue  # taint present in this method → re-evaluated below
+        if _has_literal_pm.get((vn, m)):
+            method_local_clean.setdefault(m, set()).add(vn)
+
+    # Transitive propagation: if a var's taint init nodes are only tainted via
+    # other locally-clean vars in the same method, it is also locally clean.
+    # Example: data="foo" (clean) → file=new File(root+data) should also be clean.
+    # Only (vn,m) pairs in _taint_inits are candidates; Spring annotations are excluded
+    # because they have no _taint_inits entry (direct source, always tainted).
+    try:
+        changed = True
+        _max_iters = 20  # safety cap (fixpoint reached in O(chain-depth) iters)
+        while changed and _max_iters > 0:
+            changed = False
+            _max_iters -= 1
+            for (vn, m), nodes_list in _taint_inits.items():
+                if vn in method_local_clean.get(m, set()):
+                    continue  # already locally clean
+                local_clean_m = method_local_clean.get(m, set())
+                effective_tainted = tainted - local_clean_m
+                if not any(_is_tainted(n, effective_tainted, const_ints)
+                           for n in nodes_list):
+                    method_local_clean.setdefault(m, set()).add(vn)
+                    changed = True
+    except Exception:
+        pass
+
+    return method_local_clean, mstarts
+
+
 def _collect_writers(tree) -> set[str]:
     """Find PrintWriter variable names from response.getWriter() assignments."""
     writers: set[str] = set()
@@ -1607,6 +1755,38 @@ class JavaASTAnalyzer(BaseAnalyzer):
         writers = _collect_writers(tree)
         _const_ints, _const_strings = _collect_const_context(tree, _props)
 
+        # Per-method local clean set: suppress findings where a tainted variable has
+        # only clean (literal) assignments in the sink's method and no taint source.
+        # This handles scope-insensitive contamination across bad()/good() methods.
+        _mlc, _mstarts_mlc = _compute_method_local_clean(
+            tree, tainted, _const_ints, dead_lines
+        )
+        _eff_cache: dict = {}
+
+        def _eff_tainted(node_or_line) -> set:
+            """Return effective tainted set with locally clean vars removed.
+
+            Accepts either a javalang node (line extracted via _node_line) or
+            an integer line number directly (for ClassCreator which needs the
+            pre-computed ancestor-walk line).
+            """
+            if not _mlc:
+                return tainted
+            ln = node_or_line if isinstance(node_or_line, int) else _node_line(node_or_line)
+            if ln < 0:
+                return tainted
+            midx = -1
+            for i, s in enumerate(_mstarts_mlc):
+                if ln >= s:
+                    midx = i
+                else:
+                    break
+            if midx < 0 or midx not in _mlc:
+                return tainted
+            if midx not in _eff_cache:
+                _eff_cache[midx] = tainted - _mlc[midx]
+            return _eff_cache[midx]
+
         # ── Post-fixpoint: field-level taint with strong updates ──────────────
         # Process obj.field = expr in AST (source) order so that
         # "w.value = tainted; w.value = clean" nets out as clean.
@@ -1656,26 +1836,36 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 q = str(node.qualifier or "")
                 if node.member in _JDBC_EXEC_METHODS:
                     # Case 1: any tainted arg  (executeQuery(sql), prepareStatement(sql), addBatch(sql))
-                    flagged = any(_is_tainted(a, tainted) for a in (node.arguments or []))
+                    _et = _eff_tainted(node)
+                    flagged = any(_is_tainted(a, _et) for a in (node.arguments or []))
                     # Case 2: tainted qualifier/statement object
                     # e.g. stmt = conn.prepareCall(taintedSql); stmt.executeQuery()
-                    if not flagged and q in tainted:
+                    if not flagged and q in _et:
                         flagged = True
                     if flagged:
                         _add(node, VulnType.SQL_INJECTION, Severity.HIGH, "JAST-SQL-001",
                              f"{node.member}() receives user-controlled value — "
                              "SQL injection; use PreparedStatement with parameterized queries")
+                    else:
+                        # AST determined safe via per-method clean analysis; emit suppression
+                        # sentinel so the generic SQL-001 regex finding is dropped at this line.
+                        _would_fire = (any(_is_tainted(a, tainted) for a in (node.arguments or []))
+                                       or q in tainted)
+                        if _would_fire:
+                            _add(node, VulnType.SQL_INJECTION, Severity.LOW, "JAST-SQL-SAFE",
+                                 "safe — method-local clean analysis")
                 elif node.member in _SPRING_JDBC_METHODS:
                     # Only the FIRST argument is the SQL string; subsequent args are bound
                     # parameters and are safe (e.g. queryForObject(sql, type, param...)).
                     first_arg = (node.arguments or [None])[0]
-                    if first_arg is not None and _is_tainted(first_arg, tainted):
+                    if first_arg is not None and _is_tainted(first_arg, _eff_tainted(node)):
                         _add(node, VulnType.SQL_INJECTION, Severity.HIGH, "JAST-SQL-001",
                              f"Spring JdbcTemplate.{node.member}() SQL argument is user-controlled — "
                              "SQL injection; use '?' placeholders with bound parameters")
                 elif node.member in _JPA_METHODS:
+                    _et = _eff_tainted(node)
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        if _is_tainted(arg, _et):
                             _add(node, VulnType.SQL_INJECTION, Severity.HIGH, "JAST-SQL-002",
                                  f"JPA {node.member}() with user-controlled string — "
                                  "SQL injection; use named parameters (:param)")
@@ -1690,10 +1880,11 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     continue
                 # Pattern 1: response.getWriter().println(tainted)
                 if node.member == "getWriter" and str(node.qualifier or "") in _RESPONSE_OBJECTS:
+                    _et = _eff_tainted(node)
                     for sel in (node.selectors or []):
                         if isinstance(sel, jt.MethodInvocation) and sel.member in _XSS_SINK_METHODS:
                             for arg in (sel.arguments or []):
-                                if _is_tainted(arg, tainted):
+                                if _is_tainted(arg, _et):
                                     outer_ln = _node_line(node)
                                     _add(node, VulnType.XSS, Severity.HIGH, "JAST-XSS-001",
                                          f"response.getWriter().{sel.member}() with user-controlled value — "
@@ -1703,8 +1894,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
 
                 # Pattern 2: out.println(tainted) where out = response.getWriter()
                 if node.member in _XSS_SINK_METHODS and str(node.qualifier or "") in writers:
+                    _et = _eff_tainted(node)
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        if _is_tainted(arg, _et):
                             _add(node, VulnType.XSS, Severity.HIGH, "JAST-XSS-001",
                                  f"PrintWriter.{node.member}() with user-controlled value — "
                                  "reflected XSS; encode output with ESAPI or escapeHtml")
@@ -1824,8 +2016,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     continue
                 class_name = _type_name(node.type)
                 if class_name in _FILE_CLASSES:
+                    _et_cc = _eff_tainted(_cc_line)
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        if _is_tainted(arg, _et_cc):
                             _add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, "JAST-PATH-001",
                                  f"new {class_name}() with user-controlled path — "
                                  "path traversal; canonicalize and validate within allowed root",
@@ -1839,7 +2032,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         and (_pq in ("Paths", "Path")
                              or _pq.endswith(".Paths") or _pq.endswith(".Path"))):
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        if _is_tainted(arg, _eff_tainted(node)):
                             _add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH, "JAST-PATH-002",
                                  f"Paths.{node.member}() with user-controlled path — "
                                  "path traversal; validate path does not escape allowed directory")

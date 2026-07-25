@@ -98,12 +98,14 @@ _RULES = [
         Severity.HIGH, _SSRF,
     ),
     # SQL-006: JDBC/JPA string concatenation (statement-bounded, requires SQL keyword)
+    # The concat lookahead requires + adjacent to a quote char to avoid matching arithmetic
+    # operators like `hitcount+1` that appear inside a string literal (not concatenation).
     (
         "SQL-006",
         re.compile(
             r'\b(?:\w+\s*\.\s*)?(?:prepareStatement|prepareCall|createQuery|createNativeQuery'
             r'|createSQLQuery|executeQuery|executeUpdate|execute|addBatch)\s*\('
-            r'(?=[^;\n]{0,300}\+)'          # concat operator present within statement
+            r'(?=[^;\n]{0,300}(?:["\'][ \t]*\+|\+[ \t]*["\']))'  # string-concat + next to quote
             r'(?=[^;\n]{0,300}\b(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|INTO|SET)\b)',
             re.IGNORECASE,
         ),
