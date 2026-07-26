@@ -77,6 +77,8 @@ class JavaCrossFileCtx:
     """
     remote_methods: dict[str, list[tuple]] = field(default_factory=dict)
     tainted_callee_params: dict[str, set[int]] = field(default_factory=dict)
+    # method_name → {param_index → (rule_id, VulnType, Severity, description)}
+    sink_registry: dict[str, dict[int, tuple]] = field(default_factory=dict)
 
 
 _java_cf_local = threading.local()
@@ -154,6 +156,29 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
         except Exception:
             pass
 
+    # Seed tainted_callee_params from methods that directly receive user input
+    # via request.getParameter() etc. and pass it to callee methods.
+    # This enables callee JAST rules when the caller is not a Spring controller.
+    for tree, _fp in parsed_trees:
+        try:
+            for _, method in tree.filter(jt.MethodDeclaration):
+                _tv: set[str] = set()
+                try:
+                    for _, lvd in method.filter(jt.LocalVariableDeclaration):
+                        for decl in lvd.declarators:
+                            init = decl.initializer
+                            if init and _is_request_source(init):
+                                _tv.add(decl.name)
+                            elif (init and isinstance(init, jt.MethodInvocation)
+                                  and init.member in _ANY_QUALIFIER_TAINT_METHODS):
+                                _tv.add(decl.name)
+                except Exception:
+                    pass
+                if _tv:
+                    _propagate_from_method(method, _tv)
+        except Exception:
+            pass
+
     # Fixed-point transitive propagation (up to 8 hops)
     for _ in range(8):
         changed = False
@@ -177,7 +202,151 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
         if not changed:
             break
 
-    return JavaCrossFileCtx(remote_methods=remote_methods, tainted_callee_params=tainted_callee_params)
+    # ── Sink registry: discover methods whose params flow to SQL / path sinks ──
+    # Phase 1 — direct: param → JDBC call in the same method body.
+    sink_registry: dict[str, dict[int, tuple]] = {}
+
+    def _build_method_sink_params(mnode) -> "dict[int, tuple]":
+        """Return {param_idx → sink_info} for params that flow to SQL/path sinks."""
+        params = mnode.parameters or []
+        if not params or not mnode.body:
+            return {}
+        pbyn: dict[str, int] = {}
+        for idx, p in enumerate(params):
+            pn = getattr(p, "name", "")
+            if pn:
+                pbyn[pn] = idx
+        if not pbyn:
+            return {}
+        # Seed all params as tainted, run 3-iteration mini propagation.
+        tl: set[str] = set(pbyn)
+        for _ in range(3):
+            try:
+                for _, lvd in mnode.filter(jt.LocalVariableDeclaration):
+                    for decl in lvd.declarators:
+                        if decl.name not in tl and decl.initializer:
+                            if _is_tainted(decl.initializer, tl):
+                                tl.add(decl.name)
+            except Exception:
+                pass
+        result: dict[int, tuple] = {}
+        # SQL sinks (JDBC execute methods with tainted args)
+        try:
+            for _, mi in mnode.filter(jt.MethodInvocation):
+                if mi.member not in _JDBC_EXEC_METHODS:
+                    continue
+                if any(_is_tainted(a, tl) for a in (mi.arguments or [])):
+                    for pn, pidx in pbyn.items():
+                        if pn in tl:
+                            result.setdefault(pidx, (
+                                "JAST-SQL-001", VulnType.SQL_INJECTION, Severity.HIGH,
+                                f"cross-file: tainted arg passed to {mnode.name}() which"
+                                " executes raw SQL — SQL injection; use PreparedStatement",
+                            ))
+                    break
+        except Exception:
+            pass
+        # Path traversal sinks (File/FileInputStream etc. with tainted arg)
+        if not result:
+            try:
+                for _, cc in mnode.filter(jt.ClassCreator):
+                    if _type_name(cc.type) not in _FILE_CLASSES:
+                        continue
+                    if any(_is_tainted(a, tl) for a in (cc.arguments or [])):
+                        for pn, pidx in pbyn.items():
+                            if pn in tl:
+                                result.setdefault(pidx, (
+                                    "JAST-PATH-001", VulnType.PATH_TRAVERSAL, Severity.HIGH,
+                                    f"cross-file: tainted arg passed to {mnode.name}() which"
+                                    " opens a file — path traversal; validate path",
+                                ))
+                        break
+            except Exception:
+                pass
+        return result
+
+    for tree, _fp in parsed_trees:
+        try:
+            for _, method in tree.filter(jt.MethodDeclaration):
+                sr = _build_method_sink_params(method)
+                if sr:
+                    sink_registry.setdefault(method.name, {}).update(sr)
+        except Exception:
+            pass
+
+    # Phase 2 — transitive: if M passes its params to a registry sink, M is also a sink.
+    for _hop in range(4):
+        _changed_sr = False
+        _sr_keys = set(sink_registry.keys())
+        for tree, _fp in parsed_trees:
+            try:
+                for _, method in tree.filter(jt.MethodDeclaration):
+                    if method.name in _sr_keys:
+                        continue
+                    params = method.parameters or []
+                    if not params or not method.body:
+                        continue
+                    pbyn2: dict[str, int] = {}
+                    for idx2, p2 in enumerate(params):
+                        pn2 = getattr(p2, "name", "")
+                        if pn2:
+                            pbyn2[pn2] = idx2
+                    if not pbyn2:
+                        continue
+                    tl2: set[str] = set(pbyn2)
+                    try:
+                        for _, lvd in method.filter(jt.LocalVariableDeclaration):
+                            for decl in lvd.declarators:
+                                if decl.name not in tl2 and decl.initializer:
+                                    if _is_tainted(decl.initializer, tl2):
+                                        tl2.add(decl.name)
+                    except Exception:
+                        pass
+                    new_sr: dict[int, tuple] = {}
+                    # ClassCreator selectors: (new Foo()).knownSink(param)
+                    try:
+                        for _, cc in method.filter(jt.ClassCreator):
+                            for sel in (cc.selectors or []):
+                                if not isinstance(sel, jt.MethodInvocation):
+                                    continue
+                                if sel.member not in _sr_keys:
+                                    continue
+                                args = sel.arguments or []
+                                for cpidx, sinfo in sink_registry.get(sel.member, {}).items():
+                                    if cpidx < len(args) and _is_tainted(args[cpidx], tl2):
+                                        for pn2, pidx2 in pbyn2.items():
+                                            if pn2 in tl2:
+                                                new_sr.setdefault(pidx2, sinfo)
+                    except Exception:
+                        pass
+                    # Plain MethodInvocations: helper.knownSink(param)
+                    try:
+                        for _, mi in method.filter(jt.MethodInvocation):
+                            if mi.member not in _sr_keys:
+                                continue
+                            args = mi.arguments or []
+                            for cpidx, sinfo in sink_registry.get(mi.member, {}).items():
+                                if cpidx < len(args) and _is_tainted(args[cpidx], tl2):
+                                    for pn2, pidx2 in pbyn2.items():
+                                        if pn2 in tl2:
+                                            new_sr.setdefault(pidx2, sinfo)
+                    except Exception:
+                        pass
+                    if new_sr:
+                        _bef = len(sink_registry.get(method.name, {}))
+                        sink_registry.setdefault(method.name, {}).update(new_sr)
+                        if len(sink_registry[method.name]) > _bef:
+                            _changed_sr = True
+            except Exception:
+                pass
+        if not _changed_sr:
+            break
+
+    return JavaCrossFileCtx(
+        remote_methods=remote_methods,
+        tainted_callee_params=tainted_callee_params,
+        sink_registry=sink_registry,
+    )
 
 
 def set_java_cross_file_context(ctx: JavaCrossFileCtx | None) -> None:
@@ -1584,6 +1753,60 @@ def _compute_method_local_clean(
     except Exception:
         pass
 
+    # Pass 2 — Collection clean: a collection variable freshly initialized in a method
+    # (new ArrayList<>() etc.) with no tainted add() in that method scope is locally clean.
+    # Uses the per-method clean set from Pass 1 to correctly classify add() arguments.
+    _fresh_coll: dict[tuple, bool] = {}
+    try:
+        for _, lvd in tree.filter(jt.LocalVariableDeclaration):
+            ln = getattr(getattr(lvd, "position", None), "line", -1)
+            if ln < 0 or ln in dead_lines:
+                continue
+            m = _midx(ln)
+            if m < 0:
+                continue
+            for decl in lvd.declarators:
+                vn = decl.name
+                if vn not in tainted:
+                    continue
+                init = decl.initializer
+                if (isinstance(init, jt.ClassCreator)
+                        and not _is_tainted(init, tainted, const_ints)):
+                    _fresh_coll[(vn, m)] = True
+    except Exception:
+        pass
+
+    _tainted_adds: dict[tuple, bool] = {}
+    try:
+        for _, se in tree.filter(jt.StatementExpression):
+            if not isinstance(getattr(se, "expression", None), jt.MethodInvocation):
+                continue
+            mi = se.expression
+            if mi.member not in ("add", "addAll", "set", "put"):
+                continue
+            ln = getattr(getattr(se, "position", None), "line", -1)
+            if ln < 0 or ln in dead_lines:
+                continue
+            m = _midx(ln)
+            if m < 0:
+                continue
+            q = str(mi.qualifier or "")
+            if not q or (q, m) not in _fresh_coll:
+                continue
+            args = mi.arguments or []
+            chk_idx = 1 if mi.member == "add" and len(args) == 2 else 0
+            if chk_idx >= len(args):
+                continue
+            eff_tainted_m = tainted - method_local_clean.get(m, set())
+            if _is_tainted(args[chk_idx], eff_tainted_m, const_ints):
+                _tainted_adds[(q, m)] = True
+    except Exception:
+        pass
+
+    for (vn, m) in _fresh_coll:
+        if not _tainted_adds.get((vn, m)) and not _has_taint_pm.get((vn, m)):
+            method_local_clean.setdefault(m, set()).add(vn)
+
     return method_local_clean, mstarts
 
 
@@ -2039,6 +2262,38 @@ class JavaASTAnalyzer(BaseAnalyzer):
                             break
         except Exception:
             pass
+
+        # ── Cross-file interprocedural sink detection ─────────────────────────
+        # When tainted data from this file is passed via (new Foo()).sink(data)
+        # to a method known to contain SQL/path sinks, flag the call site.
+        _cf_sr = _get_java_cf_ctx()
+        if _cf_sr and _cf_sr.sink_registry:
+            try:
+                for _cfi_path, _cfi_node in tree.filter(jt.ClassCreator):
+                    for _cfi_sel in (_cfi_node.selectors or []):
+                        if not isinstance(_cfi_sel, jt.MethodInvocation):
+                            continue
+                        _callee_sinks = _cf_sr.sink_registry.get(_cfi_sel.member)
+                        if not _callee_sinks:
+                            continue
+                        # ClassCreator nodes often have no position; walk ancestors.
+                        _cfi_line = _node_line(_cfi_node)
+                        if not _cfi_line:
+                            for _cfi_anc in reversed(_cfi_path):
+                                _cfi_line = _node_line(_cfi_anc)
+                                if _cfi_line:
+                                    break
+                        if _cfi_line in dead_lines:
+                            continue
+                        _et_cfi = _eff_tainted(_cfi_line)
+                        _cfi_args = _cfi_sel.arguments or []
+                        for _cfi_pidx, (_cfi_rid, _cfi_vt, _cfi_sv, _cfi_desc) in _callee_sinks.items():
+                            if _cfi_pidx < len(_cfi_args) and _is_tainted(_cfi_args[_cfi_pidx], _et_cfi):
+                                _add(_cfi_node, _cfi_vt, _cfi_sv, _cfi_rid, _cfi_desc,
+                                     line_override=_cfi_line)
+                                break
+            except Exception:
+                pass
 
         # ── Weak cryptography — new Random() or Math.random() ────────────────
         try:
