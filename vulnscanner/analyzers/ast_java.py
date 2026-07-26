@@ -267,76 +267,93 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
 
     for tree, _fp in parsed_trees:
         try:
-            for _, method in tree.filter(jt.MethodDeclaration):
-                sr = _build_method_sink_params(method)
-                if sr:
-                    sink_registry.setdefault(method.name, {}).update(sr)
+            for _, cls in tree.filter(jt.ClassDeclaration):
+                for method in (cls.methods or []):
+                    sr = _build_method_sink_params(method)
+                    if sr:
+                        sink_registry.setdefault((cls.name, method.name), {}).update(sr)
         except Exception:
             pass
 
     # Phase 2 — transitive: if M passes its params to a registry sink, M is also a sink.
+    # Keys in sink_registry are (class_name, method_name) tuples.
+    # _sr_method_names is a name-only fallback for plain MethodInvocation where the
+    # qualifier is a variable of unknown type (no type inference available).
     for _hop in range(4):
         _changed_sr = False
-        _sr_keys = set(sink_registry.keys())
+        _sr_keys = set(sink_registry.keys())          # set of (cls, method) tuples
+        _sr_method_names = {k[1] for k in _sr_keys}   # name-only index for plain MI fallback
         for tree, _fp in parsed_trees:
             try:
-                for _, method in tree.filter(jt.MethodDeclaration):
-                    if method.name in _sr_keys:
-                        continue
-                    params = method.parameters or []
-                    if not params or not method.body:
-                        continue
-                    pbyn2: dict[str, int] = {}
-                    for idx2, p2 in enumerate(params):
-                        pn2 = getattr(p2, "name", "")
-                        if pn2:
-                            pbyn2[pn2] = idx2
-                    if not pbyn2:
-                        continue
-                    tl2: set[str] = set(pbyn2)
-                    try:
-                        for _, lvd in method.filter(jt.LocalVariableDeclaration):
-                            for decl in lvd.declarators:
-                                if decl.name not in tl2 and decl.initializer:
-                                    if _is_tainted(decl.initializer, tl2):
-                                        tl2.add(decl.name)
-                    except Exception:
-                        pass
-                    new_sr: dict[int, tuple] = {}
-                    # ClassCreator selectors: (new Foo()).knownSink(param)
-                    try:
-                        for _, cc in method.filter(jt.ClassCreator):
-                            for sel in (cc.selectors or []):
-                                if not isinstance(sel, jt.MethodInvocation):
+                for _, cls in tree.filter(jt.ClassDeclaration):
+                    cls_name = cls.name
+                    for method in (cls.methods or []):
+                        if (cls_name, method.name) in _sr_keys:
+                            continue
+                        params = method.parameters or []
+                        if not params or not method.body:
+                            continue
+                        pbyn2: dict[str, int] = {}
+                        for idx2, p2 in enumerate(params):
+                            pn2 = getattr(p2, "name", "")
+                            if pn2:
+                                pbyn2[pn2] = idx2
+                        if not pbyn2:
+                            continue
+                        tl2: set[str] = set(pbyn2)
+                        try:
+                            for _, lvd in method.filter(jt.LocalVariableDeclaration):
+                                for decl in lvd.declarators:
+                                    if decl.name not in tl2 and decl.initializer:
+                                        if _is_tainted(decl.initializer, tl2):
+                                            tl2.add(decl.name)
+                        except Exception:
+                            pass
+                        new_sr: dict[int, tuple] = {}
+                        # ClassCreator selectors: (new Foo()).knownSink(param) — class is known.
+                        try:
+                            for _, cc in method.filter(jt.ClassCreator):
+                                for sel in (cc.selectors or []):
+                                    if not isinstance(sel, jt.MethodInvocation):
+                                        continue
+                                    _cc_type = _type_name(cc.type)
+                                    if (_cc_type, sel.member) not in _sr_keys:
+                                        continue
+                                    args = sel.arguments or []
+                                    for cpidx, sinfo in sink_registry.get((_cc_type, sel.member), {}).items():
+                                        if cpidx < len(args) and _is_tainted(args[cpidx], tl2):
+                                            for pn2, pidx2 in pbyn2.items():
+                                                if pn2 in tl2:
+                                                    new_sr.setdefault(pidx2, sinfo)
+                        except Exception:
+                            pass
+                        # Plain MethodInvocations: helper.knownSink(param) / Class.knownSink(param)
+                        # Uppercase qualifier → class reference (exact key); else variable → name fallback.
+                        try:
+                            for _, mi in method.filter(jt.MethodInvocation):
+                                if mi.member not in _sr_method_names:
                                     continue
-                                if sel.member not in _sr_keys:
-                                    continue
-                                args = sel.arguments or []
-                                for cpidx, sinfo in sink_registry.get(sel.member, {}).items():
+                                q = str(mi.qualifier or "")
+                                if q and q[0].isupper():
+                                    candidates = sink_registry.get((q, mi.member), {})
+                                else:
+                                    candidates = {}
+                                    for (ck, mk), sv in sink_registry.items():
+                                        if mk == mi.member:
+                                            candidates.update(sv)
+                                args = mi.arguments or []
+                                for cpidx, sinfo in candidates.items():
                                     if cpidx < len(args) and _is_tainted(args[cpidx], tl2):
                                         for pn2, pidx2 in pbyn2.items():
                                             if pn2 in tl2:
                                                 new_sr.setdefault(pidx2, sinfo)
-                    except Exception:
-                        pass
-                    # Plain MethodInvocations: helper.knownSink(param)
-                    try:
-                        for _, mi in method.filter(jt.MethodInvocation):
-                            if mi.member not in _sr_keys:
-                                continue
-                            args = mi.arguments or []
-                            for cpidx, sinfo in sink_registry.get(mi.member, {}).items():
-                                if cpidx < len(args) and _is_tainted(args[cpidx], tl2):
-                                    for pn2, pidx2 in pbyn2.items():
-                                        if pn2 in tl2:
-                                            new_sr.setdefault(pidx2, sinfo)
-                    except Exception:
-                        pass
-                    if new_sr:
-                        _bef = len(sink_registry.get(method.name, {}))
-                        sink_registry.setdefault(method.name, {}).update(new_sr)
-                        if len(sink_registry[method.name]) > _bef:
-                            _changed_sr = True
+                        except Exception:
+                            pass
+                        if new_sr:
+                            _bef = len(sink_registry.get((cls_name, method.name), {}))
+                            sink_registry.setdefault((cls_name, method.name), {}).update(new_sr)
+                            if len(sink_registry[(cls_name, method.name)]) > _bef:
+                                _changed_sr = True
             except Exception:
                 pass
         if not _changed_sr:
@@ -2273,7 +2290,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     for _cfi_sel in (_cfi_node.selectors or []):
                         if not isinstance(_cfi_sel, jt.MethodInvocation):
                             continue
-                        _callee_sinks = _cf_sr.sink_registry.get(_cfi_sel.member)
+                        _callee_sinks = _cf_sr.sink_registry.get(
+                            (_type_name(_cfi_node.type), _cfi_sel.member)
+                        )
                         if not _callee_sinks:
                             continue
                         # ClassCreator nodes often have no position; walk ancestors.
