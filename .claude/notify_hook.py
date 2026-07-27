@@ -39,6 +39,10 @@ _CFG = Path(__file__).parent / "pushover_config.json"
 # consumed and deleted by stop mode to suppress Q&A-only notifications.
 _WORK_FLAG = Path(tempfile.gettempdir()) / "vulnscanner_claude_work_done"
 
+# Pending notification file: written by pre mode when approval is needed,
+# deleted by post mode (approved) or timer mode (sent after 60 s timeout).
+_PENDING_NOTIF = Path(tempfile.gettempdir()) / "vulnscanner_claude_pending_notif.json"
+
 
 def _creds() -> tuple[str, str]:
     try:
@@ -102,6 +106,20 @@ def _send(title: str, msg: str, priority: int = 0) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
+
+    # timer runs as a detached background process with no stdin.
+    if mode == "timer":
+        import time
+        time.sleep(60)
+        if _PENDING_NOTIF.exists():
+            try:
+                notif = json.loads(_PENDING_NOTIF.read_text(encoding="utf-8"))
+                _PENDING_NOTIF.unlink(missing_ok=True)
+                _send(title=notif["title"], msg=notif["msg"], priority=1)
+            except Exception:
+                pass
+        return
+
     try:
         payload = json.load(sys.stdin)
     except Exception:
@@ -112,29 +130,44 @@ def main() -> None:
 
     if mode == "pre":
         if _match(cmd, _DENY):
-            # Guaranteed notification for deny-list commands (PostToolUse may not fire for denied tools)
+            # Auto-blocked commands notify immediately (no user action possible).
             _send(
                 title    = f"[deny] ブロック予定 ({tool})",
                 msg      = f"$ {cmd}\n-> deny ルールで自動ブロックされます",
                 priority = 1,
             )
         elif "\n#" in cmd:
-            # Claude Code's built-in security check fires for newline+# patterns,
-            # showing a y/n prompt AFTER the ALLOW check passes — so this must be
-            # detected here before the ALLOW short-circuit to guarantee notification.
+            # Claude Code's built-in security check fires for newline+# patterns —
+            # notify immediately since these are rare and high-priority.
             _send(
                 title    = f"[security] 確認画面が出ます ({tool})",
                 msg      = f"$ {cmd[:150]}\n-> 改行+# パターン: Claude Code が承認を求めます",
                 priority = 1,
             )
         elif not _match(cmd, _ALLOW):
-            _send(
-                title    = f"[prompt] 承認待ち ({tool})",
-                msg      = f"$ {cmd}\n-> Claude Code で承認 / 拒否してください",
-                priority = 1,
+            # Write pending notification; a background timer sends it only if the
+            # user hasn't approved/denied within 60 seconds.
+            _PENDING_NOTIF.write_text(
+                json.dumps({
+                    "title": f"[prompt] 承認待ち ({tool})",
+                    "msg":   f"$ {cmd}\n-> 1分間応答なし。Claude Code で承認 / 拒否してください",
+                }),
+                encoding="utf-8",
+            )
+            import subprocess
+            subprocess.Popen(
+                [sys.executable, __file__, "timer"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
 
     elif mode == "post":
+        # Tool executed = permission was granted → cancel any pending notification.
+        try:
+            _PENDING_NOTIF.unlink(missing_ok=True)
+        except Exception:
+            pass
         resp = payload.get("tool_response", {})
         text = (str(resp.get("content", "")) + str(resp.get("error", ""))).lower()
         blocked = (

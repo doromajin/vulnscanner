@@ -912,6 +912,49 @@ def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> 
     return False
 
 
+def _is_tainted_raw(node, tainted_raw: "set[str]", const_ints: "dict | None" = None) -> bool:
+    """Like _is_tainted but does NOT treat XSS sanitizers as cleaners.
+    Used for trust-boundary checks: HTML encoding doesn't fix session storage violation."""
+    if node is None:
+        return False
+    if isinstance(node, jt.MethodInvocation):
+        if _is_request_source(node):
+            return True
+        if node.member in _TAINT_SAFE_QUERY_METHODS:
+            return False
+        q = str(node.qualifier or "")
+        if q and q in tainted_raw:
+            return True
+        if any(_is_tainted_raw(a, tainted_raw, const_ints) for a in (node.arguments or [])):
+            return True
+        return False
+    if isinstance(node, jt.MemberReference):
+        if node.member in tainted_raw:
+            return True
+        q = str(node.qualifier or "")
+        if q and "." not in q and f"{q}::{node.member}" in tainted_raw:
+            return True
+        return False
+    if isinstance(node, jt.BinaryOperation):
+        return _is_tainted_raw(node.operandl, tainted_raw, const_ints) or _is_tainted_raw(node.operandr, tainted_raw, const_ints)
+    if isinstance(node, jt.Literal):
+        return False
+    if isinstance(node, jt.ClassCreator):
+        return any(_is_tainted_raw(a, tainted_raw, const_ints) for a in (node.arguments or []))
+    if isinstance(node, jt.Cast):
+        return _is_tainted_raw(node.expression, tainted_raw, const_ints)
+    if isinstance(node, jt.TernaryExpression):
+        if const_ints is not None:
+            cond_val = _eval_const_expr(node.condition, const_ints, {})
+            if cond_val is not None:
+                branch = node.if_true if cond_val != 0 else node.if_false
+                return _is_tainted_raw(branch, tainted_raw, const_ints)
+        return _is_tainted_raw(node.if_true, tainted_raw, const_ints) or _is_tainted_raw(node.if_false, tainted_raw, const_ints)
+    if hasattr(node, "expression"):
+        return _is_tainted_raw(node.expression, tainted_raw, const_ints)
+    return False
+
+
 def _analyze_local_method(
     tree,
     method_name: str,
@@ -1103,6 +1146,9 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
     - Dead-code branches from constant if/switch conditions are skipped
     """
     tainted: set = set()
+    # Parallel set: propagates through XSS sanitizers (for trust-boundary checks where
+    # HTML encoding doesn't neutralize the session-storage violation).
+    tainted_raw: set = set()
 
     # Constant context enables dead-branch skipping and constant-condition ternary
     const_ints, const_strings = _collect_const_context(tree)
@@ -1150,6 +1196,7 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                         pname = getattr(param, "name", "")
                         if pname:
                             tainted.add(pname)
+                            tainted_raw.add(pname)
                         break
     except Exception:
         pass
@@ -1171,6 +1218,7 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                         pname = getattr(params[idx], "name", "")
                         if pname:
                             tainted.add(pname)
+                            tainted_raw.add(pname)
         except Exception:
             pass
 
@@ -1289,6 +1337,10 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                 continue
                         if _is_tainted(init, tainted, const_ints):
                             tainted.add(decl.name)
+                            tainted_raw.add(decl.name)
+                            changed = True
+                        elif decl.name not in tainted_raw and _is_tainted_raw(init, tainted_raw, const_ints):
+                            tainted_raw.add(decl.name)
                             changed = True
         except Exception:
             pass
@@ -1309,6 +1361,7 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                         continue
                     if _is_tainted(decl.initializer, tainted, const_ints):
                         tainted.add(decl.name)
+                        tainted_raw.add(decl.name)
                         changed = True
         except Exception:
             pass
@@ -1418,6 +1471,10 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                             continue
                     if _is_tainted(rhs, tainted, const_ints):
                         tainted.add(_vname)
+                        tainted_raw.add(_vname)
+                        changed = True
+                    elif _vname not in tainted_raw and _is_tainted_raw(rhs, tainted_raw, const_ints):
+                        tainted_raw.add(_vname)
                         changed = True
         except Exception:
             pass
@@ -1642,7 +1699,7 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
     except Exception:
         pass
 
-    return tainted, list_tainted_vars, dead_lines
+    return tainted, list_tainted_vars, dead_lines, tainted_raw
 
 
 def _compute_method_local_clean(
@@ -2008,7 +2065,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
 
         lines = content.splitlines()
         _props = _load_properties_files(file_path)
-        tainted, list_tainted_vars, dead_lines = _collect_tainted(tree)
+        tainted, list_tainted_vars, dead_lines, tainted_raw = _collect_tainted(tree)
         # Remove format-validated variables (guarded by early-exit if-throw/return).
         # These are provably safe after the guard; keeping them in tainted causes FP.
         tainted -= _collect_java_guards(tree)
@@ -2215,13 +2272,21 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 if node.member not in _SESSION_SET_METHODS:
                     continue
                 q = str(node.qualifier or "")
-                if not (q in _SESSION_QUALIFIERS
+                # qualifier=="" means chained call: request.getSession().setAttribute(...)
+                if not (not q
+                        or q in _SESSION_QUALIFIERS
                         or "session" in q.lower()):
                     continue
                 args = node.arguments or []
-                if len(args) >= 2 and _is_tainted(args[1], tainted):
+                # Use tainted_raw: HTML encoding doesn't fix session-storage violations.
+                key_tainted = len(args) >= 1 and (
+                    _is_tainted(args[0], tainted) or _is_tainted_raw(args[0], tainted_raw, _const_ints))
+                val_tainted = len(args) >= 2 and (
+                    _is_tainted(args[1], tainted) or _is_tainted_raw(args[1], tainted_raw, _const_ints))
+                if key_tainted or val_tainted:
+                    which = "key" if key_tainted else "value"
                     _add(node, VulnType.TRUST_BOUNDARY_VIOLATION, Severity.MEDIUM, "JAST-TBV-001",
-                         f"session.{node.member}() with user-controlled value — "
+                         f"session.{node.member}() with user-controlled {which} — "
                          "storing untrusted request data in session (CWE-501); validate before storing")
         except Exception:
             pass
