@@ -1335,6 +1335,23 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                 tainted.add(decl.name)
                                 changed = True
                                 continue
+                        # new Foo().method(args) — ClassCreator with chained MethodInvocation.
+                        # _is_tainted(ClassCreator) only checks constructor args, not selectors.
+                        # Analyze the chained method's return taint via intra-file analysis.
+                        if (isinstance(init, jt.ClassCreator)
+                                and init.selectors
+                                and isinstance(init.selectors[-1], jt.MethodInvocation)):
+                            _ccs = init.selectors[-1]
+                            _cc_r = _analyze_local_method(
+                                tree, _ccs.member, _ccs.arguments or [], tainted, const_ints)
+                            if _cc_r is None:
+                                _cc_r = _analyze_remote_method(
+                                    _ccs.member, _ccs.arguments or [], tainted, const_ints)
+                            if _cc_r is not None:
+                                if _cc_r:
+                                    tainted.add(decl.name)
+                                    changed = True
+                                continue
                         if _is_tainted(init, tainted, const_ints):
                             tainted.add(decl.name)
                             tainted_raw.add(decl.name)
@@ -1468,6 +1485,21 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                         if _rq2 is True:
                             tainted.add(_vname)
                             changed = True
+                            continue
+                    # new Foo().method(args) — ClassCreator with chained MethodInvocation.
+                    if (isinstance(rhs, jt.ClassCreator)
+                            and rhs.selectors
+                            and isinstance(rhs.selectors[-1], jt.MethodInvocation)):
+                        _ccs2 = rhs.selectors[-1]
+                        _cc_r2 = _analyze_local_method(
+                            tree, _ccs2.member, _ccs2.arguments or [], tainted, const_ints)
+                        if _cc_r2 is None:
+                            _cc_r2 = _analyze_remote_method(
+                                _ccs2.member, _ccs2.arguments or [], tainted, const_ints)
+                        if _cc_r2 is not None:
+                            if _cc_r2:
+                                tainted.add(_vname)
+                                changed = True
                             continue
                     if _is_tainted(rhs, tainted, const_ints):
                         tainted.add(_vname)
@@ -1670,6 +1702,34 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                 if (vn in tainted and decl.initializer is not None
                         and _is_tainted(decl.initializer, tainted, const_ints)):
                     last_taint_line[vn] = ln
+
+        # Collect SE lines inside IfStatement branches: conditional assignments must not
+        # count as "last clean line" — they only execute on one path, so they cannot
+        # guarantee the variable is clean after the if-statement.
+        # This fixes two patterns from OWASP Benchmark:
+        #   (1) if (param == null) param = "";   — null-guard after request.getParameter()
+        #   (2) else bar = "literal";            — dead else branch of a constant condition
+        _cond_se_lines: set = set()
+        try:
+            for _, _if in tree.filter(jt.IfStatement):
+                for _blk in (_if.then_statement, _if.else_statement):
+                    if _blk is None:
+                        continue
+                    if isinstance(_blk, jt.StatementExpression):
+                        _bl = _line_of(_blk)
+                        if _bl > 0:
+                            _cond_se_lines.add(_bl)
+                    else:
+                        try:
+                            for _, _se2 in _blk.filter(jt.StatementExpression):
+                                _bl = _line_of(_se2)
+                                if _bl > 0:
+                                    _cond_se_lines.add(_bl)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
         for _, se in tree.filter(jt.StatementExpression):
             if not isinstance(getattr(se, "expression", None), jt.Assignment):
                 continue
@@ -1681,11 +1741,17 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
             if vn not in local_vars:
                 continue  # Only apply strong update to local variables
             ln = _line_of(se)
+            # Skip dead branches and conditional branches for clean-assignment tracking.
+            # Dead branches (dead_lines) were never executed; conditional branches only
+            # execute on one path — neither can guarantee the variable ends up clean.
+            is_conditional = ln in _cond_se_lines or ln in dead_lines
             if isinstance(assign.value, jt.Literal):
-                last_clean_line[vn] = max(last_clean_line.get(vn, 0), ln)
+                if not is_conditional:
+                    last_clean_line[vn] = max(last_clean_line.get(vn, 0), ln)
             elif not _is_tainted(assign.value, tainted, const_ints):
                 # RHS is provably clean (e.g. iter = cleanColl.iterator())
-                last_clean_line[vn] = max(last_clean_line.get(vn, 0), ln)
+                if not is_conditional:
+                    last_clean_line[vn] = max(last_clean_line.get(vn, 0), ln)
             else:
                 last_taint_line[vn] = max(last_taint_line.get(vn, 0), ln)
         for vn in list(tainted):
@@ -1850,6 +1916,12 @@ def _compute_method_local_clean(
     # Pass 2 — Collection clean: a collection variable freshly initialized in a method
     # (new ArrayList<>() etc.) with no tainted add() in that method scope is locally clean.
     # Uses the per-method clean set from Pass 1 to correctly classify add() arguments.
+    # Collection type names that qualify for the "fresh collection" clean check.
+    _COLL_TYPE_NAMES = frozenset({
+        "ArrayList", "LinkedList", "Vector", "HashSet", "LinkedHashSet", "TreeSet",
+        "ArrayDeque", "PriorityQueue", "HashMap", "LinkedHashMap", "TreeMap",
+        "Hashtable", "ConcurrentHashMap", "CopyOnWriteArrayList",
+    })
     _fresh_coll: dict[tuple, bool] = {}
     try:
         for _, lvd in tree.filter(jt.LocalVariableDeclaration):
@@ -1865,6 +1937,7 @@ def _compute_method_local_clean(
                     continue
                 init = decl.initializer
                 if (isinstance(init, jt.ClassCreator)
+                        and _type_name(init.type) in _COLL_TYPE_NAMES
                         and not _is_tainted(init, tainted, const_ints)):
                     _fresh_coll[(vn, m)] = True
     except Exception:
