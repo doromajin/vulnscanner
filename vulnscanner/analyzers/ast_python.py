@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import functools
 import json
 import re
 import threading as _threading
@@ -994,7 +995,7 @@ class _VulnVisitor(ast.NodeVisitor):
         saved = self._assignments
         saved_canon = self._canonicalized_paths
         saved_web = self._current_func_is_web_entry
-        self._assignments = _collect_scope_assignments(node)
+        self._assignments = dict(_collect_scope_assignments(node))
         # CLI entry functions: parameters come from the operator command line,
         # not from untrusted web input.  Inject CLEAN sentinels for any
         # parameter not already assigned in the body.
@@ -2458,6 +2459,7 @@ def _collect_module_level_assignments(module: ast.Module) -> dict[str, ast.expr]
     return result
 
 
+@functools.lru_cache(maxsize=None)
 def _collect_scope_assignments(
     func: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> dict[str, ast.expr]:
