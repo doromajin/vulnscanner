@@ -463,8 +463,12 @@ _XSS_SANITIZER_METHODS = frozenset({
     "htmlEscape", "escapeHtml", "escapeHtml4", "escapeHtml3",
     "encodeForHTML", "encodeForHTMLAttribute",
     "htmlEncode", "escapeXml", "escapeXml10", "escapeXml11",
-    "encode",  # ESAPI encoder().encode()
+    "encode",  # URLEncoder.encode() — sanitizes for URL/redirect (but tracked in tainted_raw)
 })
+
+# These methods undo URL encoding; if input was URL-encoded user data (tainted_raw),
+# the decoded output is again directly user-tainted. e.g. URLDecoder.decode(enc) after encode.
+_URL_DECODE_METHODS = frozenset({"decode"})
 
 # ── Weak cryptography ──────────────────────────────────────────────────────────
 
@@ -907,6 +911,12 @@ def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> 
                 branch = node.if_true if cond_val != 0 else node.if_false
                 return _is_tainted(branch, tainted, const_ints)
         return _is_tainted(node.if_true, tainted, const_ints) or _is_tainted(node.if_false, tainted, const_ints)
+    if isinstance(node, jt.This):
+        # this.field — javalang: This(selectors=[MemberReference(member="field")])
+        for sel in (node.selectors or []):
+            if isinstance(sel, jt.MemberReference) and sel.member in tainted:
+                return True
+        return False
     if hasattr(node, "expression"):
         return _is_tainted(node.expression, tainted, const_ints)
     return False
@@ -1368,6 +1378,13 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                             tainted.add(decl.name)
                             tainted_raw.add(decl.name)
                             changed = True
+                        elif (isinstance(init, jt.MethodInvocation)
+                              and init.member in _URL_DECODE_METHODS
+                              and str(init.qualifier or "").endswith("Decoder")
+                              and _is_tainted_raw(init, tainted_raw, const_ints)):
+                            tainted.add(decl.name)
+                            tainted_raw.add(decl.name)
+                            changed = True
                         elif decl.name not in tainted_raw and _is_tainted_raw(init, tainted_raw, const_ints):
                             tainted_raw.add(decl.name)
                             changed = True
@@ -1520,6 +1537,15 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                 changed = True
                             continue
                     if _is_tainted(rhs, tainted, const_ints):
+                        tainted.add(_vname)
+                        tainted_raw.add(_vname)
+                        changed = True
+                    elif (isinstance(rhs, jt.MethodInvocation)
+                          and rhs.member in _URL_DECODE_METHODS
+                          and str(rhs.qualifier or "").endswith("Decoder")
+                          and _is_tainted_raw(rhs, tainted_raw, const_ints)):
+                        # URLDecoder.decode() reverses URL encoding; if the encoded input was
+                        # user-controlled (tracked in tainted_raw), the decoded result is tainted.
                         tainted.add(_vname)
                         tainted_raw.add(_vname)
                         changed = True
