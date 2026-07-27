@@ -77,8 +77,10 @@ class JavaCrossFileCtx:
     """
     remote_methods: dict[str, list[tuple]] = field(default_factory=dict)
     tainted_callee_params: dict[str, set[int]] = field(default_factory=dict)
-    # method_name → {param_index → (rule_id, VulnType, Severity, description)}
+    # (class_name, method_name) → {param_index → (rule_id, VulnType, Severity, description)}
     sink_registry: dict[str, dict[int, tuple]] = field(default_factory=dict)
+    # method_name-only reverse index for variable-qualifier MI lookup (no type inference)
+    sink_registry_by_method: dict[str, dict[int, tuple]] = field(default_factory=dict)
 
 
 _java_cf_local = threading.local()
@@ -276,93 +278,111 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
             pass
 
     # Phase 2 — transitive: if M passes its params to a registry sink, M is also a sink.
-    # Keys in sink_registry are (class_name, method_name) tuples.
-    # _sr_method_names is a name-only fallback for plain MethodInvocation where the
-    # qualifier is a variable of unknown type (no type inference available).
+    # Precompute each method's call sites ONCE to avoid repeated tree.filter() per hop.
+    # _p2_data: (cls, method) → {pbyn, tl, cc_calls, mi_calls}
+    # cc_calls: [(cc_type, sel_member, sel_args), ...]
+    # mi_calls: [(qualifier, mi_member, mi_args), ...]
+    _p2_data: dict[tuple, dict] = {}
+    for tree, _fp in parsed_trees:
+        try:
+            for _, cls in tree.filter(jt.ClassDeclaration):
+                for method in (cls.methods or []):
+                    params = method.parameters or []
+                    if not params or not method.body:
+                        continue
+                    pbyn2: dict[str, int] = {}
+                    for idx2, p2 in enumerate(params):
+                        pn2 = getattr(p2, "name", "")
+                        if pn2:
+                            pbyn2[pn2] = idx2
+                    if not pbyn2:
+                        continue
+                    tl2: set[str] = set(pbyn2)
+                    try:
+                        for _, lvd in method.filter(jt.LocalVariableDeclaration):
+                            for decl in lvd.declarators:
+                                if decl.name not in tl2 and decl.initializer:
+                                    if _is_tainted(decl.initializer, tl2):
+                                        tl2.add(decl.name)
+                    except Exception:
+                        pass
+                    cc_calls: list[tuple] = []
+                    try:
+                        for _, cc in method.filter(jt.ClassCreator):
+                            for sel in (cc.selectors or []):
+                                if isinstance(sel, jt.MethodInvocation):
+                                    cc_calls.append((_type_name(cc.type), sel.member,
+                                                     sel.arguments or []))
+                    except Exception:
+                        pass
+                    mi_calls: list[tuple] = []
+                    try:
+                        for _, mi in method.filter(jt.MethodInvocation):
+                            mi_calls.append((str(mi.qualifier or ""), mi.member,
+                                             mi.arguments or []))
+                    except Exception:
+                        pass
+                    _p2_data[(cls.name, method.name)] = {
+                        "pbyn": pbyn2, "tl": tl2,
+                        "cc": cc_calls, "mi": mi_calls,
+                    }
+        except Exception:
+            pass
+
+    # Build name-only reverse index once per hop (rebuilt after each registry update).
     for _hop in range(4):
         _changed_sr = False
-        _sr_keys = set(sink_registry.keys())          # set of (cls, method) tuples
-        _sr_method_names = {k[1] for k in _sr_keys}   # name-only index for plain MI fallback
-        for tree, _fp in parsed_trees:
-            try:
-                for _, cls in tree.filter(jt.ClassDeclaration):
-                    cls_name = cls.name
-                    for method in (cls.methods or []):
-                        if (cls_name, method.name) in _sr_keys:
-                            continue
-                        params = method.parameters or []
-                        if not params or not method.body:
-                            continue
-                        pbyn2: dict[str, int] = {}
-                        for idx2, p2 in enumerate(params):
-                            pn2 = getattr(p2, "name", "")
-                            if pn2:
-                                pbyn2[pn2] = idx2
-                        if not pbyn2:
-                            continue
-                        tl2: set[str] = set(pbyn2)
-                        try:
-                            for _, lvd in method.filter(jt.LocalVariableDeclaration):
-                                for decl in lvd.declarators:
-                                    if decl.name not in tl2 and decl.initializer:
-                                        if _is_tainted(decl.initializer, tl2):
-                                            tl2.add(decl.name)
-                        except Exception:
-                            pass
-                        new_sr: dict[int, tuple] = {}
-                        # ClassCreator selectors: (new Foo()).knownSink(param) — class is known.
-                        try:
-                            for _, cc in method.filter(jt.ClassCreator):
-                                for sel in (cc.selectors or []):
-                                    if not isinstance(sel, jt.MethodInvocation):
-                                        continue
-                                    _cc_type = _type_name(cc.type)
-                                    if (_cc_type, sel.member) not in _sr_keys:
-                                        continue
-                                    args = sel.arguments or []
-                                    for cpidx, sinfo in sink_registry.get((_cc_type, sel.member), {}).items():
-                                        if cpidx < len(args) and _is_tainted(args[cpidx], tl2):
-                                            for pn2, pidx2 in pbyn2.items():
-                                                if pn2 in tl2:
-                                                    new_sr.setdefault(pidx2, sinfo)
-                        except Exception:
-                            pass
-                        # Plain MethodInvocations: helper.knownSink(param) / Class.knownSink(param)
-                        # Uppercase qualifier → class reference (exact key); else variable → name fallback.
-                        try:
-                            for _, mi in method.filter(jt.MethodInvocation):
-                                if mi.member not in _sr_method_names:
-                                    continue
-                                q = str(mi.qualifier or "")
-                                if q and q[0].isupper():
-                                    candidates = sink_registry.get((q, mi.member), {})
-                                else:
-                                    candidates = {}
-                                    for (ck, mk), sv in sink_registry.items():
-                                        if mk == mi.member:
-                                            candidates.update(sv)
-                                args = mi.arguments or []
-                                for cpidx, sinfo in candidates.items():
-                                    if cpidx < len(args) and _is_tainted(args[cpidx], tl2):
-                                        for pn2, pidx2 in pbyn2.items():
-                                            if pn2 in tl2:
-                                                new_sr.setdefault(pidx2, sinfo)
-                        except Exception:
-                            pass
-                        if new_sr:
-                            _bef = len(sink_registry.get((cls_name, method.name), {}))
-                            sink_registry.setdefault((cls_name, method.name), {}).update(new_sr)
-                            if len(sink_registry[(cls_name, method.name)]) > _bef:
-                                _changed_sr = True
-            except Exception:
-                pass
+        _sr_keys = set(sink_registry.keys())
+        # Reverse index: method_name → merged sink params across all classes
+        _sr_by_mn: dict[str, dict] = {}
+        for (ck, mk), sv in sink_registry.items():
+            _sr_by_mn.setdefault(mk, {}).update(sv)
+
+        for (cls_name, method_name), data in _p2_data.items():
+            if (cls_name, method_name) in _sr_keys:
+                continue
+            pbyn2 = data["pbyn"]
+            tl2 = data["tl"]
+            new_sr: dict[int, tuple] = {}
+            # ClassCreator selectors: (new Foo()).knownSink(param) — class is known.
+            for _cc_type, sel_member, sel_args in data["cc"]:
+                if (_cc_type, sel_member) not in _sr_keys:
+                    continue
+                for cpidx, sinfo in sink_registry.get((_cc_type, sel_member), {}).items():
+                    if cpidx < len(sel_args) and _is_tainted(sel_args[cpidx], tl2):
+                        for pn2, pidx2 in pbyn2.items():
+                            if pn2 in tl2:
+                                new_sr.setdefault(pidx2, sinfo)
+            # Plain MIs: uppercase qualifier → exact (class, method); else name-only index.
+            for q, mi_member, mi_args in data["mi"]:
+                if mi_member not in _sr_by_mn:
+                    continue
+                candidates = (sink_registry.get((q, mi_member), {})
+                              if q and q[0].isupper()
+                              else _sr_by_mn.get(mi_member, {}))
+                for cpidx, sinfo in candidates.items():
+                    if cpidx < len(mi_args) and _is_tainted(mi_args[cpidx], tl2):
+                        for pn2, pidx2 in pbyn2.items():
+                            if pn2 in tl2:
+                                new_sr.setdefault(pidx2, sinfo)
+            if new_sr:
+                _bef = len(sink_registry.get((cls_name, method_name), {}))
+                sink_registry.setdefault((cls_name, method_name), {}).update(new_sr)
+                if len(sink_registry[(cls_name, method_name)]) > _bef:
+                    _changed_sr = True
         if not _changed_sr:
             break
+
+    # Build name-only reverse index for caller-side variable-qualifier lookups.
+    sink_registry_by_method: dict[str, dict] = {}
+    for (ck, mk), sv in sink_registry.items():
+        sink_registry_by_method.setdefault(mk, {}).update(sv)
 
     return JavaCrossFileCtx(
         remote_methods=remote_methods,
         tainted_callee_params=tainted_callee_params,
         sink_registry=sink_registry,
+        sink_registry_by_method=sink_registry_by_method,
     )
 
 
@@ -2341,10 +2361,10 @@ class JavaASTAnalyzer(BaseAnalyzer):
 
             # Pattern B: obj.method(data) where obj was declared as new Foo().
             if _var_type_mid:
-                _sr_mn_b = {k[1] for k in _cf_sr.sink_registry}
+                _sr_mn_b = _cf_sr.sink_registry_by_method  # pre-built name-only index
                 try:
                     for _mi2_path, _mi2_node in tree.filter(jt.MethodInvocation):
-                        if _mi2_node.member not in _sr_mn_b:
+                        if _mi2_node.member not in _sr_mn_b:  # O(1) dict lookup
                             continue
                         _q2 = str(_mi2_node.qualifier or "")
                         if not _q2 or _q2[0].isupper():
