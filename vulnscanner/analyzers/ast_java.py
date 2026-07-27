@@ -927,6 +927,12 @@ def _is_tainted_raw(node, tainted_raw: "set[str]", const_ints: "dict | None" = N
             return True
         if any(_is_tainted_raw(a, tainted_raw, const_ints) for a in (node.arguments or [])):
             return True
+        # Chained selectors: e.g. ESAPI.encoder().encodeForHTML(taintedParam) — the outer
+        # node is encoder() with no args; taint lives in the selector's arguments.
+        for _sel in (node.selectors or []):
+            if isinstance(_sel, jt.MethodInvocation):
+                if any(_is_tainted_raw(a, tainted_raw, const_ints) for a in (_sel.arguments or [])):
+                    return True
         return False
     if isinstance(node, jt.MemberReference):
         if node.member in tainted_raw:
@@ -1326,6 +1332,8 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                             if _loc_r is not None:
                                 if _loc_r:
                                     tainted.add(decl.name); changed = True
+                                elif decl.name not in tainted_raw and _is_tainted_raw(init, tainted_raw, const_ints):
+                                    tainted_raw.add(decl.name); changed = True
                                 continue  # analysis was definitive
                         # Cross-file: qualified method call (obj.method() / Class.method())
                         # where the qualifier itself isn't tainted (caught by _is_tainted below).
@@ -1463,6 +1471,8 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                             if result:
                                 tainted.add(_vname)
                                 changed = True
+                            elif _vname not in tainted_raw and _is_tainted_raw(rhs, tainted_raw, const_ints):
+                                tainted_raw.add(_vname); changed = True
                             continue  # analysis decided; skip arg-based fallback
                     # this.method(args) in assignment RHS
                     if (isinstance(rhs, jt.This)
