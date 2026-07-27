@@ -2281,10 +2281,35 @@ class JavaASTAnalyzer(BaseAnalyzer):
             pass
 
         # ── Cross-file interprocedural sink detection ─────────────────────────
-        # When tainted data from this file is passed via (new Foo()).sink(data)
-        # to a method known to contain SQL/path sinks, flag the call site.
+        # Pattern A: (new Foo()).sink(data) — ClassCreator with selector.
+        # Pattern B: Foo foo = new Foo(); foo.sink(data) — variable-qualified MI.
+        # Both patterns use sink_registry keyed by (class_name, method_name).
         _cf_sr = _get_java_cf_ctx()
         if _cf_sr and _cf_sr.sink_registry:
+            # Build (var_name, method_idx) → class_name for pattern B.
+            # Method index is the same as _eff_tainted uses, giving per-method scope.
+            _var_type_mid: dict = {}
+            try:
+                for _, _vtm_lvd in tree.filter(jt.LocalVariableDeclaration):
+                    _vtm_ln = getattr(getattr(_vtm_lvd, "position", None), "line", -1)
+                    if _vtm_ln < 0 or _vtm_ln in dead_lines:
+                        continue
+                    _vtm_midx = -1
+                    for _vi, _vs in enumerate(_mstarts_mlc):
+                        if _vtm_ln >= _vs:
+                            _vtm_midx = _vi
+                        else:
+                            break
+                    if _vtm_midx < 0:
+                        continue
+                    for _vtm_decl in _vtm_lvd.declarators:
+                        _vtm_init = _vtm_decl.initializer
+                        if isinstance(_vtm_init, jt.ClassCreator):
+                            _var_type_mid[(_vtm_decl.name, _vtm_midx)] = _type_name(_vtm_init.type)
+            except Exception:
+                pass
+
+            # Pattern A
             try:
                 for _cfi_path, _cfi_node in tree.filter(jt.ClassCreator):
                     for _cfi_sel in (_cfi_node.selectors or []):
@@ -2313,6 +2338,46 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                 break
             except Exception:
                 pass
+
+            # Pattern B: obj.method(data) where obj was declared as new Foo().
+            if _var_type_mid:
+                _sr_mn_b = {k[1] for k in _cf_sr.sink_registry}
+                try:
+                    for _mi2_path, _mi2_node in tree.filter(jt.MethodInvocation):
+                        if _mi2_node.member not in _sr_mn_b:
+                            continue
+                        _q2 = str(_mi2_node.qualifier or "")
+                        if not _q2 or _q2[0].isupper():
+                            continue  # skip class-qualified; handled by Pattern A / Phase 1
+                        _mi2_line = _node_line(_mi2_node)
+                        if not _mi2_line:
+                            for _mi2_anc in reversed(_mi2_path):
+                                _mi2_line = _node_line(_mi2_anc)
+                                if _mi2_line:
+                                    break
+                        if not _mi2_line or _mi2_line in dead_lines:
+                            continue
+                        _mi2_midx = -1
+                        for _i2, _s2 in enumerate(_mstarts_mlc):
+                            if _mi2_line >= _s2:
+                                _mi2_midx = _i2
+                            else:
+                                break
+                        _cls2 = _var_type_mid.get((_q2, _mi2_midx))
+                        if not _cls2:
+                            continue
+                        _callee_sinks2 = _cf_sr.sink_registry.get((_cls2, _mi2_node.member))
+                        if not _callee_sinks2:
+                            continue
+                        _et_mi2 = _eff_tainted(_mi2_line)
+                        _mi2_args = _mi2_node.arguments or []
+                        for _mi2_pidx, (_mi2_rid, _mi2_vt, _mi2_sv, _mi2_desc) in _callee_sinks2.items():
+                            if _mi2_pidx < len(_mi2_args) and _is_tainted(_mi2_args[_mi2_pidx], _et_mi2):
+                                _add(_mi2_node, _mi2_vt, _mi2_sv, _mi2_rid, _mi2_desc,
+                                     line_override=_mi2_line)
+                                break
+                except Exception:
+                    pass
 
         # ── Weak cryptography — new Random() or Math.random() ────────────────
         try:
