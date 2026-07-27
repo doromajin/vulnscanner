@@ -730,6 +730,9 @@ def _build_remote_func_defs(
                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         if not n.name.startswith("_"):
                             remote[f"{as_name}.{n.name}"] = (n, module_file)
+                # Phase B: import config; config.HOST — map "alias.varname" → source_file
+                for tname in module_tainted_globals.get(module_file, set()):
+                    remote_globals[f"{as_name}.{tname}"] = module_file
 
     return remote, class_methods, remote_globals
 
@@ -910,6 +913,15 @@ class PythonASTAnalyzer(BaseAnalyzer):
                                 _as = _al.asname or _al.name
                                 if _al.name in _src_tainted and _as not in _rtg:
                                     _rtg[_as] = _src_fp
+                    elif isinstance(_imp, ast.Import):
+                        for _alias in _imp.names:
+                            _src_fp = _resolve_module_to_file(_alias.name, file_path, _all)
+                            if _src_fp and _src_fp in _cf_summary.tainted_globals:
+                                _as = _alias.asname or _alias.name
+                                for _tname in _cf_summary.tainted_globals[_src_fp]:
+                                    _dotted = f"{_as}.{_tname}"
+                                    if _dotted not in _rtg:
+                                        _rtg[_dotted] = _src_fp
             _cross_file_local.remote_func_defs = _rfd
             _cross_file_local.remote_class_methods = _rcm
             _cross_file_local.remote_tainted_globals = _rtg
@@ -3007,6 +3019,14 @@ def _taint_of(
         # Attribute of a clean object (e.g. imported module constant) stays clean.
         if obj_taint.status == TaintStatus.CLEAN:
             return CLEAN_LITERAL
+        # import config; config.HOST — look up "module.attr" in remote_tainted_globals.
+        if isinstance(node.value, ast.Name):
+            _rtg = getattr(_cross_file_local, "remote_tainted_globals", {})
+            dotted = f"{node.value.id}.{attr}"
+            if dotted in _rtg:
+                return TaintInfo(TaintStatus.TAINTED,
+                                 f"tainted module global '{dotted}' from {_rtg[dotted]}",
+                                 source=dotted)
         # Path navigation attributes on UNKNOWN objects: cannot carry injected content
         # (TAINTED objects are caught above — their attributes propagate TAINTED).
         if attr in _CLEAN_PATH_ATTRS:
