@@ -1285,14 +1285,18 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                 and str(_li_inner.qualifier or "") in list_contents):
                             _liq = str(_li_inner.qualifier)
                             _lia = _li_inner.arguments or []
+                            _lii_resolved = False
                             if _lia:
                                 _lii = _eval_const_expr(_lia[0], const_ints, const_strings)
                                 if (_lii is not None
-                                        and 0 <= _lii < len(list_contents[_liq])
-                                        and list_contents[_liq][_lii]):
-                                    tainted.add(decl.name); changed = True
-                            if _liq not in tainted:
-                                continue  # skip general propagation for tracked clean list
+                                        and 0 <= _lii < len(list_contents[_liq])):
+                                    _lii_resolved = True
+                                    if list_contents[_liq][_lii]:
+                                        tainted.add(decl.name); changed = True
+                            # Index-resolved: definitive result, skip general propagation.
+                            # Unresolved but clean list: also skip (no taint to propagate).
+                            if _lii_resolved or _liq not in tainted:
+                                continue
                         # Key-matched HashMap.get: (Type) map.get("key").
                         # For literal-key access on a tracked map, key-specific result is
                         # final — do not allow qualifier-in-tainted to override clean keys.
@@ -1431,14 +1435,18 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                             and str(_li_rhs.qualifier or "") in list_contents):
                         _liq2 = str(_li_rhs.qualifier)
                         _lia2 = _li_rhs.arguments or []
+                        _lii2_resolved = False
                         if _lia2:
                             _lii2 = _eval_const_expr(_lia2[0], const_ints, const_strings)
                             if (_lii2 is not None
-                                    and 0 <= _lii2 < len(list_contents[_liq2])
-                                    and list_contents[_liq2][_lii2]):
-                                tainted.add(_vname); changed = True
-                        if _liq2 not in tainted:
-                            continue  # skip general propagation for tracked clean list
+                                    and 0 <= _lii2 < len(list_contents[_liq2])):
+                                _lii2_resolved = True
+                                if list_contents[_liq2][_lii2]:
+                                    tainted.add(_vname); changed = True
+                        # Index-resolved: definitive result, skip general propagation.
+                        # Unresolved but clean list: also skip.
+                        if _lii2_resolved or _liq2 not in tainted:
+                            continue
                     # For bare (no-qualifier) static calls, try intra-file return analysis.
                     # qualifier='' → bare call; qualifier=None → new X().m() chain → skip.
                     if (isinstance(rhs, jt.MethodInvocation)
