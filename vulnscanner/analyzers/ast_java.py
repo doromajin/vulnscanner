@@ -1850,6 +1850,22 @@ def _compute_method_local_clean(
                 elif _is_tainted(init, tainted, const_ints):
                     _has_taint_pm[(vn, m)] = True
                     _taint_inits.setdefault((vn, m), []).append(init)
+                elif (isinstance(init, jt.ClassCreator)
+                        and init.selectors
+                        and isinstance(init.selectors[-1], jt.MethodInvocation)):
+                    # ClassCreator+selector: new Foo().method(args)
+                    # _is_tainted(ClassCreator, ...) only checks constructor args and misses
+                    # taint from the fixpoint ClassCreator+selector path. Use CROSS-FILE
+                    # analysis only — same-file methods may rely on list tracking that
+                    # _analyze_local_method's simplified pass does not model.
+                    _ccs_m = init.selectors[-1]
+                    _rcc = _analyze_remote_method(
+                        _ccs_m.member, _ccs_m.arguments or [], tainted, const_ints)
+                    if _rcc is True:
+                        _has_taint_pm[(vn, m)] = True
+                    elif _rcc is False:
+                        _has_literal_pm[(vn, m)] = True
+                    # None → unknown; leave unset (conservative: taint not cleaned)
     except Exception:
         pass
 
