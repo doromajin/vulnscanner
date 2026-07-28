@@ -913,9 +913,13 @@ def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> 
         return _is_tainted(node.if_true, tainted, const_ints) or _is_tainted(node.if_false, tainted, const_ints)
     if isinstance(node, jt.This):
         # this.field — javalang: This(selectors=[MemberReference(member="field")])
+        # this.method(args) — javalang: This(selectors=[MethodInvocation(member="m")])
         for sel in (node.selectors or []):
             if isinstance(sel, jt.MemberReference) and sel.member in tainted:
                 return True
+            if isinstance(sel, jt.MethodInvocation):
+                if any(_is_tainted(a, tainted, const_ints) for a in (sel.arguments or [])):
+                    return True
         return False
     if hasattr(node, "expression"):
         return _is_tainted(node.expression, tainted, const_ints)
@@ -1812,6 +1816,121 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
     return tainted, list_tainted_vars, dead_lines, tainted_raw
 
 
+def _build_method_scope_tainted(method_node, tree, const_ints: dict, dead_lines: set) -> set:
+    """Compute which variables are tainted by sources WITHIN a single method (fresh start).
+
+    Runs an independent fixpoint for the given method, starting with an empty tainted
+    set. Only variables that receive taint from explicit sources (readLine, getParameter,
+    etc.) WITHIN this method's own body end up in the returned set.
+
+    This is used to distinguish scope-contamination FPs (Juliet _31/_42 variants) from
+    genuine taint: in goodG2B() the scanner might report data as tainted due to bad()'s
+    global taint, but per-method analysis starting fresh shows data is clean in goodG2B().
+    """
+    m_tainted: set = set()
+
+    def _m_line(n) -> int:
+        pos = getattr(n, "position", None)
+        return pos.line if pos else -1
+
+    m_ci: dict = {}
+    try:
+        for _, lvd in method_node.filter(jt.LocalVariableDeclaration):
+            for decl in lvd.declarators:
+                if decl.initializer is None:
+                    continue
+                init = decl.initializer
+                if isinstance(init, jt.Literal):
+                    v = str(init.value or "")
+                    try:
+                        m_ci[decl.name] = int(v)
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+
+    m_dead = _collect_dead_lines(method_node, m_ci, {})
+
+    for _ in range(8):
+        chg = False
+        try:
+            for _, lvd in method_node.filter(jt.LocalVariableDeclaration):
+                if _m_line(lvd) in m_dead:
+                    continue
+                for decl in lvd.declarators:
+                    vn = decl.name
+                    if vn in m_tainted:
+                        continue
+                    init = decl.initializer
+                    if init is None:
+                        continue
+                    if isinstance(init, jt.MethodInvocation):
+                        if _is_request_source(init):
+                            m_tainted.add(vn); chg = True; continue
+                        # Unqualified local method call: analyze it fresh
+                        if not (init.qualifier or ""):
+                            _loc = _analyze_local_method(
+                                tree, init.member, init.arguments or [], m_tainted, m_ci)
+                            if _loc is True:
+                                m_tainted.add(vn); chg = True; continue
+                            elif _loc is False:
+                                continue  # definitively clean
+                        else:
+                            # Qualified call: check cross-file taint source registry
+                            _rmr = _analyze_remote_method(
+                                init.member, init.arguments or [], m_tainted, m_ci)
+                            if _rmr is True:
+                                m_tainted.add(vn); chg = True; continue
+                    if _is_tainted(init, m_tainted, m_ci):
+                        m_tainted.add(vn); chg = True
+        except Exception:
+            pass
+        try:
+            for _, se in method_node.filter(jt.StatementExpression):
+                if not isinstance(getattr(se, "expression", None), jt.Assignment):
+                    continue
+                if _m_line(se) in m_dead:
+                    continue
+                assign = se.expression
+                lhs = assign.expressionl
+                if not isinstance(lhs, jt.MemberReference) or str(lhs.qualifier or ""):
+                    continue
+                vn = lhs.member
+                if vn in m_tainted:
+                    continue
+                rhs = assign.value
+                if isinstance(rhs, jt.MethodInvocation) and _is_request_source(rhs):
+                    m_tainted.add(vn); chg = True; continue
+                if _is_tainted(rhs, m_tainted, m_ci):
+                    m_tainted.add(vn); chg = True
+        except Exception:
+            pass
+        # Collection add/put tracking: coll.add(tainted) → coll becomes tainted,
+        # enabling coll.get(i) to propagate in the next fixpoint iteration.
+        try:
+            for _, se in method_node.filter(jt.StatementExpression):
+                if not isinstance(getattr(se, "expression", None), jt.MethodInvocation):
+                    continue
+                if _m_line(se) in m_dead:
+                    continue
+                mi = se.expression
+                if mi.member not in ("add", "addAll", "set", "put", "putAll", "offer", "push"):
+                    continue
+                q = str(mi.qualifier or "")
+                if not q or q in m_tainted:
+                    continue
+                args = mi.arguments or []
+                chk_idx = 1 if mi.member in ("add", "set") and len(args) == 2 else 0
+                if chk_idx < len(args) and _is_tainted(args[chk_idx], m_tainted, m_ci):
+                    m_tainted.add(q); chg = True
+        except Exception:
+            pass
+        if not chg:
+            break
+
+    return m_tainted
+
+
 def _compute_method_local_clean(
     tree, tainted: set, const_ints: dict, dead_lines: set
 ) -> "tuple[dict[int, set[str]], list[int]]":
@@ -2033,6 +2152,48 @@ def _compute_method_local_clean(
     for (vn, m) in _fresh_coll:
         if not _tainted_adds.get((vn, m)) and not _has_taint_pm.get((vn, m)):
             method_local_clean.setdefault(m, set()).add(vn)
+
+    # Pass 3: per-method scope analysis — catch scope-contamination FPs that Passes 1+2
+    # cannot resolve due to circular dependencies in the global tainted set.
+    # (Juliet _31: dataCopy=data(literal) forms a mutual-taint cycle with global tainted;
+    #  Juliet _42: data=goodG2BSource() is locally clean but global tainted from badSource())
+    # Only suppresses LOCAL VARIABLES (LVD names within the method body) — never instance
+    # fields, to avoid suppressing legitimate inter-method field-taint (e.g., SecuriBench Inter4).
+    try:
+        sorted_methods = sorted(
+            (m for _, m in tree.filter(jt.MethodDeclaration)),
+            key=lambda m: getattr(getattr(m, "position", None), "line", 0)
+        )
+        for method_node in sorted_methods:
+            m_ln = getattr(getattr(method_node, "position", None), "line", -1)
+            if m_ln < 0:
+                continue
+            m_idx = _midx(m_ln)
+            if m_idx < 0:
+                continue
+            # Collect LVD names in this method that are globally tainted
+            local_lvd_vars: set = set()
+            try:
+                for _, lvd in method_node.filter(jt.LocalVariableDeclaration):
+                    for decl in lvd.declarators:
+                        if decl.name in tainted:
+                            local_lvd_vars.add(decl.name)
+            except Exception:
+                pass
+            if not local_lvd_vars:
+                continue
+            # Build per-method scope tainted (fresh, independent of global contamination)
+            m_scope_tainted = _build_method_scope_tainted(method_node, tree, const_ints, dead_lines)
+            # Only suppress when the method has NO local taint sources at all.
+            # If the method has genuine local taint (request params, cookies, collection
+            # chains etc.), our simplified analysis may not fully track all propagation
+            # paths (e.g., enhanced-for variables, nested constructors). Being conservative:
+            # if any local taint was found, don't suppress anything in this method.
+            if not m_scope_tainted:
+                for vn in local_lvd_vars:
+                    method_local_clean.setdefault(m_idx, set()).add(vn)
+    except Exception:
+        pass
 
     return method_local_clean, mstarts
 
