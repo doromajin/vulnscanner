@@ -12,6 +12,7 @@ from vulnscanner.analyzers.ast_java import (
 )
 from vulnscanner.analyzers.ast_go import GoASTAnalyzer, _TS_GO_AVAILABLE
 from vulnscanner.analyzers.ast_js import JSASTAnalyzer, TSASTAnalyzer, _TS_JS_AVAILABLE, _TS_TS_AVAILABLE
+from vulnscanner.analyzers.ast_typescript import TypeScriptASTAnalyzer, _TSAST_AVAIL
 from vulnscanner.analyzers.ast_ruby import RubyASTAnalyzer, _TS_RUBY_AVAILABLE
 from vulnscanner.analyzers.ast_php import PhpASTAnalyzer, _TS_AVAILABLE as _TS_PHP_AVAILABLE
 
@@ -3381,6 +3382,216 @@ res.redirect('/login?next=' + safe);
 
 
 _GOAST = GoASTAnalyzer()
+_TSAST2 = TypeScriptASTAnalyzer()
+_skip_no_tsast2 = pytest.mark.skipif(not _TSAST_AVAIL, reason="tree-sitter-typescript not installed")
+
+
+@_skip_no_tsast2
+class TestTypeScriptASTAnalyzer:
+    """TypeScript-ecosystem AST taint analyzer (TSAST-* rules)."""
+
+    # ── TypeORM QueryBuilder injection ─────────────────────────────────────────
+
+    def test_typeorm_where_tainted_string(self):
+        code = """
+import { getRepository } from 'typeorm';
+app.get('/users', async (req, res) => {
+    const name = req.query.name;
+    const users = await getRepository(User)
+        .createQueryBuilder('u')
+        .where("u.name = '" + name + "'")
+        .getMany();
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-001" in rule_ids, "TypeORM where() with concatenated user input not detected"
+
+    def test_typeorm_andwhere_tainted(self):
+        code = """
+app.get('/q', async (req, res) => {
+    const role = req.query.role;
+    const q = ds.createQueryBuilder('user', 'u').andWhere("u.role = '" + role + "'");
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-001" in rule_ids
+
+    def test_typeorm_where_parameterized_is_safe(self):
+        """where(sql, { param: val }) is the TypeORM safe parameterized form — no finding."""
+        code = """
+app.get('/users', async (req, res) => {
+    const name = req.query.name;
+    await qb.where("u.name = :name", { name }).getMany();
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-001" not in rule_ids, "TypeORM parameterized where() must not be flagged"
+
+    # ── Prisma unsafe raw queries ───────────────────────────────────────────────
+
+    def test_prisma_query_raw_unsafe(self):
+        code = """
+app.get('/user', async (req, res) => {
+    const id = req.query.id;
+    const result = await prisma.$queryRawUnsafe('SELECT * FROM users WHERE id = ' + id);
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-002" in rule_ids, "Prisma $queryRawUnsafe with user input not detected"
+
+    def test_prisma_execute_raw_unsafe(self):
+        code = """
+app.delete('/user', async (req, res) => {
+    const id = req.body.id;
+    await prisma.$executeRawUnsafe('DELETE FROM users WHERE id = ' + id);
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-002" in rule_ids
+
+    def test_prisma_query_raw_tagged_template_unsafe(self):
+        """prisma.$queryRaw`SELECT ${tainted}` — interpolation without Prisma.sql is unsafe."""
+        code = """
+app.get('/user', async (req, res) => {
+    const id = req.query.id;
+    const result = await prisma.$queryRaw`SELECT * FROM users WHERE id = ${id}`;
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-002" in rule_ids, "Prisma $queryRaw tagged template interpolation not detected"
+
+    # ── Knex raw methods ────────────────────────────────────────────────────────
+
+    def test_knex_where_raw_tainted(self):
+        code = """
+app.get('/q', async (req, res) => {
+    const age = req.query.age;
+    const rows = await knex('users').whereRaw('age > ' + age);
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-003" in rule_ids, "Knex whereRaw with user input not detected"
+
+    def test_knex_having_raw_tainted(self):
+        code = """
+app.get('/stats', async (req, res) => {
+    const min = req.query.min;
+    await knex('orders').havingRaw('total > ' + min);
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-003" in rule_ids
+
+    def test_knex_where_raw_parameterized_is_safe(self):
+        """whereRaw('col = ?', [value]) is parameterized — no finding."""
+        code = """
+app.get('/q', async (req, res) => {
+    const age = req.query.age;
+    await knex('users').whereRaw('age > ?', [age]);
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-003" not in rule_ids, "Knex parameterized whereRaw must not be flagged"
+
+    # ── Sequelize literal ───────────────────────────────────────────────────────
+
+    def test_sequelize_literal_tainted(self):
+        code = """
+app.get('/q', async (req, res) => {
+    const col = req.query.col;
+    await User.findAll({ order: [Sequelize.literal(col)] });
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-004" in rule_ids, "Sequelize.literal with user input not detected"
+
+    def test_global_literal_tainted(self):
+        """literal(tainted) as a global function call (Sequelize destructured import)."""
+        code = """
+import { literal } from 'sequelize';
+app.get('/q', async (req, res) => {
+    const col = req.query.col;
+    User.findAll({ order: [literal(col)] });
+});
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-004" in rule_ids
+
+    # ── React dangerouslySetInnerHTML ───────────────────────────────────────────
+
+    def test_dangerous_set_inner_html_tainted(self):
+        """searchParams.html flows into dangerouslySetInnerHTML.__html — XSS."""
+        code = """
+import React from 'react';
+export default function Page({ searchParams }: { searchParams: { html: string } }) {
+    return <div dangerouslySetInnerHTML={{ __html: searchParams.html }} />;
+}
+"""
+        findings = _TSAST2.analyze("app.tsx", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-XSS-001" in rule_ids, "dangerouslySetInnerHTML with tainted __html not detected"
+
+    # ── Next.js source: context.query ──────────────────────────────────────────
+
+    def test_nextjs_context_query_to_sql(self):
+        """context.query.* in getServerSideProps is a user-controlled taint source."""
+        code = """
+export async function getServerSideProps(context) {
+    const id = context.query.id;
+    const result = await prisma.$queryRawUnsafe('SELECT * WHERE id=' + id);
+    return { props: { result } };
+}
+"""
+        findings = _TSAST2.analyze("page.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-002" in rule_ids, "Next.js context.query source not propagated to sink"
+
+    def test_nextjs_use_search_params_to_sql(self):
+        """useSearchParams() → get() → Prisma raw unsafe — taint chain detected."""
+        code = """
+import { useSearchParams } from 'next/navigation';
+export async function loader() {
+    const searchParams = useSearchParams();
+    const q = searchParams.get('q');
+    const rows = await prisma.$queryRawUnsafe('SELECT * FROM items WHERE name = ' + q);
+    return rows;
+}
+"""
+        findings = _TSAST2.analyze("page.tsx", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-002" in rule_ids, "useSearchParams() → get() taint not propagated to Prisma sink"
+
+    # ── No false positives on clean code ────────────────────────────────────────
+
+    def test_no_fp_typeorm_literal_value(self):
+        """TypeORM where with a literal string constant — no finding."""
+        code = """
+const users = await qb.where("u.active = true").getMany();
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-001" not in rule_ids, "TypeORM where with literal string should not be flagged"
+
+    def test_no_fp_prisma_safe_query(self):
+        """prisma.user.findMany with a parameterized filter — no finding."""
+        code = """
+const name = req.query.name;
+const users = await prisma.user.findMany({ where: { name } });
+"""
+        findings = _TSAST2.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "TSAST-SQL-002" not in rule_ids, "Prisma parameterized findMany should not be flagged"
 
 
 @_skip_no_tsgo

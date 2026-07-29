@@ -2,6 +2,7 @@ from vulnscanner.analyzers.ast_go import GoASTAnalyzer
 from vulnscanner.analyzers.ast_ruby import RubyASTAnalyzer
 from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
 from vulnscanner.analyzers.ast_js import JSASTAnalyzer, TSASTAnalyzer
+from vulnscanner.analyzers.ast_typescript import TypeScriptASTAnalyzer
 from vulnscanner.analyzers.js_taint import JSTaintAnalyzer
 from vulnscanner.analyzers.malware import MalwareAnalyzer
 from vulnscanner.analyzers.csrf import CSRFAnalyzer
@@ -61,6 +62,8 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     JSASTAnalyzer(),
     # TS AST taint tracker (.ts/.tsx — same logic, TypeScript parser)
     TSASTAnalyzer(),
+    # TS ecosystem-specific patterns (TypeORM QB, Prisma raw, Knex raw, Sequelize, React JSX)
+    TypeScriptASTAnalyzer(),
     # JS/TS regex taint tracker (fallback for patterns AST doesn't cover)
     JSTaintAnalyzer(),
     CSRFAnalyzer(),
