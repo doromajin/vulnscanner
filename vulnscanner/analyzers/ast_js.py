@@ -637,6 +637,67 @@ _REDOS_ALTERNATION = _re.compile(
 )
 
 
+def _is_safe_alternation_group(group_str: str) -> bool:
+    """Return True if group_str is a (?:A|B) where A and B have mutually exclusive first chars.
+
+    Catches the common tokenizer pattern  (?:"[^"]*"|[^\\s"])+  where the
+    quoted-string alternative starts with `"` and the fallback class excludes `"`,
+    making catastrophic backtracking impossible even though `[^"]*` has an inner `*`.
+    """
+    if not group_str.startswith("(?:"):
+        return False
+
+    inner_with_tail = group_str[3:]
+    paren_pos = inner_with_tail.rfind(")")
+    if paren_pos == -1:
+        return False
+    inner = inner_with_tail[:paren_pos]
+
+    # Locate top-level `|` (skip pipes inside nested groups or character classes)
+    depth = 0
+    in_class = False
+    pipe_positions: list[int] = []
+    for i, ch in enumerate(inner):
+        if ch == "[" and not in_class:
+            in_class = True
+        elif ch == "]" and in_class:
+            in_class = False
+        elif not in_class:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "|" and depth == 0:
+                pipe_positions.append(i)
+
+    if len(pipe_positions) != 1:
+        return False
+
+    pipe = pipe_positions[0]
+    a1, a2 = inner[:pipe], inner[pipe + 1:]
+
+    def _first(s: str) -> str:
+        s = s.lstrip()
+        if not s:
+            return ""
+        if s[0] == "[":
+            end = s.find("]", 1)
+            return s[: end + 1] if end != -1 else s
+        if s[0] == "\\":
+            return s[:2] if len(s) >= 2 else s
+        return s[0]
+
+    c1, c2 = _first(a1), _first(a2)
+
+    # literal char on one side, negated class [^...] on the other that excludes it
+    if len(c1) == 1 and c1 != "\\" and c2.startswith("[^") and c1 in c2:
+        return True
+    if len(c2) == 1 and c2 != "\\" and c1.startswith("[^") and c2 in c1:
+        return True
+
+    return False
+
+
 def _is_redos_pattern(pattern_src: str) -> str | None:
     """Return a short description if *pattern_src* has a ReDoS-risky construct, else None.
 
@@ -645,7 +706,10 @@ def _is_redos_pattern(pattern_src: str) -> str | None:
     """
     m = _REDOS_NESTED.search(pattern_src)
     if m:
-        return f"nested quantifier: {m.group()!r}"
+        # Skip safe tokenizer patterns like (?:"[^"]*"|[^\\s"])+ where alternation
+        # branches have mutually exclusive first characters (no ambiguous backtracking).
+        if not _is_safe_alternation_group(m.group()):
+            return f"nested quantifier: {m.group()!r}"
 
     m = _REDOS_ALTERNATION.search(pattern_src)
     if m:

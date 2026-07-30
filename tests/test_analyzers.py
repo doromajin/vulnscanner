@@ -3171,6 +3171,20 @@ app.post('/run', (req, res) => {
         redos = [f for f in findings if f.rule_id == "JSAST-REDOS-001"]
         assert not redos, 'Standard escape-aware string regex must not FP'
 
+    def test_no_fp_redos_tokenizer_pattern(self):
+        """Tokenizer (?:"[^"]*"|[^\\s"])+ has mutually exclusive branches — must not FP."""
+        code = r'const TOKEN_RE = /(?:"[^"]*"|[^\s"])+/g;'
+        findings = _JSAST.analyze("tokenizer.js", code)
+        redos = [f for f in findings if f.rule_id == "JSAST-REDOS-001"]
+        assert not redos, "Tokenizer regex with mutually exclusive alternation must not FP"
+
+    def test_no_fp_redos_sqtoken_pattern(self):
+        """Single-quoted variant (?:'[^']*'|[^\\s'])+ — mutually exclusive, must not FP."""
+        code = r"const SQTOKEN_RE = /(?:'[^']*'|[^\s'])+/g;"
+        findings = _JSAST.analyze("tokenizer.js", code)
+        redos = [f for f in findings if f.rule_id == "JSAST-REDOS-001"]
+        assert not redos, "Single-quoted tokenizer regex must not FP"
+
     # ── DOM-based XSS ─────────────────────────────────────────────────────────
 
     def test_dom_xss_innerhtml_location(self):
