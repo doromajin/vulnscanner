@@ -127,6 +127,34 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     ("DESER-010",     "java/deserialization.java",     "CRITICAL", "Java XMLDecoder arbitrary object instantiation"),
     ("JAST-DESER-001","java/deserialization.java",     "CRITICAL", "Java AST deserialization"),
     ("JAST-DESER-002","java/deserialization.java",     "CRITICAL", "SnakeYAML new Yaml() without SafeConstructor (CVE-2022-1471)"),
+
+    # -- Go: SQL injection --------------------------------------------------------
+    ("GOAST-SQL-001", "go/sql_injection.go",           "HIGH",     "Go: tainted string concatenated into db.Query()"),
+
+    # -- Go: command injection ----------------------------------------------------
+    ("GOAST-CMD-001", "go/command_injection.go",       "CRITICAL", "Go: tainted arg in exec.Command()"),
+
+    # -- Go: path traversal -------------------------------------------------------
+    ("GOAST-PATH-001","go/path_traversal.go",          "HIGH",     "Go: tainted path in os.Open()"),
+
+    # -- Go: SSRF -----------------------------------------------------------------
+    ("GOAST-SSRF-001","go/ssrf.go",                   "HIGH",     "Go: tainted URL in http.Get()"),
+
+    # -- TypeScript: TypeORM QueryBuilder injection --------------------------------
+    ("TSAST-SQL-001", "ts/typeorm_sqli.ts",            "HIGH",     "TypeORM .where() raw string concatenation"),
+
+    # -- TypeScript: Prisma $queryRawUnsafe ----------------------------------------
+    ("TSAST-SQL-002", "ts/prisma_sqli.ts",             "CRITICAL", "Prisma $queryRawUnsafe with tainted arg"),
+
+    # -- TypeScript: Knex .whereRaw() ---------------------------------------------
+    ("TSAST-SQL-003", "ts/knex_sqli.ts",               "HIGH",     "Knex .whereRaw() without bindings array"),
+
+    # -- TypeScript: Sequelize .query() -------------------------------------------
+    ("TSAST-SQL-004", "ts/sequelize_sqli.ts",          "HIGH",     "Sequelize .query() with tainted arg"),
+    ("JSAST-SQL-001", "ts/sequelize_sqli.ts",          "HIGH",     "Sequelize .query() also caught by generic JSAST SQL sink"),
+
+    # -- TypeScript: React dangerouslySetInnerHTML --------------------------------
+    ("TSAST-XSS-001", "ts/jsx_xss.tsx",               "HIGH",     "React dangerouslySetInnerHTML with searchParams"),
 ]
 
 
@@ -284,13 +312,18 @@ def run(verbose: bool = False) -> int:
     )
 
     # ── Output ────────────────────────────────────────────────────────────
+    def _safe(s: str) -> str:
+        return s.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
+            sys.stdout.encoding or "utf-8", errors="replace"
+        )
+
     print(f"\n-- recall_check {'=' * 56}")
     for msg in passes:
-        print(f"  \033[32m{msg}\033[0m")
+        print(f"  \033[32m{_safe(msg)}\033[0m")
     if fails:
         print()
     for msg in fails:
-        print(f"  \033[31m{msg}\033[0m")
+        print(f"  \033[31m{_safe(msg)}\033[0m")
 
     print(f"\n  recall {n_r_pass}/{n_expected}", end="")
     print(f"  |  neg FP {len(neg_fp)}/{neg_total}", end="")

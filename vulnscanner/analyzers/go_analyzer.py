@@ -13,6 +13,15 @@ import re
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
+try:
+    from vulnscanner.analyzers.ast_go import _TS_GO_AVAILABLE as _AST_GO_AVAILABLE
+except Exception:
+    _AST_GO_AVAILABLE = False
+
+# Rule IDs whose patterns are fully superseded by GoASTAnalyzer when tree-sitter-go is installed.
+# Suppressing them avoids FPs on parameterized queries that the regex can't distinguish from unsafe ones.
+_AST_SUPERSEDED = frozenset({"GO-SQL-001", "GO-SQL-002"})
+
 _SI   = VulnType.SQL_INJECTION
 _CI   = VulnType.COMMAND_INJECTION
 _PT   = VulnType.PATH_TRAVERSAL
@@ -144,7 +153,8 @@ class GoAnalyzer(BaseAnalyzer):
     supported_extensions = (".go",)
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        findings = self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)
+        rules = [r for r in _RULES if not (_AST_GO_AVAILABLE and r[0] in _AST_SUPERSEDED)]
+        findings = self._scan_lines(file_path, content, repo_url, rules, guard=_GUARD)
         findings.extend(self._taint_lite(file_path, content, repo_url))
         return findings
 
@@ -180,6 +190,8 @@ class GoAnalyzer(BaseAnalyzer):
             if tainted.get(matched_var) == i:
                 continue
             for sink_re, rule_id, desc, severity, vuln_type in _TAINT_SINKS:
+                if _AST_GO_AVAILABLE and rule_id in _AST_SUPERSEDED:
+                    continue
                 if not sink_re.search(line):
                     continue
                 key = (i, rule_id)
