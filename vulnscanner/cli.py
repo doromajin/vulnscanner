@@ -1,7 +1,14 @@
 import os
 import sys
+from pathlib import Path
 
 import click
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=False)
+except ImportError:
+    pass
 from rich.console import Console
 
 from vulnscanner.reporters.console import print_results, print_finding_detail, print_rank_table
