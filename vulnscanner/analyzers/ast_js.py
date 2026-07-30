@@ -444,41 +444,73 @@ def _extract_destruct_local(node) -> str | None:
     return None
 
 
+def _func_body_is_tainted(func_node, state: _JSTaintState) -> bool:
+    """Return True if func_node (arrow/function/method) returns tainted data."""
+    body = func_node.child_by_field_name("body")
+    if body is None:
+        return False
+    # Arrow function with expression body: (req) => req.query.id
+    if body.type != "statement_block":
+        body_unwrapped = _unwrap(body)
+        return state.is_tainted_node(body_unwrapped) or _is_request_source(body_unwrapped)
+    # Block body: look for any return statement that carries taint
+    for sub in _walk(body):
+        if sub.type == "return_statement" and sub.named_children:
+            ret_val = _unwrap(sub.named_children[0])
+            if state.is_tainted_node(ret_val) or _is_request_source(ret_val):
+                return True
+    return False
+
+
 def _analyze_functions(root, state: _JSTaintState) -> bool:
-    """Find named functions whose return value is tainted. Returns True if new."""
+    """Find named functions whose return value is tainted. Returns True if new.
+
+    Covers three forms:
+      1. function f() {}  /  function* f() {}  — function_declaration
+      2. const f = () => ...  /  const f = function() {}  — variable_declarator
+      3. { method() {} }  — object method (method_definition / pair with function value)
+    """
     changed = False
     for node in _walk(root):
-        if node.type not in ("function_declaration", "generator_function_declaration"):
-            continue
-        name_node = node.child_by_field_name("name")
-        if name_node is None:
-            continue
-        fname = name_node.text.decode("utf-8", errors="replace")
-        if fname in state.tainted_funcs:
+        fname: str | None = None
+        func_node = None
+
+        if node.type in ("function_declaration", "generator_function_declaration"):
+            name_node = node.child_by_field_name("name")
+            if name_node is None:
+                continue
+            fname = name_node.text.decode("utf-8", errors="replace")
+            func_node = node
+
+        elif node.type == "variable_declarator":
+            # const f = (req) => ...  or  const f = function(req) { ... }
+            name_node = node.child_by_field_name("name")
+            val_node = node.child_by_field_name("value")
+            if name_node is None or val_node is None or name_node.type != "identifier":
+                continue
+            val_unwrapped = _unwrap(val_node)
+            if val_unwrapped.type not in (
+                "arrow_function", "function_expression", "generator_function"
+            ):
+                continue
+            fname = name_node.text.decode("utf-8", errors="replace")
+            func_node = val_unwrapped
+
+        elif node.type == "method_definition":
+            # class / object method shorthand:  getInput(req) { return req.body.name; }
+            name_node = node.child_by_field_name("name")
+            if name_node is None:
+                continue
+            fname = name_node.text.decode("utf-8", errors="replace")
+            func_node = node
+
+        if fname is None or func_node is None or fname in state.tainted_funcs:
             continue
 
-        # Get parameter names → they are locally scoped and not tainted per se
-        # (we can't know if callers pass tainted args without tracking call sites)
-        params: set[str] = set()
-        param_node = node.child_by_field_name("parameters")
-        if param_node:
-            for p in param_node.named_children:
-                if p.type == "identifier":
-                    params.add(p.text.decode())
+        if _func_body_is_tainted(func_node, state):
+            state.tainted_funcs.add(fname)
+            changed = True
 
-        body = node.child_by_field_name("body")
-        if body is None:
-            continue
-
-        # Check if any return statement returns tainted data
-        for sub in _walk(body):
-            if sub.type == "return_statement" and sub.named_children:
-                ret_val = sub.named_children[0]
-                ret_val = _unwrap(ret_val)
-                if state.is_tainted_node(ret_val) or _is_request_source(ret_val):
-                    state.tainted_funcs.add(fname)
-                    changed = True
-                    break
     return changed
 
 

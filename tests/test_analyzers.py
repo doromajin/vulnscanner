@@ -3309,6 +3309,51 @@ app.get('/search', async (req: Request, res: Response) => {
         rule_ids = {f.rule_id for f in findings}
         assert "JSAST-SQL-001" in rule_ids, "TS interprocedural return taint not propagated"
 
+    def test_interprocedural_arrow_function(self):
+        """Arrow function assigned to const: taint in return value propagates."""
+        code = """
+const getParam = (req: Request, key: string): string => req.query[key] as string;
+
+app.get('/search', (req: Request, res: Response) => {
+    const id = getParam(req, 'id');
+    db.query("SELECT * FROM users WHERE id = '" + id + "'");
+});
+"""
+        findings = _TSAST.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "Arrow function interprocedural taint not detected"
+
+    def test_interprocedural_async_arrow(self):
+        """Async arrow function: await of tainted return propagates taint."""
+        code = """
+const fetchId = async (req: any): Promise<string> => {
+    return req.query.id as string;
+};
+
+async function handler(req: any, res: any) {
+    const id = await fetchId(req);
+    db.query("SELECT * WHERE id = '" + id + "'");
+}
+"""
+        findings = _TSAST.analyze("handler.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "Async arrow interprocedural taint not detected"
+
+    def test_interprocedural_two_hop_arrows(self):
+        """Two-hop chain: arrow → arrow → SQL sink must be detected."""
+        code = """
+const getRaw = (req: any, key: string) => req.query[key];
+const getId = (req: any) => getRaw(req, 'id');
+
+function handler(req: any, res: any) {
+    const id = getId(req);
+    db.query("SELECT * WHERE id='" + id + "'");
+}
+"""
+        findings = _TSAST.analyze("handler.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "Two-hop arrow chain taint not detected"
+
     def test_no_fp_parseint_sanitizer(self):
         code = """
 app.get('/page', (req: Request, res: Response): void => {

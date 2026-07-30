@@ -155,6 +155,10 @@ EXPECTED: list[tuple[str, str, str, str]] = [
 
     # -- TypeScript: React dangerouslySetInnerHTML --------------------------------
     ("TSAST-XSS-001", "ts/jsx_xss.tsx",               "HIGH",     "React dangerouslySetInnerHTML with searchParams"),
+
+    # -- TypeScript: arrow function interprocedural taint -------------------------
+    ("JSAST-SQL-001", "ts/arrow_sqli.ts",             "HIGH",     "Arrow function return taint flows to SQL sink"),
+    ("JSAST-SQL-001", "ts/async_arrow_sqli.ts",       "HIGH",     "Async arrow function return taint flows to SQL sink"),
 ]
 
 
