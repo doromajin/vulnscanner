@@ -3354,6 +3354,51 @@ function handler(req: any, res: any) {
         rule_ids = {f.rule_id for f in findings}
         assert "JSAST-SQL-001" in rule_ids, "Two-hop arrow chain taint not detected"
 
+    def test_interprocedural_obj_method(self):
+        """Object method shorthand: helpers.getInput(req) must propagate taint."""
+        code = """
+const helpers = {
+    getInput(req: any) { return req.body.name; }
+};
+function handler(req: any, res: any) {
+    const name = helpers.getInput(req);
+    db.query("SELECT * WHERE name='" + name + "'");
+}
+"""
+        findings = _TSAST.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "obj.method() interprocedural taint not detected"
+
+    def test_interprocedural_this_method(self):
+        """Class method: this.getParam(req) must propagate taint."""
+        code = """
+class UserService {
+    getParam(req: any) { return req.query.id; }
+    handle(req: any, res: any) {
+        const id = this.getParam(req);
+        db.query("SELECT * WHERE id='" + id + "'");
+    }
+}
+"""
+        findings = _TSAST.analyze("app.ts", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JSAST-SQL-001" in rule_ids, "this.method() interprocedural taint not detected"
+
+    def test_no_fp_obj_method_constant_return(self):
+        """Object method returning a constant must NOT propagate taint."""
+        code = """
+const helpers = {
+    getDefaultRole() { return 'viewer'; }
+};
+function handler(req: any, res: any) {
+    const role = helpers.getDefaultRole();
+    db.query('SELECT * WHERE role = ?', [role]);
+}
+"""
+        findings = _TSAST.analyze("app.ts", code)
+        sql = [f for f in findings if f.rule_id == "JSAST-SQL-001"]
+        assert not sql, "Method returning constant must not FP"
+
     def test_no_fp_parseint_sanitizer(self):
         code = """
 app.get('/page', (req: Request, res: Response): void => {

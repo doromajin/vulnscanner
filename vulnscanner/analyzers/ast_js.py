@@ -272,10 +272,19 @@ class _JSTaintState:
             if _is_request_source(node):
                 return True
             func = node.child_by_field_name("function")
-            if func is not None and func.type == "identifier":
-                fname = func.text.decode("utf-8", errors="replace")
-                if fname in self.tainted_funcs:
-                    return True
+            if func is not None:
+                if func.type == "identifier":
+                    # f(req) — plain function call
+                    if func.text.decode("utf-8", errors="replace") in self.tainted_funcs:
+                        return True
+                elif func.type == "member_expression":
+                    # obj.method(req) — check the method name against taint-source methods.
+                    # The method name is stored in tainted_funcs by _analyze_functions when
+                    # its body returns a tainted value (e.g. helpers.getInput returns req.body.x).
+                    prop = func.child_by_field_name("property")
+                    if prop is not None:
+                        if prop.text.decode("utf-8", errors="replace") in self.tainted_funcs:
+                            return True
             return False
 
         # Object literal {key: taintedVal} — common in NoSQL queries like find({name: x})

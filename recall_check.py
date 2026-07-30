@@ -55,6 +55,7 @@ EXPECTED: list[tuple[str, str, str, str]] = [
     # -- JavaScript ---------------------------------------------------------------
     # JSAST-DOMXSS-001 (JS taint analyzer) supersedes XSS-001 (regex) at the same line
     ("JSAST-DOMXSS-001", "js/xss.js",                "HIGH",     "innerHTML XSS"),
+    ("JSAST-SQL-001",    "js/obj_method_sqli.js",    "HIGH",     "Object method interprocedural taint flows to SQL sink"),
 
     # -- PHP: PHAST-* are AST findings; DESER-004/SQL-004 are regex rules --------
     # PHAST-DESER-001 (PHP AST) supersedes DESER-004 (regex) at the same line
