@@ -33,7 +33,10 @@ Analyzers:
 """
 from __future__ import annotations
 
+import posixpath as _posixpath
 import re as _re
+import threading as _threading
+from dataclasses import dataclass as _dataclass, field as _field
 
 try:
     import tree_sitter_javascript as _tsjs
@@ -60,6 +63,29 @@ from vulnscanner.models import Finding, Severity, VulnType
 
 _JS_AST_EXTS = (".js", ".jsx", ".mjs", ".cjs")
 _TS_AST_EXTS = (".ts", ".tsx")
+_ALL_JS_TS_EXTS = _JS_AST_EXTS + _TS_AST_EXTS
+
+# ── Cross-file taint context ──────────────────────────────────────────────────
+
+
+@_dataclass
+class JSCrossFileContext:
+    """Exported tainted function names, pre-computed for all JS/TS files."""
+    # normalized file path → frozenset of exported function names that return tainted data
+    tainted_exports: dict[str, frozenset[str]] = _field(default_factory=dict)
+    # normalized paths of all JS/TS files in the project (for import resolution)
+    all_paths: frozenset[str] = _field(default_factory=frozenset)
+
+
+_js_cf_local = _threading.local()
+
+
+def set_js_cross_file_context(ctx: "JSCrossFileContext | None") -> None:
+    _js_cf_local.ctx = ctx
+
+
+def _get_js_cf_ctx() -> "JSCrossFileContext | None":
+    return getattr(_js_cf_local, "ctx", None)
 
 # ── Taint source detection ────────────────────────────────────────────────────
 
@@ -1056,6 +1082,241 @@ def _check_sinks(
     return findings
 
 
+# ── Cross-file export / import resolution ────────────────────────────────────
+
+
+def _collect_rhs_tainted(node, tainted_funcs: set[str], out: set[str]) -> None:
+    """Collect tainted function names from the RHS of a module.exports = ... assignment."""
+    if node.type == "object":
+        for prop in node.named_children:
+            if prop.type == "pair":
+                key = prop.child_by_field_name("key")
+                val = prop.child_by_field_name("value")
+                if val and val.type == "identifier":
+                    vname = val.text.decode("utf-8", errors="replace")
+                    if vname in tainted_funcs:
+                        kname = key.text.decode("utf-8", errors="replace") if key else vname
+                        out.add(kname)
+            elif prop.type == "shorthand_property_identifier":
+                name = prop.text.decode("utf-8", errors="replace")
+                if name in tainted_funcs:
+                    out.add(name)
+            elif prop.type == "method_definition":
+                name_node = prop.child_by_field_name("name")
+                if name_node:
+                    name = name_node.text.decode("utf-8", errors="replace")
+                    if name in tainted_funcs:
+                        out.add(name)
+    elif node.type == "identifier":
+        name = node.text.decode("utf-8", errors="replace")
+        if name in tainted_funcs:
+            out.add("default")
+
+
+def _find_js_exports(root, tainted_funcs: set[str]) -> set[str]:
+    """Return exported function names (from tainted_funcs) for this file."""
+    exported: set[str] = set()
+    for node in _walk(root):
+        if node.type == "export_statement":
+            is_default = any(
+                not c.is_named and c.text == b"default" for c in node.children
+            )
+            for child in node.named_children:
+                if child.type in ("function_declaration", "generator_function_declaration"):
+                    name_node = child.child_by_field_name("name")
+                    if name_node:
+                        name = name_node.text.decode("utf-8", errors="replace")
+                        if name in tainted_funcs:
+                            exported.add(name)
+                elif child.type in ("lexical_declaration", "variable_declaration"):
+                    for decl in child.named_children:
+                        if decl.type == "variable_declarator":
+                            n = decl.child_by_field_name("name")
+                            if n and n.type == "identifier":
+                                name = n.text.decode("utf-8", errors="replace")
+                                if name in tainted_funcs:
+                                    exported.add(name)
+                elif child.type == "export_clause":
+                    for spec in child.named_children:
+                        if spec.type == "export_specifier":
+                            local_node = spec.child_by_field_name("name") or (
+                                spec.named_children[0] if spec.named_children else None
+                            )
+                            if local_node:
+                                local = local_node.text.decode("utf-8", errors="replace")
+                                if local in tainted_funcs:
+                                    alias_node = spec.child_by_field_name("alias")
+                                    out_name = (
+                                        alias_node.text.decode("utf-8", errors="replace")
+                                        if alias_node else local
+                                    )
+                                    exported.add(out_name)
+                elif child.type == "identifier" and is_default:
+                    name = child.text.decode("utf-8", errors="replace")
+                    if name in tainted_funcs:
+                        exported.add("default")
+
+        elif node.type == "assignment_expression":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is None or right is None:
+                continue
+            chain = _member_chain(left)
+            if chain[:2] == ["module", "exports"]:
+                if len(chain) == 2:
+                    _collect_rhs_tainted(right, tainted_funcs, exported)
+                elif len(chain) == 3:
+                    if chain[2] in tainted_funcs:
+                        exported.add(chain[2])
+            elif chain[:1] == ["exports"] and len(chain) == 2:
+                if chain[1] in tainted_funcs:
+                    exported.add(chain[1])
+    return exported
+
+
+def _resolve_js_path(current_file: str, spec: str, all_paths: frozenset[str]) -> "str | None":
+    """Resolve a relative import spec to a known project file path (forward-slash normalized)."""
+    if not spec.startswith("."):
+        return None  # skip node_modules / bare specifiers
+    current_dir = current_file.rsplit("/", 1)[0] if "/" in current_file else ""
+    joined = (current_dir + "/" + spec) if current_dir else spec
+    # Normalize . and ..
+    parts: list[str] = []
+    for part in joined.split("/"):
+        if part == "..":
+            if parts:
+                parts.pop()
+        elif part and part != ".":
+            parts.append(part)
+    base = "/".join(parts)
+    for ext in (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"):
+        cand = base + ext
+        if cand in all_paths:
+            return cand
+    for idx in ("index.js", "index.ts"):
+        cand = base + "/" + idx
+        if cand in all_paths:
+            return cand
+    return None
+
+
+def _resolve_js_imports(root, file_path: str, cf_ctx: JSCrossFileContext) -> set[str]:
+    """Return local names bound to tainted functions imported from other files."""
+    result: set[str] = set()
+    norm = file_path.replace("\\", "/")
+    for node in _walk(root):
+        if node.type == "import_statement":
+            source = node.child_by_field_name("source")
+            if source is None:
+                continue
+            spec = source.text.decode("utf-8", errors="replace").strip("'\"")
+            resolved = _resolve_js_path(norm, spec, cf_ctx.all_paths)
+            if resolved is None or resolved not in cf_ctx.tainted_exports:
+                continue
+            tainted = cf_ctx.tainted_exports[resolved]
+            # import_clause is a named child but NOT accessible via field name in
+            # tree-sitter's JS grammar — iterate named_children instead.
+            clause = next(
+                (c for c in node.named_children if c.type == "import_clause"), None
+            )
+            if clause is None:
+                continue
+            for child in clause.named_children:
+                if child.type == "named_imports":
+                    for spec_node in child.named_children:
+                        if spec_node.type == "import_specifier":
+                            exp_node = spec_node.child_by_field_name("name") or (
+                                spec_node.named_children[0] if spec_node.named_children else None
+                            )
+                            loc_node = spec_node.child_by_field_name("alias") or exp_node
+                            if exp_node:
+                                exp_name = exp_node.text.decode("utf-8", errors="replace")
+                                if exp_name in tainted and loc_node:
+                                    result.add(loc_node.text.decode("utf-8", errors="replace"))
+                elif child.type == "namespace_import":
+                    # import * as h from './m' — add all tainted names directly
+                    result.update(tainted - {"default"})
+                elif child.type == "identifier":
+                    # import f from './m' (default import)
+                    if "default" in tainted:
+                        result.add(child.text.decode("utf-8", errors="replace"))
+
+        elif node.type == "variable_declarator":
+            val = node.child_by_field_name("value")
+            if val is None:
+                continue
+            val_u = _unwrap(val)
+            if val_u.type != "call_expression":
+                continue
+            func = val_u.child_by_field_name("function")
+            if func is None or func.text.decode("utf-8", errors="replace") != "require":
+                continue
+            args = val_u.child_by_field_name("arguments")
+            if args is None or not args.named_children:
+                continue
+            spec = args.named_children[0].text.decode("utf-8", errors="replace").strip("'\"")
+            resolved = _resolve_js_path(norm, spec, cf_ctx.all_paths)
+            if resolved is None or resolved not in cf_ctx.tainted_exports:
+                continue
+            tainted = cf_ctx.tainted_exports[resolved]
+            name_node = node.child_by_field_name("name")
+            if name_node is None:
+                continue
+            if name_node.type == "object_pattern":
+                for prop in name_node.named_children:
+                    if prop.type == "shorthand_property_identifier_pattern":
+                        pname = prop.text.decode("utf-8", errors="replace")
+                        if pname in tainted:
+                            result.add(pname)
+                    elif prop.type == "pair_pattern":
+                        key = prop.child_by_field_name("key")
+                        alias = prop.child_by_field_name("value")
+                        if key:
+                            kname = key.text.decode("utf-8", errors="replace")
+                            if kname in tainted:
+                                local = alias.text.decode("utf-8", errors="replace") if alias else kname
+                                result.add(local)
+            elif name_node.type == "identifier":
+                # const h = require('./m') — namespace; add all tainted method names
+                result.update(tainted - {"default"})
+    return result
+
+
+def build_js_cross_file_context(all_contents: dict[str, str]) -> JSCrossFileContext:
+    """Pre-pass: build export-taint map for all JS/TS files so cross-file callers can seed imports."""
+    if not (_TS_JS_AVAILABLE or _TS_TS_AVAILABLE):
+        return JSCrossFileContext()
+    all_paths: frozenset[str] = frozenset(
+        p.replace("\\", "/") for p in all_contents
+        if any(p.endswith(e) for e in _ALL_JS_TS_EXTS)
+    )
+    tainted_exports: dict[str, frozenset[str]] = {}
+    for path, content in all_contents.items():
+        is_js = any(path.endswith(e) for e in _JS_AST_EXTS)
+        is_ts = any(path.endswith(e) for e in _TS_AST_EXTS)
+        if not (is_js or is_ts):
+            continue
+        try:
+            if is_ts:
+                if not _TS_TS_AVAILABLE:
+                    continue
+                parser = _tsx_parser if path.endswith(".tsx") else _ts_parser
+            else:
+                if not _TS_JS_AVAILABLE:
+                    continue
+                parser = _js_parser
+            tree = parser.parse(content.encode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        state = _build_taint_state(tree.root_node)
+        if not state.tainted_funcs:
+            continue
+        exported = _find_js_exports(tree.root_node, state.tainted_funcs)
+        if exported:
+            tainted_exports[path.replace("\\", "/")] = frozenset(exported)
+    return JSCrossFileContext(tainted_exports=tainted_exports, all_paths=all_paths)
+
+
 # ── Analyzer ──────────────────────────────────────────────────────────────────
 
 def _analyze_with_parser(
@@ -1067,9 +1328,21 @@ def _analyze_with_parser(
     except Exception:
         return []
     lines = content.splitlines()
-    # ReDoS: pure structural analysis — runs even when file has no request sources
     results = _check_redos(tree.root_node, file_path, lines, repo_url)
     state = _build_taint_state(tree.root_node)
+
+    # Augment state with cross-file imports: if another file exports a tainted
+    # function that this file imports, seed tainted_funcs and re-propagate.
+    cf_ctx = _get_js_cf_ctx()
+    if cf_ctx and cf_ctx.tainted_exports:
+        imported = _resolve_js_imports(tree.root_node, file_path, cf_ctx)
+        added = imported - state.tainted_funcs
+        if added:
+            state.tainted_funcs.update(added)
+            for _ in range(4):
+                if not _collect_declarations(tree.root_node, state):
+                    break
+
     if not state.tainted and not state.tainted_funcs and not state.tainted_attrs:
         return results
     results += _check_sinks(tree.root_node, state, file_path, lines, repo_url)

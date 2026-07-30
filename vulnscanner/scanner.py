@@ -25,6 +25,10 @@ from vulnscanner.analyzers.ast_go import (
     build_go_cross_file_context,
     set_go_cross_file_context,
 )
+from vulnscanner.analyzers.ast_js import (
+    build_js_cross_file_context,
+    set_js_cross_file_context,
+)
 from vulnscanner.analyzers.file_context import (
     INCLUDE_TEST_FILES,
     INCLUDE_VENDOR_FILES,
@@ -197,6 +201,7 @@ class VulnScanner:
         cf_summary = build_cross_file_summary(all_contents)
         java_cf_ctx = build_java_cross_file_context(all_contents)
         go_cf_ctx = build_go_cross_file_context(all_contents)
+        js_cf_ctx = build_js_cross_file_context(all_contents)
 
         start = time.perf_counter()
         with Progress(
@@ -211,7 +216,7 @@ class VulnScanner:
 
             with ThreadPoolExecutor(max_workers=self._workers) as pool:
                 futures = {
-                    pool.submit(self._analyze_file_pure, fp, content, directory, all_contents, cf_summary, java_cf_ctx, go_cf_ctx): fp
+                    pool.submit(self._analyze_file_pure, fp, content, directory, all_contents, cf_summary, java_cf_ctx, go_cf_ctx, js_cf_ctx): fp
                     for fp, content in files
                 }
                 for future in as_completed(futures):
@@ -238,6 +243,7 @@ class VulnScanner:
         cf_summary=None,
         java_cf_ctx=None,
         go_cf_ctx=None,
+        js_cf_ctx=None,
     ) -> _FileResult:
         """Analyze a single file; returns results without mutating shared state."""
         # Provide cross-file content map and Phase C summary via thread-local storage.
@@ -246,6 +252,7 @@ class VulnScanner:
             set_cross_file_context(all_contents, cf_summary)
         set_java_cross_file_context(java_cf_ctx)
         set_go_cross_file_context(go_cf_ctx)
+        set_js_cross_file_context(js_cf_ctx)
 
         partial = _FileResult(scanned_lines=content.count("\n") + 1)
         lines = content.splitlines()

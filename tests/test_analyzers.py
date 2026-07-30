@@ -11,7 +11,10 @@ from vulnscanner.analyzers.ast_java import (
     set_java_cross_file_context,
 )
 from vulnscanner.analyzers.ast_go import GoASTAnalyzer, _TS_GO_AVAILABLE
-from vulnscanner.analyzers.ast_js import JSASTAnalyzer, TSASTAnalyzer, _TS_JS_AVAILABLE, _TS_TS_AVAILABLE
+from vulnscanner.analyzers.ast_js import (
+    JSASTAnalyzer, TSASTAnalyzer, _TS_JS_AVAILABLE, _TS_TS_AVAILABLE,
+    build_js_cross_file_context, set_js_cross_file_context,
+)
 from vulnscanner.analyzers.ast_typescript import TypeScriptASTAnalyzer, _TSAST_AVAIL
 from vulnscanner.analyzers.ast_ruby import RubyASTAnalyzer, _TS_RUBY_AVAILABLE
 from vulnscanner.analyzers.ast_php import PhpASTAnalyzer, _TS_AVAILABLE as _TS_PHP_AVAILABLE
@@ -4931,3 +4934,128 @@ class TestExploitabilityFilter:
         secrets = [f for f in findings if f.taint_status is None and not f.suppression_reason]
         kept = [f for f in secrets if f.taint_status != "unknown"]
         assert kept, "Secret findings (no taint tracking) must survive exploitable filter"
+
+
+# ── JS/TS cross-file taint ────────────────────────────────────────────────────
+
+@pytest.mark.skipif(not _TS_JS_AVAILABLE, reason="tree-sitter-javascript not installed")
+class TestJSCrossFileTaint:
+    """Cross-file interprocedural taint: exporter → consumer → sink."""
+
+    def _run(self, all_contents: dict, consumer_path: str) -> list:
+        ctx = build_js_cross_file_context(all_contents)
+        set_js_cross_file_context(ctx)
+        try:
+            if consumer_path.endswith(".ts"):
+                analyzer = TSASTAnalyzer()
+            else:
+                analyzer = JSASTAnalyzer()
+            return analyzer.analyze(consumer_path, all_contents[consumer_path])
+        finally:
+            set_js_cross_file_context(None)
+
+    def test_cjs_named_export_sqli(self):
+        """module.exports = { getInput } → const { getInput } = require → SQL sink."""
+        helper = """\
+function getInput(req) { return req.body.name; }
+module.exports = { getInput };
+"""
+        consumer = """\
+const { getInput } = require('./helpers');
+function handler(req, res) {
+    const db = { query: (s) => s };
+    const name = getInput(req);
+    db.query("SELECT * FROM users WHERE name='" + name + "'");
+}
+"""
+        findings = self._run(
+            {"helpers.js": helper, "consumer.js": consumer},
+            "consumer.js",
+        )
+        ids = [f.rule_id for f in findings]
+        assert "JSAST-SQL-001" in ids, "CJS named export cross-file taint not detected"
+
+    def test_esm_named_export_sqli(self):
+        """export function getInput → import { getInput } → SQL sink."""
+        exporter = """\
+export function getInput(req) { return req.query.id; }
+"""
+        consumer = """\
+import { getInput } from './utils';
+function handler(req, res) {
+    const db = { query: (s) => s };
+    const id = getInput(req);
+    db.query("SELECT * FROM items WHERE id=" + id);
+}
+"""
+        # Both files in same directory so './utils' resolves correctly
+        findings = self._run(
+            {"utils.js": exporter, "handler.js": consumer},
+            "handler.js",
+        )
+        ids = [f.rule_id for f in findings]
+        assert "JSAST-SQL-001" in ids, "ESM named export cross-file taint not detected"
+
+    def test_cjs_namespace_require_sqli(self):
+        """const h = require('./m') — namespace import propagates method taint."""
+        helper = """\
+function getInput(req) { return req.body.q; }
+module.exports = { getInput };
+"""
+        consumer = """\
+const h = require('./helper');
+function handler(req, res) {
+    const db = { query: (s) => s };
+    const q = h.getInput(req);
+    db.query("SELECT * FROM t WHERE q='" + q + "'");
+}
+"""
+        findings = self._run(
+            {"helper.js": helper, "consumer.js": consumer},
+            "consumer.js",
+        )
+        ids = [f.rule_id for f in findings]
+        assert "JSAST-SQL-001" in ids, "Namespace require cross-file taint not detected"
+
+    def test_no_fp_safe_constant_export(self):
+        """Exporter returns a constant — must NOT produce a finding in consumer."""
+        helper = """\
+function getRole() { return 'admin'; }
+module.exports = { getRole };
+"""
+        consumer = """\
+const { getRole } = require('./helper');
+function handler(req, res) {
+    const db = { query: (sql, p) => null };
+    const role = getRole();
+    db.query('SELECT * FROM users WHERE role = ?', [role]);
+}
+"""
+        findings = self._run(
+            {"helper.js": helper, "consumer.js": consumer},
+            "consumer.js",
+        )
+        ids = [f.rule_id for f in findings]
+        assert "JSAST-SQL-001" not in ids, "Constant-return export must not FP"
+
+    @pytest.mark.skipif(not _TS_TS_AVAILABLE, reason="tree-sitter-typescript not installed")
+    def test_ts_esm_export_sqli(self):
+        """TypeScript ESM export → import → SQL sink."""
+        exporter = """\
+export function getInput(req: any): string { return req.query.id; }
+"""
+        consumer = """\
+import { getInput } from './helpers';
+function handler(req: any, res: any): void {
+    const db = { query: (s: string) => s };
+    const id = getInput(req);
+    db.query("SELECT * FROM items WHERE id=" + id);
+}
+"""
+        # Both files in same directory so './helpers' resolves to 'helpers.ts'
+        findings = self._run(
+            {"helpers.ts": exporter, "handler.ts": consumer},
+            "handler.ts",
+        )
+        ids = [f.rule_id for f in findings]
+        assert "JSAST-SQL-001" in ids, "TS ESM cross-file taint not detected"
