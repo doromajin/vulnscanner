@@ -193,6 +193,7 @@ _TAINTED_ATTR_NAMES = frozenset({
     "params",       # request.params (ASGI / SQLAlchemy)
     "query_params", # ASGI request.query_params
     "GET", "POST", "REQUEST", "COOKIE", "FILES",  # Django / PHP-style
+    "files",        # Flask request.files (uploaded file objects; .filename / .read() are attacker-controlled)
     "cookies",      # request.cookies
     "headers",      # request.headers
     "body",         # request.body (raw body)
@@ -3102,7 +3103,15 @@ def _taint_of(
 
         # Phase 3b: self.method(tainted_arg) — attr call where the short method name is
         # in local_func_defs but full ("self.foo") is not.  Skips 'self' when mapping params.
-        if (attr and isinstance(node.func, ast.Attribute)
+        # Guard: only apply when the direct receiver is `self` (not chained x.y.z.method())
+        # to avoid confusing framework getter methods (e.g. dict.get, QueryDict.get) with
+        # same-named local class methods (e.g. class View: def get(self, request):...).
+        _phase3b_direct_self = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        )
+        if (attr and _phase3b_direct_self
                 and attr in _lfd and _depth <= 12
                 and (not full or full not in _lfd)):
             _fd_m = _lfd[attr]

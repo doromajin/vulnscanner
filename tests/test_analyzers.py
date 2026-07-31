@@ -2718,6 +2718,83 @@ public class SafeController {
         assert not sql, "@RequestParam with parameterized query must not FP"
 
 
+# ── Python framework models ───────────────────────────────────────────────────
+
+class TestPythonFrameworkModels:
+    """Django CBV self.request.GET/POST and Flask request.files.filename detection."""
+
+    def _az(self):
+        return PythonASTAnalyzer()
+
+    def test_django_cbv_self_request_get_sql(self):
+        """Django CBV self.request.GET.get('q') → SQL must fire, not be suppressed by Phase 3b."""
+        code = """
+from django.views import View
+class SearchView(View):
+    def get(self, request):
+        q = self.request.GET.get('q')
+        import sqlite3
+        sqlite3.connect('db').execute('SELECT * FROM t WHERE q=' + q)
+"""
+        findings = self._az().analyze('views.py', code)
+        sql = [f for f in findings if f.rule_id == 'AST-SQL-002' and not f.suppression_reason]
+        assert sql, "Django CBV self.request.GET.get() must taint SQL sink"
+
+    def test_django_cbv_self_request_post_sql(self):
+        """Django CBV self.request.POST['name'] → SQL must fire."""
+        code = """
+from django.views import View
+class CreateView(View):
+    def post(self, request):
+        name = self.request.POST['name']
+        import sqlite3
+        sqlite3.connect('db').execute("INSERT INTO t VALUES ('" + name + "')")
+"""
+        findings = self._az().analyze('views.py', code)
+        sql = [f for f in findings if f.rule_id == 'AST-SQL-002' and not f.suppression_reason]
+        assert sql, "Django CBV self.request.POST[] must taint SQL sink"
+
+    def test_flask_files_filename_path_traversal(self):
+        """Flask request.files['upload'].filename → open() must fire path traversal."""
+        code = """
+from flask import request
+def upload():
+    fname = request.files['upload'].filename
+    open('/uploads/' + fname, 'rb')
+"""
+        findings = self._az().analyze('app.py', code)
+        path = [f for f in findings if 'PATH' in f.rule_id and not f.suppression_reason]
+        assert path, "Flask request.files['upload'].filename must taint open() (path traversal)"
+
+    def test_flask_files_filename_sql(self):
+        """Flask request.files['upload'].filename → SQL must fire."""
+        code = """
+from flask import request
+import sqlite3
+def upload():
+    fname = request.files['upload'].filename
+    sqlite3.connect('db').execute('INSERT INTO uploads VALUES (' + fname + ')')
+"""
+        findings = self._az().analyze('app.py', code)
+        sql = [f for f in findings if f.rule_id == 'AST-SQL-002' and not f.suppression_reason]
+        assert sql, "Flask request.files['upload'].filename must taint SQL sink"
+
+    def test_no_fp_django_cbv_safe_parameterized(self):
+        """Django CBV with parameterized query must NOT fire."""
+        code = """
+from django.views import View
+class SafeView(View):
+    def get(self, request):
+        q = self.request.GET.get('q')
+        import sqlite3
+        cur = sqlite3.connect('db').cursor()
+        cur.execute('SELECT * FROM t WHERE q=?', (q,))
+"""
+        findings = self._az().analyze('views.py', code)
+        sql = [f for f in findings if f.rule_id == 'AST-SQL-002' and not f.suppression_reason]
+        assert not sql, "Django CBV with parameterized query must not FP"
+
+
 # ── Java CFG guards ───────────────────────────────────────────────────────────
 
 @_skip_no_javalang
