@@ -1,7 +1,8 @@
 """C/C++ AST taint analyzer (tree-sitter-c / tree-sitter-cpp).
 
 Detects user-controlled data (argv, stdin, network recv) flowing into dangerous
-sinks via intra-function fixed-point taint propagation.
+sinks via intra-function fixed-point taint propagation with optional
+intra-file interprocedural analysis and macro expansion.
 
 Rule IDs (CAST-*):
   CAST-SQL-001   SQL injection (mysql_query, sqlite3_exec, PQexec, ODBC)
@@ -12,6 +13,10 @@ Rule IDs (CAST-*):
   CAST-MEM-001   Inherently unsafe functions (gets, mktemp, tmpnam, getwd)
 """
 from __future__ import annotations
+
+import re
+import subprocess
+from dataclasses import dataclass, field
 
 try:
     import tree_sitter_c as _tsc
@@ -171,6 +176,71 @@ _ALWAYS_UNSAFE: dict[str, tuple] = {
 }
 
 
+# ── Macro expansion / preprocessing ──────────────────────────────────────────
+
+_CLANG_AVAIL: bool | None = None
+
+
+def _expand_defines(content: str) -> str:
+    """Expand simple #define UPPER lower portability aliases (no external deps).
+
+    Handles patterns like:  #define SYSTEM system
+    Does NOT handle function-like macros or multi-token replacements.
+    """
+    defines: dict[str, str] = {}
+    for m in re.finditer(
+        r'^[ \t]*#[ \t]*define[ \t]+([A-Z_][A-Z0-9_]*)[ \t]+([a-z_][a-z0-9_]*)[ \t]*(?:#.*)?$',
+        content, re.MULTILINE
+    ):
+        defines[m.group(1)] = m.group(2)
+    for macro, repl in defines.items():
+        content = re.sub(r'\b' + re.escape(macro) + r'\b', repl, content)
+    return content
+
+
+def _try_clang_preprocess(content: str, lang: str = "c") -> str | None:
+    """Run `clang -E -P` to expand macros. Returns None if clang is unavailable."""
+    global _CLANG_AVAIL
+    if _CLANG_AVAIL is False:
+        return None
+    # Strip #include lines so clang doesn't need header search paths
+    stripped = re.sub(r'^[ \t]*#[ \t]*include\b.*$', '', content, flags=re.MULTILINE)
+    try:
+        r = subprocess.run(
+            ["clang", "-E", "-P", "-w", "-ferror-limit=0",
+             "-Wno-everything", "-x", lang, "-"],
+            input=stripped.encode("utf-8", errors="replace"),
+            capture_output=True, timeout=15,
+        )
+        if _CLANG_AVAIL is None:
+            _CLANG_AVAIL = True
+        if r.stdout:
+            return r.stdout.decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        _CLANG_AVAIL = False
+    except Exception:
+        pass
+    return None
+
+
+def _preprocess(content: str, lang: str = "c") -> str:
+    """Preprocess C/C++ source: try clang -E, fall back to regex define expansion."""
+    result = _try_clang_preprocess(content, lang)
+    if result:
+        return result
+    return _expand_defines(content)
+
+
+# ── Interprocedural function summaries ────────────────────────────────────────
+
+@dataclass
+class _FuncSummary:
+    """Per-function taint summary built during intra-file interprocedural analysis."""
+    returns_tainted: bool = False
+    # Indices of parameters observed to receive tainted arguments at call sites
+    param_tainted: set[int] = field(default_factory=set)
+
+
 # ── AST helpers ───────────────────────────────────────────────────────────────
 
 def _walk(node):
@@ -252,7 +322,8 @@ def _is_literal(node) -> bool:
 
 # ── Taint expression evaluator ────────────────────────────────────────────────
 
-def _is_tainted(node, tainted: set[str]) -> bool:
+def _is_tainted(node, tainted: set[str],
+                summaries: dict[str, _FuncSummary] | None = None) -> bool:
     """Return True if the AST expression node carries tainted data."""
     if node is None or _is_literal(node):
         return False
@@ -268,7 +339,7 @@ def _is_tainted(node, tainted: set[str]) -> bool:
 
     if t in ("parenthesized_expression",):
         inner = next((c for c in node.named_children), None)
-        return _is_tainted(inner, tainted)
+        return _is_tainted(inner, tainted, summaries)
 
     if t == "cast_expression":
         # (char *)expr — tainted if inner expr is tainted
@@ -278,52 +349,51 @@ def _is_tainted(node, tainted: set[str]) -> bool:
                                "abstract_declarator", "type_qualifier")),
             None,
         )
-        return _is_tainted(inner, tainted)
+        return _is_tainted(inner, tainted, summaries)
 
     if t == "pointer_expression":
         # *expr — tainted if expr is tainted; &expr is NOT tainted data
-        star = next((c for c in node.children if c.is_named is False and _txt(c) == "&"), None)
-        if star:
-            return False
-        # Check if the operator is '&'
         op = node.children[0]
         if _txt(op) == "&":
             return False
         inner = next((c for c in node.named_children), None)
-        return _is_tainted(inner, tainted)
+        return _is_tainted(inner, tainted, summaries)
 
     if t in ("binary_expression", "comma_expression"):
         left = node.child_by_field_name("left")
         right = node.child_by_field_name("right")
-        return _is_tainted(left, tainted) or _is_tainted(right, tainted)
+        return _is_tainted(left, tainted, summaries) or _is_tainted(right, tainted, summaries)
 
     if t == "conditional_expression":
         nc = node.named_children
-        return any(_is_tainted(c, tainted) for c in nc[1:])
+        return any(_is_tainted(c, tainted, summaries) for c in nc[1:])
 
     if t in ("field_expression",):
         # obj->field or obj.field
         obj = node.child_by_field_name("argument")
-        return _is_tainted(obj, tainted)
+        return _is_tainted(obj, tainted, summaries)
 
     if t == "call_expression":
         fname = _call_fname(node)
         args = _call_args(node)
         # C++ method on tainted object: path.c_str(), str.data(), etc.
         receiver = _call_receiver(node)
-        if receiver and fname in _CPP_DATA_ACCESSORS and _is_tainted(receiver, tainted):
+        if receiver and fname in _CPP_DATA_ACCESSORS and _is_tainted(receiver, tainted, summaries):
             return True
         # propagating: strdup(tainted) → tainted return
         if fname in _PROP_DST_SRC:
             dst_idx, src_indices = _PROP_DST_SRC[fname]
             if dst_idx == -1:
-                return any(i < len(args) and _is_tainted(args[i], tainted)
+                return any(i < len(args) and _is_tainted(args[i], tainted, summaries)
                            for i in src_indices)
         if fname in ("strdup", "strndup", "strtok", "strtok_r", "strchr", "strrchr",
                      "strpbrk", "index", "rindex"):
-            return bool(args) and _is_tainted(args[0], tainted)
+            return bool(args) and _is_tainted(args[0], tainted, summaries)
         # Input calls always return tainted
         if fname in _INPUT_BUF:
+            return True
+        # Interprocedural: known-tainted return value from intra-file function
+        if summaries and fname in summaries and summaries[fname].returns_tainted:
             return True
         return False
 
@@ -361,8 +431,15 @@ def _seed_main_argv(func_node: object, tainted: set[str]) -> None:
         tainted.add(argv_name)
 
 
-def _propagate(body_node, tainted: set[str]) -> bool:
-    """One propagation pass; returns True if tainted set grew."""
+def _propagate(body_node, tainted: set[str],
+               summaries: dict[str, _FuncSummary] | None = None,
+               call_sites: dict[str, set[int]] | None = None) -> bool:
+    """One propagation pass; returns True if tainted set grew.
+
+    summaries: optional intra-file function taint summaries.
+    call_sites: optional dict to accumulate which param indices of each
+                callee receive tainted args (for interprocedural seeding).
+    """
     changed = False
 
     for node in _walk(body_node):
@@ -373,7 +450,7 @@ def _propagate(body_node, tainted: set[str]) -> bool:
             decl = node.child_by_field_name("declarator")
             val = node.child_by_field_name("value")
             var = _first_identifier(decl)
-            if var and val and _is_tainted(val, tainted):
+            if var and val and _is_tainted(val, tainted, summaries):
                 if var not in tainted:
                     tainted.add(var)
                     changed = True
@@ -382,7 +459,7 @@ def _propagate(body_node, tainted: set[str]) -> bool:
         elif t == "assignment_expression":
             lhs = node.child_by_field_name("left")
             rhs = node.child_by_field_name("right")
-            if lhs and lhs.type == "identifier" and rhs and _is_tainted(rhs, tainted):
+            if lhs and lhs.type == "identifier" and rhs and _is_tainted(rhs, tainted, summaries):
                 var = _txt(lhs)
                 if var not in tainted:
                     tainted.add(var)
@@ -408,7 +485,7 @@ def _propagate(body_node, tainted: set[str]) -> bool:
             if fname in _PROP_DST_SRC:
                 dst_idx, src_indices = _PROP_DST_SRC[fname]
                 if dst_idx >= 0 and dst_idx < len(args):
-                    if any(i < len(args) and _is_tainted(args[i], tainted)
+                    if any(i < len(args) and _is_tainted(args[i], tainted, summaries)
                            for i in src_indices):
                         dst = (args[dst_idx].type == "identifier"
                                and _txt(args[dst_idx])
@@ -416,6 +493,12 @@ def _propagate(body_node, tainted: set[str]) -> bool:
                         if dst and dst not in tainted:
                             tainted.add(dst)
                             changed = True
+
+            # Interprocedural: record which param indices receive tainted args
+            if call_sites is not None and summaries is not None and fname in summaries:
+                for i, arg in enumerate(args):
+                    if _is_tainted(arg, tainted, summaries):
+                        call_sites[fname].add(i)
 
         # C++: cin >> var
         elif t == "binary_expression":
@@ -433,7 +516,8 @@ def _propagate(body_node, tainted: set[str]) -> bool:
 
 
 def _detect_sinks(body_node, tainted: set[str], lines: list[str],
-                  file_path: str, findings: list[Finding]) -> None:
+                  file_path: str, findings: list[Finding],
+                  summaries: dict[str, _FuncSummary] | None = None) -> None:
     """Walk body and emit findings for tainted sinks and always-unsafe calls."""
     seen: set[tuple] = set()
 
@@ -467,8 +551,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
         # Taint-sensitive sinks
         if fname in _SINKS:
             arg_idx, rule_id, vtype, sev, desc = _SINKS[fname]
-            # For buffer-overflow sinks also guarded by CAST-MEM-001, still report BUF-001
-            if arg_idx < len(args) and _is_tainted(args[arg_idx], tainted):
+            if arg_idx < len(args) and _is_tainted(args[arg_idx], tainted, summaries):
                 key = (file_path, line_no, rule_id)
                 if key not in seen:
                     seen.add(key)
@@ -483,36 +566,137 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     ))
 
 
-def _analyze_function(func_node, lines: list[str],
-                      file_path: str, findings: list[Finding]) -> None:
-    """Run taint analysis on a single function definition."""
-    tainted: set[str] = set()
-    _seed_main_argv(func_node, tainted)
+# ── Interprocedural helpers ───────────────────────────────────────────────────
 
+def _collect_funcs(root_node) -> dict[str, object]:
+    """Return {func_name: func_node} for all top-level function definitions."""
+    funcs: dict[str, object] = {}
+    for node in _walk(root_node):
+        if node.type != "function_definition":
+            continue
+        decl = node.child_by_field_name("declarator")
+        if decl is None:
+            continue
+        name = _first_identifier(decl)
+        if name and name not in funcs:
+            funcs[name] = node
+    return funcs
+
+
+def _get_param_names(func_node) -> list[str]:
+    """Return parameter identifier names for a function definition."""
+    decl = func_node.child_by_field_name("declarator")
+    if decl is None:
+        return []
+    param_list = next((n for n in _walk(decl) if n.type == "parameter_list"), None)
+    if param_list is None:
+        return []
+    names: list[str] = []
+    for param in param_list.named_children:
+        if param.type not in ("parameter_declaration", "variadic_parameter"):
+            continue
+        # Find the deepest identifier that's the variable name
+        for n in _walk(param):
+            if n.type == "identifier":
+                names.append(_txt(n))
+                break
+    return names
+
+
+def _check_returns_tainted(func_node, tainted: set[str],
+                           summaries: dict[str, _FuncSummary] | None) -> bool:
+    """Return True if any return statement carries a tainted expression."""
     body = func_node.child_by_field_name("body")
     if body is None:
-        return
+        return False
+    for node in _walk(body):
+        if node.type == "return_statement":
+            ret_val = next((c for c in node.named_children), None)
+            if ret_val and _is_tainted(ret_val, tainted, summaries):
+                return True
+    return False
 
-    # Fixed-point propagation
+
+def _seed_with_summaries(func_node, summary: _FuncSummary | None) -> set[str]:
+    """Seed initial taint set for a function, including interprocedural params."""
+    tainted: set[str] = set()
+    _seed_main_argv(func_node, tainted)
+    if summary:
+        param_names = _get_param_names(func_node)
+        for idx in summary.param_tainted:
+            if idx < len(param_names):
+                tainted.add(param_names[idx])
+    return tainted
+
+
+def _analyze_func_with_summaries(
+    func_node,
+    summaries: dict[str, _FuncSummary],
+    call_sites: dict[str, set[int]] | None,
+) -> set[str]:
+    """Propagate taint through one function using current summaries. Return final tainted set."""
+    fname = _first_identifier(func_node.child_by_field_name("declarator") or func_node)
+    tainted = _seed_with_summaries(func_node, summaries.get(fname))
+    body = func_node.child_by_field_name("body")
+    if body is None:
+        return tainted
     for _ in range(10):
-        if not _propagate(body, tainted):
+        if not _propagate(body, tainted, summaries, call_sites):
             break
-
-    _detect_sinks(body, tainted, lines, file_path, findings)
+    return tainted
 
 
 def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
+    # Step 1: Preprocess (macro expansion / clang -E)
+    lang = "c++" if any(file_path.endswith(e) for e in _CPP_EXTS) else "c"
+    processed = _preprocess(content, lang)
+
     try:
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
+        tree = parser.parse(processed.encode("utf-8", errors="replace"))
     except Exception:
         return []
 
+    # Use original lines for accurate line-number reporting
     lines = content.splitlines()
     findings: list[Finding] = []
 
-    for node in _walk(tree.root_node):
-        if node.type == "function_definition":
-            _analyze_function(node, lines, file_path, findings)
+    # Step 2: Collect all function definitions
+    funcs = _collect_funcs(tree.root_node)
+    if not funcs:
+        return []
+
+    # Step 3: Interprocedural fixed-point analysis
+    summaries: dict[str, _FuncSummary] = {name: _FuncSummary() for name in funcs}
+
+    for _outer in range(5):
+        changed = False
+        call_sites: dict[str, set[int]] = {name: set() for name in funcs}
+
+        for fname, func_node in funcs.items():
+            tainted = _analyze_func_with_summaries(func_node, summaries, call_sites)
+
+            # Update return-taint summary
+            if not summaries[fname].returns_tainted:
+                if _check_returns_tainted(func_node, tainted, summaries):
+                    summaries[fname].returns_tainted = True
+                    changed = True
+
+        # Propagate call-site taint to callee param summaries
+        for callee, tainted_indices in call_sites.items():
+            new_indices = tainted_indices - summaries[callee].param_tainted
+            if new_indices:
+                summaries[callee].param_tainted |= new_indices
+                changed = True
+
+        if not changed:
+            break
+
+    # Step 4: Final pass — emit findings
+    for func_node in funcs.values():
+        tainted = _analyze_func_with_summaries(func_node, summaries, None)
+        body = func_node.child_by_field_name("body")
+        if body:
+            _detect_sinks(body, tainted, lines, file_path, findings, summaries)
 
     return findings
 
