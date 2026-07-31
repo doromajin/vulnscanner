@@ -20,6 +20,7 @@ from vulnscanner.analyzers.ast_ruby import RubyASTAnalyzer, _TS_RUBY_AVAILABLE
 from vulnscanner.analyzers.ast_php import PhpASTAnalyzer, _TS_AVAILABLE as _TS_PHP_AVAILABLE
 from vulnscanner.analyzers.ast_c import CASTAnalyzer, CPPASTAnalyzer, _TS_C_AVAILABLE
 from vulnscanner.analyzers.ast_rust import RustASTAnalyzer, _TS_RUST_AVAILABLE
+from vulnscanner.analyzers.ast_csharp import CSharpASTAnalyzer, _TS_CS_AVAILABLE
 
 _skip_no_tsjs = pytest.mark.skipif(not _TS_JS_AVAILABLE, reason="tree-sitter-javascript not installed")
 _skip_no_tsts = pytest.mark.skipif(not _TS_TS_AVAILABLE, reason="tree-sitter-typescript not installed")
@@ -28,6 +29,7 @@ _skip_no_tsrb = pytest.mark.skipif(not _TS_RUBY_AVAILABLE, reason="tree-sitter-r
 _skip_no_tsphp = pytest.mark.skipif(not _TS_PHP_AVAILABLE, reason="tree-sitter-php not installed")
 _skip_no_tsc = pytest.mark.skipif(not _TS_C_AVAILABLE, reason="tree-sitter-c not installed")
 _skip_no_tsrust = pytest.mark.skipif(not _TS_RUST_AVAILABLE, reason="tree-sitter-rust not installed")
+_skip_no_tscs = pytest.mark.skipif(not _TS_CS_AVAILABLE, reason="tree-sitter-c-sharp not installed")
 
 _skip_no_javalang = pytest.mark.skipif(not _HAS_JAVALANG, reason="javalang not installed")
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
@@ -5590,3 +5592,196 @@ async fn safe(user_id: i64) {
         findings = self._az().analyze("main.rs", code)
         sql_fp = [f for f in findings if f.rule_id == "RAST-SQL-001"]
         assert not sql_fp, "sqlx with parameterized constant query must not fire SQL injection"
+
+
+@_skip_no_tscs
+class TestCSharpASTAnalyzer:
+    """C# AST taint: ASP.NET controller params → SQL/CMD/PATH/DESER sinks."""
+
+    def _az(self):
+        return CSharpASTAnalyzer()
+
+    # ── SQL injection ─────────────────────────────────────────────────────────
+
+    def test_from_query_sql_command(self):
+        """[FromQuery] → new SqlCommand(sql) must fire CSAST-SQL-001."""
+        code = """
+using System.Data.SqlClient;
+[ApiController]
+public class UserController : ControllerBase {
+    [HttpGet]
+    public IActionResult Get([FromQuery] string name) {
+        string sql = "SELECT * FROM users WHERE name=" + name;
+        var cmd = new SqlCommand(sql, conn);
+        return Ok(cmd.ExecuteScalar());
+    }
+}
+"""
+        findings = self._az().analyze("UserController.cs", code)
+        ids = [f.rule_id for f in findings]
+        assert "CSAST-SQL-001" in ids, "[FromQuery] → SqlCommand must fire SQL injection"
+
+    def test_from_body_sql_command_direct(self):
+        """[FromBody] param concatenated directly into SqlCommand ctor must fire."""
+        code = """
+using System.Data.SqlClient;
+public class OrderController : Controller {
+    [HttpPost]
+    public IActionResult Create([FromBody] string userId) {
+        var cmd = new SqlCommand("DELETE FROM orders WHERE uid=" + userId, conn);
+        cmd.ExecuteNonQuery();
+        return Ok();
+    }
+}
+"""
+        findings = self._az().analyze("OrderController.cs", code)
+        ids = [f.rule_id for f in findings]
+        assert "CSAST-SQL-001" in ids, "[FromBody] → SqlCommand ctor direct must fire SQL injection"
+
+    def test_command_text_assignment(self):
+        """cmd.CommandText = tainted_query → ExecuteNonQuery must fire CSAST-SQL-001."""
+        code = """
+using System.Data.SqlClient;
+public class SearchController : ControllerBase {
+    [HttpGet]
+    public IActionResult Search([FromQuery] string q) {
+        string query = "SELECT * FROM t WHERE q=" + q;
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = query;
+        cmd.ExecuteNonQuery();
+        return Ok();
+    }
+}
+"""
+        findings = self._az().analyze("SearchController.cs", code)
+        ids = [f.rule_id for f in findings]
+        assert "CSAST-SQL-001" in ids, "CommandText=tainted → ExecuteNonQuery must fire SQL injection"
+
+    def test_dapper_execute(self):
+        """Dapper conn.Execute(tainted_sql) must fire CSAST-SQL-001."""
+        code = """
+public class ItemController : Controller {
+    [HttpDelete("{id}")]
+    public IActionResult Delete([FromRoute] string id) {
+        string sql = "DELETE FROM items WHERE id=" + id;
+        conn.Execute(sql);
+        return NoContent();
+    }
+}
+"""
+        findings = self._az().analyze("ItemController.cs", code)
+        ids = [f.rule_id for f in findings]
+        assert "CSAST-SQL-001" in ids, "Dapper conn.Execute with tainted SQL must fire SQL injection"
+
+    def test_ef_core_execute_sql_raw(self):
+        """EF Core ExecuteSqlRaw(tainted) must fire CSAST-SQL-001."""
+        code = """
+public class AdminController : ControllerBase {
+    [HttpPost]
+    public IActionResult Exec([FromBody] string sql) {
+        _context.Database.ExecuteSqlRaw(sql);
+        return Ok();
+    }
+}
+"""
+        findings = self._az().analyze("AdminController.cs", code)
+        ids = [f.rule_id for f in findings]
+        assert "CSAST-SQL-001" in ids, "EF Core ExecuteSqlRaw with tainted SQL must fire SQL injection"
+
+    def test_interpolated_string_sql(self):
+        """$\"SELECT...{name}\" → SqlCommand must fire CSAST-SQL-001."""
+        code = """
+public class Controller : ControllerBase {
+    [HttpGet]
+    public IActionResult Get([FromQuery] string name) {
+        string q = $"SELECT * FROM users WHERE name={name}";
+        var cmd = new SqlCommand(q, conn);
+        return Ok(cmd.ExecuteScalar());
+    }
+}
+"""
+        findings = self._az().analyze("Controller.cs", code)
+        ids = [f.rule_id for f in findings]
+        assert "CSAST-SQL-001" in ids, "Interpolated string with tainted var → SqlCommand must fire"
+
+    # ── Command injection ─────────────────────────────────────────────────────
+
+    def test_process_start_tainted_args(self):
+        """Process.Start(\"cmd.exe\", tainted_command) must fire CSAST-CMD-001."""
+        code = """
+public class ToolController : Controller {
+    [HttpPost]
+    public IActionResult Run([FromBody] string command) {
+        System.Diagnostics.Process.Start("cmd.exe", command);
+        return Ok();
+    }
+}
+"""
+        findings = self._az().analyze("ToolController.cs", code)
+        ids = [f.rule_id for f in findings]
+        assert "CSAST-CMD-001" in ids, "Process.Start with tainted arg must fire command injection"
+
+    # ── Path traversal ────────────────────────────────────────────────────────
+
+    def test_file_read_all_text_tainted_path(self):
+        """File.ReadAllText(tainted_path) must fire CSAST-PATH-001."""
+        code = """
+public class FileController : ControllerBase {
+    [HttpGet]
+    public IActionResult ReadFile([FromQuery] string path) {
+        string content = System.IO.File.ReadAllText(path);
+        return Ok(content);
+    }
+}
+"""
+        findings = self._az().analyze("FileController.cs", code)
+        ids = [f.rule_id for f in findings]
+        assert "CSAST-PATH-001" in ids, "File.ReadAllText with tainted path must fire path traversal"
+
+    # ── Unsafe deserialization ────────────────────────────────────────────────
+
+    def test_binary_formatter_always_unsafe(self):
+        """new BinaryFormatter() must fire CSAST-DESER-001 unconditionally."""
+        code = """
+using System.Runtime.Serialization.Formatters.Binary;
+class Processor {
+    void Load(System.IO.Stream s) {
+        var bf = new BinaryFormatter();
+        bf.Deserialize(s);
+    }
+}
+"""
+        findings = self._az().analyze("Processor.cs", code)
+        ids = [f.rule_id for f in findings]
+        assert "CSAST-DESER-001" in ids, "BinaryFormatter must fire DESER unconditionally"
+
+    # ── Negative cases (no false positives) ──────────────────────────────────
+
+    def test_no_fp_parameterized_sql(self):
+        """Parameterized query with .AddWithValue must NOT fire."""
+        code = """
+public class SafeController : ControllerBase {
+    [HttpGet]
+    public IActionResult Get([FromQuery] string name) {
+        var cmd = new SqlCommand("SELECT * FROM users WHERE name=@name", conn);
+        cmd.Parameters.AddWithValue("@name", name);
+        return Ok(cmd.ExecuteScalar());
+    }
+}
+"""
+        findings = self._az().analyze("SafeController.cs", code)
+        sql_fp = [f for f in findings if f.rule_id == "CSAST-SQL-001"]
+        assert not sql_fp, "Parameterized query must not fire SQL injection"
+
+    def test_no_fp_constant_file_path(self):
+        """File.ReadAllText with constant path must NOT fire."""
+        code = """
+class SafeFileReader {
+    string Read() {
+        return System.IO.File.ReadAllText("/app/config.json");
+    }
+}
+"""
+        findings = self._az().analyze("SafeFileReader.cs", code)
+        path_fp = [f for f in findings if f.rule_id == "CSAST-PATH-001"]
+        assert not path_fp, "File.ReadAllText with constant path must not fire path traversal"

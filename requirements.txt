@@ -47,6 +47,8 @@ tree-sitter-cpp==0.23.4
 
 # Rust AST analysis (.rs — env::args/stdin/web-framework taint tracking)
 tree-sitter-rust==0.24.2
+# C# AST analysis (.cs — ASP.NET controller params → SqlCommand/Process/File taint)
+tree-sitter-c-sharp==0.23.5
 
 # Testing
 pytest==8.2.2

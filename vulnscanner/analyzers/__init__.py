@@ -1,5 +1,6 @@
 from vulnscanner.analyzers.ast_c import CASTAnalyzer, CPPASTAnalyzer
 from vulnscanner.analyzers.ast_rust import RustASTAnalyzer
+from vulnscanner.analyzers.ast_csharp import CSharpASTAnalyzer
 from vulnscanner.analyzers.ast_go import GoASTAnalyzer
 from vulnscanner.analyzers.ast_ruby import RubyASTAnalyzer
 from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
@@ -65,6 +66,8 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     CPPASTAnalyzer(),
     # Rust AST taint tracker (env::args/stdin/web-params → Command/fs/sqlx/diesel)
     RustASTAnalyzer(),
+    # C# AST taint tracker (ASP.NET controller params → SqlCommand/Process/File/BinaryFormatter)
+    CSharpASTAnalyzer(),
     # JS AST taint tracker (.js/.jsx/.mjs/.cjs — interprocedural, true AST)
     JSASTAnalyzer(),
     # TS AST taint tracker (.ts/.tsx — same logic, TypeScript parser)
