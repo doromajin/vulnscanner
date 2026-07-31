@@ -73,6 +73,7 @@ _PROP_DST_SRC: dict[str, tuple[int, list[int]]] = {
 _INPUT_BUF: dict[str, int] = {
     "gets":      0,  # also CAST-MEM-001
     "fgets":     0,
+    "fgetws":    0,  # wide-char fgets
     "fread":     0,  # fread(ptr, size, count, stream) → ptr tainted
     "pread":     1,  # pread(fd, buf, n, offset) → buf tainted
     "read":      1,
@@ -142,6 +143,15 @@ _SINKS: dict[str, tuple] = {
     "CreateProcessA":_cmd(1, "Command injection via Win32 CreateProcessA()"),
     "CreateProcessW":_cmd(1, "Command injection via Win32 CreateProcessW()"),
     "WinExec":       _cmd(0, "Command injection via Win32 WinExec()"),
+    # Wide-char exec variants (wchar_t)
+    "_wexecv":   _cmd(0, "Command injection via _wexecv() with wide-char command"),
+    "_wexecve":  _cmd(0, "Command injection via _wexecve() with wide-char command"),
+    "_wexecvp":  _cmd(0, "Command injection via _wexecvp() with wide-char command"),
+    "_wexecvpe": _cmd(0, "Command injection via _wexecvpe() with wide-char command"),
+    "_wexecl":   _cmd(0, "Command injection via _wexecl() with wide-char command"),
+    "_wexecle":  _cmd(0, "Command injection via _wexecle() with wide-char command"),
+    "_wexeclp":  _cmd(0, "Command injection via _wexeclp() with wide-char command"),
+    "_wexeclpe": _cmd(0, "Command injection via _wexeclpe() with wide-char command"),
     # Format string (tainted format argument)
     "printf":    _fmt(0, "Format string: user-controlled format in printf()"),
     "vprintf":   _fmt(0, "Format string: user-controlled format in vprintf()"),
@@ -193,6 +203,17 @@ _SINKS: dict[str, tuple] = {
     "sscanf":    _buf(2, "Buffer overflow: sscanf() with %s reads unbounded user input"),
     "fscanf":    _buf(1, "Buffer overflow: fscanf() with %s reads unbounded input"),
 }
+
+# Windows _spawn* / _wspawn* functions: first arg is mode, rest may carry tainted data.
+# We check args[1:] for taint (any tainted arg triggers CAST-CMD-001).
+_SPAWN_SINKS: frozenset[str] = frozenset({
+    "_spawnl",   "_spawnle",  "_spawnlp",  "_spawnlpe",
+    "_spawnv",   "_spawnve",  "_spawnvp",  "_spawnvpe",
+    "_wspawnl",  "_wspawnle", "_wspawnlp", "_wspawnlpe",
+    "_wspawnv",  "_wspawnve", "_wspawnvp", "_wspawnvpe",
+    "spawnl",    "spawnle",   "spawnlp",   "spawnlpe",
+    "spawnv",    "spawnve",   "spawnvp",   "spawnvpe",
+})
 
 # Functions that are always dangerous regardless of taint
 # (rule_id, severity, vuln_type, description)
@@ -708,6 +729,22 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                         line_content=line_text,
                         description=desc,
                         rule_id=rule_id,
+                    ))
+
+        # Windows _spawn* family: mode is arg 0, any subsequent tainted arg is dangerous
+        if fname in _SPAWN_SINKS and len(args) > 1:
+            if any(_is_tainted(a, tainted, summaries) for a in args[1:]):
+                key = (file_path, line_no, "CAST-CMD-001")
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(Finding(
+                        vuln_type=VulnType.COMMAND_INJECTION,
+                        severity=Severity.CRITICAL,
+                        file_path=file_path,
+                        line_number=line_no,
+                        line_content=line_text,
+                        description=f"Command injection via {fname}() with user-controlled argument",
+                        rule_id="CAST-CMD-001",
                     ))
 
 

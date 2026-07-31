@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -82,6 +83,44 @@ def _scan_file(path: Path) -> list[str]:
         findings = _CPP_AZ.analyze(str(path), content)
     else:
         findings = _C_AZ.analyze(str(path), content)
+    return [f.rule_id for f in findings]
+
+
+# Cross-file variant group key: strip the trailing letter from _51a, _53b, etc.
+# e.g. "CWE78_foo_51a.c" → group key "CWE78_foo_51.c"
+_CROSS_FILE_RE = re.compile(r'_(\d{2,})([a-e])$')
+
+
+def _cross_file_group_key(path: Path) -> str | None:
+    """Return a group key for cross-file variant files (_51a/_51b etc.), or None."""
+    m = _CROSS_FILE_RE.search(path.stem)
+    if m:
+        base = path.stem[: m.start()] + "_" + m.group(1)
+        return str(path.parent / base) + path.suffix
+    return None
+
+
+def _scan_group(paths: list[Path]) -> list[str]:
+    """Concatenate a group of related files and scan as one compilation unit.
+
+    This enables interprocedural taint to flow across file boundaries:
+    e.g. _51a.c (source) + _51b.c (sink) → fixed-point connects them.
+    """
+    parts: list[str] = []
+    for p in sorted(paths):  # sort a→b→c so source comes before sink
+        try:
+            parts.append(p.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            pass
+    if not parts:
+        return []
+    combined = "\n\n".join(parts)
+    # Use extension of the first file (all in a group share the same extension)
+    ext = paths[0].suffix.lower()
+    if ext in (".cc", ".cpp", ".cxx", ".c++", ".hh", ".hpp"):
+        findings = _CPP_AZ.analyze(str(paths[0]), combined)
+    else:
+        findings = _C_AZ.analyze(str(paths[0]), combined)
     return [f.rule_id for f in findings]
 
 
@@ -166,22 +205,41 @@ def run(juliet_root: Path, verbose: bool = False, max_workers: int = 4) -> None:
             continue
         expected_rules = set(CWE_RULES[cwe])
 
+        # Separate cross-file variant groups from single-file variants
+        groups: dict[str, list[Path]] = {}
+        solos: list[Path] = []
+        for p in files:
+            key = _cross_file_group_key(p)
+            if key:
+                groups.setdefault(key, []).append(p)
+            else:
+                solos.append(p)
+
         tp = fn = 0
         misses: list[Path] = []
 
-        def _job(p: Path) -> tuple[Path, list[str]]:
-            return p, _scan_file(p)
+        def _solo_job(p: Path) -> tuple[list[Path], list[str]]:
+            return [p], _scan_file(p)
+
+        def _group_job(grp: list[Path]) -> tuple[list[Path], list[str]]:
+            return grp, _scan_group(grp)
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(_job, p): p for p in files}
+            futures: dict = {}
+            for p in solos:
+                futures[ex.submit(_solo_job, p)] = p
+            for grp in groups.values():
+                futures[ex.submit(_group_job, grp)] = grp[0]
+
             for fut in as_completed(futures):
-                fpath, rule_ids = fut.result()
-                fired = set(rule_ids) & expected_rules
-                if fired:
-                    tp += 1
-                else:
-                    fn += 1
-                    misses.append(fpath)
+                paths_in_job, rule_ids = fut.result()
+                fired = bool(set(rule_ids) & expected_rules)
+                for fpath in paths_in_job:
+                    if fired:
+                        tp += 1
+                    else:
+                        fn += 1
+                        misses.append(fpath)
 
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         rule_str = "/".join(sorted(expected_rules))
