@@ -1829,6 +1829,19 @@ def _build_method_scope_tainted(method_node, tree, const_ints: dict, dead_lines:
     """
     m_tainted: set = set()
 
+    # Seed Spring-annotated parameters as local taint sources so that Pass 3
+    # of _compute_method_local_clean does not classify derived LVD vars as clean.
+    try:
+        for param in (method_node.parameters or []):
+            for ann in (getattr(param, "annotations", None) or []):
+                if getattr(ann, "name", "") in _SPRING_PARAM_ANNOTATIONS:
+                    pname = getattr(param, "name", "")
+                    if pname:
+                        m_tainted.add(pname)
+                    break
+    except Exception:
+        pass
+
     def _m_line(n) -> int:
         pos = getattr(n, "position", None)
         return pos.line if pos else -1

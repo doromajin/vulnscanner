@@ -2638,6 +2638,86 @@ public class UserDao {
         assert sql, "3-hop @RequestParam→Service→DAO SQLi must be detected"
 
 
+# ── Spring annotation same-file taint ────────────────────────────────────────
+
+@_skip_no_javalang
+class TestJavaSpringAnnotations:
+    """Spring @RequestParam / @PathVariable / @RequestBody in-controller SQL detection."""
+
+    def _az(self):
+        return JavaASTAnalyzer()
+
+    def test_requestparam_sql_same_file(self):
+        """@RequestParam name → sql = '...' + name → jdbcTemplate.queryForObject(sql) must fire."""
+        code = """
+import org.springframework.web.bind.annotation.*;
+@RestController
+public class UserController {
+    @GetMapping("/users")
+    public String getUser(@RequestParam String name) {
+        String sql = "SELECT * FROM users WHERE name=" + name;
+        return jdbcTemplate.queryForObject(sql, String.class);
+    }
+}
+"""
+        findings = self._az().analyze("UserController.java", code)
+        sql = [f for f in findings if f.rule_id == "JAST-SQL-001"]
+        assert sql, "@RequestParam must taint SQL string in same-file controller"
+
+    def test_pathvariable_jdbc_same_file(self):
+        """@PathVariable id → Statement.executeQuery taint must fire."""
+        code = """
+import org.springframework.web.bind.annotation.*;
+import java.sql.*;
+@RestController
+public class ItemController {
+    @GetMapping("/items/{id}")
+    public String getItem(@PathVariable String id, Connection conn) throws Exception {
+        Statement st = conn.createStatement();
+        return st.executeQuery("SELECT * FROM items WHERE id=" + id).toString();
+    }
+}
+"""
+        findings = self._az().analyze("ItemController.java", code)
+        sql = [f for f in findings if f.rule_id == "JAST-SQL-001"]
+        assert sql, "@PathVariable must taint SQL in same-file JDBC"
+
+    def test_requestheader_sql_same_file(self):
+        """@RequestHeader value → JPA createNativeQuery must fire."""
+        code = """
+import org.springframework.web.bind.annotation.*;
+import javax.persistence.*;
+@RestController
+public class SessionController {
+    @GetMapping("/session")
+    public String session(@RequestHeader("X-Token") String token, EntityManager em) {
+        return em.createNativeQuery("SELECT * FROM sessions WHERE token='" + token + "'")
+                 .getResultList().toString();
+    }
+}
+"""
+        findings = self._az().analyze("SessionController.java", code)
+        sql = [f for f in findings if f.rule_id in ("JAST-SQL-001", "JAST-SQL-002")]
+        assert sql, "@RequestHeader must taint SQL in same-file JPA"
+
+    def test_no_fp_requestparam_parameterized(self):
+        """@RequestParam with parameterized query must NOT fire."""
+        code = """
+import org.springframework.web.bind.annotation.*;
+@RestController
+public class SafeController {
+    @GetMapping("/users")
+    public String getUser(@RequestParam String name) {
+        return jdbcTemplate.queryForObject(
+            "SELECT * FROM users WHERE name=?", String.class, name);
+    }
+}
+"""
+        findings = self._az().analyze("SafeController.java", code)
+        sql = [f for f in findings if f.rule_id == "JAST-SQL-001"]
+        assert not sql, "@RequestParam with parameterized query must not FP"
+
+
 # ── Java CFG guards ───────────────────────────────────────────────────────────
 
 @_skip_no_javalang
