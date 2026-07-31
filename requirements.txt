@@ -45,6 +45,9 @@ tree-sitter-ruby==0.23.1
 tree-sitter-c==0.24.2
 tree-sitter-cpp==0.23.4
 
+# Rust AST analysis (.rs — env::args/stdin/web-framework taint tracking)
+tree-sitter-rust==0.24.2
+
 # Testing
 pytest==8.2.2
 pytest-cov==5.0.0

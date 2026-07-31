@@ -19,6 +19,7 @@ from vulnscanner.analyzers.ast_typescript import TypeScriptASTAnalyzer, _TSAST_A
 from vulnscanner.analyzers.ast_ruby import RubyASTAnalyzer, _TS_RUBY_AVAILABLE
 from vulnscanner.analyzers.ast_php import PhpASTAnalyzer, _TS_AVAILABLE as _TS_PHP_AVAILABLE
 from vulnscanner.analyzers.ast_c import CASTAnalyzer, CPPASTAnalyzer, _TS_C_AVAILABLE
+from vulnscanner.analyzers.ast_rust import RustASTAnalyzer, _TS_RUST_AVAILABLE
 
 _skip_no_tsjs = pytest.mark.skipif(not _TS_JS_AVAILABLE, reason="tree-sitter-javascript not installed")
 _skip_no_tsts = pytest.mark.skipif(not _TS_TS_AVAILABLE, reason="tree-sitter-typescript not installed")
@@ -26,6 +27,7 @@ _skip_no_tsgo = pytest.mark.skipif(not _TS_GO_AVAILABLE, reason="tree-sitter-go 
 _skip_no_tsrb = pytest.mark.skipif(not _TS_RUBY_AVAILABLE, reason="tree-sitter-ruby not installed")
 _skip_no_tsphp = pytest.mark.skipif(not _TS_PHP_AVAILABLE, reason="tree-sitter-php not installed")
 _skip_no_tsc = pytest.mark.skipif(not _TS_C_AVAILABLE, reason="tree-sitter-c not installed")
+_skip_no_tsrust = pytest.mark.skipif(not _TS_RUST_AVAILABLE, reason="tree-sitter-rust not installed")
 
 _skip_no_javalang = pytest.mark.skipif(not _HAS_JAVALANG, reason="javalang not installed")
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
@@ -5433,3 +5435,158 @@ void init(sqlite3 *db) {
         findings = self._c().analyze("db_init.c", code)
         sql_fp = [f for f in findings if f.rule_id == "CAST-SQL-001"]
         assert not sql_fp, "sqlite3_exec with constant SQL must not fire SQL injection"
+
+
+# ── Rust AST analyzer ─────────────────────────────────────────────────────────
+
+@_skip_no_tsrust
+class TestRustASTAnalyzer:
+    """Rust AST taint: env::args/stdin/web-params → Command/fs/sqlx/rusqlite."""
+
+    def _az(self):
+        return RustASTAnalyzer()
+
+    # ── Positive (must detect) ────────────────────────────────────────────────
+
+    def test_argv_command_arg_cmd(self):
+        """env::args → Command::arg(tainted) must fire RAST-CMD-001."""
+        code = """
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let user_cmd = &args[1];
+    std::process::Command::new("sh").arg("-c").arg(user_cmd).output();
+}
+"""
+        findings = self._az().analyze("main.rs", code)
+        ids = [f.rule_id for f in findings]
+        assert "RAST-CMD-001" in ids, "env::args → Command::arg must fire CMD injection"
+
+    def test_argv_command_new_tainted_path(self):
+        """env::args → Command::new(tainted_path) must fire RAST-CMD-001."""
+        code = """
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let exe = args[1].clone();
+    std::process::Command::new(&exe).output();
+}
+"""
+        findings = self._az().analyze("main.rs", code)
+        ids = [f.rule_id for f in findings]
+        assert "RAST-CMD-001" in ids, "env::args → Command::new(tainted) must fire CMD injection"
+
+    def test_argv_fs_read_to_string_path(self):
+        """env::args → std::fs::read_to_string(tainted) must fire RAST-PATH-001."""
+        code = """
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let path = args[1].clone();
+    std::fs::read_to_string(&path);
+}
+"""
+        findings = self._az().analyze("main.rs", code)
+        ids = [f.rule_id for f in findings]
+        assert "RAST-PATH-001" in ids, "env::args → fs::read_to_string must fire PATH traversal"
+
+    def test_argv_format_sqlx_query(self):
+        """env::args → format!() → sqlx::query() must fire RAST-SQL-001."""
+        code = """
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let name = args[1].clone();
+    let q = format!("SELECT * FROM users WHERE name={}", name);
+    sqlx::query(&q);
+}
+"""
+        findings = self._az().analyze("main.rs", code)
+        ids = [f.rule_id for f in findings]
+        assert "RAST-SQL-001" in ids, "env::args → format! → sqlx::query must fire SQL injection"
+
+    def test_stdin_read_line_command(self):
+        """stdin().read_line(&mut buf) → Command::arg(buf) must fire RAST-CMD-001."""
+        code = """
+fn run() {
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+    std::process::Command::new("sh").arg("-c").arg(&input).output();
+}
+"""
+        findings = self._az().analyze("main.rs", code)
+        ids = [f.rule_id for f in findings]
+        assert "RAST-CMD-001" in ids, "stdin read_line → Command must fire CMD injection"
+
+    def test_argv_multihop_trim_open(self):
+        """env::args → .clone().trim().to_string() → fs::File::open must fire RAST-PATH-001."""
+        code = """
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let raw = args[1].clone();
+    let path = raw.trim().to_string();
+    std::fs::File::open(&path);
+}
+"""
+        findings = self._az().analyze("main.rs", code)
+        ids = [f.rule_id for f in findings]
+        assert "RAST-PATH-001" in ids, "multi-hop taint through .trim().to_string() must fire PATH"
+
+    def test_argv_format_rusqlite_execute(self):
+        """env::args → format!() → rusqlite conn.execute() must fire RAST-SQL-001."""
+        code = """
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let id = args[1].clone();
+    let q = format!("SELECT * FROM items WHERE id={}", id);
+    conn.execute(&q, []);
+}
+"""
+        findings = self._az().analyze("main.rs", code)
+        ids = [f.rule_id for f in findings]
+        assert "RAST-SQL-001" in ids, "env::args → rusqlite execute must fire SQL injection"
+
+    def test_actix_web_query_sqlx(self):
+        """actix-web web::Query param → format! → sqlx::query must fire RAST-SQL-001."""
+        code = """
+use actix_web::web;
+async fn search(query: web::Query<std::collections::HashMap<String, String>>) {
+    let name = query.get("name").unwrap();
+    let q = format!("SELECT * FROM users WHERE n={}", name);
+    sqlx::query(&q).fetch_one(&pool).await;
+}
+"""
+        findings = self._az().analyze("handler.rs", code)
+        ids = [f.rule_id for f in findings]
+        assert "RAST-SQL-001" in ids, "actix-web Query param → sqlx must fire SQL injection"
+
+    # ── Negative (must NOT fire) ──────────────────────────────────────────────
+
+    def test_no_fp_constant_fs_open(self):
+        """fs::read_to_string with string literal must NOT fire."""
+        code = """
+fn main() {
+    std::fs::read_to_string("/etc/config.toml");
+}
+"""
+        findings = self._az().analyze("main.rs", code)
+        path_fp = [f for f in findings if f.rule_id == "RAST-PATH-001"]
+        assert not path_fp, "fs::read_to_string with constant path must not fire PATH"
+
+    def test_no_fp_constant_command(self):
+        """Command with all string literals must NOT fire."""
+        code = """
+fn main() {
+    std::process::Command::new("ls").arg("-la").output();
+}
+"""
+        findings = self._az().analyze("main.rs", code)
+        cmd_fp = [f for f in findings if f.rule_id == "RAST-CMD-001"]
+        assert not cmd_fp, "Command with constant args must not fire CMD injection"
+
+    def test_no_fp_parameterized_sqlx(self):
+        """sqlx::query with constant SQL + .bind() must NOT fire."""
+        code = """
+async fn safe(user_id: i64) {
+    sqlx::query("SELECT * FROM users WHERE id = $1").bind(user_id).fetch_one(&pool).await;
+}
+"""
+        findings = self._az().analyze("main.rs", code)
+        sql_fp = [f for f in findings if f.rule_id == "RAST-SQL-001"]
+        assert not sql_fp, "sqlx with parameterized constant query must not fire SQL injection"
