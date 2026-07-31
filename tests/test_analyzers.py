@@ -18,12 +18,14 @@ from vulnscanner.analyzers.ast_js import (
 from vulnscanner.analyzers.ast_typescript import TypeScriptASTAnalyzer, _TSAST_AVAIL
 from vulnscanner.analyzers.ast_ruby import RubyASTAnalyzer, _TS_RUBY_AVAILABLE
 from vulnscanner.analyzers.ast_php import PhpASTAnalyzer, _TS_AVAILABLE as _TS_PHP_AVAILABLE
+from vulnscanner.analyzers.ast_c import CASTAnalyzer, CPPASTAnalyzer, _TS_C_AVAILABLE
 
 _skip_no_tsjs = pytest.mark.skipif(not _TS_JS_AVAILABLE, reason="tree-sitter-javascript not installed")
 _skip_no_tsts = pytest.mark.skipif(not _TS_TS_AVAILABLE, reason="tree-sitter-typescript not installed")
 _skip_no_tsgo = pytest.mark.skipif(not _TS_GO_AVAILABLE, reason="tree-sitter-go not installed")
 _skip_no_tsrb = pytest.mark.skipif(not _TS_RUBY_AVAILABLE, reason="tree-sitter-ruby not installed")
 _skip_no_tsphp = pytest.mark.skipif(not _TS_PHP_AVAILABLE, reason="tree-sitter-php not installed")
+_skip_no_tsc = pytest.mark.skipif(not _TS_C_AVAILABLE, reason="tree-sitter-c not installed")
 
 _skip_no_javalang = pytest.mark.skipif(not _HAS_JAVALANG, reason="javalang not installed")
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
@@ -5216,3 +5218,218 @@ function handler(req: any, res: any): void {
         )
         ids = [f.rule_id for f in findings]
         assert "JSAST-SQL-001" in ids, "TS ESM cross-file taint not detected"
+
+
+# ── C / C++ AST analyzer ──────────────────────────────────────────────────────
+
+@_skip_no_tsc
+class TestCASTAnalyzer:
+    """C AST taint: argv / stdin / recv → system / fopen / sqlite3_exec / printf."""
+
+    def _c(self):
+        return CASTAnalyzer()
+
+    def _cpp(self):
+        return CPPASTAnalyzer()
+
+    # ── Positive (must detect) ────────────────────────────────────────────────
+
+    def test_argv_system_cmd(self):
+        """argv[1] passed directly to system() must fire CAST-CMD-001."""
+        code = """
+int main(int argc, char *argv[]) {
+    system(argv[1]);
+}
+"""
+        findings = self._c().analyze("test.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-CMD-001" in ids, "argv[1] → system() must fire CMD injection"
+
+    def test_argv_strcpy_system_multihop(self):
+        """argv[1] → strcpy(buf, argv[1]) → system(buf) must fire (multi-hop)."""
+        code = """
+int main(int argc, char *argv[]) {
+    char buf[256];
+    strcpy(buf, argv[1]);
+    system(buf);
+}
+"""
+        findings = self._c().analyze("test.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-CMD-001" in ids, "argv → strcpy(buf) → system(buf) must fire CMD"
+
+    def test_argv_sqlite3_exec_sql(self):
+        """argv[1] passed to sqlite3_exec() must fire CAST-SQL-001."""
+        code = """
+int main(int argc, char *argv[]) {
+    sqlite3 *db;
+    sqlite3_exec(db, argv[1], 0, 0, 0);
+}
+"""
+        findings = self._c().analyze("test.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-SQL-001" in ids, "argv[1] → sqlite3_exec() must fire SQL injection"
+
+    def test_argv_printf_format_string(self):
+        """argv[1] as format string to printf() must fire CAST-FMT-001."""
+        code = """
+int main(int argc, char *argv[]) {
+    printf(argv[1]);
+}
+"""
+        findings = self._c().analyze("test.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-FMT-001" in ids, "argv[1] as printf format must fire FMT vulnerability"
+
+    def test_argv_fopen_path_traversal(self):
+        """argv[1] → strcpy(buf) → fopen(buf) must fire CAST-PATH-001."""
+        code = """
+int main(int argc, char *argv[]) {
+    char path[512];
+    strcpy(path, argv[1]);
+    FILE *f = fopen(path, "r");
+}
+"""
+        findings = self._c().analyze("test.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-PATH-001" in ids, "argv → fopen() must fire path traversal"
+
+    def test_recv_system_network_input(self):
+        """recv(sock, buf) → system(buf) must fire CMD injection."""
+        code = """
+void handle(int sock) {
+    char cmd[1024];
+    recv(sock, cmd, sizeof(cmd), 0);
+    system(cmd);
+}
+"""
+        findings = self._c().analyze("server.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-CMD-001" in ids, "recv() → system() must fire CMD injection"
+
+    def test_fgets_sprintf_sqlite_multihop(self):
+        """fgets(input) → sprintf(query, ..., input) → sqlite3_exec(query) must fire SQL."""
+        code = """
+void query_user(sqlite3 *db) {
+    char input[256], query[512];
+    fgets(input, 256, stdin);
+    sprintf(query, "SELECT * FROM users WHERE name='%s'", input);
+    sqlite3_exec(db, query, 0, 0, 0);
+}
+"""
+        findings = self._c().analyze("db.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-SQL-001" in ids, "fgets → sprintf(query) → sqlite3_exec must fire SQL"
+
+    def test_gets_always_mem001(self):
+        """gets() must always fire CAST-MEM-001 regardless of taint."""
+        code = """
+void f() {
+    char buf[10];
+    gets(buf);
+}
+"""
+        findings = self._c().analyze("legacy.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-MEM-001" in ids, "gets() must always fire CAST-MEM-001"
+
+    def test_mktemp_mem001(self):
+        """mktemp() must always fire CAST-MEM-001 (TOCTOU race)."""
+        code = """
+void f() {
+    char tmpl[] = "/tmp/tmpXXXXXX";
+    char *path = mktemp(tmpl);
+}
+"""
+        findings = self._c().analyze("util.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-MEM-001" in ids, "mktemp() must fire CAST-MEM-001 (TOCTOU)"
+
+    def test_argv_pqexec_sql(self):
+        """argv[1] → PQexec() must fire CAST-SQL-001 (libpq)."""
+        code = """
+int main(int argc, char *argv[]) {
+    PGconn *conn;
+    PQexec(conn, argv[1]);
+}
+"""
+        findings = self._c().analyze("pg_client.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-SQL-001" in ids, "argv[1] → PQexec() must fire SQL injection"
+
+    def test_argv_strcpy_buf_overflow(self):
+        """argv[1] → strcpy(buf) must fire CAST-BUF-001 (no bounds check)."""
+        code = """
+int main(int argc, char *argv[]) {
+    char buf[16];
+    strcpy(buf, argv[1]);
+}
+"""
+        findings = self._c().analyze("test.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-BUF-001" in ids, "strcpy(buf, argv[1]) must fire BUF overflow"
+
+    def test_cpp_cin_fopen(self):
+        """C++: cin >> path → fopen(path.c_str()) must fire CAST-PATH-001."""
+        code = """
+#include <iostream>
+#include <string>
+int main() {
+    std::string path;
+    std::cin >> path;
+    fopen(path.c_str(), "r");
+}
+"""
+        findings = self._cpp().analyze("app.cpp", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-PATH-001" in ids, "cin >> path → fopen(path.c_str()) must fire PATH"
+
+    def test_cpp_cin_system(self):
+        """C++: cin >> cmd → system(cmd.c_str()) must fire CAST-CMD-001."""
+        code = """
+#include <iostream>
+#include <string>
+int main() {
+    std::string cmd;
+    std::cin >> cmd;
+    system(cmd.c_str());
+}
+"""
+        findings = self._cpp().analyze("app.cpp", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-CMD-001" in ids, "cin >> cmd → system(cmd.c_str()) must fire CMD"
+
+    # ── Negative (must NOT fire) ──────────────────────────────────────────────
+
+    def test_no_fp_constant_fopen(self):
+        """fopen with string literal must NOT fire."""
+        code = """
+int main(int argc, char *argv[]) {
+    FILE *f = fopen("/etc/passwd", "r");
+}
+"""
+        findings = self._c().analyze("safe.c", code)
+        path_fp = [f for f in findings if f.rule_id == "CAST-PATH-001"]
+        assert not path_fp, "fopen('/etc/passwd') constant path must not fire PATH"
+
+    def test_no_fp_constant_system(self):
+        """system() with string literal must NOT fire."""
+        code = """
+void f() {
+    system("ls -la");
+}
+"""
+        findings = self._c().analyze("safe.c", code)
+        cmd_fp = [f for f in findings if f.rule_id == "CAST-CMD-001"]
+        assert not cmd_fp, "system(\"ls\") constant must not fire CMD injection"
+
+    def test_no_fp_parameterized_sqlite3(self):
+        """sqlite3_exec with constant SQL must NOT fire."""
+        code = """
+void init(sqlite3 *db) {
+    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS t (id INTEGER)", 0, 0, 0);
+}
+"""
+        findings = self._c().analyze("db_init.c", code)
+        sql_fp = [f for f in findings if f.rule_id == "CAST-SQL-001"]
+        assert not sql_fp, "sqlite3_exec with constant SQL must not fire SQL injection"
