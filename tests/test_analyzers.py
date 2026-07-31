@@ -5403,6 +5403,110 @@ int main() {
         ids = [f.rule_id for f in findings]
         assert "CAST-CMD-001" in ids, "cin >> cmd → system(cmd.c_str()) must fire CMD"
 
+    def test_getenv_cmd_injection(self):
+        """getenv() result passed to system() must fire CAST-CMD-001."""
+        code = """
+#include <stdlib.h>
+void run() {
+    char *cmd = getenv("CMD");
+    if (cmd) {
+        system(cmd);
+    }
+}
+"""
+        findings = self._c().analyze("env_cmd.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-CMD-001" in ids, "getenv → system() must fire CMD injection"
+
+    def test_getenv_strncat_system(self):
+        """getenv() → strncat(buf, env) → system(buf) must fire (multi-hop)."""
+        code = """
+#include <string.h>
+#include <stdlib.h>
+void run() {
+    char data[100] = "ls ";
+    char *env = getenv("ADD");
+    if (env) {
+        strncat(data, env, 97);
+    }
+    system(data);
+}
+"""
+        findings = self._c().analyze("env_strncat.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-CMD-001" in ids, "getenv → strncat(buf) → system(buf) must fire CMD"
+
+    def test_struct_field_taint_propagation(self):
+        """Taint through struct field: s.data = tainted → system(s.data) must fire."""
+        code = """
+#include <stdlib.h>
+typedef struct { char *data; } Container;
+void run() {
+    Container c;
+    c.data = getenv("CMD");
+    system(c.data);
+}
+"""
+        findings = self._c().analyze("struct_taint.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-CMD-001" in ids, "struct field taint s.data = getenv → system(s.data)"
+
+    def test_strcpy_always_unsafe(self):
+        """strcpy() must always fire CAST-BUF-001 (no bounds check)."""
+        code = """
+#include <string.h>
+void f() {
+    char dst[10];
+    strcpy(dst, "hello");
+}
+"""
+        findings = self._c().analyze("strcpy_safe_looking.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-BUF-001" in ids, "strcpy() must always fire BUF-001 (always unsafe)"
+
+    def test_wcscpy_always_unsafe(self):
+        """wcscpy() must always fire CAST-BUF-001."""
+        code = """
+#include <wchar.h>
+void f() {
+    wchar_t dst[32];
+    wcscpy(dst, L"hello");
+}
+"""
+        findings = self._c().analyze("wcscpy.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-BUF-001" in ids, "wcscpy() must always fire BUF-001"
+
+    def test_struct_memcpy_overrun(self):
+        """memcpy(s.member, src, sizeof(s)) must fire CAST-BUF-002."""
+        code = """
+#include <string.h>
+typedef struct { char buf[16]; void *ptr; } S;
+void f() {
+    S s;
+    char src[32] = "AAAAAAAAAAAAAAAA";
+    memcpy(s.buf, src, sizeof(s));
+}
+"""
+        findings = self._c().analyze("struct_overrun.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-BUF-002" in ids, "memcpy(s.buf, src, sizeof(s)) must fire BUF-002"
+
+    def test_struct_memcpy_good_no_fp(self):
+        """memcpy(s.member, src, sizeof(s.member)) must NOT fire CAST-BUF-002."""
+        code = """
+#include <string.h>
+typedef struct { char buf[16]; void *ptr; } S;
+void f() {
+    S s;
+    char src[16] = "AAAAAAAAAAAAAAAA";
+    memcpy(s.buf, src, sizeof(s.buf));
+}
+"""
+        findings = self._c().analyze("struct_safe.c", code)
+        buf002 = [f for f in findings if f.rule_id == "CAST-BUF-002"]
+        assert not buf002, "memcpy(s.buf, src, sizeof(s.buf)) must NOT fire BUF-002"
+
     # ── Negative (must NOT fire) ──────────────────────────────────────────────
 
     def test_no_fp_constant_fopen(self):

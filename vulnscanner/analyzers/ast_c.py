@@ -41,6 +41,7 @@ _CPP_EXTS = (".cc", ".cpp", ".cxx", ".c++", ".hh", ".hpp", ".hxx")
 # (dst_arg_index, [src_arg_indices])
 # dst_arg_index = -1 means the return value is tainted (caller assigns it to a var)
 _PROP_DST_SRC: dict[str, tuple[int, list[int]]] = {
+    # Narrow string copy/append
     "strcpy":   (0, [1]),
     "strncpy":  (0, [1]),
     "strcat":   (0, [0, 1]),
@@ -55,6 +56,16 @@ _PROP_DST_SRC: dict[str, tuple[int, list[int]]] = {
     "strndup":  (-1, [0]),
     "strtok":   (-1, [0]),
     "strtok_r": (-1, [0]),
+    # Wide string copy/append (wchar_t)
+    "wcscpy":   (0, [1]),
+    "wcsncpy":  (0, [1]),
+    "wcscat":   (0, [0, 1]),
+    "wcsncat":  (0, [0, 1]),
+    "wmemcpy":  (0, [1]),
+    "wmemmove": (0, [1]),
+    "wcsdup":   (-1, [0]),
+    "swprintf": (0, list(range(2, 8))),
+    "vswprintf":(0, [2, 3]),
 }
 
 # Input-reading functions that taint a buffer argument
@@ -62,11 +73,24 @@ _PROP_DST_SRC: dict[str, tuple[int, list[int]]] = {
 _INPUT_BUF: dict[str, int] = {
     "gets":      0,  # also CAST-MEM-001
     "fgets":     0,
+    "fread":     0,  # fread(ptr, size, count, stream) → ptr tainted
+    "pread":     1,  # pread(fd, buf, n, offset) → buf tainted
     "read":      1,
     "recv":      1,
     "recvfrom":  1,
     "recvmsg":   1,
+    "getline":   0,  # POSIX getline(*lineptr, *n, fp) → lineptr tainted
+    "__getline": 0,
 }
+
+# Functions whose return value is always tainted (env vars, credentials, etc.)
+_INPUT_RET: frozenset[str] = frozenset({
+    "getenv", "secure_getenv",
+    "_wgetenv", "_tgetenv", "__wgetenv",  # Windows wide/TCHAR variants
+    "getpass",   # password prompt
+    "getlogin", "cuserid",  # login name
+    "readline",  # GNU readline
+})
 
 # ── Sinks ─────────────────────────────────────────────────────────────────────
 # Each value: (tainted_arg_index, rule_id, vuln_type, severity, description)
@@ -110,6 +134,8 @@ _SINKS: dict[str, tuple] = {
     "execlp":        _cmd(0, "Command injection via execlp()"),
     "execle":        _cmd(0, "Command injection via execle()"),
     "wordexp":       _cmd(0, "Command injection via wordexp() shell word expansion"),
+    "_wsystem":  _cmd(0, "Command injection via _wsystem() with user-controlled wide string"),
+    "_wpopen":   _cmd(0, "Command injection via _wpopen() with user-controlled wide string"),
     "ShellExecute":  _cmd(2, "Command injection via Win32 ShellExecute()"),
     "ShellExecuteA": _cmd(2, "Command injection via Win32 ShellExecuteA()"),
     "ShellExecuteW": _cmd(2, "Command injection via Win32 ShellExecuteW()"),
@@ -131,6 +157,9 @@ _SINKS: dict[str, tuple] = {
     "wprintf":   _fmt(0, "Format string: user-controlled format in wprintf()"),
     "fwprintf":  _fmt(1, "Format string: user-controlled format in fwprintf()"),
     "swprintf":  _fmt(2, "Format string: user-controlled format in swprintf()"),
+    "vwprintf":  _fmt(0, "Format string: user-controlled format in vwprintf()"),
+    "vfwprintf": _fmt(1, "Format string: user-controlled format in vfwprintf()"),
+    "vswprintf": _fmt(2, "Format string: user-controlled format in vswprintf()"),
     # Path traversal
     "fopen":    _path(0, "Path traversal via fopen() with user-controlled path"),
     "freopen":  _path(0, "Path traversal via freopen() with user-controlled path"),
@@ -157,22 +186,40 @@ _SINKS: dict[str, tuple] = {
     # Buffer overflow (tainted source, no bounds check)
     "strcpy":    _buf(1, "Buffer overflow: strcpy() copies unbounded user-controlled src"),
     "strcat":    _buf(1, "Buffer overflow: strcat() appends unbounded user-controlled src"),
+    "wcscpy":    _buf(1, "Buffer overflow: wcscpy() copies unbounded user-controlled wide src"),
+    "wcscat":    _buf(1, "Buffer overflow: wcscat() appends unbounded user-controlled wide src"),
     "gets":      _buf(0, "Buffer overflow: gets() reads unbounded input (always unsafe)"),
     "scanf":     _buf(1, "Buffer overflow: scanf() with %s reads unbounded user input"),
     "sscanf":    _buf(2, "Buffer overflow: sscanf() with %s reads unbounded user input"),
+    "fscanf":    _buf(1, "Buffer overflow: fscanf() with %s reads unbounded input"),
 }
 
 # Functions that are always dangerous regardless of taint
 # (rule_id, severity, vuln_type, description)
 _ALWAYS_UNSAFE: dict[str, tuple] = {
-    "gets":   ("CAST-MEM-001", Severity.CRITICAL, VulnType.TRUST_BOUNDARY_VIOLATION,
-               "Inherently unsafe: gets() has no bounds check — use fgets() instead"),
-    "getwd":  ("CAST-MEM-001", Severity.MEDIUM, VulnType.TRUST_BOUNDARY_VIOLATION,
-               "Inherently unsafe: getwd() may overflow fixed-size buffer — use getcwd()"),
-    "mktemp": ("CAST-MEM-001", Severity.MEDIUM, VulnType.RACE_CONDITION,
-               "Inherently unsafe: mktemp() has TOCTOU race condition — use mkstemp()"),
-    "tmpnam": ("CAST-MEM-001", Severity.MEDIUM, VulnType.RACE_CONDITION,
-               "Inherently unsafe: tmpnam() has TOCTOU race condition — use mkstemp()"),
+    "gets":    ("CAST-MEM-001", Severity.CRITICAL, VulnType.TRUST_BOUNDARY_VIOLATION,
+                "Inherently unsafe: gets() has no bounds check — use fgets() instead"),
+    "getwd":   ("CAST-MEM-001", Severity.MEDIUM, VulnType.TRUST_BOUNDARY_VIOLATION,
+                "Inherently unsafe: getwd() may overflow fixed-size buffer — use getcwd()"),
+    "mktemp":  ("CAST-MEM-001", Severity.MEDIUM, VulnType.RACE_CONDITION,
+                "Inherently unsafe: mktemp() has TOCTOU race condition — use mkstemp()"),
+    "tmpnam":  ("CAST-MEM-001", Severity.MEDIUM, VulnType.RACE_CONDITION,
+                "Inherently unsafe: tmpnam() has TOCTOU race condition — use mkstemp()"),
+    # Unbounded copy/append — always require bounds-safe alternatives
+    "strcpy":  ("CAST-BUF-001", Severity.HIGH, VulnType.TRUST_BOUNDARY_VIOLATION,
+                "Unsafe: strcpy() has no bounds check — use strncpy() or strlcpy()"),
+    "strcat":  ("CAST-BUF-001", Severity.MEDIUM, VulnType.TRUST_BOUNDARY_VIOLATION,
+                "Unsafe: strcat() has no bounds check — use strncat() or strlcat()"),
+    "wcscpy":  ("CAST-BUF-001", Severity.HIGH, VulnType.TRUST_BOUNDARY_VIOLATION,
+                "Unsafe: wcscpy() has no bounds check — use wcsncpy()"),
+    "wcscat":  ("CAST-BUF-001", Severity.MEDIUM, VulnType.TRUST_BOUNDARY_VIOLATION,
+                "Unsafe: wcscat() has no bounds check — use wcsncat()"),
+    "swprintf":("CAST-BUF-001", Severity.MEDIUM, VulnType.TRUST_BOUNDARY_VIOLATION,
+                "Unsafe: swprintf() may overflow fixed buffer — use snwprintf()"),
+    "sprintf": ("CAST-BUF-001", Severity.MEDIUM, VulnType.TRUST_BOUNDARY_VIOLATION,
+                "Unsafe: sprintf() may overflow fixed buffer — use snprintf()"),
+    "vsprintf":("CAST-BUF-001", Severity.MEDIUM, VulnType.TRUST_BOUNDARY_VIOLATION,
+                "Unsafe: vsprintf() may overflow fixed buffer — use vsnprintf()"),
 }
 
 
@@ -239,6 +286,8 @@ class _FuncSummary:
     returns_tainted: bool = False
     # Indices of parameters observed to receive tainted arguments at call sites
     param_tainted: set[int] = field(default_factory=set)
+    # Global/static variable names this function writes with tainted data
+    global_writes: set[str] = field(default_factory=set)
 
 
 # ── AST helpers ───────────────────────────────────────────────────────────────
@@ -392,6 +441,9 @@ def _is_tainted(node, tainted: set[str],
         # Input calls always return tainted
         if fname in _INPUT_BUF:
             return True
+        # Environment / credential sources always return tainted
+        if fname in _INPUT_RET:
+            return True
         # Interprocedural: known-tainted return value from intra-file function
         if summaries and fname in summaries and summaries[fname].returns_tainted:
             return True
@@ -433,12 +485,16 @@ def _seed_main_argv(func_node: object, tainted: set[str]) -> None:
 
 def _propagate(body_node, tainted: set[str],
                summaries: dict[str, _FuncSummary] | None = None,
-               call_sites: dict[str, set[int]] | None = None) -> bool:
+               call_sites: dict[str, set[int]] | None = None,
+               local_vars: set[str] | None = None,
+               global_writes: set[str] | None = None) -> bool:
     """One propagation pass; returns True if tainted set grew.
 
     summaries: optional intra-file function taint summaries.
     call_sites: optional dict to accumulate which param indices of each
                 callee receive tainted args (for interprocedural seeding).
+    local_vars: set of locally declared variable names in the current function.
+    global_writes: set to accumulate global variable names written with tainted data.
     """
     changed = False
 
@@ -455,15 +511,47 @@ def _propagate(body_node, tainted: set[str],
                     tainted.add(var)
                     changed = True
 
-        # var = expr;
+        # var = expr;  (also struct field and array element assignment)
         elif t == "assignment_expression":
             lhs = node.child_by_field_name("left")
             rhs = node.child_by_field_name("right")
-            if lhs and lhs.type == "identifier" and rhs and _is_tainted(rhs, tainted, summaries):
-                var = _txt(lhs)
-                if var not in tainted:
-                    tainted.add(var)
-                    changed = True
+            if lhs and rhs and _is_tainted(rhs, tainted, summaries):
+                if lhs.type == "identifier":
+                    var = _txt(lhs)
+                    if var not in tainted:
+                        tainted.add(var)
+                        changed = True
+                    # Track global writes: if var is not locally declared it's a global
+                    if global_writes is not None and local_vars is not None:
+                        if var not in local_vars:
+                            global_writes.add(var)
+                elif lhs.type == "field_expression":
+                    # s.a = tainted → mark parent struct s as tainted (field-insensitive)
+                    obj = lhs.child_by_field_name("argument")
+                    if obj and obj.type == "identifier":
+                        var = _txt(obj)
+                        if var not in tainted:
+                            tainted.add(var)
+                            changed = True
+                        if global_writes is not None and local_vars is not None:
+                            if var not in local_vars:
+                                global_writes.add(var)
+                elif lhs.type == "subscript_expression":
+                    # buf[i] = tainted → mark buf as tainted
+                    base = next((c for c in lhs.named_children), None)
+                    if base and base.type == "identifier":
+                        var = _txt(base)
+                        if var not in tainted:
+                            tainted.add(var)
+                            changed = True
+                elif lhs.type == "pointer_expression":
+                    # *ptr = tainted → mark ptr as tainted
+                    inner = next((c for c in lhs.named_children), None)
+                    if inner and inner.type == "identifier":
+                        var = _txt(inner)
+                        if var not in tainted:
+                            tainted.add(var)
+                            changed = True
 
         # call_expression — propagate buffer-copy sinks into destination
         elif t == "call_expression":
@@ -515,6 +603,45 @@ def _propagate(body_node, tainted: set[str],
     return changed
 
 
+def _is_struct_memcpy_overrun(args: list) -> bool:
+    """Detect memcpy(var.field, src, sizeof(var)) — dst is a member but size is the parent.
+
+    BAD:  memcpy(s.charBuf, src, sizeof(s))          ← copies sizeof(struct) into charBuf
+    GOOD: memcpy(s.charBuf, src, sizeof(s.charBuf))  ← correct: sizeof member
+    """
+    if len(args) < 3:
+        return False
+    dst = args[0]
+    size = args[2]
+    if dst.type != "field_expression":
+        return False
+    parent = dst.child_by_field_name("argument")
+    if parent is None:
+        return False
+    parent_name = _txt(parent)
+    if size.type != "sizeof_expression":
+        return False
+    # Find what's inside sizeof() — may be wrapped in parenthesized_expression
+    size_content = next((c for c in size.named_children
+                         if c.type not in ("comment",)), None)
+    if size_content is None:
+        return False
+    # Unwrap parenthesized_expression: sizeof(x) → x
+    if size_content.type == "parenthesized_expression":
+        size_content = next((c for c in size_content.named_children), None)
+    if size_content is None:
+        return False
+    # BAD case: sizeof(var) → just an identifier matching parent
+    if size_content.type == "identifier" and _txt(size_content) == parent_name:
+        return True
+    # BAD case: sizeof(*ptr) where ptr == parent_name
+    if size_content.type == "pointer_expression":
+        inner = next((c for c in size_content.named_children), None)
+        if inner and inner.type == "identifier" and _txt(inner) == parent_name:
+            return True
+    return False
+
+
 def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                   file_path: str, findings: list[Finding],
                   summaries: dict[str, _FuncSummary] | None = None) -> None:
@@ -548,6 +675,24 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     rule_id=rule_id,
                 ))
 
+        # Structural buffer overrun: memcpy/memmove(s.field, src, sizeof(s))
+        if fname in ("memcpy", "memmove") and _is_struct_memcpy_overrun(args):
+            key = (file_path, line_no, "CAST-BUF-002")
+            if key not in seen:
+                seen.add(key)
+                findings.append(Finding(
+                    vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                    severity=Severity.HIGH,
+                    file_path=file_path,
+                    line_number=line_no,
+                    line_content=line_text,
+                    description=(
+                        "Buffer overflow: memcpy/memmove uses sizeof(parent_struct) "
+                        "instead of sizeof(member_field) — overwrites adjacent memory"
+                    ),
+                    rule_id="CAST-BUF-002",
+                ))
+
         # Taint-sensitive sinks
         if fname in _SINKS:
             arg_idx, rule_id, vtype, sev, desc = _SINKS[fname]
@@ -567,6 +712,29 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
 
 
 # ── Interprocedural helpers ───────────────────────────────────────────────────
+
+def _collect_local_decls(func_node) -> set[str]:
+    """Return set of all locally declared variable names in a function (incl. params)."""
+    locals_: set[str] = set(_get_param_names(func_node))
+    body = func_node.child_by_field_name("body")
+    if body is None:
+        return locals_
+    for node in _walk(body):
+        if node.type == "declaration":
+            for n in _walk(node):
+                if n.type == "init_declarator":
+                    decl = n.child_by_field_name("declarator")
+                    ident = _first_identifier(decl or n)
+                    if ident:
+                        locals_.add(ident)
+                elif n.type in ("pointer_declarator", "array_declarator", "function_declarator"):
+                    ident = _first_identifier(n)
+                    if ident:
+                        locals_.add(ident)
+                elif n.type == "identifier" and n.parent and n.parent.type == "declaration":
+                    locals_.add(_txt(n))
+    return locals_
+
 
 def _collect_funcs(root_node) -> dict[str, object]:
     """Return {func_name: func_node} for all top-level function definitions."""
@@ -633,15 +801,23 @@ def _analyze_func_with_summaries(
     func_node,
     summaries: dict[str, _FuncSummary],
     call_sites: dict[str, set[int]] | None,
+    global_tainted: set[str] | None = None,
 ) -> set[str]:
     """Propagate taint through one function using current summaries. Return final tainted set."""
     fname = _first_identifier(func_node.child_by_field_name("declarator") or func_node)
     tainted = _seed_with_summaries(func_node, summaries.get(fname))
+    # Seed from globally tainted variables
+    if global_tainted:
+        tainted |= global_tainted
     body = func_node.child_by_field_name("body")
     if body is None:
         return tainted
+    # Collect local declarations for global-write tracking
+    local_vars = _collect_local_decls(func_node)
+    summary = summaries.get(fname)
+    global_writes = summary.global_writes if summary is not None else None
     for _ in range(10):
-        if not _propagate(body, tainted, summaries, call_sites):
+        if not _propagate(body, tainted, summaries, call_sites, local_vars, global_writes):
             break
     return tainted
 
@@ -665,15 +841,18 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
     if not funcs:
         return []
 
-    # Step 3: Interprocedural fixed-point analysis
+    # Step 3: Interprocedural fixed-point analysis (with global variable taint)
     summaries: dict[str, _FuncSummary] = {name: _FuncSummary() for name in funcs}
+    global_tainted: set[str] = set()  # file-scope variables written with tainted data
 
-    for _outer in range(5):
+    for _outer in range(7):
         changed = False
         call_sites: dict[str, set[int]] = {name: set() for name in funcs}
 
         for fname, func_node in funcs.items():
-            tainted = _analyze_func_with_summaries(func_node, summaries, call_sites)
+            tainted = _analyze_func_with_summaries(
+                func_node, summaries, call_sites, global_tainted
+            )
 
             # Update return-taint summary
             if not summaries[fname].returns_tainted:
@@ -688,12 +867,20 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
                 summaries[callee].param_tainted |= new_indices
                 changed = True
 
+        # Accumulate globally tainted variables from all function summaries
+        new_globals: set[str] = set()
+        for s in summaries.values():
+            new_globals |= s.global_writes
+        if new_globals - global_tainted:
+            global_tainted |= new_globals
+            changed = True
+
         if not changed:
             break
 
     # Step 4: Final pass — emit findings
     for func_node in funcs.values():
-        tainted = _analyze_func_with_summaries(func_node, summaries, None)
+        tainted = _analyze_func_with_summaries(func_node, summaries, None, global_tainted)
         body = func_node.child_by_field_name("body")
         if body:
             _detect_sinks(body, tainted, lines, file_path, findings, summaries)
