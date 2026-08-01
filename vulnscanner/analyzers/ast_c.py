@@ -1077,19 +1077,39 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
         if not member_tainted:
             continue
 
-        # Pass B: re-analyze each method with member taint injected, emit findings
+        # Pass B: re-analyze each method with member taint injected, emit findings.
+        # Also scan helper functions called from class methods (e.g. badVaSink(data))
+        # whose summaries were built before class member taint was known.
         for _mname, func_node in cls_methods:
             local = _collect_local_decls(func_node)
             extra = member_tainted - local  # don't shadow legitimate locals
             if not extra:
                 continue
+            new_call_sites: dict[str, set[int]] = {name: set() for name in funcs}
             tainted = _analyze_func_with_summaries(
-                func_node, summaries, None, global_tainted | extra
+                func_node, summaries, new_call_sites, global_tainted | extra
             )
             tainted |= extra
+            fpm = _collect_funcptr_map(func_node)
             body = func_node.child_by_field_name("body")
             if body:
-                _detect_sinks(body, tainted, lines, file_path, findings, summaries)
+                _detect_sinks(body, tainted, lines, file_path, findings, summaries, fpm)
+            # Also scan helpers that received newly-tainted args via the class member
+            for callee, tainted_idxs in new_call_sites.items():
+                if not tainted_idxs or callee not in funcs:
+                    continue
+                helper_node = funcs[callee]
+                helper_param_names = _get_param_names(helper_node)
+                helper_tainted: set[str] = set()
+                for idx in tainted_idxs:
+                    if idx < len(helper_param_names):
+                        helper_tainted.add(helper_param_names[idx])
+                if not helper_tainted:
+                    continue
+                helper_body = helper_node.child_by_field_name("body")
+                if helper_body:
+                    _detect_sinks(helper_body, helper_tainted, lines, file_path,
+                                  findings, summaries, _collect_funcptr_map(helper_node))
 
     return findings
 
