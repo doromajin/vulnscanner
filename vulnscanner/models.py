@@ -41,6 +41,7 @@ class VulnType(str, Enum):
     CORS_MISCONFIGURATION = "CORS Misconfiguration"
     JWT_MISCONFIGURATION = "JWT Misconfiguration"
     REDOS = "Regular Expression Denial of Service (ReDoS)"
+    INTENT_INJECTION = "Android Intent Injection"
 
 
 @dataclass

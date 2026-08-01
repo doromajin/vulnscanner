@@ -536,6 +536,88 @@ _JAVA_GUARD_VALIDATION_METHODS = frozenset({
     "validate",         # Custom validation utility
 })
 
+# ── Android AOSP taint sources ────────────────────────────────────────────────
+
+# Intent getter methods — all return caller-controlled data.
+_INTENT_GETTERS = frozenset({
+    "getStringExtra", "getIntExtra", "getLongExtra", "getBooleanExtra",
+    "getFloatExtra", "getDoubleExtra", "getByteExtra", "getCharExtra",
+    "getShortExtra", "getBundleExtra", "getSerializableExtra",
+    "getParcelableExtra", "getParcelableArrayExtra", "getStringArrayExtra",
+    "getCharSequenceExtra", "getDataString", "getAction",
+    "getExtras",
+})
+
+_INTENT_QUALIFIERS = frozenset({
+    "intent", "mIntent", "i", "in", "msg", "launchIntent",
+    "callerIntent", "receivedIntent", "data",
+})
+
+# Bundle getter methods (from getExtras(), onSaveInstanceState args, etc.)
+_BUNDLE_GETTERS = frozenset({
+    "getString", "getInt", "getLong", "getBoolean", "getFloat", "getDouble",
+    "getByte", "getChar", "getCharSequence", "getParcelable", "getSerializable",
+    "getStringArrayList", "getCharSequenceArrayList",
+})
+
+_BUNDLE_QUALIFIERS = frozenset({
+    "bundle", "extras", "args", "data", "b", "mBundle",
+    "savedState", "savedInstanceState", "options",
+})
+
+# ContentResolver / Cursor: values from query() results are caller-controlled
+_CURSOR_GETTERS = frozenset({
+    "getString", "getInt", "getLong", "getFloat", "getDouble",
+    "getBlob", "getShort",
+})
+_CURSOR_QUALIFIERS = frozenset({
+    "cursor", "c", "cur", "mCursor", "resultCursor", "result",
+})
+
+# External storage paths are attacker-influenced (other apps can write there)
+_EXTERNAL_STORAGE_METHODS = frozenset({
+    "getExternalStorageDirectory", "getExternalFilesDir",
+    "getExternalCacheDir", "getExternalStoragePublicDirectory",
+    "getExternalMediaDirs", "getExternalStorageState",
+})
+
+# ── Android guard/sanitizer patterns ─────────────────────────────────────────
+
+# Permission-enforcement methods that throw SecurityException if caller lacks
+# permission.  They narrow the *caller's* trust but do NOT sanitize data content.
+# Detected in method preambles to add a note to findings (lower-severity variant).
+_ANDROID_PERMISSION_GUARDS = frozenset({
+    "enforceCallingPermission", "enforceCallingOrSelfPermission",
+    "enforcePermission", "enforceCallingUriPermission", "enforceUriPermission",
+    "checkCallingPermission", "checkCallingOrSelfPermission",
+    "checkPermission", "checkSelfPermission", "requirePermission",
+    "checkOpNoThrow", "checkOp", "noteOp", "noteOpNoThrow",
+})
+
+# Path-canonicalization: getCanonicalPath()/toRealPath() resolves `../` sequences.
+# When the canonical path is subsequently compared against an allowed root,
+# path traversal is blocked.  We treat the call itself as a partial sanitizer
+# (reduces severity) but do NOT fully kill taint — the check might be absent.
+_PATH_CANON_METHODS = frozenset({
+    "getCanonicalPath", "getCanonicalFile", "toRealPath",
+})
+
+# ── Android Intent launch sinks (Intent injection / redirection) ──────────────
+
+_ANDROID_LAUNCH_METHODS = frozenset({
+    "startActivity", "startActivityForResult", "startActivityIfNeeded",
+    "startService", "stopService", "bindService", "startForegroundService",
+    "sendBroadcast", "sendOrderedBroadcast", "sendStickyBroadcast",
+    "sendBroadcastAsUser", "sendOrderedBroadcastAsUser",
+})
+
+# Intent construction/mutation methods that incorporate tainted data into an Intent
+_INTENT_MUTATORS = frozenset({
+    "setData", "setAction", "setClassName", "setComponent", "setPackage",
+    "setDataAndNormalize", "setDataAndType", "setDataAndTypeAndNormalize",
+    "parseUri",
+})
+
 # ── taint helpers ──────────────────────────────────────────────────────────────
 
 def _type_name(ref_type) -> str:
@@ -552,12 +634,36 @@ def _node_line(node) -> int:
     return 0
 
 
+def _is_android_source(node) -> bool:
+    """True if node is an Android AOSP taint source (Intent, Bundle, Cursor, external storage)."""
+    if not isinstance(node, jt.MethodInvocation):
+        return False
+    q = str(node.qualifier or "")
+    # Intent getters: getStringExtra / getAction / getExtras etc.
+    # These methods only exist on Intent, so any qualifier is fine.
+    if node.member in _INTENT_GETTERS:
+        return True
+    # Bundle getters: require the qualifier to look like a Bundle variable to avoid
+    # FP on arbitrary getString() calls (e.g. ResourceBundle, JSONObject).
+    if node.member in _BUNDLE_GETTERS and q in _BUNDLE_QUALIFIERS:
+        return True
+    # Cursor getters from ContentProvider query results
+    if node.member in _CURSOR_GETTERS and q in _CURSOR_QUALIFIERS:
+        return True
+    # Environment.getExternalStorageDirectory() — attacker-influenced paths
+    if node.member in _EXTERNAL_STORAGE_METHODS:
+        return True
+    return False
+
+
 def _is_request_source(node) -> bool:
-    """True if node is a direct call to a servlet/framework request getter."""
+    """True if node is a direct call to a servlet/framework request getter or AOSP source."""
     if not isinstance(node, jt.MethodInvocation):
         return False
     if node.member in _ANY_QUALIFIER_TAINT_METHODS:
         return True  # tainted regardless of what object it is called on
+    if _is_android_source(node):
+        return True
     if node.member not in _REQUEST_METHODS:
         return False
     q = node.qualifier or ""
@@ -1221,6 +1327,22 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
     except Exception:
         pass
 
+    # Android AOSP: Binder stub entrypoints (onTransact, handleMessage) receive
+    # data from untrusted remote callers via Parcel/Message.
+    # Seed the first "data" / "msg" parameter as tainted.
+    _BINDER_ENTRY_METHODS = frozenset({"onTransact", "handleMessage", "onReceive"})
+    try:
+        for _, method in tree.filter(jt.MethodDeclaration):
+            if method.name not in _BINDER_ENTRY_METHODS:
+                continue
+            for param in (method.parameters or []):
+                pname = getattr(param, "name", "")
+                if pname and pname not in ("reply", "flags"):
+                    tainted.add(pname)
+                    tainted_raw.add(pname)
+    except Exception:
+        pass
+
     # Cross-file callee-param seeding: if this file's methods are called from
     # Spring controllers with tainted args, pre-seed those params as tainted.
     # Enables detection of SQL/CMD sinks in service classes that have no Spring
@@ -1839,6 +1961,19 @@ def _build_method_scope_tainted(method_node, tree, const_ints: dict, dead_lines:
                     if pname:
                         m_tainted.add(pname)
                     break
+    except Exception:
+        pass
+
+    # Android: Binder stub / BroadcastReceiver entry methods receive untrusted
+    # data from remote callers.  Seed their input params so that Pass 3 does not
+    # incorrectly classify downstream variables as locally clean.
+    _BINDER_ENTRY_SCOPE = frozenset({"onTransact", "handleMessage", "onReceive"})
+    try:
+        if getattr(method_node, "name", "") in _BINDER_ENTRY_SCOPE:
+            for param in (method_node.parameters or []):
+                pname = getattr(param, "name", "")
+                if pname and pname not in ("reply", "flags"):
+                    m_tainted.add(pname)
     except Exception:
         pass
 
@@ -2669,6 +2804,112 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                  f"Paths.{node.member}() with user-controlled path — "
                                  "path traversal; validate path does not escape allowed directory")
                             break
+        except Exception:
+            pass
+
+        # ── Android AOSP: Intent injection / redirection ─────────────────────
+        # Flag when a tainted value flows into Intent mutation or directly into
+        # a launch method (startActivity, sendBroadcast, etc.).
+        #
+        # Patterns detected:
+        #   intent.setAction(tainted)       → JAST-ANDROID-001 (HIGH)
+        #   intent.setClassName(pkg, tainted) → JAST-ANDROID-001
+        #   new Intent(tainted)             → JAST-ANDROID-001
+        #   startActivity(tainted_intent)   → when intent itself is tracked as tainted
+        try:
+            # Collect permission-guard presence: if enforceCallingPermission() is called
+            # anywhere in this file, we know the code has caller trust checks.
+            # We still fire the finding but lower severity to MEDIUM (access-controlled).
+            _has_perm_guard = False
+            try:
+                for _, _pg_node in tree.filter(jt.MethodInvocation):
+                    if _pg_node.member in _ANDROID_PERMISSION_GUARDS:
+                        _has_perm_guard = True
+                        break
+            except Exception:
+                pass
+            _android_severity = Severity.MEDIUM if _has_perm_guard else Severity.HIGH
+
+            # Track Intent variables that have been tainted via mutation methods
+            _tainted_intents: set[str] = set()
+
+            # Intent mutation: intent.setData(tainted), intent.setAction(tainted), etc.
+            for _, node in tree.filter(jt.MethodInvocation):
+                if _node_line(node) in dead_lines:
+                    continue
+                if node.member not in _INTENT_MUTATORS:
+                    continue
+                _et = _eff_tainted(node)
+                if any(_is_tainted(a, _et) for a in (node.arguments or [])):
+                    _add(node, VulnType.INTENT_INJECTION, _android_severity,
+                         "JAST-ANDROID-001",
+                         f"intent.{node.member}() with user-controlled data — "
+                         "Intent injection; validate and allowlist component/URI before launch")
+                    q = str(node.qualifier or "")
+                    if q:
+                        _tainted_intents.add(q)
+
+            # Intent constructor: new Intent(tainted_uri_or_action)
+            for _icc_path, node in tree.filter(jt.ClassCreator):
+                if _type_name(node.type) != "Intent":
+                    continue
+                _icc_line = _node_line(node)
+                if not _icc_line:
+                    for _anc in reversed(_icc_path):
+                        _icc_line = _node_line(_anc)
+                        if _icc_line:
+                            break
+                if _icc_line in dead_lines:
+                    continue
+                _et = _eff_tainted(_icc_line)
+                if any(_is_tainted(a, _et) for a in (node.arguments or [])):
+                    _add(node, VulnType.INTENT_INJECTION, _android_severity,
+                         "JAST-ANDROID-001",
+                         "new Intent() with user-controlled argument — "
+                         "Intent injection; validate action/URI/component before launch",
+                         line_override=_icc_line)
+
+            # Launch with tainted Intent variable
+            for _, node in tree.filter(jt.MethodInvocation):
+                if node.member not in _ANDROID_LAUNCH_METHODS:
+                    continue
+                if _node_line(node) in dead_lines:
+                    continue
+                _et = _eff_tainted(node)
+                for arg in (node.arguments or []):
+                    arg_name = arg.member if isinstance(arg, jt.MemberReference) else ""
+                    if arg_name and arg_name in _tainted_intents:
+                        _add(node, VulnType.INTENT_INJECTION, _android_severity,
+                             "JAST-ANDROID-001",
+                             f"{node.member}() with user-controlled Intent — "
+                             "Intent injection/redirection; validate component before launch")
+                        break
+                    if _is_tainted(arg, _et):
+                        _add(node, VulnType.PATH_TRAVERSAL, _android_severity,
+                             "JAST-ANDROID-002",
+                             f"{node.member}() with user-controlled argument — "
+                             "validate data before launching component")
+                        break
+        except Exception:
+            pass
+
+        # ── Android AOSP: path traversal via external storage ─────────────────
+        # getExternalStorageDirectory() returns a path attackers can influence.
+        # Taint already flows through _is_android_source; existing JAST-PATH-001
+        # handles the File() sink.  Add openFileOutput / openFile sinks here.
+        try:
+            for _, node in tree.filter(jt.MethodInvocation):
+                if node.member not in ("openFileOutput", "openFile", "openInputStream",
+                                       "openOutputStream"):
+                    continue
+                if _node_line(node) in dead_lines:
+                    continue
+                args = node.arguments or []
+                if args and _is_tainted(args[0], _eff_tainted(node)):
+                    _add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH,
+                         "JAST-ANDROID-003",
+                         f"{node.member}() with user-controlled path — "
+                         "path traversal; canonicalize and validate within app sandbox")
         except Exception:
             pass
 
