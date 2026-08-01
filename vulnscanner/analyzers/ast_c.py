@@ -124,16 +124,9 @@ _SINKS: dict[str, tuple] = {
     "SQLExecDirect":      _sql(1, "SQL injection via ODBC SQLExecDirect()"),
     "SQLExecDirectW":     _sql(1, "SQL injection via ODBC SQLExecDirectW()"),
     "OCIStmtPrepare":     _sql(1, "SQL injection via Oracle OCI OCIStmtPrepare()"),
-    # Command
+    # Command (single-string sinks: any taint in arg N is sufficient)
     "system":        _cmd(0, "Command injection via system() with user-controlled string"),
     "popen":         _cmd(0, "Command injection via popen() with user-controlled string"),
-    "execv":         _cmd(0, "Command injection via execv()"),
-    "execvp":        _cmd(0, "Command injection via execvp()"),
-    "execvpe":       _cmd(0, "Command injection via execvpe()"),
-    "execve":        _cmd(0, "Command injection via execve()"),
-    "execl":         _cmd(0, "Command injection via execl()"),
-    "execlp":        _cmd(0, "Command injection via execlp()"),
-    "execle":        _cmd(0, "Command injection via execle()"),
     "wordexp":       _cmd(0, "Command injection via wordexp() shell word expansion"),
     "_wsystem":  _cmd(0, "Command injection via _wsystem() with user-controlled wide string"),
     "_wpopen":   _cmd(0, "Command injection via _wpopen() with user-controlled wide string"),
@@ -143,15 +136,7 @@ _SINKS: dict[str, tuple] = {
     "CreateProcessA":_cmd(1, "Command injection via Win32 CreateProcessA()"),
     "CreateProcessW":_cmd(1, "Command injection via Win32 CreateProcessW()"),
     "WinExec":       _cmd(0, "Command injection via Win32 WinExec()"),
-    # Wide-char exec variants (wchar_t)
-    "_wexecv":   _cmd(0, "Command injection via _wexecv() with wide-char command"),
-    "_wexecve":  _cmd(0, "Command injection via _wexecve() with wide-char command"),
-    "_wexecvp":  _cmd(0, "Command injection via _wexecvp() with wide-char command"),
-    "_wexecvpe": _cmd(0, "Command injection via _wexecvpe() with wide-char command"),
-    "_wexecl":   _cmd(0, "Command injection via _wexecl() with wide-char command"),
-    "_wexecle":  _cmd(0, "Command injection via _wexecle() with wide-char command"),
-    "_wexeclp":  _cmd(0, "Command injection via _wexeclp() with wide-char command"),
-    "_wexeclpe": _cmd(0, "Command injection via _wexeclpe() with wide-char command"),
+    # NOTE: exec*/wexec* moved to _EXEC_SINKS (any-arg check) — see below
     # Format string (tainted format argument)
     "printf":    _fmt(0, "Format string: user-controlled format in printf()"),
     "vprintf":   _fmt(0, "Format string: user-controlled format in vprintf()"),
@@ -203,6 +188,21 @@ _SINKS: dict[str, tuple] = {
     "sscanf":    _buf(2, "Buffer overflow: sscanf() with %s reads unbounded user input"),
     "fscanf":    _buf(1, "Buffer overflow: fscanf() with %s reads unbounded input"),
 }
+
+# exec* / _exec* / _wexec* family: path is arg 0, but tainted data may appear at any arg position.
+# Juliet patterns: execl(fixed_path, fixed_path, "/c", data, NULL) — taint at arg 3.
+# We check all args for taint (any tainted arg triggers CAST-CMD-001).
+_EXEC_SINKS: frozenset[str] = frozenset({
+    # POSIX exec variants
+    "execl", "execle", "execlp",
+    "execv", "execve", "execvp", "execvpe",
+    # Windows _exec variants
+    "_execl", "_execle", "_execlp", "_execlpe",
+    "_execv", "_execve", "_execvp", "_execvpe",
+    # Windows wide-char _wexec variants
+    "_wexecl", "_wexecle", "_wexeclp", "_wexeclpe",
+    "_wexecv", "_wexecve", "_wexecvp", "_wexecvpe",
+})
 
 # Windows _spawn* / _wspawn* functions: first arg is mode, rest may carry tainted data.
 # We check args[1:] for taint (any tainted arg triggers CAST-CMD-001).
@@ -735,6 +735,22 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                         line_content=line_text,
                         description=desc,
                         rule_id=rule_id,
+                    ))
+
+        # exec* / _exec* / _wexec*: path at arg 0, but ANY arg may carry tainted data
+        if fname in _EXEC_SINKS and args:
+            if any(_is_tainted(a, tainted, summaries) for a in args):
+                key = (file_path, line_no, "CAST-CMD-001")
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(Finding(
+                        vuln_type=VulnType.COMMAND_INJECTION,
+                        severity=Severity.CRITICAL,
+                        file_path=file_path,
+                        line_number=line_no,
+                        line_content=line_text,
+                        description=f"Command injection via {fname}() with user-controlled argument",
+                        rule_id="CAST-CMD-001",
                     ))
 
         # Windows _spawn* family: mode is arg 0, any subsequent tainted arg is dangerous
