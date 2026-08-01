@@ -1,5 +1,5 @@
 // VulnScanner VS Code Extension
-// Runs vulnscanner on Python/Java/JS/TS/Go/Ruby/PHP files and shows findings as diagnostics.
+// Runs vulnscanner on Python/Java/JS/TS/Go/Ruby/PHP/C/C++/C# files and shows findings as diagnostics.
 const vscode = require('vscode');
 const { execFile } = require('child_process');
 const path = require('path');
@@ -7,6 +7,7 @@ const path = require('path');
 const SUPPORTED_LANGUAGES = new Set([
     'python', 'java', 'javascript', 'typescript',
     'javascriptreact', 'typescriptreact', 'go', 'ruby', 'php',
+    'c', 'cpp', 'csharp',
 ]);
 
 const SEVERITY_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];
@@ -42,6 +43,22 @@ function activate(context) {
             diagnosticCollection.clear();
             updateStatusBar(null);
         }),
+        vscode.commands.registerCommand('vulnscanner.addIgnoreComment', cmdAddIgnoreComment),
+    );
+
+    // Code Action provider: "Suppress with vulnscanner: ignore"
+    const selector = [...SUPPORTED_LANGUAGES].map(lang => ({ language: lang }));
+    context.subscriptions.push(
+        vscode.languages.registerCodeActionsProvider(
+            selector,
+            new VulnScannerCodeActionProvider(),
+            { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] },
+        ),
+    );
+
+    // Hover provider: show remediation advice
+    context.subscriptions.push(
+        vscode.languages.registerHoverProvider(selector, new VulnScannerHoverProvider()),
     );
 
     // Scan on save
@@ -293,6 +310,164 @@ function updateStatusBar(count) {
         statusBarItem.text = `$(warning) VulnScanner ${count} issue${count === 1 ? '' : 's'}`;
         statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
     }
+}
+
+// ── Remediation advice ────────────────────────────────────────────────────────
+
+const REMEDIATION = {
+    // SQL Injection
+    'JAST-SQL-001': 'Use parameterized queries / PreparedStatement instead of string concatenation.',
+    'AST-SQL-001':  'Use parameterized queries (cursor.execute("… %s", (val,))) instead of f-strings.',
+    'CAST-SQL-001': 'Use parameterized queries via sqlite3_bind_*() or similar.',
+    // Command Injection
+    'JAST-CMD-001': 'Avoid Runtime.exec()/ProcessBuilder with user input. Validate and escape, or use a fixed command list.',
+    'AST-CMD-001':  'Use subprocess with a list argument (no shell=True) and validate input.',
+    'CAST-CMD-001': 'Validate input before passing to system()/popen(). Prefer execv() with argv instead of shell commands.',
+    // XSS
+    'JAST-XSS-001': 'Escape output with HtmlUtils.htmlEscape() or use a template engine with auto-escaping.',
+    'AST-XSS-001':  'Use markupsafe.escape() or a template engine. Never render raw user input as HTML.',
+    // Path Traversal
+    'JAST-PATH-001': 'Canonicalize the path with File.getCanonicalPath() and verify it starts with the expected base directory.',
+    'AST-PATH-001':  'Use os.path.realpath() and verify the resolved path is within the intended directory.',
+    'CAST-PATH-001': 'Use realpath() and check the result starts with the allowed directory prefix.',
+    // Buffer Overflow
+    'CAST-BUF-001': 'Use strncpy/snprintf instead of strcpy/sprintf. Ensure the destination buffer is large enough.',
+    'CAST-BUF-002': 'Check array bounds before subscript access. Use safe alternatives like std::vector with .at().',
+    // Format String
+    'CAST-FMT-001': 'Never pass user-controlled data directly as a printf format string. Use printf("%s", data) instead.',
+    // UAF
+    'CAST-UAF-001': 'Set pointer to NULL immediately after free(). Use smart pointers (unique_ptr/shared_ptr) in C++.',
+    // Integer Overflow
+    'CAST-INT-001': 'Validate size arguments before malloc/new. Check for integer overflow with __builtin_mul_overflow or similar.',
+    // SSRF
+    'CSAST-SSRF-001': 'Validate and whitelist target URLs. Block private IP ranges. Use an allowlist instead of denylisting.',
+    'JAST-URI-001':   'Validate URI scheme and host against an allowlist before passing to ContentResolver.',
+    // Authorization
+    'JAST-ANDROID-AUTHZ-001': 'Call enforceCallingPermission() or checkCallingPermission() at the start of Binder entry methods.',
+    'JAST-ANDROID-AUTHZ-002': 'Do not write user-controlled data to Settings.Secure/System/Global without authorization check.',
+};
+
+function remediationFor(ruleId) {
+    if (REMEDIATION[ruleId]) return REMEDIATION[ruleId];
+    // Prefix match
+    const prefix = Object.keys(REMEDIATION).find(k => ruleId.startsWith(k.split('-').slice(0, 2).join('-')));
+    return prefix ? REMEDIATION[prefix] : null;
+}
+
+// ── Code Action Provider ──────────────────────────────────────────────────────
+
+class VulnScannerCodeActionProvider {
+    /**
+     * @param {vscode.TextDocument} document
+     * @param {vscode.Range} range
+     * @param {vscode.CodeActionContext} context
+     * @returns {vscode.CodeAction[]}
+     */
+    provideCodeActions(document, range, context) {
+        const actions = [];
+        for (const diag of context.diagnostics) {
+            if (diag.source !== 'VulnScanner') continue;
+            const ruleId = typeof diag.code === 'object' ? diag.code.value : String(diag.code || '');
+            if (!ruleId) continue;
+
+            // Action 1: Add suppress comment
+            const suppressAction = new vscode.CodeAction(
+                `Suppress: add '# vulnscanner: ignore' comment`,
+                vscode.CodeActionKind.QuickFix,
+            );
+            suppressAction.command = {
+                command: 'vulnscanner.addIgnoreComment',
+                title: 'Add ignore comment',
+                arguments: [document, diag.range.start.line, ruleId],
+            };
+            suppressAction.diagnostics = [diag];
+            actions.push(suppressAction);
+
+            // Action 2: Open CWE reference
+            const cweLine = diag.relatedInformation && diag.relatedInformation[0]
+                ? diag.relatedInformation[0].message : '';
+            const cweMatch = cweLine.match(/CWE-(\d+)/);
+            if (cweMatch) {
+                const openCweAction = new vscode.CodeAction(
+                    `View CWE-${cweMatch[1]} on MITRE`,
+                    vscode.CodeActionKind.Empty,
+                );
+                openCweAction.command = {
+                    command: 'vscode.open',
+                    title: 'Open CWE',
+                    arguments: [vscode.Uri.parse(`https://cwe.mitre.org/data/definitions/${cweMatch[1]}.html`)],
+                };
+                actions.push(openCweAction);
+            }
+        }
+        return actions;
+    }
+}
+
+// ── Hover Provider ────────────────────────────────────────────────────────────
+
+class VulnScannerHoverProvider {
+    /**
+     * @param {vscode.TextDocument} document
+     * @param {vscode.Position} position
+     * @returns {vscode.Hover | undefined}
+     */
+    provideHover(document, position) {
+        const diags = diagnosticCollection.get(document.uri);
+        if (!diags || diags.length === 0) return;
+
+        const diag = diags.find(d => d.range.contains(position) && d.source === 'VulnScanner');
+        if (!diag) return;
+
+        const ruleId = typeof diag.code === 'object' ? diag.code.value : String(diag.code || '');
+        const remediation = remediationFor(ruleId);
+        if (!remediation) return;
+
+        const md = new vscode.MarkdownString();
+        md.isTrusted = true;
+        md.appendMarkdown(`**VulnScanner [${ruleId}]** — Remediation\n\n`);
+        md.appendMarkdown(`${remediation}\n\n`);
+        md.appendMarkdown(`*Add \`# vulnscanner: ignore\` on this line to suppress.*`);
+        return new vscode.Hover(md);
+    }
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+/**
+ * Insert a '# vulnscanner: ignore' (or language-appropriate comment) on the finding's line.
+ * @param {vscode.TextDocument} document
+ * @param {number} lineIndex
+ * @param {string} ruleId
+ */
+async function cmdAddIgnoreComment(document, lineIndex, ruleId) {
+    const editor = vscode.window.visibleTextEditors.find(e => e.document === document);
+    if (!editor) return;
+
+    const lineText = document.lineAt(lineIndex).text;
+    const indent = lineText.match(/^(\s*)/)[1];
+
+    // Pick the right comment syntax
+    const lang = document.languageId;
+    let commentPrefix;
+    if (['c', 'cpp', 'csharp', 'java', 'javascript', 'typescript',
+         'javascriptreact', 'typescriptreact', 'go'].includes(lang)) {
+        commentPrefix = '// vulnscanner: ignore';
+    } else {
+        commentPrefix = '# vulnscanner: ignore';
+    }
+
+    // If the line already has a vulnscanner: ignore, add the rule ID
+    if (lineText.includes('vulnscanner: ignore')) {
+        // Already suppressed — inform user
+        vscode.window.showInformationMessage(`VulnScanner: line ${lineIndex + 1} is already suppressed.`);
+        return;
+    }
+
+    await editor.edit(eb => {
+        const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+        eb.insert(new vscode.Position(lineIndex, 0), `${indent}${commentPrefix}[${ruleId}]${eol}`);
+    });
 }
 
 module.exports = { activate, deactivate };

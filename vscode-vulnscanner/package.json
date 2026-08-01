@@ -1,8 +1,8 @@
 {
   "name": "vulnscanner",
   "displayName": "VulnScanner",
-  "description": "Static security vulnerability scanner for Python, Java, JavaScript, TypeScript, Go, Ruby, and PHP",
-  "version": "0.1.0",
+  "description": "Static security vulnerability scanner for Python, Java, JavaScript, TypeScript, Go, Ruby, PHP, C, C++, and C#",
+  "version": "0.2.0",
   "publisher": "vulnscanner",
   "license": "MIT",
   "engines": {
@@ -18,7 +18,10 @@
     "python",
     "java",
     "javascript",
-    "typescript"
+    "typescript",
+    "c",
+    "cpp",
+    "csharp"
   ],
   "activationEvents": [
     "onLanguage:python",
@@ -29,7 +32,10 @@
     "onLanguage:typescriptreact",
     "onLanguage:go",
     "onLanguage:ruby",
-    "onLanguage:php"
+    "onLanguage:php",
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:csharp"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -45,6 +51,10 @@
       {
         "command": "vulnscanner.clearDiagnostics",
         "title": "VulnScanner: Clear Diagnostics"
+      },
+      {
+        "command": "vulnscanner.addIgnoreComment",
+        "title": "VulnScanner: Suppress Finding (add ignore comment)"
       }
     ],
     "configuration": {
