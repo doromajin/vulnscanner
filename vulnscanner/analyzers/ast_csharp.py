@@ -115,6 +115,24 @@ _DIR_STATIC_METHODS: frozenset[str] = frozenset({
     "EnumerateFiles", "EnumerateDirectories",
 })
 
+# ── SSRF sinks — HttpClient / WebClient / WebRequest ─────────────────────────
+# Methods where arg[0] (or Uri) is a URL that should not be user-controlled.
+_HTTP_CLIENT_ASYNC_METHODS: frozenset[str] = frozenset({
+    "GetAsync", "PostAsync", "PutAsync", "PatchAsync", "DeleteAsync", "SendAsync",
+    "GetStringAsync", "GetByteArrayAsync", "GetStreamAsync",
+})
+_WEB_CLIENT_METHODS: frozenset[str] = frozenset({
+    "DownloadString", "DownloadStringAsync", "DownloadStringTaskAsync",
+    "DownloadData", "DownloadDataAsync", "DownloadDataTaskAsync",
+    "DownloadFile", "DownloadFileAsync", "DownloadFileTaskAsync",
+    "UploadString", "UploadStringAsync", "UploadStringTaskAsync",
+    "UploadData", "UploadDataAsync",
+    "OpenRead", "OpenReadAsync", "OpenReadTaskAsync",
+})
+_WEB_REQUEST_CREATE: frozenset[str] = frozenset({"Create", "CreateDefault", "CreateHttp"})
+# URI wrapper types whose constructor propagates taint
+_URI_CTOR_TYPES: frozenset[str] = frozenset({"Uri", "UriBuilder", "HttpRequestMessage"})
+
 # ── Unsafe deserialization types ─────────────────────────────────────────────
 _UNSAFE_DESER_TYPES: frozenset[str] = frozenset({
     "BinaryFormatter", "LosFormatter", "ObjectStateFormatter",
@@ -339,10 +357,10 @@ def _is_tainted(node, tainted: set[str]) -> bool:
         return False
 
     if t == "object_creation_expression":
-        # new String(tainted_chars) etc. — for SQL commands handled in sink detection
         ctor = _ctor_type_name(node)
         args = _ctor_args(node)
-        if ctor in ("String",):
+        # String / Uri wrapper ctors propagate taint from first argument
+        if ctor in ("String",) or ctor in _URI_CTOR_TYPES:
             return bool(args) and _is_tainted(args[0], tainted)
         return False
 
@@ -564,6 +582,33 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                          "validate all arguments before crossing the managed/native boundary "
                          "(CWE-111); ensure buffer sizes and string encoding are correct",
                          line_no, line_text)
+
+            # SSRF: HttpClient.*Async(url) with user-controlled URL
+            if method in _HTTP_CLIENT_ASYNC_METHODS:
+                # First arg is URL (string or Uri); check it for taint
+                if args and _is_tainted(args[0], tainted):
+                    emit("CSAST-SSRF-001", VulnType.SSRF, Severity.HIGH,
+                         f"SSRF via HttpClient.{method}() with user-controlled URL — "
+                         "validate scheme/host against an allowlist before making requests",
+                         line_no, line_text)
+
+            # SSRF: WebClient.DownloadString/DownloadData/etc. with user-controlled URL
+            if method in _WEB_CLIENT_METHODS:
+                if args and _is_tainted(args[0], tainted):
+                    emit("CSAST-SSRF-001", VulnType.SSRF, Severity.HIGH,
+                         f"SSRF via WebClient.{method}() with user-controlled URL — "
+                         "validate scheme/host against an allowlist before making requests",
+                         line_no, line_text)
+
+            # SSRF: WebRequest.Create(url) / HttpWebRequest.Create(url)
+            if method in _WEB_REQUEST_CREATE:
+                recv_text_up = recv_text.upper()
+                if "REQUEST" in recv_text_up or "WEBREQUEST" in recv_text_up:
+                    if args and _is_tainted(args[0], tainted):
+                        emit("CSAST-SSRF-001", VulnType.SSRF, Severity.HIGH,
+                             f"SSRF via WebRequest.{method}() with user-controlled URL — "
+                             "validate scheme/host against an allowlist before making requests",
+                             line_no, line_text)
 
 
 # ── Top-level analysis ────────────────────────────────────────────────────────

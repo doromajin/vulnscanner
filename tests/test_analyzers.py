@@ -6168,3 +6168,139 @@ public class UnguardedReceiver {
         assert android_findings, "Intent injection should be detected"
         assert all(f.severity.value == "HIGH" for f in android_findings), \
             "Unguarded method should produce HIGH severity"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FuguAI roadmap #6: Path/URI/file taint — Java ContentResolver + C# HttpClient
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestJavaContentResolverSinks:
+    """JAST-URI-001: ContentResolver file ops with tainted URI."""
+
+    def _az(self):
+        from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
+        return JavaASTAnalyzer()
+
+    def test_open_input_stream_tainted_uri_fires(self):
+        code = """
+import javax.servlet.http.HttpServletRequest;
+public class ContentHandler {
+    public void handle(HttpServletRequest req, android.content.ContentResolver resolver) throws Exception {
+        String raw = req.getParameter("uri");
+        android.net.Uri uri = android.net.Uri.parse(raw);
+        java.io.InputStream is = resolver.openInputStream(uri);
+    }
+}
+"""
+        findings = self._az().analyze("ContentHandler.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-URI-001" in rule_ids, \
+            "openInputStream(tainted_uri) must fire JAST-URI-001"
+
+    def test_content_resolver_query_tainted_uri_fires(self):
+        code = """
+import javax.servlet.http.HttpServletRequest;
+public class QueryHandler {
+    public void query(HttpServletRequest req, android.content.ContentResolver resolver) {
+        String raw = req.getParameter("uri");
+        android.net.Uri uri = android.net.Uri.parse(raw);
+        android.database.Cursor c = resolver.query(uri, null, null, null, null);
+    }
+}
+"""
+        findings = self._az().analyze("QueryHandler.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-URI-001" in rule_ids, \
+            "resolver.query(tainted_uri) must fire JAST-URI-001"
+
+    def test_open_input_stream_constant_uri_no_fire(self):
+        code = """
+public class SafeContent {
+    public void handle(android.content.ContentResolver resolver) throws Exception {
+        android.net.Uri uri = android.net.Uri.parse("content://com.example/data");
+        java.io.InputStream is = resolver.openInputStream(uri);
+    }
+}
+"""
+        findings = self._az().analyze("SafeContent.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-URI-001" not in rule_ids, \
+            "openInputStream with constant URI must not fire JAST-URI-001"
+
+
+class TestCSharpSSRF:
+    """CSAST-SSRF-001: HttpClient/WebClient/WebRequest with tainted URL."""
+
+    def _az(self):
+        from vulnscanner.analyzers.ast_csharp import CSharpASTAnalyzer
+        return CSharpASTAnalyzer()
+
+    def test_httpclient_get_async_tainted_url_fires(self):
+        code = """
+using System.Net.Http;
+using Microsoft.AspNetCore.Mvc;
+public class ProxyController : ControllerBase {
+    [HttpGet]
+    public async Task<IActionResult> Fetch([FromQuery] string url) {
+        var client = new HttpClient();
+        var response = await client.GetAsync(url);
+        return Ok(await response.Content.ReadAsStringAsync());
+    }
+}
+"""
+        findings = self._az().analyze("ProxyController.cs", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CSAST-SSRF-001" in rule_ids, \
+            "HttpClient.GetAsync(tainted_url) must fire CSAST-SSRF-001"
+
+    def test_httpclient_get_async_with_new_uri_fires(self):
+        code = """
+using System;
+using System.Net.Http;
+using Microsoft.AspNetCore.Mvc;
+public class ProxyController : ControllerBase {
+    [HttpGet]
+    public async Task<IActionResult> Fetch([FromQuery] string target) {
+        var client = new HttpClient();
+        var uri = new Uri(target);
+        var response = await client.GetAsync(uri);
+        return Ok();
+    }
+}
+"""
+        findings = self._az().analyze("ProxyController.cs", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CSAST-SSRF-001" in rule_ids, \
+            "new Uri(tainted) → HttpClient.GetAsync must fire CSAST-SSRF-001"
+
+    def test_httpclient_constant_url_no_fire(self):
+        code = """
+using System.Net.Http;
+public class SafeClient {
+    public async Task Ping() {
+        var client = new HttpClient();
+        await client.GetAsync("https://api.example.com/health");
+    }
+}
+"""
+        findings = self._az().analyze("SafeClient.cs", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CSAST-SSRF-001" not in rule_ids, \
+            "HttpClient with constant URL must not fire CSAST-SSRF-001"
+
+    def test_webclient_download_string_tainted_fires(self):
+        code = """
+using System.Net;
+using Microsoft.AspNetCore.Mvc;
+public class FetchController : ControllerBase {
+    [HttpGet]
+    public string Download([FromQuery] string target) {
+        var wc = new WebClient();
+        return wc.DownloadString(target);
+    }
+}
+"""
+        findings = self._az().analyze("FetchController.cs", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CSAST-SSRF-001" in rule_ids, \
+            "WebClient.DownloadString(tainted) must fire CSAST-SSRF-001"

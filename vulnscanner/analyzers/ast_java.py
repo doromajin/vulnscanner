@@ -3058,6 +3058,58 @@ class JavaASTAnalyzer(BaseAnalyzer):
         except Exception:
             pass
 
+        # ── Android AOSP: ContentResolver URI sinks ──────────────────────────
+        # openInputStream/openOutputStream/openFile: qualifier is typically a
+        # ContentResolver or context.  openInputStream(taintedUri) → path traversal.
+        # query/insert/update/delete with tainted URI: arbitrary provider access.
+        _CR_FILE_OPS = frozenset({
+            "openInputStream", "openOutputStream", "openFile",
+            "openAssetFile", "openTypedAssetFile", "openRawResource",
+        })
+        _CR_DATA_OPS = frozenset({"insert", "update", "delete"})
+        # query() is too generic — only fire when qualifier hints at ContentResolver
+        _CR_RESOLVER_HINTS = frozenset({
+            "resolver", "cr", "contentResolver", "mContentResolver",
+            "getContentResolver()", "provider",
+        })
+        try:
+            for _, node in tree.filter(jt.MethodInvocation):
+                _cr_line = _node_line(node)
+                if _cr_line in dead_lines:
+                    continue
+                _et_cr = _eff_tainted(node)
+                args_cr = node.arguments or []
+                mname_cr = node.member
+                # openInputStream/openFile/etc. — fairly ContentResolver-specific
+                if mname_cr in _CR_FILE_OPS:
+                    if args_cr and _is_tainted(args_cr[0], _et_cr):
+                        _add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH,
+                             "JAST-URI-001",
+                             f"ContentResolver.{mname_cr}() with user-controlled URI — "
+                             "path traversal via arbitrary content provider access; "
+                             "validate and restrict the URI scheme/authority")
+                # insert/update/delete with tainted URI
+                elif mname_cr in _CR_DATA_OPS:
+                    q_cr = str(node.qualifier or "").lower()
+                    if any(hint in q_cr for hint in _CR_RESOLVER_HINTS):
+                        if args_cr and _is_tainted(args_cr[0], _et_cr):
+                            _add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH,
+                                 "JAST-URI-001",
+                                 f"ContentResolver.{mname_cr}() with user-controlled URI — "
+                                 "arbitrary content provider write; validate URI authority "
+                                 "against an allowlist of trusted providers")
+                # query(taintedUri, ...) — only when qualifier hints at resolver
+                elif mname_cr == "query":
+                    q_cr = str(node.qualifier or "").lower()
+                    if any(hint in q_cr for hint in _CR_RESOLVER_HINTS):
+                        if args_cr and _is_tainted(args_cr[0], _et_cr):
+                            _add(node, VulnType.PATH_TRAVERSAL, Severity.HIGH,
+                                 "JAST-URI-001",
+                                 "ContentResolver.query() with user-controlled URI — "
+                                 "arbitrary content provider read; validate URI authority")
+        except Exception:
+            pass
+
         # ── Cross-file interprocedural sink detection ─────────────────────────
         # Pattern A: (new Foo()).sink(data) — ClassCreator with selector.
         # Pattern B: Foo foo = new Foo(); foo.sink(data) — variable-qualified MI.
