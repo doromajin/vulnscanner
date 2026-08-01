@@ -311,6 +311,10 @@ class _FuncSummary:
     param_tainted: set[int] = field(default_factory=set)
     # Global/static variable names this function writes with tainted data
     global_writes: set[str] = field(default_factory=set)
+    # Indices of parameters that this function writes with tainted data (output params).
+    # Used for reference/pointer output params: after f(&x), x becomes tainted if
+    # output_param_tainted contains the index for &x.
+    output_param_tainted: set[int] = field(default_factory=set)
 
 
 # ── AST helpers ───────────────────────────────────────────────────────────────
@@ -609,11 +613,30 @@ def _propagate(body_node, tainted: set[str],
                             tainted.add(dst)
                             changed = True
 
-            # Interprocedural: record which param indices receive tainted args
+            # Interprocedural: record which param indices receive tainted args.
+            # Also handle &data (address-of tainted var passed to pointer/ref param).
             if call_sites is not None and summaries is not None and fname in summaries:
                 for i, arg in enumerate(args):
                     if _is_tainted(arg, tainted, summaries):
                         call_sites[fname].add(i)
+                    elif (arg.type == "pointer_expression"
+                          and arg.children and _txt(arg.children[0]) == "&"):
+                        inner = next((c for c in arg.named_children), None)
+                        if inner and _is_tainted(inner, tainted, summaries):
+                            call_sites[fname].add(i)
+
+            # Output-param propagation: if the callee writes tainted data to a
+            # reference/pointer param (e.g. badSource(char *&data)), the corresponding
+            # caller variable becomes tainted after the call.
+            if summaries is not None and fname in summaries:
+                for i in summaries[fname].output_param_tainted:
+                    if i < len(args):
+                        arg_var = (_txt(args[i])
+                                   if args[i].type == "identifier"
+                                   else _first_identifier(args[i]))
+                        if arg_var and arg_var not in tainted:
+                            tainted.add(arg_var)
+                            changed = True
 
         # C++: cin >> var
         elif t == "binary_expression":
@@ -961,6 +984,15 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
                 if _check_returns_tainted(func_node, tainted, summaries):
                     summaries[fname].returns_tainted = True
                     changed = True
+
+            # Update output-param summary: params tainted by the function body
+            # (not from input param seeding) — e.g. badSource(char *&data) fills data
+            param_names = _get_param_names(func_node)
+            for i, pname in enumerate(param_names):
+                if pname in tainted and i not in summaries[fname].param_tainted:
+                    if i not in summaries[fname].output_param_tainted:
+                        summaries[fname].output_param_tainted.add(i)
+                        changed = True
 
         # Propagate call-site taint to callee param summaries
         for callee, tainted_indices in call_sites.items():
