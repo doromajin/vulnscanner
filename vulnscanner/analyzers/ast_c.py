@@ -402,6 +402,36 @@ _CPP_DATA_ACCESSORS: frozenset[str] = frozenset({
     "begin", "end", "front", "back",
 })
 
+# B-3: Smart pointer accessor methods — propagate taint from the smart pointer
+# wrapper to the raw pointer/reference it manages.
+_SMART_PTR_ACCESSORS: frozenset[str] = frozenset({
+    # unique_ptr / shared_ptr / weak_ptr
+    "get", "release", "operator*", "operator->",
+    # scoped_refptr<T> (Chromium), raw_ptr<T> (Chromium MiraclePtr)
+    "get", "release", "lock",
+    # absl::optional / std::optional
+    "value", "operator*",
+    # base::WeakPtr<T>
+    "get",
+    # span / base::span
+    "data", "begin",
+})
+
+# B-4: Move/forward semantics — ownership transfer preserves taint
+_MOVE_FUNCS: frozenset[str] = frozenset({
+    "std::move", "move", "std::forward", "forward",
+    "std::exchange", "exchange",
+})
+
+# B-3b: Smart pointer / wrapper constructor base names (strip template args + namespace).
+# Constructing a smart pointer from a tainted raw pointer → the wrapper is also tainted.
+_SMART_CTOR_BASES: frozenset[str] = frozenset({
+    "shared_ptr", "unique_ptr", "weak_ptr", "scoped_ptr", "scoped_refptr",
+    "raw_ptr", "intrusive_ptr", "RefPtr", "WeakPtr", "StrongPtr",
+    "make_shared", "make_unique", "make_scoped_ptr", "make_intrusive",
+    "optional", "variant", "expected",
+})
+
 
 def _call_args(node) -> list:
     """Return the named argument nodes of a call_expression."""
@@ -495,6 +525,17 @@ def _is_tainted(node, tainted: set[str],
         # C++ method on tainted object: path.c_str(), str.data(), etc.
         receiver = _call_receiver(node)
         if receiver and fname in _CPP_DATA_ACCESSORS and _is_tainted(receiver, tainted, summaries):
+            return True
+        # B-3: Smart pointer accessor: ptr.get(), ptr.value(), ptr.release()
+        if receiver and fname in _SMART_PTR_ACCESSORS and _is_tainted(receiver, tainted, summaries):
+            return True
+        # B-4: Move/forward: std::move(tainted) → tainted
+        if fname in _MOVE_FUNCS:
+            return bool(args) and _is_tainted(args[0], tainted, summaries)
+        # B-3b: Smart pointer constructor: shared_ptr<T>(tainted) → tainted wrapper
+        _fname_base = fname.split("<")[0].rsplit("::", 1)[-1]
+        if _fname_base in _SMART_CTOR_BASES and any(
+                _is_tainted(a, tainted, summaries) for a in args):
             return True
         # propagating: strdup(tainted) → tainted return
         if fname in _PROP_DST_SRC:
@@ -612,6 +653,15 @@ def _propagate(body_node, tainted: set[str],
             val = node.child_by_field_name("value")
             var = _first_identifier(decl)
             if var and val and _is_tainted(val, tainted, summaries):
+                if var not in tainted:
+                    tainted.add(var)
+                    changed = True
+            # B-4: Reference alias: T& ref = obj  →  ref aliases obj → tainted if obj is
+            # Reference declarator is wrapped in reference_declarator node inside decl
+            if (decl and val and var
+                    and any(n.type in ("reference_declarator", "rvalue_reference_declarator")
+                            for n in _walk(decl))
+                    and _is_tainted(val, tainted, summaries)):
                 if var not in tainted:
                     tainted.add(var)
                     changed = True
@@ -970,6 +1020,59 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                 ),
                 rule_id="CAST-INT-001",
             ))
+
+    # C-7: Scoped UAF — free(p)/delete p followed by use in same function
+    _freed: dict[str, int] = {}
+    _FREE_FUNCS_UAF = frozenset({"free", "cfree", "_free", "kfree",
+                                 "HeapFree", "LocalFree", "GlobalFree",
+                                 "operator delete", "operator delete[]"})
+    for _uaf_node in _walk(body_node):
+        _uaf_t = _uaf_node.type
+        if _uaf_t == "call_expression":
+            _uaf_fn = _call_fname(_uaf_node)
+            _uaf_args = _call_args(_uaf_node)
+            if _uaf_fn in _FREE_FUNCS_UAF and _uaf_args:
+                _uaf_var = _txt(_uaf_args[0]).strip("() \t")
+                if _uaf_var and _uaf_var not in _freed:
+                    _freed[_uaf_var] = _uaf_node.start_point[0] + 1
+        elif _uaf_t in ("delete_expression", "delete_expression_statement"):
+            _del_inner = next(
+                (c for c in _uaf_node.named_children if c.type != "comment"), None
+            )
+            if _del_inner and _del_inner.type == "identifier":
+                _del_var = _txt(_del_inner)
+                if _del_var and _del_var not in _freed:
+                    _freed[_del_var] = _uaf_node.start_point[0] + 1
+
+    if _freed:
+        for _uaf_node in _walk(body_node):
+            _uaf_t = _uaf_node.type
+            if _uaf_t in ("pointer_expression", "subscript_expression", "field_expression"):
+                _cand = _uaf_node.child_by_field_name("argument") or (
+                    _uaf_node.named_children[0] if _uaf_node.named_children else None
+                )
+                if _cand and _cand.type == "identifier":
+                    _cvar = _txt(_cand)
+                    _free_ln = _freed.get(_cvar)
+                    if _free_ln and _uaf_node.start_point[0] + 1 > _free_ln:
+                        _uaf_ln = _uaf_node.start_point[0] + 1
+                        _key = (file_path, _uaf_ln, "CAST-UAF-001")
+                        if _key not in seen:
+                            seen.add(_key)
+                            _uaf_text = (lines[_uaf_node.start_point[0]].strip()
+                                         if _uaf_node.start_point[0] < len(lines) else "")
+                            findings.append(Finding(
+                                vuln_type=VulnType.RACE_CONDITION,
+                                severity=Severity.HIGH,
+                                file_path=file_path,
+                                line_number=_uaf_ln,
+                                line_content=_uaf_text,
+                                description=(
+                                    f"Use-after-free: '{_cvar}' is used at line {_uaf_ln} "
+                                    f"after being freed at line {_free_ln} (CWE-416)"
+                                ),
+                                rule_id="CAST-UAF-001",
+                            ))
 
 
 # ── Interprocedural helpers ───────────────────────────────────────────────────

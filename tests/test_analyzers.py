@@ -6304,3 +6304,254 @@ public class FetchController : ControllerBase {
         rule_ids = {f.rule_id for f in findings}
         assert "CSAST-SSRF-001" in rule_ids, \
             "WebClient.DownloadString(tainted) must fire CSAST-SSRF-001"
+
+
+# ── A-1: Java in-file interprocedural taint ───────────────────────────────────
+
+class TestJavaInterprocedural:
+    def _az(self):
+        from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
+        return JavaASTAnalyzer()
+
+    def test_tainted_arg_propagates_to_callee_sink(self):
+        code = """
+import javax.servlet.http.HttpServletRequest;
+public class Svc {
+    private void sink(String q) {
+        java.sql.DriverManager.getConnection("jdbc:mysql://").createStatement().execute(q);
+    }
+    public void handle(HttpServletRequest req) {
+        String user = req.getParameter("id");
+        sink(user);
+    }
+}
+"""
+        findings = self._az().analyze("Svc.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SQL-001" in rule_ids, \
+            "tainted arg passed to in-file method must reach SQL sink (interprocedural)"
+
+    def test_non_tainted_arg_no_fire(self):
+        code = """
+public class Safe {
+    private void sink(String q) {
+        java.sql.DriverManager.getConnection("jdbc:mysql://").createStatement().execute(q);
+    }
+    public void handle() {
+        sink("SELECT 1");
+    }
+}
+"""
+        findings = self._az().analyze("Safe.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-SQL-001" not in rule_ids, \
+            "constant arg to in-file method must not trigger SQL finding"
+
+
+# ── A-2: Android inter-component taint sources ────────────────────────────────
+
+class TestAndroidInterComponent:
+    def _az(self):
+        from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
+        return JavaASTAnalyzer()
+
+    def test_get_intent_extra_to_sink(self):
+        code = """
+public class MainActivity extends android.app.Activity {
+    public void onCreate(android.os.Bundle b) {
+        android.content.Intent intent = getIntent();
+        String cmd = intent.getStringExtra("cmd");
+        Runtime.getRuntime().exec(cmd);
+    }
+}
+"""
+        findings = self._az().analyze("MainActivity.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-CMD-001" in rule_ids, \
+            "getIntent().getStringExtra() used in exec() must fire JAST-CMD-001"
+
+    def test_get_arguments_fragment_to_sink(self):
+        code = """
+public class MyFrag extends android.app.Fragment {
+    public void onCreateView(android.view.LayoutInflater i,
+            android.view.ViewGroup g, android.os.Bundle s) {
+        android.os.Bundle args = getArguments();
+        String url = args.getString("url");
+        java.net.URL u = new java.net.URL(url);
+        u.openConnection().getInputStream();
+    }
+}
+"""
+        findings = self._az().analyze("MyFrag.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert any(f.rule_id.startswith("JAST-") for f in findings), \
+            "getArguments().getString() used in URL open must fire a JAST finding"
+
+
+# ── B-3: C++ smart pointer accessor propagation ───────────────────────────────
+
+class TestSmartPointerTaint:
+    def _az(self):
+        from vulnscanner.analyzers.ast_c import CPPASTAnalyzer
+        return CPPASTAnalyzer()
+
+    def test_shared_ptr_get_propagates_taint(self):
+        code = r"""
+#include <cstdlib>
+#include <memory>
+int main() {
+    const char *s = getenv("X");
+    auto p = std::shared_ptr<const char>(s);
+    system(p.get());
+    return 0;
+}
+"""
+        findings = self._az().analyze("test.cpp", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-CMD-001" in rule_ids, \
+            "shared_ptr<T>(tainted).get() → system() must fire CAST-CMD-001"
+
+    def test_make_unique_get_propagates_taint(self):
+        code = r"""
+#include <cstdlib>
+#include <memory>
+#include <cstring>
+int main() {
+    char *env = getenv("CMD");
+    char *buf = strdup(env);
+    auto p = std::unique_ptr<char>(buf);
+    system(p.get());
+    return 0;
+}
+"""
+        findings = self._az().analyze("test.cpp", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-CMD-001" in rule_ids, \
+            "unique_ptr<T>(tainted_buf).get() → system() must fire CAST-CMD-001"
+
+    def test_clean_ptr_no_fire(self):
+        code = r"""
+#include <memory>
+#include <cstdlib>
+int main() {
+    char buf[64] = "ls -l";
+    auto p = std::unique_ptr<char>(buf);
+    system(p.get());
+    return 0;
+}
+"""
+        findings = self._az().analyze("test.cpp", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-CMD-001" not in rule_ids, \
+            "unique_ptr wrapping constant string must not fire CAST-CMD-001"
+
+
+# ── B-4: C++ reference alias and std::move taint ─────────────────────────────
+
+class TestReferenceAliasTaint:
+    def _az(self):
+        from vulnscanner.analyzers.ast_c import CPPASTAnalyzer
+        return CPPASTAnalyzer()
+
+    def test_reference_alias_propagates(self):
+        code = r"""
+#include <cstdlib>
+int main() {
+    char *cmd = getenv("CMD");
+    char *&ref = cmd;
+    system(ref);
+    return 0;
+}
+"""
+        findings = self._az().analyze("test.cpp", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-CMD-001" in rule_ids, \
+            "char*& reference alias to tainted var must propagate to system()"
+
+    def test_std_move_propagates(self):
+        code = r"""
+#include <cstdlib>
+int main() {
+    char *cmd = getenv("CMD");
+    char *moved = (char*)std::move(cmd);
+    system(moved);
+    return 0;
+}
+"""
+        findings = self._az().analyze("test.cpp", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-CMD-001" in rule_ids, \
+            "std::move(tainted) must preserve taint and fire CAST-CMD-001"
+
+
+# ── C-7: Scoped use-after-free detection ─────────────────────────────────────
+
+class TestScopedUAF:
+    def _az_c(self):
+        from vulnscanner.analyzers.ast_c import CASTAnalyzer
+        return CASTAnalyzer()
+
+    def _az_cpp(self):
+        from vulnscanner.analyzers.ast_c import CPPASTAnalyzer
+        return CPPASTAnalyzer()
+
+    def test_free_then_deref_fires(self):
+        code = r"""
+#include <stdlib.h>
+int main() {
+    char *p = (char*)malloc(100);
+    free(p);
+    *p = 'x';
+    return 0;
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-UAF-001" in rule_ids, \
+            "free(p) followed by *p dereference must fire CAST-UAF-001"
+
+    def test_free_then_field_fires(self):
+        code = r"""
+#include <stdlib.h>
+struct Node { int val; };
+int main() {
+    struct Node *p = (struct Node*)malloc(sizeof(struct Node));
+    free(p);
+    int x = p->val;
+    return x;
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-UAF-001" in rule_ids, \
+            "free(p) followed by p->field must fire CAST-UAF-001"
+
+    def test_no_free_no_fire(self):
+        code = r"""
+#include <stdlib.h>
+int main() {
+    char *p = (char*)malloc(100);
+    *p = 'x';
+    free(p);
+    return 0;
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-UAF-001" not in rule_ids, \
+            "use before free must not fire CAST-UAF-001"
+
+    def test_delete_then_deref_cpp_fires(self):
+        code = r"""
+struct Obj { int x; };
+int main() {
+    Obj *p = new Obj();
+    delete p;
+    int v = p->x;
+    return v;
+}
+"""
+        findings = self._az_cpp().analyze("test.cpp", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-UAF-001" in rule_ids, \
+            "delete p followed by p->field must fire CAST-UAF-001 in C++"

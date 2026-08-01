@@ -677,6 +677,13 @@ def _is_android_source(node) -> bool:
     # These methods only exist on Intent, so any qualifier is fine.
     if node.member in _INTENT_GETTERS:
         return True
+    # A-2: getIntent() — retrieves the Intent that started this Activity, carrying
+    # data from any caller app (including malicious ones for exported activities).
+    # getArguments() — Fragment arguments bundle, set by the calling code.
+    # Both return untrusted data in the inter-component channel.
+    if node.member in ("getIntent", "getArguments", "getLaunchIntentForPackage",
+                       "getParentActivityIntent"):
+        return True
     # Bundle getters: require the qualifier to look like a Bundle variable to avoid
     # FP on arbitrary getString() calls (e.g. ResourceBundle, JSONObject).
     if node.member in _BUNDLE_GETTERS and q in _BUNDLE_QUALIFIERS:
@@ -2555,16 +2562,19 @@ class JavaASTAnalyzer(BaseAnalyzer):
             tree, tainted, _const_ints, dead_lines
         )
         _eff_cache: dict = {}
+        # A-1: In-file interprocedural extra taint — callee params seeded from call sites.
+        # Populated below before any _eff_tainted call; read by closure.
+        _infile_extra_taint: dict[int, set] = {}
 
         def _eff_tainted(node_or_line) -> set:
-            """Return effective tainted set with locally clean vars removed.
+            """Return effective tainted set for the enclosing method.
+
+            = (global_tainted − locally_clean_vars) ∪ interprocedural_callee_params
 
             Accepts either a javalang node (line extracted via _node_line) or
             an integer line number directly (for ClassCreator which needs the
             pre-computed ancestor-walk line).
             """
-            if not _mlc:
-                return tainted
             ln = node_or_line if isinstance(node_or_line, int) else _node_line(node_or_line)
             if ln < 0:
                 return tainted
@@ -2574,11 +2584,48 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     midx = i
                 else:
                     break
-            if midx < 0 or midx not in _mlc:
+            if midx < 0:
                 return tainted
             if midx not in _eff_cache:
-                _eff_cache[midx] = tainted - _mlc[midx]
+                base = tainted - _mlc.get(midx, frozenset())
+                extra = _infile_extra_taint.get(midx, frozenset())
+                _eff_cache[midx] = base | extra
             return _eff_cache[midx]
+
+        # ── A-1: Build in-file interprocedural callee-param taint map ────────
+        # For each call site foo(tainted_arg) where foo is defined in this file,
+        # seed the corresponding formal param name in _infile_extra_taint[callee_midx].
+        # _eff_tainted then includes these seeds so that sinks inside the callee body
+        # are flagged when detected by the main sink-detection loops.
+        try:
+            # Map: method_name → list of (callee_midx, [param_names])
+            _ipt_local: dict[str, list[tuple[int, list[str]]]] = {}
+            for _, _ipt_m in tree.filter(jt.MethodDeclaration):
+                _ipt_pos = getattr(_ipt_m, "position", None)
+                _ipt_ln = _ipt_pos.line if _ipt_pos else -1
+                if _ipt_ln < 0 or not _mstarts_mlc:
+                    continue
+                _ipt_midx = 0
+                for _ii, _is in enumerate(_mstarts_mlc):
+                    if _ipt_ln >= _is:
+                        _ipt_midx = _ii
+                    else:
+                        break
+                _ipt_params = [getattr(p, "name", "") for p in (_ipt_m.parameters or [])]
+                _ipt_local.setdefault(_ipt_m.name, []).append((_ipt_midx, _ipt_params))
+
+            for _, _ipc in tree.filter(jt.MethodInvocation):
+                if _node_line(_ipc) in dead_lines or _ipc.member not in _ipt_local:
+                    continue
+                _ipc_args = _ipc.arguments or []
+                for _ipc_cm, _ipc_ps in _ipt_local[_ipc.member]:
+                    for _ipc_ai, _ipc_arg in enumerate(_ipc_args):
+                        if _ipc_ai < len(_ipc_ps) and _is_tainted(_ipc_arg, tainted):
+                            _pn = _ipc_ps[_ipc_ai]
+                            if _pn:
+                                _infile_extra_taint.setdefault(_ipc_cm, set()).add(_pn)
+        except Exception:
+            pass
 
         # ── Post-fixpoint: field-level taint with strong updates ──────────────
         # Process obj.field = expr in AST (source) order so that
