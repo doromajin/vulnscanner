@@ -86,14 +86,28 @@ def _scan_file(path: Path) -> list[str]:
     return [f.rule_id for f in findings]
 
 
-# Cross-file variant group key: strip the trailing letter from _51a, _53b, etc.
+# Variant 51-67 pattern: _51a/_51b etc. — strip trailing letter.
 # e.g. "CWE78_foo_51a.c" → group key "CWE78_foo_51.c"
 _CROSS_FILE_RE = re.compile(r'_(\d{2,})([a-e])$')
 
+# Class-based variant pattern: _83_bad / _83_goodG2B etc. — strip _bad/_good* suffix.
+# e.g. "CWE78_foo_83_bad.cpp" → group key "CWE78_foo_83.cpp"
+# Also groups _83a.cpp (via _CROSS_FILE_RE) into the same key.
+_CLASS_VARIANT_RE = re.compile(r'_(\d+)_(bad|good\w*)$')
+
 
 def _cross_file_group_key(path: Path) -> str | None:
-    """Return a group key for cross-file variant files (_51a/_51b etc.), or None."""
+    """Return a group key for cross-file variant files, or None for solos.
+
+    Handles two naming conventions:
+      _51a/_51b  - data-flow variants (source in _a, sink in _b)
+      _83_bad / _83_goodG2B - class-based variants (class in _bad, caller in _a)
+    """
     m = _CROSS_FILE_RE.search(path.stem)
+    if m:
+        base = path.stem[: m.start()] + "_" + m.group(1)
+        return str(path.parent / base) + path.suffix
+    m = _CLASS_VARIANT_RE.search(path.stem)
     if m:
         base = path.stem[: m.start()] + "_" + m.group(1)
         return str(path.parent / base) + path.suffix
@@ -105,9 +119,24 @@ def _scan_group(paths: list[Path]) -> list[str]:
 
     This enables interprocedural taint to flow across file boundaries:
     e.g. _51a.c (source) + _51b.c (sink) → fixed-point connects them.
+
+    For class-based variants (_83_bad.cpp etc.) the companion header (_83.h)
+    is prepended if it exists, so macro definitions (COMMAND_ARG3 = data) are
+    visible during preprocessing.
     """
+    # For class-based variants, look for a companion .h file with the group base name.
+    # e.g. group key "…_83.cpp" → check for "…_83.h"
+    extra_headers: list[Path] = []
+    if paths:
+        key = _cross_file_group_key(paths[0])
+        if key:
+            h_candidate = Path(key).with_suffix(".h")
+            if h_candidate.exists() and h_candidate not in paths:
+                extra_headers.append(h_candidate)
+
+    all_paths = extra_headers + sorted(paths)  # header first so defines come before uses
     parts: list[str] = []
-    for p in sorted(paths):  # sort a→b→c so source comes before sink
+    for p in all_paths:
         try:
             parts.append(p.read_text(encoding="utf-8", errors="replace"))
         except Exception:

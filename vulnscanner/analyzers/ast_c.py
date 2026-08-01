@@ -255,10 +255,12 @@ def _expand_defines(content: str) -> str:
     Handles patterns like:  #define SYSTEM system
     Does NOT handle function-like macros or multi-token replacements.
     """
+    # Normalise CRLF so $ in MULTILINE anchors correctly on Windows files.
+    normalised = content.replace('\r\n', '\n').replace('\r', '\n')
     defines: dict[str, str] = {}
     for m in re.finditer(
         r'^[ \t]*#[ \t]*define[ \t]+([A-Z_][A-Z0-9_]*)[ \t]+([a-z_][a-z0-9_]*)[ \t]*(?:#.*)?$',
-        content, re.MULTILINE
+        normalised, re.MULTILINE
     ):
         defines[m.group(1)] = m.group(2)
     for macro, repl in defines.items():
@@ -433,6 +435,10 @@ def _is_tainted(node, tainted: set[str],
         left = node.child_by_field_name("left")
         right = node.child_by_field_name("right")
         return _is_tainted(left, tainted, summaries) or _is_tainted(right, tainted, summaries)
+
+    if t == "initializer_list":
+        # {a, b, c} array/struct literal — tainted if any element is tainted
+        return any(_is_tainted(c, tainted, summaries) for c in node.named_children)
 
     if t == "conditional_expression":
         nc = node.named_children
@@ -859,6 +865,49 @@ def _analyze_func_with_summaries(
     return tainted
 
 
+def _get_class_method_info(func_node) -> tuple[str, str] | None:
+    """If func_node is a C++ qualified method (Class::method), return (class_name, method_name).
+
+    Distinguishes constructor (name==class), destructor (name starts with ~), and
+    regular methods — enabling cross-method taint propagation within a class.
+    """
+    decl = func_node.child_by_field_name("declarator")
+    if decl is None:
+        return None
+    # Walk to find the innermost function_declarator
+    func_decl = next((n for n in _walk(decl) if n.type == "function_declarator"), None)
+    if func_decl is None:
+        return None
+    inner = func_decl.child_by_field_name("declarator")
+    if inner is None or inner.type != "qualified_identifier":
+        return None
+    # qualified_identifier children: [scope, ::, name]
+    scope = inner.child_by_field_name("scope")
+    name = inner.child_by_field_name("name")
+    if scope is None or name is None:
+        children = [c for c in inner.named_children]
+        if len(children) >= 2:
+            scope, name = children[0], children[-1]
+    if scope is None or name is None:
+        return None
+    class_name = _txt(scope)
+    method_name = _txt(name)  # "ClassName", "~ClassName", or "methodName"
+    return class_name, method_name
+
+
+def _collect_class_methods(root_node) -> dict[str, list[tuple[str, object]]]:
+    """Return {class_name: [(method_name, func_node), ...]} for C++ class methods."""
+    result: dict[str, list] = {}
+    for node in _walk(root_node):
+        if node.type != "function_definition":
+            continue
+        cm = _get_class_method_info(node)
+        if cm:
+            cls, method = cm
+            result.setdefault(cls, []).append((method, node))
+    return result
+
+
 def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
     # Step 1: Preprocess (macro expansion / clang -E)
     lang = "c++" if any(file_path.endswith(e) for e in _CPP_EXTS) else "c"
@@ -921,6 +970,40 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
         body = func_node.child_by_field_name("body")
         if body:
             _detect_sinks(body, tainted, lines, file_path, findings, summaries)
+
+    # Step 5: C++ class member cross-method taint (constructor→destructor, etc.)
+    # For each class, collect "free variables" (tainted but not locally declared) from
+    # every method, then re-analyze all methods with those member names seeded as tainted.
+    class_methods = _collect_class_methods(tree.root_node)
+    for cls_methods in class_methods.values():
+        if len(cls_methods) < 2:
+            continue  # need ≥ 2 methods for cross-method propagation
+
+        # Pass A: accumulate member taint from every method
+        member_tainted: set[str] = set()
+        for _mname, func_node in cls_methods:
+            local = _collect_local_decls(func_node)
+            tainted = _analyze_func_with_summaries(
+                func_node, summaries, None, global_tainted
+            )
+            member_tainted |= (tainted - local)
+
+        if not member_tainted:
+            continue
+
+        # Pass B: re-analyze each method with member taint injected, emit findings
+        for _mname, func_node in cls_methods:
+            local = _collect_local_decls(func_node)
+            extra = member_tainted - local  # don't shadow legitimate locals
+            if not extra:
+                continue
+            tainted = _analyze_func_with_summaries(
+                func_node, summaries, None, global_tainted | extra
+            )
+            tainted |= extra
+            body = func_node.child_by_field_name("body")
+            if body:
+                _detect_sinks(body, tainted, lines, file_path, findings, summaries)
 
     return findings
 
