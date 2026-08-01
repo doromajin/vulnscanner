@@ -514,11 +514,41 @@ def _seed_main_argv(func_node: object, tainted: set[str]) -> None:
         tainted.add(argv_name)
 
 
+def _collect_funcptr_map(func_node) -> dict[str, str]:
+    """Return {fp_var: actual_func_name} for simple function pointer assignments.
+
+    Handles:
+      void (*fp)(char*) = real_func;   // init_declarator
+      fp = real_func;                  // assignment_expression
+    """
+    result: dict[str, str] = {}
+    body = func_node.child_by_field_name("body")
+    if body is None:
+        return result
+    for node in _walk(body):
+        if node.type == "init_declarator":
+            decl = node.child_by_field_name("declarator")
+            val = node.child_by_field_name("value")
+            if decl and val and val.type == "identifier":
+                var = _first_identifier(decl)
+                if var:
+                    result[var] = _txt(val)
+        elif node.type == "assignment_expression":
+            lhs = node.child_by_field_name("left")
+            rhs = node.child_by_field_name("right")
+            if (lhs and rhs
+                    and lhs.type == "identifier"
+                    and rhs.type == "identifier"):
+                result[_txt(lhs)] = _txt(rhs)
+    return result
+
+
 def _propagate(body_node, tainted: set[str],
                summaries: dict[str, _FuncSummary] | None = None,
                call_sites: dict[str, set[int]] | None = None,
                local_vars: set[str] | None = None,
-               global_writes: set[str] | None = None) -> bool:
+               global_writes: set[str] | None = None,
+               funcptr_map: dict[str, str] | None = None) -> bool:
     """One propagation pass; returns True if tainted set grew.
 
     summaries: optional intra-file function taint summaries.
@@ -587,6 +617,9 @@ def _propagate(body_node, tainted: set[str],
         # call_expression — propagate buffer-copy sinks into destination
         elif t == "call_expression":
             fname = _call_fname(node)
+            # Resolve function pointer: funcPtr(data) → resolve to actual function
+            if funcptr_map and fname in funcptr_map:
+                fname = funcptr_map[fname]
             args = _call_args(node)
 
             # fgets(buf, n, fp) / gets(buf) / recv(s,buf,n,f) / read(fd,buf,n)
@@ -694,7 +727,8 @@ def _is_struct_memcpy_overrun(args: list) -> bool:
 
 def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                   file_path: str, findings: list[Finding],
-                  summaries: dict[str, _FuncSummary] | None = None) -> None:
+                  summaries: dict[str, _FuncSummary] | None = None,
+                  funcptr_map: dict[str, str] | None = None) -> None:
     """Walk body and emit findings for tainted sinks and always-unsafe calls."""
     seen: set[tuple] = set()
 
@@ -704,6 +738,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
         fname = _call_fname(node)
         if not fname:
             continue
+        if funcptr_map and fname in funcptr_map:
+            fname = funcptr_map[fname]
         args = _call_args(node)
         line_no = node.start_point[0] + 1
         line_text = (lines[node.start_point[0]].strip()
@@ -898,8 +934,9 @@ def _analyze_func_with_summaries(
     local_vars = _collect_local_decls(func_node)
     summary = summaries.get(fname)
     global_writes = summary.global_writes if summary is not None else None
+    funcptr_map = _collect_funcptr_map(func_node)
     for _ in range(10):
-        if not _propagate(body, tainted, summaries, call_sites, local_vars, global_writes):
+        if not _propagate(body, tainted, summaries, call_sites, local_vars, global_writes, funcptr_map):
             break
     return tainted
 
@@ -1017,7 +1054,8 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
         tainted = _analyze_func_with_summaries(func_node, summaries, None, global_tainted)
         body = func_node.child_by_field_name("body")
         if body:
-            _detect_sinks(body, tainted, lines, file_path, findings, summaries)
+            _detect_sinks(body, tainted, lines, file_path, findings, summaries,
+                          _collect_funcptr_map(func_node))
 
     # Step 5: C++ class member cross-method taint (constructor→destructor, etc.)
     # For each class, collect "free variables" (tainted but not locally declared) from
