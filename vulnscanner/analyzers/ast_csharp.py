@@ -451,7 +451,8 @@ def _propagate(body_node, tainted: set[str]) -> bool:
 # ── Sink detection ────────────────────────────────────────────────────────────
 
 def _detect_sinks(body_node, tainted: set[str], lines: list[str],
-                  file_path: str, findings: list[Finding]) -> None:
+                  file_path: str, findings: list[Finding],
+                  pinvoke_methods: "set[str] | None" = None) -> None:
     seen: set[tuple] = set()
 
     def emit(rule_id, vtype, sev, desc, line_no, line_text):
@@ -555,11 +556,50 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                          f"Path traversal via Directory.{method}() with user-controlled path",
                          line_no, line_text)
 
+            # P/Invoke: calls to [DllImport]-annotated methods with tainted args
+            if pinvoke_methods and method in pinvoke_methods:
+                if any(_is_tainted(a, tainted) for a in args):
+                    emit("CSAST-FFI-001", VulnType.TRUST_BOUNDARY_VIOLATION, Severity.HIGH,
+                         f"{method}() is a P/Invoke method called with user-controlled data — "
+                         "validate all arguments before crossing the managed/native boundary "
+                         "(CWE-111); ensure buffer sizes and string encoding are correct",
+                         line_no, line_text)
+
 
 # ── Top-level analysis ────────────────────────────────────────────────────────
 
+def _collect_pinvoke_methods(class_body_node) -> set[str]:
+    """Return names of methods with [DllImport] attribute in a class body."""
+    result: set[str] = set()
+    try:
+        for child in class_body_node.named_children:
+            if child.type != "method_declaration":
+                continue
+            # Check for attribute_list containing DllImport
+            has_dllimport = False
+            for sub in child.children:
+                if sub.type == "attribute_list":
+                    for attr in sub.named_children:
+                        if attr.type == "attribute":
+                            name_node = attr.child_by_field_name("name")
+                            attr_name = _txt(name_node) if name_node else ""
+                            if attr_name in ("DllImport", "DllImportAttribute"):
+                                has_dllimport = True
+                                break
+                if has_dllimport:
+                    break
+            if has_dllimport:
+                name_node = child.child_by_field_name("name")
+                if name_node:
+                    result.add(_txt(name_node))
+    except Exception:
+        pass
+    return result
+
+
 def _analyze_method(method_node, lines: list[str], file_path: str,
-                    findings: list[Finding], in_controller: bool) -> None:
+                    findings: list[Finding], in_controller: bool,
+                    pinvoke_methods: "set[str] | None" = None) -> None:
     tainted: set[str] = set()
     _seed_method_params(method_node, tainted, in_controller)
 
@@ -571,7 +611,8 @@ def _analyze_method(method_node, lines: list[str], file_path: str,
         if not _propagate(body, tainted):
             break
 
-    _detect_sinks(body, tainted, lines, file_path, findings)
+    _detect_sinks(body, tainted, lines, file_path, findings,
+                  pinvoke_methods=pinvoke_methods or set())
 
 
 def _analyze_content(content: str, file_path: str) -> list[Finding]:
@@ -589,9 +630,11 @@ def _analyze_content(content: str, file_path: str) -> list[Finding]:
             body = node.child_by_field_name("body")
             if body is None:
                 continue
+            pinvoke = _collect_pinvoke_methods(body)
             for child in body.named_children:
                 if child.type == "method_declaration":
-                    _analyze_method(child, lines, file_path, findings, in_ctrl)
+                    _analyze_method(child, lines, file_path, findings, in_ctrl,
+                                    pinvoke_methods=pinvoke)
 
     return findings
 

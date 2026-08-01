@@ -2807,6 +2807,32 @@ class JavaASTAnalyzer(BaseAnalyzer):
         except Exception:
             pass
 
+        # ── JNI / native method boundary (FFI, CWE-111) ─────────────────────
+        # Collect native method declarations in this file, then flag calls where
+        # tainted data crosses the Java→C/C++ boundary.
+        try:
+            _native_methods: set[str] = set()
+            for _, method in tree.filter(jt.MethodDeclaration):
+                mods = [getattr(m, "name", str(m)) for m in (method.modifiers or [])]
+                if "native" in mods:
+                    _native_methods.add(method.name)
+
+            if _native_methods:
+                for _, node in tree.filter(jt.MethodInvocation):
+                    if node.member not in _native_methods:
+                        continue
+                    if _node_line(node) in dead_lines:
+                        continue
+                    _et = _eff_tainted(node)
+                    if any(_is_tainted(a, _et) for a in (node.arguments or [])):
+                        _add(node, VulnType.TRUST_BOUNDARY_VIOLATION, Severity.HIGH,
+                             "JAST-JNI-001",
+                             f"{node.member}() is a native (JNI) method called with "
+                             "user-controlled data — validate all arguments before "
+                             "crossing the Java/C++ boundary (CWE-111)")
+        except Exception:
+            pass
+
         # ── Android AOSP: Intent injection / redirection ─────────────────────
         # Flag when a tainted value flows into Intent mutation or directly into
         # a launch method (startActivity, sendBroadcast, etc.).

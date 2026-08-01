@@ -215,7 +215,43 @@ _SPAWN_SINKS: frozenset[str] = frozenset({
     "spawnv",    "spawnve",   "spawnvp",   "spawnvpe",
 })
 
-# Functions that are always dangerous regardless of taint
+# ── Integer-overflow → allocation size (CWE-190 → CWE-787) ──────────────────
+# These functions take a size/count argument derived from user-controlled data.
+# When tainted integer arithmetic flows here, the allocation may be undersized.
+
+# Allocation functions: argument positions that carry the byte-count.
+#   key → (count_arg_idx, size_arg_idx or -1)
+#   For calloc(count, size), count_arg_idx=0 is the user-multiplied dimension.
+#   For malloc/realloc etc., count_arg_idx=0 is the direct byte count.
+_ALLOC_SIZE_ARGS: dict[str, int] = {
+    "malloc": 0, "alloca": 0, "_alloca": 0, "__builtin_alloca": 0,
+    "realloc": 1, "reallocarray": 1,
+    "HeapAlloc": 2, "LocalAlloc": 1, "GlobalAlloc": 1, "VirtualAlloc": 1,
+    "VirtualAllocEx": 3,
+    "operator new": 0,
+}
+_CALLOC_FUNCS: frozenset[str] = frozenset({"calloc"})
+
+# Checked-math patterns that suppress CAST-INT-001 (recognise safe alternatives).
+_CHECKED_MATH_FUNCS: frozenset[str] = frozenset({
+    "CheckedNumeric", "base::CheckMul", "base::CheckAdd",
+    "__builtin_mul_overflow", "__builtin_add_overflow", "__builtin_umul_overflow",
+    "safe_add", "safe_mul", "SafeInt", "checked_add", "checked_mul",
+    "overflow_safe_add", "overflow_safe_mul",
+    "MulDiv",  # Windows MulDiv uses 64-bit arithmetic internally
+})
+
+# ── C++ container taint (CWE-787 via std::vector etc.) ───────────────────────
+# When tainted data is pushed into a container, the container itself is tainted.
+# Reads from it (vec[i], vec.front(), vec.back()) then propagate taint further.
+
+_CONTAINER_MUTATORS: frozenset[str] = frozenset({
+    "push_back", "push_front", "emplace_back", "emplace_front", "emplace",
+    "insert", "assign", "append", "replace", "set",
+    "add", "offer", "enqueue", "put",
+})
+
+# ── Functions that are always dangerous regardless of taint ───────────────────
 # (rule_id, severity, vuln_type, description)
 _ALWAYS_UNSAFE: dict[str, tuple] = {
     "gets":    ("CAST-MEM-001", Severity.CRITICAL, VulnType.TRUST_BOUNDARY_VIOLATION,
@@ -469,6 +505,14 @@ def _is_tainted(node, tainted: set[str],
         if fname in ("strdup", "strndup", "strtok", "strtok_r", "strchr", "strrchr",
                      "strpbrk", "index", "rindex"):
             return bool(args) and _is_tainted(args[0], tainted, summaries)
+        # String-to-number converters: tainted string → tainted integer/float.
+        # Enables integer-overflow-to-allocation detection (CWE-190).
+        if fname in ("atoi", "atol", "atoll", "atof",
+                     "strtol", "strtoul", "strtoll", "strtoull",
+                     "strtof", "strtod", "strtold",
+                     "wcstol", "wcstoul", "wcstoll", "wcstoull",
+                     "_wtoi", "_wtol", "_wtoll", "_ttoi", "_ttol"):
+            return bool(args) and _is_tainted(args[0], tainted, summaries)
         # Input calls always return tainted
         if fname in _INPUT_BUF:
             return True
@@ -658,6 +702,17 @@ def _propagate(body_node, tainted: set[str],
                         if inner and _is_tainted(inner, tainted, summaries):
                             call_sites[fname].add(i)
 
+            # C++ container mutation: v.push_back(tainted), v.insert(pos, tainted), etc.
+            # When any argument to a mutator is tainted, the container itself is tainted.
+            if fname in _CONTAINER_MUTATORS:
+                receiver = _call_receiver(node)
+                if receiver and any(_is_tainted(a, tainted, summaries) for a in args):
+                    recv_var = (_txt(receiver) if receiver.type == "identifier"
+                                else _first_identifier(receiver))
+                    if recv_var and recv_var not in tainted:
+                        tainted.add(recv_var)
+                        changed = True
+
             # Output-param propagation: if the callee writes tainted data to a
             # reference/pointer param (e.g. badSource(char *&data)), the corresponding
             # caller variable becomes tainted after the call.
@@ -827,6 +882,94 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                         description=f"Command injection via {fname}() with user-controlled argument",
                         rule_id="CAST-CMD-001",
                     ))
+
+        # Integer overflow → allocation size (CWE-190 → CWE-787)
+        # malloc/realloc/alloca with tainted size argument.
+        if fname in _ALLOC_SIZE_ARGS:
+            idx = _ALLOC_SIZE_ARGS[fname]
+            if idx < len(args) and _is_tainted(args[idx], tainted, summaries):
+                # Skip if the size expression uses a checked-math function
+                size_text = args[idx].text.decode(errors="replace") if hasattr(args[idx], "text") else ""
+                if not any(cm in size_text for cm in _CHECKED_MATH_FUNCS):
+                    key = (file_path, line_no, "CAST-INT-001")
+                    if key not in seen:
+                        seen.add(key)
+                        findings.append(Finding(
+                            vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                            severity=Severity.HIGH,
+                            file_path=file_path,
+                            line_number=line_no,
+                            line_content=line_text,
+                            description=(
+                                f"Integer overflow → allocation: {fname}() size argument "
+                                "derived from user-controlled value — integer overflow may "
+                                "produce undersized buffer (CWE-190/787); use checked arithmetic"
+                            ),
+                            rule_id="CAST-INT-001",
+                        ))
+
+        if fname in _CALLOC_FUNCS and len(args) >= 1:
+            # calloc(count, size): tainted count → overflow when count*size wraps
+            if _is_tainted(args[0], tainted, summaries):
+                key = (file_path, line_no, "CAST-INT-001")
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(Finding(
+                        vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=line_no,
+                        line_content=line_text,
+                        description=(
+                            "Integer overflow → allocation: calloc() count argument "
+                            "derived from user-controlled value — count*size overflow may "
+                            "produce undersized buffer (CWE-190/787); use checked arithmetic"
+                        ),
+                        rule_id="CAST-INT-001",
+                    ))
+
+    # C++: new T[tainted_n] (new_expression) — allocation size from user data
+    for node in _walk(body_node):
+        if node.type != "new_expression":
+            continue
+        # Find array size: new T[expr] — tree-sitter puts it in the declarator field
+        # or directly in the arguments
+        size_node = None
+        for child in node.named_children:
+            if child.type == "argument_list":
+                # new T(n) — not array allocation
+                cargs = [c for c in child.named_children]
+                if cargs and _is_tainted(cargs[0], tainted, summaries):
+                    size_node = cargs[0]
+                break
+            if child.type in ("abstract_array_declarator", "array_declarator"):
+                # new T[n]
+                for sub in child.named_children:
+                    if sub.type not in ("[", "]", "comment"):
+                        size_node = sub
+                        break
+                break
+        if size_node is None:
+            continue
+        if not _is_tainted(size_node, tainted, summaries):
+            continue
+        line_no = node.start_point[0] + 1
+        line_text = lines[node.start_point[0]].strip() if node.start_point[0] < len(lines) else ""
+        key = (file_path, line_no, "CAST-INT-001")
+        if key not in seen:
+            seen.add(key)
+            findings.append(Finding(
+                vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                severity=Severity.HIGH,
+                file_path=file_path,
+                line_number=line_no,
+                line_content=line_text,
+                description=(
+                    "Integer overflow → allocation: new[] size derived from user-controlled "
+                    "value — integer overflow may produce undersized buffer (CWE-190/787)"
+                ),
+                rule_id="CAST-INT-001",
+            ))
 
 
 # ── Interprocedural helpers ───────────────────────────────────────────────────
