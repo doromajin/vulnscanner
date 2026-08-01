@@ -5889,3 +5889,282 @@ class SafeFileReader {
         findings = self._az().analyze("SafeFileReader.cs", code)
         path_fp = [f for f in findings if f.rule_id == "CSAST-PATH-001"]
         assert not path_fp, "File.ReadAllText with constant path must not fire path traversal"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FuguAI roadmap features: #4 CAST-INT-001, #5 container taint,
+#                          #8 JNI/P-Invoke, #3 Android AUTHZ
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCastIntOverflow:
+    """CAST-INT-001: tainted string → integer converter → malloc/calloc size."""
+
+    def _az(self):
+        from vulnscanner.analyzers.ast_c import CASTAnalyzer
+        return CASTAnalyzer()
+
+    def test_atoi_into_malloc_fires(self):
+        code = r"""
+#include <stdlib.h>
+int main() {
+    const char *s = getenv("COUNT");
+    int count = atoi(s);
+    int *buf = (int *)malloc(count * sizeof(int));
+    return 0;
+}
+"""
+        findings = self._az().analyze("main.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-INT-001" in rule_ids, "atoi(getenv()) → malloc must fire CAST-INT-001"
+
+    def test_calloc_with_tainted_count_fires(self):
+        code = r"""
+#include <stdlib.h>
+int main() {
+    const char *s = getenv("N");
+    int n = atoi(s);
+    char *buf = calloc(n, sizeof(char));
+    return 0;
+}
+"""
+        findings = self._az().analyze("main.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-INT-001" in rule_ids, "calloc with tainted count must fire CAST-INT-001"
+
+    def test_checked_math_suppresses_finding(self):
+        code = r"""
+#include <stdlib.h>
+int main() {
+    const char *s = getenv("N");
+    int n = atoi(s);
+    size_t safe_size;
+    if (__builtin_mul_overflow(n, sizeof(int), &safe_size)) return 1;
+    int *buf = (int *)malloc(safe_size);
+    return 0;
+}
+"""
+        findings = self._az().analyze("main.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-INT-001" not in rule_ids, "checked-overflow safe_size must not fire CAST-INT-001"
+
+
+class TestContainerTaint:
+    """C++ container taint: push_back(tainted) → v[0] used as sink."""
+
+    def _az(self):
+        from vulnscanner.analyzers.ast_c import CPPASTAnalyzer
+        return CPPASTAnalyzer()
+
+    def test_push_back_propagates_to_system_sink(self):
+        code = r"""
+#include <vector>
+#include <string>
+#include <cstdlib>
+int main(int argc, char **argv) {
+    std::vector<std::string> cmds;
+    cmds.push_back(argv[1]);
+    system(cmds[0].c_str());
+    return 0;
+}
+"""
+        findings = self._az().analyze("main.cpp", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-CMD-001" in rule_ids, "push_back(argv[1]) → system(v[0]) must fire CAST-CMD-001"
+
+    def test_clean_vector_no_taint(self):
+        code = r"""
+#include <vector>
+#include <cstdlib>
+int main() {
+    std::vector<const char*> cmds;
+    cmds.push_back("ls");
+    system(cmds[0]);
+    return 0;
+}
+"""
+        findings = self._az().analyze("main.cpp", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-CMD-001" not in rule_ids, "literal in vector must not taint system() call"
+
+
+class TestJNIBoundary:
+    """JAST-JNI-001: tainted arg passed to native (JNI) method."""
+
+    def _az(self):
+        from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
+        return JavaASTAnalyzer()
+
+    def test_tainted_arg_to_native_method_fires(self):
+        code = """
+import javax.servlet.http.HttpServletRequest;
+public class FileHandler {
+    private native void processPath(String path);
+    public void handle(HttpServletRequest request) {
+        String file = request.getParameter("file");
+        processPath(file);
+    }
+}
+"""
+        findings = self._az().analyze("FileHandler.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-JNI-001" in rule_ids, "tainted arg to native method must fire JAST-JNI-001"
+
+    def test_constant_arg_to_native_no_fire(self):
+        code = """
+public class SafeNative {
+    private native void init(String config);
+    public void setup() {
+        init("/etc/app/config.json");
+    }
+}
+"""
+        findings = self._az().analyze("SafeNative.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-JNI-001" not in rule_ids, "constant arg to native must not fire JAST-JNI-001"
+
+
+class TestPInvokeBoundary:
+    """CSAST-FFI-001: tainted arg passed across P/Invoke [DllImport] boundary."""
+
+    def _az(self):
+        from vulnscanner.analyzers.ast_csharp import CSharpASTAnalyzer
+        return CSharpASTAnalyzer()
+
+    def test_tainted_arg_to_dllimport_method_fires(self):
+        code = """
+using System.Runtime.InteropServices;
+using Microsoft.AspNetCore.Mvc;
+public class FileController : ControllerBase {
+    [DllImport("kernel32.dll")]
+    static extern bool DeleteFile(string path);
+    [HttpDelete]
+    public IActionResult Delete([FromQuery] string filePath) {
+        DeleteFile(filePath);
+        return Ok();
+    }
+}
+"""
+        findings = self._az().analyze("FileController.cs", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CSAST-FFI-001" in rule_ids, "tainted arg to [DllImport] method must fire CSAST-FFI-001"
+
+    def test_constant_arg_to_dllimport_no_fire(self):
+        code = """
+using System.Runtime.InteropServices;
+public class SafeNative {
+    [DllImport("kernel32.dll")]
+    static extern bool DeleteFile(string path);
+    public void Cleanup() {
+        DeleteFile("C:\\\\temp\\\\work.tmp");
+    }
+}
+"""
+        findings = self._az().analyze("SafeNative.cs", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CSAST-FFI-001" not in rule_ids, "constant arg must not fire CSAST-FFI-001"
+
+
+class TestAndroidAuthz:
+    """JAST-ANDROID-AUTHZ-001/002: confused-deputy and Settings injection."""
+
+    def _az(self):
+        from vulnscanner.analyzers.ast_java import JavaASTAnalyzer
+        return JavaASTAnalyzer()
+
+    def test_binder_entry_privileged_sink_without_guard_fires(self):
+        code = """
+public class MyService extends Binder {
+    public boolean onTransact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) {
+        String pkg = data.readString();
+        pm.grantRuntimePermission(pkg, "android.permission.READ_CONTACTS", user);
+        return true;
+    }
+}
+"""
+        findings = self._az().analyze("MyService.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-ANDROID-AUTHZ-001" in rule_ids, \
+            "onTransact() → grantRuntimePermission() without guard must fire JAST-ANDROID-AUTHZ-001"
+
+    def test_binder_entry_with_guard_no_authz_fire(self):
+        code = """
+public class MyService extends Binder {
+    public boolean onTransact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) {
+        enforceCallingPermission("android.permission.GRANT_RUNTIME_PERMISSIONS", "grant");
+        String pkg = data.readString();
+        pm.grantRuntimePermission(pkg, "android.permission.READ_CONTACTS", user);
+        return true;
+    }
+}
+"""
+        findings = self._az().analyze("MyService.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-ANDROID-AUTHZ-001" not in rule_ids, \
+            "guarded Binder entry must not fire JAST-ANDROID-AUTHZ-001"
+
+    def test_settings_put_with_tainted_value_fires(self):
+        code = """
+import javax.servlet.http.HttpServletRequest;
+public class SettingsHandler {
+    public void update(HttpServletRequest req, android.content.ContentResolver resolver) {
+        String val = req.getParameter("value");
+        Settings.Secure.putString(resolver, "screen_brightness_mode", val);
+    }
+}
+"""
+        findings = self._az().analyze("SettingsHandler.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-ANDROID-AUTHZ-002" in rule_ids, \
+            "Settings.Secure.putString with tainted value must fire JAST-ANDROID-AUTHZ-002"
+
+    def test_settings_put_constant_no_fire(self):
+        code = """
+public class SafeSettings {
+    public void setup(android.content.ContentResolver resolver) {
+        Settings.Secure.putString(resolver, "screen_off_timeout", "30000");
+    }
+}
+"""
+        findings = self._az().analyze("SafeSettings.java", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "JAST-ANDROID-AUTHZ-002" not in rule_ids, \
+            "Settings.Secure.putString with constants must not fire JAST-ANDROID-AUTHZ-002"
+
+    def test_intent_injection_in_guarded_method_is_medium(self):
+        """Permission guard in same method downgrades Intent injection to MEDIUM."""
+        code = """
+import javax.servlet.http.HttpServletRequest;
+public class GuardedReceiver {
+    public void handle(HttpServletRequest req, android.content.Context ctx) {
+        enforceCallingPermission("android.permission.BROADCAST_SMS", "sms");
+        String action = req.getParameter("action");
+        android.content.Intent intent = new android.content.Intent();
+        intent.setAction(action);
+        ctx.sendBroadcast(intent);
+    }
+}
+"""
+        findings = self._az().analyze("GuardedReceiver.java", code)
+        android_findings = [f for f in findings if f.rule_id == "JAST-ANDROID-001"]
+        assert android_findings, "Intent injection should still be detected"
+        assert all(f.severity.value == "MEDIUM" for f in android_findings), \
+            "Guarded method should produce MEDIUM severity, not HIGH"
+
+    def test_intent_injection_without_guard_is_high(self):
+        """No permission guard → Intent injection severity stays HIGH."""
+        code = """
+import javax.servlet.http.HttpServletRequest;
+public class UnguardedReceiver {
+    public void handle(HttpServletRequest req, android.content.Context ctx) {
+        String action = req.getParameter("action");
+        android.content.Intent intent = new android.content.Intent();
+        intent.setAction(action);
+        ctx.sendBroadcast(intent);
+    }
+}
+"""
+        findings = self._az().analyze("UnguardedReceiver.java", code)
+        android_findings = [f for f in findings if f.rule_id == "JAST-ANDROID-001"]
+        assert android_findings, "Intent injection should be detected"
+        assert all(f.severity.value == "HIGH" for f in android_findings), \
+            "Unguarded method should produce HIGH severity"

@@ -618,6 +618,40 @@ _INTENT_MUTATORS = frozenset({
     "parseUri",
 })
 
+# Android privileged sinks — methods that affect system-level state
+# and therefore require proper caller permission checks (CWE-862).
+_ANDROID_PRIVILEGED_SINKS = frozenset({
+    # Permission grant/revoke
+    "grantPermission", "revokePermission",
+    "grantRuntimePermission", "revokeRuntimePermission",
+    "grantRuntimePermissions", "revokeRuntimePermissions",
+    "setPermissionEnforced",
+    # Package management
+    "installPackage", "deletePackage", "uninstall",
+    "setPackageStopState", "forceStopPackage",
+    "setApplicationEnabledSetting",
+    # Account management
+    "addAccount", "removeAccount", "invalidateAuthToken", "clearPassword",
+    "updateCredentials",
+    # Process / user control
+    "killBackgroundProcesses",
+    "removeUser", "setUserRestriction", "setApplicationRestrictions",
+    "setUserEnabled", "createUser",
+    # Content provider external acquisition
+    "acquireContentProviderExternal",
+    # Broadcast with user scope (requires INTERACT_ACROSS_USERS)
+    "sendBroadcastAsUser", "sendOrderedBroadcastAsUser",
+})
+
+# Settings class qualifiers and mutator methods for Settings injection detection
+_SETTINGS_QUALIFIERS = frozenset({
+    "Settings.Secure", "Settings.System", "Settings.Global",
+    "android.provider.Settings.Secure",
+    "android.provider.Settings.System",
+    "android.provider.Settings.Global",
+})
+_SETTINGS_PUT_METHODS = frozenset({"putString", "putInt", "putLong", "putFloat", "putStringForUser"})
+
 # ── taint helpers ──────────────────────────────────────────────────────────────
 
 def _type_name(ref_type) -> str:
@@ -2842,20 +2876,40 @@ class JavaASTAnalyzer(BaseAnalyzer):
         #   intent.setClassName(pkg, tainted) → JAST-ANDROID-001
         #   new Intent(tainted)             → JAST-ANDROID-001
         #   startActivity(tainted_intent)   → when intent itself is tracked as tainted
+        # Build per-method permission guard map so severity reflects the enclosing
+        # method's actual guard status rather than file-level presence.
+        # _method_guard_starts: sorted list of (method_start_line, has_guard)
+        _method_guard_starts: list[tuple[int, bool]] = []
         try:
-            # Collect permission-guard presence: if enforceCallingPermission() is called
-            # anywhere in this file, we know the code has caller trust checks.
-            # We still fire the finding but lower severity to MEDIUM (access-controlled).
-            _has_perm_guard = False
-            try:
-                for _, _pg_node in tree.filter(jt.MethodInvocation):
-                    if _pg_node.member in _ANDROID_PERMISSION_GUARDS:
-                        _has_perm_guard = True
-                        break
-            except Exception:
-                pass
-            _android_severity = Severity.MEDIUM if _has_perm_guard else Severity.HIGH
+            for _, _mgm in tree.filter(jt.MethodDeclaration):
+                _mgm_pos = getattr(_mgm, "position", None)
+                _mgm_start = _mgm_pos.line if _mgm_pos else 0
+                _mgm_guard = False
+                try:
+                    for _, _mgmi in _mgm.filter(jt.MethodInvocation):
+                        if _mgmi.member in _ANDROID_PERMISSION_GUARDS:
+                            _mgm_guard = True
+                            break
+                except Exception:
+                    pass
+                _method_guard_starts.append((_mgm_start, _mgm_guard))
+            _method_guard_starts.sort()
+        except Exception:
+            pass
 
+        def _enclosing_has_guard(node_line: int) -> bool:
+            """True if the method containing node_line has a permission guard call."""
+            if not _method_guard_starts or not node_line:
+                return False
+            idx = 0
+            for i, (ml, _) in enumerate(_method_guard_starts):
+                if ml <= node_line:
+                    idx = i
+                else:
+                    break
+            return _method_guard_starts[idx][1]
+
+        try:
             # Track Intent variables that have been tainted via mutation methods
             _tainted_intents: set[str] = set()
 
@@ -2867,7 +2921,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     continue
                 _et = _eff_tainted(node)
                 if any(_is_tainted(a, _et) for a in (node.arguments or [])):
-                    _add(node, VulnType.INTENT_INJECTION, _android_severity,
+                    _android_sev = Severity.MEDIUM if _enclosing_has_guard(_node_line(node)) else Severity.HIGH
+                    _add(node, VulnType.INTENT_INJECTION, _android_sev,
                          "JAST-ANDROID-001",
                          f"intent.{node.member}() with user-controlled data — "
                          "Intent injection; validate and allowlist component/URI before launch")
@@ -2889,7 +2944,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     continue
                 _et = _eff_tainted(_icc_line)
                 if any(_is_tainted(a, _et) for a in (node.arguments or [])):
-                    _add(node, VulnType.INTENT_INJECTION, _android_severity,
+                    _add(node, VulnType.INTENT_INJECTION,
+                         Severity.MEDIUM if _enclosing_has_guard(_icc_line) else Severity.HIGH,
                          "JAST-ANDROID-001",
                          "new Intent() with user-controlled argument — "
                          "Intent injection; validate action/URI/component before launch",
@@ -2899,19 +2955,21 @@ class JavaASTAnalyzer(BaseAnalyzer):
             for _, node in tree.filter(jt.MethodInvocation):
                 if node.member not in _ANDROID_LAUNCH_METHODS:
                     continue
-                if _node_line(node) in dead_lines:
+                _ln_launch = _node_line(node)
+                if _ln_launch in dead_lines:
                     continue
                 _et = _eff_tainted(node)
+                _launch_sev = Severity.MEDIUM if _enclosing_has_guard(_ln_launch) else Severity.HIGH
                 for arg in (node.arguments or []):
                     arg_name = arg.member if isinstance(arg, jt.MemberReference) else ""
                     if arg_name and arg_name in _tainted_intents:
-                        _add(node, VulnType.INTENT_INJECTION, _android_severity,
+                        _add(node, VulnType.INTENT_INJECTION, _launch_sev,
                              "JAST-ANDROID-001",
                              f"{node.member}() with user-controlled Intent — "
                              "Intent injection/redirection; validate component before launch")
                         break
                     if _is_tainted(arg, _et):
-                        _add(node, VulnType.PATH_TRAVERSAL, _android_severity,
+                        _add(node, VulnType.PATH_TRAVERSAL, _launch_sev,
                              "JAST-ANDROID-002",
                              f"{node.member}() with user-controlled argument — "
                              "validate data before launching component")
@@ -2936,6 +2994,67 @@ class JavaASTAnalyzer(BaseAnalyzer):
                          "JAST-ANDROID-003",
                          f"{node.member}() with user-controlled path — "
                          "path traversal; canonicalize and validate within app sandbox")
+        except Exception:
+            pass
+
+        # ── Android AOSP: confused-deputy / missing permission check ──────────
+        # Detect Binder entry methods that invoke privileged system APIs without
+        # first calling an enforceCallingPermission-family guard (CWE-862).
+        _BINDER_ENTRY_SET = frozenset({"onTransact", "handleMessage", "onReceive", "onBind"})
+        try:
+            for _, _authz_method in tree.filter(jt.MethodDeclaration):
+                if _authz_method.name not in _BINDER_ENTRY_SET:
+                    continue
+                # Check if this specific method has a permission guard
+                _am_has_guard = False
+                try:
+                    for _, _ami in _authz_method.filter(jt.MethodInvocation):
+                        if _ami.member in _ANDROID_PERMISSION_GUARDS:
+                            _am_has_guard = True
+                            break
+                except Exception:
+                    pass
+                if _am_has_guard:
+                    continue
+                # Fire for each privileged sink call in this unguarded Binder entry
+                try:
+                    for _, _asink in _authz_method.filter(jt.MethodInvocation):
+                        if _asink.member not in _ANDROID_PRIVILEGED_SINKS:
+                            continue
+                        _as_line = _node_line(_asink)
+                        if _as_line and _as_line in dead_lines:
+                            continue
+                        _add(_asink, VulnType.MISSING_AUTHORIZATION, Severity.HIGH,
+                             "JAST-ANDROID-AUTHZ-001",
+                             f"Binder entry '{_authz_method.name}()' calls privileged "
+                             f"'{_asink.member}()' without enforcing caller permission — "
+                             "possible confused-deputy or privilege escalation (CWE-862)")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # ── Android AOSP: Settings mutation with tainted value ────────────────
+        # Settings.Secure/System/Global.putString(resolver, key, tainted_value) allows
+        # an attacker to overwrite system settings when the key or value is user-controlled.
+        try:
+            for _, node in tree.filter(jt.MethodInvocation):
+                if node.member not in _SETTINGS_PUT_METHODS:
+                    continue
+                _sq = str(node.qualifier or "")
+                if _sq not in _SETTINGS_QUALIFIERS:
+                    continue
+                _sl = _node_line(node)
+                if _sl in dead_lines:
+                    continue
+                _et = _eff_tainted(node)
+                args = node.arguments or []
+                # putString(ContentResolver, key, value) — value is arg[2], key is arg[1]
+                if any(_is_tainted(a, _et) for a in args):
+                    _add(node, VulnType.MISSING_AUTHORIZATION, Severity.HIGH,
+                         "JAST-ANDROID-AUTHZ-002",
+                         f"{_sq}.{node.member}() with user-controlled key or value — "
+                         "Settings injection; validate key against allowlist and sanitize value")
         except Exception:
             pass
 
