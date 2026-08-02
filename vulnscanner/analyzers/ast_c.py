@@ -1354,6 +1354,56 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                 rule_id="CAST-INT-001",
             ))
 
+    # CWE-124/127 via loop: data[i] = src[i] where data is underpointed (write=124)
+    # or src[i] = data[i] where data is underpointed (read=127)
+    if _underpointed:
+        for _loop_n in _walk(body_node):
+            if _loop_n.type != "assignment_expression":
+                continue
+            _loop_lhs = _loop_n.child_by_field_name("left")
+            _loop_rhs = _loop_n.child_by_field_name("right")
+            _loop_ln = _loop_n.start_point[0] + 1
+            _loop_txt = (lines[_loop_n.start_point[0]].strip()
+                         if _loop_n.start_point[0] < len(lines) else "")
+            # CWE-124: write to underpointed dst: data[i] = ...
+            if _loop_lhs and _loop_lhs.type == "subscript_expression":
+                _la = _loop_lhs.child_by_field_name("argument")
+                if _la and _la.type == "identifier" and _txt(_la) in _underpointed:
+                    _lkey = (file_path, _loop_ln, "CAST-BUF-001")
+                    if _lkey not in seen:
+                        seen.add(_lkey)
+                        findings.append(Finding(
+                            vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                            severity=Severity.HIGH,
+                            file_path=file_path,
+                            line_number=_loop_ln,
+                            line_content=_loop_txt,
+                            description=(
+                                f"Buffer underwrite: loop writes to '{_txt(_la)}[i]' which "
+                                "points before its allocation — CWE-124"
+                            ),
+                            rule_id="CAST-BUF-001",
+                        ))
+            # CWE-127: read from underpointed src: ... = data[i]
+            if _loop_rhs and _loop_rhs.type == "subscript_expression":
+                _ra = _loop_rhs.child_by_field_name("argument")
+                if _ra and _ra.type == "identifier" and _txt(_ra) in _underpointed:
+                    _lkey = (file_path, _loop_ln, "CAST-BUF-001")
+                    if _lkey not in seen:
+                        seen.add(_lkey)
+                        findings.append(Finding(
+                            vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                            severity=Severity.HIGH,
+                            file_path=file_path,
+                            line_number=_loop_ln,
+                            line_content=_loop_txt,
+                            description=(
+                                f"Buffer under-read: loop reads from '{_txt(_ra)}[i]' which "
+                                "points before its allocation — CWE-127"
+                            ),
+                            rule_id="CAST-BUF-001",
+                        ))
+
     # C-7: Scoped UAF — free(p)/delete p followed by use in same function
     _freed: dict[str, int] = {}
     _FREE_FUNCS_UAF = frozenset({"free", "cfree", "_free", "kfree",
