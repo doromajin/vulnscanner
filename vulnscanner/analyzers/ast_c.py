@@ -366,6 +366,11 @@ class _FuncSummary:
     # Used for reference/pointer output params: after f(&x), x becomes tainted if
     # output_param_tainted contains the index for &x.
     output_param_tainted: set[int] = field(default_factory=set)
+    # Minimum element count returned by this function (via `return var` where var has
+    # a known allocation size). Used to propagate alloc_counts through call sites.
+    returns_alloc_count: int | None = None
+    # Minimum element count for each parameter index (for interprocedural size tracking).
+    param_alloc_counts: dict[int, int] = field(default_factory=dict)
 
 
 # ── AST helpers ───────────────────────────────────────────────────────────────
@@ -946,10 +951,180 @@ def _is_struct_memcpy_overrun(args: list) -> bool:
     return False
 
 
+def _compute_alloc_counts(body_node) -> dict[str, int]:
+    """Return var → element_count from malloc/alloca/array declarations in body_node.
+
+    Uses take-minimum semantics so if/else branches with different sizes resolve
+    to the smallest allocation seen (worst-case for overflow detection).
+    """
+    alloc_counts: dict[str, int] = {}
+    _ALLOC_FUNCS = frozenset({"malloc", "alloca", "ALLOCA", "_alloca",
+                               "VirtualAlloc", "HeapAlloc", "LocalAlloc", "GlobalAlloc"})
+
+    def _set(var: str, count: int) -> None:
+        ex = alloc_counts.get(var)
+        if ex is None or count < ex:
+            alloc_counts[var] = count
+
+    for sn in _walk(body_node):
+        st = sn.type
+        if st == "declaration":
+            type_node = sn.child_by_field_name("type")
+            if type_node is None:
+                for tc in sn.named_children:
+                    if tc.type in ("primitive_type", "type_identifier", "sized_type_specifier"):
+                        type_node = tc
+                        break
+            elem_sz = _sizeof_type_text(_txt(type_node)) if type_node else 4
+            for dc in sn.named_children:
+                if dc.type == "array_declarator":
+                    var = _decl_leaf_id(dc)
+                    arr_n = None
+                    for ac in dc.named_children:
+                        if ac.type not in ("comment",) and ac != dc.named_children[0]:
+                            arr_n = _eval_const(ac)
+                            if arr_n is not None:
+                                break
+                    if var and arr_n:
+                        _set(var, arr_n)
+                elif dc.type == "init_declarator":
+                    iv = _decl_leaf_id(dc.child_by_field_name("declarator"))
+                    val = dc.child_by_field_name("value")
+                    if iv and val:
+                        val_u = val
+                        for _ in range(3):
+                            if val_u.type in ("cast_expression", "parenthesized_expression"):
+                                inner = next((c for c in val_u.named_children
+                                              if c.type not in ("type_descriptor", "comment")), None)
+                                if inner:
+                                    val_u = inner
+                                else:
+                                    break
+                            else:
+                                break
+                        if val_u.type == "call_expression":
+                            fn2 = _call_fname(val_u); a2 = _call_args(val_u)
+                            if fn2 in _ALLOC_FUNCS and a2:
+                                cnt2 = _extract_elem_count(a2[0])
+                                if cnt2:
+                                    _set(iv, cnt2)
+                            elif fn2 == "calloc" and len(a2) >= 2:
+                                n2 = _eval_const(a2[0])
+                                if n2:
+                                    _set(iv, n2)
+                        elif val_u.type == "identifier":
+                            src = alloc_counts.get(_txt(val_u))
+                            if src:
+                                _set(iv, src)
+        elif st == "assignment_expression":
+            lhs = sn.child_by_field_name("left"); rhs = sn.child_by_field_name("right")
+            if lhs and rhs and lhs.type == "identifier":
+                lvar = _txt(lhs)
+                if rhs.type == "identifier":
+                    src = alloc_counts.get(_txt(rhs))
+                    if src:
+                        _set(lvar, src)
+                else:
+                    rhs_u = rhs
+                    for _ in range(3):
+                        if rhs_u.type in ("cast_expression", "parenthesized_expression"):
+                            inner = next((c for c in rhs_u.named_children
+                                          if c.type not in ("type_descriptor", "comment")), None)
+                            if inner:
+                                rhs_u = inner
+                            else:
+                                break
+                        else:
+                            break
+                    if rhs_u.type == "call_expression":
+                        fn2 = _call_fname(rhs_u); a2 = _call_args(rhs_u)
+                        if fn2 in _ALLOC_FUNCS and a2:
+                            cnt2 = _extract_elem_count(a2[0])
+                            if cnt2:
+                                _set(lvar, cnt2)
+                        elif fn2 == "calloc" and len(a2) >= 2:
+                            n2 = _eval_const(a2[0])
+                            if n2:
+                                _set(lvar, n2)
+    return alloc_counts
+
+
+def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -> None:
+    """Propagate alloc_counts through function call sites (return values and parameters).
+
+    Two passes:
+      Pass 1: Compute per-function alloc_counts + infer returns_alloc_count.
+      Pass 2: At each call site, if the callee has returns_alloc_count, seed the
+              lhs variable; if an argument has known count, update param_alloc_counts.
+    """
+    # Pass 1: local alloc_counts + return value alloc_count for each function
+    func_counts: dict[str, dict[str, int]] = {}
+    for fname, func_node in funcs.items():
+        body = func_node.child_by_field_name("body")
+        if body is None:
+            continue
+        counts = _compute_alloc_counts(body)
+        func_counts[fname] = counts
+        # Infer returns_alloc_count: scan for `return var` where var has known count
+        for ret_node in _walk(body):
+            if ret_node.type != "return_statement":
+                continue
+            ret_val = next((c for c in ret_node.named_children
+                            if c.type not in ("comment",)), None)
+            if ret_val is None:
+                continue
+            rv = ret_val
+            # Unwrap casts
+            for _ in range(3):
+                if rv.type in ("cast_expression", "parenthesized_expression"):
+                    inner = next((c for c in rv.named_children
+                                  if c.type not in ("type_descriptor", "comment")), None)
+                    if inner:
+                        rv = inner
+                    else:
+                        break
+                else:
+                    break
+            cnt = None
+            if rv.type == "identifier":
+                cnt = counts.get(_txt(rv))
+            elif rv.type == "call_expression":
+                # return malloc(N*sizeof(T)) directly
+                fn2 = _call_fname(rv); a2 = _call_args(rv)
+                if fn2 in {"malloc", "alloca", "ALLOCA", "_alloca"} and a2:
+                    cnt = _extract_elem_count(a2[0])
+            if cnt is not None:
+                existing = summaries[fname].returns_alloc_count
+                if existing is None or cnt < existing:
+                    summaries[fname].returns_alloc_count = cnt
+
+    # Pass 2: propagate through call sites
+    for fname, func_node in funcs.items():
+        body = func_node.child_by_field_name("body")
+        if body is None:
+            continue
+        local_counts = func_counts.get(fname, {})
+        for call_node in _walk(body):
+            if call_node.type != "call_expression":
+                continue
+            callee = _call_fname(call_node)
+            if not callee or callee not in summaries:
+                continue
+            args = _call_args(call_node)
+            for idx, arg in enumerate(args):
+                if arg.type == "identifier":
+                    cnt = local_counts.get(_txt(arg))
+                    if cnt is not None:
+                        existing = summaries[callee].param_alloc_counts.get(idx)
+                        if existing is None or cnt < existing:
+                            summaries[callee].param_alloc_counts[idx] = cnt
+
+
 def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                   file_path: str, findings: list[Finding],
                   summaries: dict[str, _FuncSummary] | None = None,
-                  funcptr_map: dict[str, str] | None = None) -> None:
+                  funcptr_map: dict[str, str] | None = None,
+                  extra_alloc_counts: dict[str, int] | None = None) -> None:
     """Walk body and emit findings for tainted sinks and always-unsafe calls."""
     seen: set[tuple] = set()
 
@@ -957,6 +1132,11 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     # Maps variable name → allocated byte count when statically determinable.
     _alloc_sizes: dict[str, int] = {}
     _alloc_counts: dict[str, int] = {}  # variable → element count (stack arrays only)
+
+    # Seed from interprocedural parameter/return-value alloc counts
+    if extra_alloc_counts:
+        for _ev, _ec in extra_alloc_counts.items():
+            _alloc_counts[_ev] = _ec
 
     def _set_alloc(var: str, bytes_: int, count: int | None = None) -> None:
         """Update alloc maps taking minimum seen — handles if/else with different sizes."""
@@ -1074,6 +1254,14 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                             _s2 = _eval_const(_a2[1])
                             if _n2 and _s2:
                                 _set_alloc(_lvar, _n2 * _s2, _n2)
+                        elif summaries and _fn2 in summaries:
+                            # data = badSource(data) where badSource returns alloc'd ptr
+                            _ret_cnt = summaries[_fn2].returns_alloc_count
+                            if _ret_cnt is not None:
+                                _alloc_counts[_lvar] = (
+                                    min(_alloc_counts[_lvar], _ret_cnt)
+                                    if _lvar in _alloc_counts else _ret_cnt
+                                )
 
     # Pointer underwrite tracking: data = buffer - N → "underpointed"
     # Any write/read through such a pointer accesses memory before the allocation.
@@ -1802,13 +1990,23 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
         if not changed:
             break
 
+    # Interprocedural alloc_count propagation: return values and parameters
+    _update_alloc_summaries(funcs, summaries)
+
     # Step 4: Final pass — emit findings
-    for func_node in funcs.values():
+    for fname, func_node in funcs.items():
         tainted = _analyze_func_with_summaries(func_node, summaries, None, global_tainted)
         body = func_node.child_by_field_name("body")
         if body:
+            # Seed extra alloc_counts from interprocedural param summaries
+            _extra: dict[str, int] = {}
+            param_names = _get_param_names(func_node)
+            for _pidx, _pcnt in summaries[fname].param_alloc_counts.items():
+                if _pidx < len(param_names):
+                    _extra[param_names[_pidx]] = _pcnt
             _detect_sinks(body, tainted, lines, file_path, findings, summaries,
-                          _collect_funcptr_map(func_node))
+                          _collect_funcptr_map(func_node),
+                          extra_alloc_counts=_extra if _extra else None)
 
     # Step 5: C++ class member cross-method taint (constructor→destructor, etc.)
     # For each class, collect "free variables" (tainted but not locally declared) from
