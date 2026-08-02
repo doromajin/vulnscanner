@@ -6555,3 +6555,132 @@ int main() {
         rule_ids = {f.rule_id for f in findings}
         assert "CAST-UAF-001" in rule_ids, \
             "delete p followed by p->field must fire CAST-UAF-001 in C++"
+
+
+class TestConstantSizeOverflow:
+    """CWE805/CWE121/CWE122: memcpy/memmove/strncpy with statically-known overflow."""
+
+    def _az_c(self):
+        from vulnscanner.analyzers.ast_c import CASTAnalyzer
+        return CASTAnalyzer()
+
+    def test_declare_memcpy_overflow_fires(self):
+        code = r"""
+#include <string.h>
+void bad() {
+    int *data;
+    int dataBadBuffer[50];
+    data = dataBadBuffer;
+    int source[100] = {0};
+    memcpy(data, source, 100*sizeof(int));
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" in rule_ids, \
+            "memcpy 400 bytes into 200-byte buffer must fire CAST-BUF-001"
+
+    def test_declare_memcpy_good_no_fire(self):
+        code = r"""
+#include <string.h>
+void good() {
+    int *data;
+    int dataGoodBuffer[100];
+    data = dataGoodBuffer;
+    int source[100] = {0};
+    memcpy(data, source, 100*sizeof(int));
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" not in rule_ids, \
+            "memcpy exactly into same-size buffer must NOT fire CAST-BUF-001"
+
+    def test_malloc_memcpy_overflow_fires(self):
+        code = r"""
+#include <string.h>
+#include <stdlib.h>
+void bad() {
+    char *data = (char *)malloc(50*sizeof(char));
+    char source[100];
+    memcpy(data, source, 100*sizeof(char));
+    free(data);
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" in rule_ids, \
+            "malloc(50) then memcpy(data, src, 100) must fire CAST-BUF-001"
+
+    def test_wchar_wcsncpy_overflow_fires(self):
+        code = r"""
+#include <wchar.h>
+void bad() {
+    wchar_t *data;
+    wchar_t dataBadBuffer[50];
+    data = dataBadBuffer;
+    wchar_t source[100];
+    wcsncpy(data, source, 100-1);
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" in rule_ids, \
+            "wcsncpy 99 wchar_t into 50-wchar_t buffer must fire CAST-BUF-001"
+
+
+class TestPointerUnderwrite:
+    """CWE124/CWE127: pointer arithmetic sets pointer before allocation."""
+
+    def _az_c(self):
+        from vulnscanner.analyzers.ast_c import CASTAnalyzer
+        return CASTAnalyzer()
+
+    def test_underwrite_dst_fires(self):
+        """CWE124: data = buffer - 8; wcsncpy(data, ...) writes before buffer."""
+        code = r"""
+#include <wchar.h>
+void bad() {
+    wchar_t dataBuffer[100];
+    wchar_t *data = dataBuffer - 8;
+    wchar_t source[100];
+    wcsncpy(data, source, 100-1);
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" in rule_ids, \
+            "wcsncpy with underpointed dst must fire CAST-BUF-001 (CWE-124)"
+
+    def test_underread_src_fires(self):
+        """CWE127: data = buffer - 8; memmove(dest, data, ...) reads before buffer."""
+        code = r"""
+#include <string.h>
+#include <wchar.h>
+void bad() {
+    wchar_t dataBuffer[100];
+    wchar_t *data = dataBuffer - 8;
+    wchar_t dest[100];
+    wcsncpy(dest, data, 99);
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" in rule_ids, \
+            "wcsncpy with underpointed src must fire CAST-BUF-001 (CWE-127)"
+
+    def test_good_no_underwrite(self):
+        """Good case: no pointer arithmetic before buffer → no finding."""
+        code = r"""
+#include <wchar.h>
+void good() {
+    wchar_t dataBuffer[100];
+    wchar_t *data = dataBuffer;
+    wchar_t source[100];
+    wcsncpy(data, source, 99);
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" not in rule_ids, \
+            "direct assignment (no negative offset) must NOT fire CAST-BUF-001"

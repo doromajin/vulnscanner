@@ -806,6 +806,91 @@ def _propagate(body_node, tainted: set[str],
     return changed
 
 
+_SIZEOF_APPROX: tuple[tuple[str, int], ...] = (
+    # longest/most-specific patterns first to avoid substring false-matches
+    ("long long", 8), ("long_long", 8), ("int64_t", 8), ("uint64_t", 8),
+    ("int64", 8), ("uint64", 8), ("double", 8), ("intptr_t", 8),
+    ("uintptr_t", 8), ("ptrdiff_t", 8), ("ssize_t", 8), ("size_t", 8),
+    ("int32_t", 4), ("uint32_t", 4), ("int32", 4), ("uint32", 4),
+    ("long", 4), ("float", 4), ("unsigned int", 4), ("unsigned", 4), ("int", 4),
+    ("wchar_t", 2), ("char16_t", 2), ("char32_t", 4),
+    ("int16_t", 2), ("uint16_t", 2), ("int16", 2), ("uint16", 2), ("short", 2),
+    ("int8_t", 1), ("uint8_t", 1), ("int8", 1), ("uint8", 1),
+    ("char", 1), ("byte", 1), ("bool", 1),
+)
+
+
+def _sizeof_type_text(type_text: str) -> int:
+    """Approximate sizeof(T) in bytes for a type string."""
+    t = type_text.strip().lower()
+    for kw, sz in _SIZEOF_APPROX:
+        if kw in t:
+            return sz
+    return 4
+
+
+def _eval_const(node) -> int | None:
+    """Evaluate a constant-foldable size expression to an integer byte count.
+
+    Handles: number_literal, sizeof_expression, binary_expression (*,+,-),
+    cast_expression, parenthesized_expression, subscript_expression (sizeof).
+    Returns None when the expression is not statically evaluable.
+    """
+    if node is None:
+        return None
+    t = node.type
+    if t == "number_literal":
+        raw = _txt(node).rstrip("uUlL")
+        try:
+            return int(raw, 0)
+        except ValueError:
+            return None
+    if t in ("cast_expression", "parenthesized_expression"):
+        for c in node.named_children:
+            if c.type not in ("type_descriptor", "comment"):
+                v = _eval_const(c)
+                if v is not None:
+                    return v
+        return None
+    if t == "sizeof_expression":
+        for c in node.named_children:
+            if c.type not in ("comment",):
+                inner = c
+                if inner.type == "parenthesized_expression":
+                    inner = next((x for x in inner.named_children), inner)
+                return _sizeof_type_text(_txt(inner))
+        return 1
+    if t == "binary_expression":
+        op_node = node.child_by_field_name("operator")
+        op = _txt(op_node) if op_node else None
+        lnode = node.child_by_field_name("left")
+        rnode = node.child_by_field_name("right")
+        if op and lnode and rnode:
+            lv = _eval_const(lnode)
+            rv = _eval_const(rnode)
+            if lv is not None and rv is not None:
+                if op == "*":
+                    return lv * rv
+                if op == "+":
+                    return lv + rv
+                if op == "-" and lv >= rv:
+                    return lv - rv
+    return None
+
+
+def _decl_leaf_id(declarator_node) -> str | None:
+    """Recursively extract the leaf identifier name from a complex declarator."""
+    if declarator_node is None:
+        return None
+    if declarator_node.type == "identifier":
+        return _txt(declarator_node)
+    for child in declarator_node.named_children:
+        result = _decl_leaf_id(child)
+        if result:
+            return result
+    return None
+
+
 def _is_struct_memcpy_overrun(args: list) -> bool:
     """Detect memcpy(var.field, src, sizeof(var)) — dst is a member but size is the parent.
 
@@ -851,6 +936,165 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                   funcptr_map: dict[str, str] | None = None) -> None:
     """Walk body and emit findings for tainted sinks and always-unsafe calls."""
     seen: set[tuple] = set()
+
+    # ── Pre-scan: build constant allocation-size map for CWE805 detection ───
+    # Maps variable name → allocated byte count when statically determinable.
+    _alloc_sizes: dict[str, int] = {}
+    _ALLOC_FUNCS_SZ = frozenset({"malloc", "alloca", "ALLOCA", "_alloca",
+                                  "VirtualAlloc", "HeapAlloc", "LocalAlloc",
+                                  "GlobalAlloc"})
+    for _sn in _walk(body_node):
+        _st = _sn.type
+        if _st == "declaration":
+            # Derive element size from type specifier
+            _type_node = _sn.child_by_field_name("type")
+            if _type_node is None:
+                for _tc in _sn.named_children:
+                    if _tc.type in ("primitive_type", "type_identifier",
+                                    "sized_type_specifier"):
+                        _type_node = _tc
+                        break
+            _elem_sz = _sizeof_type_text(_txt(_type_node)) if _type_node else 4
+            for _dc in _sn.named_children:
+                if _dc.type == "array_declarator":
+                    # int buf[50] → 50 * sizeof(int)
+                    _var = _decl_leaf_id(_dc)
+                    _arr_n = None
+                    for _ac in _dc.named_children:
+                        if _ac.type not in ("comment",) and _ac != _dc.named_children[0]:
+                            _arr_n = _eval_const(_ac)
+                            if _arr_n is not None:
+                                break
+                    if _var and _arr_n:
+                        _alloc_sizes[_var] = _arr_n * _elem_sz
+                elif _dc.type == "init_declarator":
+                    # char *p = malloc(N) / (type*)ALLOCA(N) / calloc(N, M)
+                    _iv = _decl_leaf_id(_dc.child_by_field_name("declarator"))
+                    _val = _dc.child_by_field_name("value")
+                    if _iv and _val:
+                        # Unwrap cast layers: (wchar_t *)ALLOCA(...) → ALLOCA(...)
+                        _val_u = _val
+                        for _ in range(3):
+                            if _val_u.type in ("cast_expression",
+                                               "parenthesized_expression"):
+                                _inner = next(
+                                    (c for c in _val_u.named_children
+                                     if c.type not in ("type_descriptor",
+                                                       "comment")), None)
+                                if _inner:
+                                    _val_u = _inner
+                                else:
+                                    break
+                            else:
+                                break
+                        if _val_u.type == "call_expression":
+                            _fn2 = _call_fname(_val_u)
+                            _a2 = _call_args(_val_u)
+                            if _fn2 in _ALLOC_FUNCS_SZ and _a2:
+                                _sz2 = _eval_const(_a2[0])
+                                if _sz2:
+                                    _alloc_sizes[_iv] = _sz2
+                            elif _fn2 == "calloc" and len(_a2) >= 2:
+                                _n2 = _eval_const(_a2[0])
+                                _s2 = _eval_const(_a2[1])
+                                if _n2 and _s2:
+                                    _alloc_sizes[_iv] = _n2 * _s2
+                        elif _val_u.type == "identifier":
+                            # char *p = existingBuffer → inherit size
+                            _src_sz = _alloc_sizes.get(_txt(_val_u))
+                            if _src_sz:
+                                _alloc_sizes[_iv] = _src_sz
+        elif _st == "assignment_expression":
+            _lhs = _sn.child_by_field_name("left")
+            _rhs = _sn.child_by_field_name("right")
+            if _lhs and _rhs and _lhs.type == "identifier":
+                _lvar = _txt(_lhs)
+                if _rhs.type == "identifier":
+                    # data = dataBadBuffer → propagate known allocation size
+                    _src_sz = _alloc_sizes.get(_txt(_rhs))
+                    if _src_sz:
+                        _alloc_sizes[_lvar] = _src_sz
+                else:
+                    # data = (type*)malloc(N) — unwrap cast layers first
+                    _rhs_u = _rhs
+                    for _ in range(3):
+                        if _rhs_u.type in ("cast_expression",
+                                           "parenthesized_expression"):
+                            _inner = next(
+                                (c for c in _rhs_u.named_children
+                                 if c.type not in ("type_descriptor", "comment")),
+                                None)
+                            if _inner:
+                                _rhs_u = _inner
+                            else:
+                                break
+                        else:
+                            break
+                    if _rhs_u.type == "call_expression":
+                        _fn2 = _call_fname(_rhs_u)
+                        _a2 = _call_args(_rhs_u)
+                        if _fn2 in _ALLOC_FUNCS_SZ and _a2:
+                            _sz2 = _eval_const(_a2[0])
+                            if _sz2:
+                                _alloc_sizes[_lvar] = _sz2
+                        elif _fn2 == "calloc" and len(_a2) >= 2:
+                            _n2 = _eval_const(_a2[0])
+                            _s2 = _eval_const(_a2[1])
+                            if _n2 and _s2:
+                                _alloc_sizes[_lvar] = _n2 * _s2
+
+    # Pointer underwrite tracking: data = buffer - N → "underpointed"
+    # Any write/read through such a pointer accesses memory before the allocation.
+    _underpointed: set[str] = set()
+
+    def _check_underpointed(lvar: str, rhs_expr) -> None:
+        """Check if rhs_expr is 'identifier - constant' and mark lvar underpointed."""
+        if rhs_expr is None:
+            return
+        # Unwrap casts/parens
+        node = rhs_expr
+        for _ in range(3):
+            if node.type in ("cast_expression", "parenthesized_expression"):
+                nxt = next(
+                    (c for c in node.named_children
+                     if c.type not in ("type_descriptor", "comment")), None)
+                if nxt:
+                    node = nxt
+                else:
+                    break
+            else:
+                break
+        if node.type != "binary_expression":
+            return
+        _op_n = node.child_by_field_name("operator")
+        if not _op_n or _txt(_op_n) != "-":
+            return
+        _bl = node.child_by_field_name("left")
+        _br = node.child_by_field_name("right")
+        if _bl and _br and _bl.type == "identifier" and _eval_const(_br) is not None:
+            _underpointed.add(lvar)
+
+    for _sn in _walk(body_node):
+        if _sn.type == "assignment_expression":
+            _lhs = _sn.child_by_field_name("left")
+            _rhs = _sn.child_by_field_name("right")
+            if _lhs and _lhs.type == "identifier":
+                _check_underpointed(_txt(_lhs), _rhs)
+        elif _sn.type == "init_declarator":
+            _iv = _decl_leaf_id(_sn.child_by_field_name("declarator"))
+            _val = _sn.child_by_field_name("value")
+            if _iv and _val:
+                _check_underpointed(_iv, _val)
+
+    # (size_arg_index, bytes_per_element)
+    # Element size is 1 for byte-based functions, 2 for wchar_t-based functions.
+    _BOUNDED_COPY_SINKS: dict[str, tuple[int, int]] = {
+        "memcpy":   (2, 1), "memmove":  (2, 1),
+        "wmemcpy":  (2, 2), "wmemmove": (2, 2),
+        "strncpy":  (2, 1), "wcsncpy":  (2, 2),
+        "strncat":  (2, 1), "wcsncat":  (2, 2),
+        "memcpy_s": (1, 1),  # memcpy_s(dst, dstSize, src, count)
+    }
 
     for node in _walk(body_node):
         if node.type != "call_expression":
@@ -898,6 +1142,72 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     ),
                     rule_id="CAST-BUF-002",
                 ))
+
+        # Constant-size buffer overflow: copy size > known destination allocation
+        if fname in _BOUNDED_COPY_SINKS and len(args) >= 3:
+            _csi, _bpe = _BOUNDED_COPY_SINKS[fname]
+            _copy_n = _eval_const(args[_csi]) if _csi < len(args) else None
+            _copy_sz = _copy_n * _bpe if _copy_n is not None else None
+            _dst_arg = args[0]
+            _dst_var = (_txt(_dst_arg) if _dst_arg.type == "identifier"
+                        else _first_identifier(_dst_arg))
+            _dst_alloc = _alloc_sizes.get(_dst_var) if _dst_var else None
+            if _copy_sz and _dst_alloc and _copy_sz > _dst_alloc:
+                _key = (file_path, line_no, "CAST-BUF-001")
+                if _key not in seen:
+                    seen.add(_key)
+                    findings.append(Finding(
+                        vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=line_no,
+                        line_content=line_text,
+                        description=(
+                            f"Buffer overflow: {fname}() copies {_copy_sz} bytes "
+                            f"into '{_dst_var}' ({_dst_alloc}-byte buffer) — CWE-805"
+                        ),
+                        rule_id="CAST-BUF-001",
+                    ))
+            # Pointer underwrite (CWE-124): dst was derived from buffer - N
+            if _dst_var and _dst_var in _underpointed:
+                _key = (file_path, line_no, "CAST-BUF-001")
+                if _key not in seen:
+                    seen.add(_key)
+                    findings.append(Finding(
+                        vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=line_no,
+                        line_content=line_text,
+                        description=(
+                            f"Buffer underwrite: '{_dst_var}' points before its allocation "
+                            f"(set via pointer arithmetic '= buf - N'); {fname}() writes "
+                            "before the buffer start — CWE-124"
+                        ),
+                        rule_id="CAST-BUF-001",
+                    ))
+            # Pointer under-read (CWE-127): src was derived from buffer - N
+            if len(args) >= 2:
+                _src_arg = args[1]
+                _src_var = (_txt(_src_arg) if _src_arg.type == "identifier"
+                            else _first_identifier(_src_arg))
+                if _src_var and _src_var in _underpointed:
+                    _key = (file_path, line_no, "CAST-BUF-001")
+                    if _key not in seen:
+                        seen.add(_key)
+                        findings.append(Finding(
+                            vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                            severity=Severity.HIGH,
+                            file_path=file_path,
+                            line_number=line_no,
+                            line_content=line_text,
+                            description=(
+                                f"Buffer under-read: '{_src_var}' points before its allocation "
+                                f"(set via pointer arithmetic '= buf - N'); {fname}() reads "
+                                "before the buffer start — CWE-127"
+                            ),
+                            rule_id="CAST-BUF-001",
+                        ))
 
         # Taint-sensitive sinks
         if fname in _SINKS:
