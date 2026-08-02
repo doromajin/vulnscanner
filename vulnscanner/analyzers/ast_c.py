@@ -82,6 +82,13 @@ _INPUT_BUF: dict[str, int] = {
     "recvmsg":   1,
     "getline":   0,  # POSIX getline(*lineptr, *n, fp) → lineptr tainted
     "__getline": 0,
+    # scanf family: first output arg (after stream+format or just format)
+    # The *first* non-literal arg carries user-supplied data.
+    "scanf":     1,   # scanf(fmt, arg0, …)
+    "wscanf":    1,   # wide-char scanf
+    "fscanf":    2,   # fscanf(fp, fmt, arg0, …)
+    "fwscanf":   2,
+    "sscanf":    2,   # sscanf(str, fmt, arg0, …) – marks first output
 }
 
 # Functions whose return value is always tainted (env vars, credentials, etc.)
@@ -371,8 +378,20 @@ class _FuncSummary:
     returns_alloc_count: int | None = None
     # Minimum element count for each parameter index (for interprocedural size tracking).
     param_alloc_counts: dict[int, int] = field(default_factory=dict)
+    # Minimum element count for parameters receiving pointer-to-buffer (&var where var has alloc).
+    # Enables V63: &data passed where data is small → callee does *dataPtr[i] OOB.
+    param_ptr_alloc_counts: dict[int, int] = field(default_factory=dict)
     # Parameter indices that receive underpointed pointers (= buf - N) at call sites.
     param_underpointed: set[int] = field(default_factory=set)
+    # Parameter indices that receive untrusted integer values (from rand/atoi) at call sites.
+    # Used to propagate CWE-129 detection interprocedurally (V41/V42 patterns).
+    untrusted_int_params: set[int] = field(default_factory=set)
+    # True if the function returns an untrusted integer (rand or atoi).
+    # Enables V42 (rand-source): data = badSource() where badSource returns RAND32().
+    returns_untrusted_int: bool = False
+    # Parameter indices that receive pointers to untrusted integers (&var where var is untrusted_int).
+    # Enables V63/V64/V65/V66/V67: data passed as pointer from one function to another.
+    untrusted_int_ptr_params: set[int] = field(default_factory=set)
 
 
 # ── AST helpers ───────────────────────────────────────────────────────────────
@@ -990,8 +1009,21 @@ def _compute_alloc_counts(body_node) -> dict[str, int]:
                     if var and arr_n:
                         _set(var, arr_n)
                 elif dc.type == "init_declarator":
-                    iv = _decl_leaf_id(dc.child_by_field_name("declarator"))
+                    _decl_node2 = dc.child_by_field_name("declarator")
+                    iv = _decl_leaf_id(_decl_node2)
                     val = dc.child_by_field_name("value")
+                    if iv:
+                        # int buf[10] = {0} → declarator is array_declarator; extract size
+                        if _decl_node2 is not None and _decl_node2.type == "array_declarator":
+                            _arr_n2 = None
+                            for _ac2 in _decl_node2.named_children:
+                                if (_ac2.type not in ("comment",)
+                                        and _ac2 != _decl_node2.named_children[0]):
+                                    _arr_n2 = _eval_const(_ac2)
+                                    if _arr_n2 is not None:
+                                        break
+                            if _arr_n2:
+                                _set(iv, _arr_n2)
                     if iv and val:
                         val_u = val
                         for _ in range(3):
@@ -1048,6 +1080,13 @@ def _compute_alloc_counts(body_node) -> dict[str, int]:
                             n2 = _eval_const(a2[0])
                             if n2:
                                 _set(lvar, n2)
+            elif lhs and rhs and lhs.type == "field_expression":
+                # struct.field = ptr_var → field-insensitive: mark struct with alloc_count
+                _fe_base67 = lhs.child_by_field_name("argument")
+                if _fe_base67 and _fe_base67.type == "identifier" and rhs.type == "identifier":
+                    src67 = alloc_counts.get(_txt(rhs))
+                    if src67:
+                        _set(_txt(_fe_base67), src67)
     return alloc_counts
 
 
@@ -1143,30 +1182,145 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
                 if existing is None or cnt < existing:
                     summaries[fname].returns_alloc_count = cnt
 
-    # Pass 2: propagate alloc_counts and underpointed through call sites
-    for fname, func_node in funcs.items():
-        body = func_node.child_by_field_name("body")
-        if body is None:
-            continue
-        local_counts = func_counts.get(fname, {})
-        local_up = func_underpointed.get(fname, set())
-        for call_node in _walk(body):
-            if call_node.type != "call_expression":
+    # Pass 2: fixpoint propagation of alloc_counts/underpointed/ptr_alloc through call sites.
+    # Iterates until stable so multi-level chains (V52/53/54: a→b→c) are handled correctly.
+    _a2_changed = True
+    while _a2_changed:
+        _a2_changed = False
+        for fname, func_node in funcs.items():
+            body = func_node.child_by_field_name("body")
+            if body is None:
                 continue
-            callee = _call_fname(call_node)
-            if not callee or callee not in summaries:
-                continue
-            args = _call_args(call_node)
-            for idx, arg in enumerate(args):
-                if arg.type == "identifier":
-                    aname = _txt(arg)
-                    cnt = local_counts.get(aname)
-                    if cnt is not None:
-                        existing = summaries[callee].param_alloc_counts.get(idx)
-                        if existing is None or cnt < existing:
-                            summaries[callee].param_alloc_counts[idx] = cnt
-                    if aname in local_up:
-                        summaries[callee].param_underpointed.add(idx)
+            # Merge local alloc_counts with interprocedural param_alloc_counts.
+            # This lets intermediate pass-through functions propagate counts they received
+            # as parameters (V52: 52b receives data from 52a, passes to 52c).
+            local_counts: dict[str, int] = dict(func_counts.get(fname, {}))
+            _pnames = _get_param_names(func_node)
+            for _pidx2, _pcnt2 in summaries[fname].param_alloc_counts.items():
+                if _pidx2 < len(_pnames):
+                    _pn2 = _pnames[_pidx2]
+                    if _pn2 not in local_counts or local_counts[_pn2] > _pcnt2:
+                        local_counts[_pn2] = _pcnt2
+            # Also propagate pointer-to-buffer: deref from param_ptr_alloc_counts
+            for _pidx2, _pcnt2 in summaries[fname].param_ptr_alloc_counts.items():
+                if _pidx2 < len(_pnames):
+                    _pn2 = _pnames[_pidx2]
+                    # param is char** dataPtr; inside function: char* data = *dataPtr
+                    # Track deref: if we see `id = *pname`, mark id with cnt
+                    _fbody2 = func_node.child_by_field_name("body")
+                    if _fbody2:
+                        for _ps2 in _walk(_fbody2):
+                            _lhs2 = None; _rhs2 = None
+                            if _ps2.type == "declaration":
+                                for _dc2 in _ps2.named_children:
+                                    if _dc2.type == "init_declarator":
+                                        _lhs2 = _decl_leaf_id(_dc2.child_by_field_name("declarator"))
+                                        _rhs2 = _dc2.child_by_field_name("value")
+                            elif _ps2.type == "assignment_expression":
+                                _lhsn2 = _ps2.child_by_field_name("left")
+                                if _lhsn2 and _lhsn2.type == "identifier":
+                                    _lhs2 = _txt(_lhsn2)
+                                _rhs2 = _ps2.child_by_field_name("right")
+                            if _lhs2 and _rhs2:
+                                _rhs2u = _rhs2
+                                for _ in range(2):
+                                    if _rhs2u.type in ("cast_expression", "parenthesized_expression"):
+                                        _i2 = next((c for c in _rhs2u.named_children
+                                                    if c.type not in ("type_descriptor", "comment")), None)
+                                        if _i2: _rhs2u = _i2
+                                        else: break
+                                    else: break
+                                if (_rhs2u.type == "pointer_expression"
+                                        and _rhs2u.children
+                                        and _txt(_rhs2u.children[0]) == "*"):
+                                    _inner2 = next((c for c in _rhs2u.named_children), None)
+                                    if (_inner2 and _inner2.type == "identifier"
+                                            and _txt(_inner2) == _pn2):
+                                        if _lhs2 not in local_counts or local_counts[_lhs2] > _pcnt2:
+                                            local_counts[_lhs2] = _pcnt2
+            local_up = func_underpointed.get(fname, set())
+            # Fixpoint: also update returns_alloc_count from augmented local_counts
+            body2 = func_node.child_by_field_name("body")
+            if body2:
+                for _ret2 in _walk(body2):
+                    if _ret2.type != "return_statement":
+                        continue
+                    _rv2 = next((c for c in _ret2.named_children
+                                 if c.type not in ("comment",)), None)
+                    if _rv2 is None:
+                        continue
+                    for _ in range(3):
+                        if _rv2.type in ("cast_expression", "parenthesized_expression"):
+                            _i2 = next((c for c in _rv2.named_children
+                                        if c.type not in ("type_descriptor", "comment")), None)
+                            if _i2: _rv2 = _i2
+                            else: break
+                        else: break
+                    if _rv2.type == "identifier":
+                        _rcnt2 = local_counts.get(_txt(_rv2))
+                        if _rcnt2 is not None:
+                            ex2 = summaries[fname].returns_alloc_count
+                            if ex2 is None or _rcnt2 < ex2:
+                                summaries[fname].returns_alloc_count = _rcnt2
+                                _a2_changed = True
+            for call_node in _walk(body):
+                if call_node.type != "call_expression":
+                    continue
+                callee = _call_fname(call_node)
+                if not callee:
+                    continue
+                # Resolve function pointer (V65: funcPtr = badSink; funcPtr(data))
+                if callee not in summaries:
+                    _fpm65 = _collect_funcptr_map(func_node)
+                    callee = _fpm65.get(callee, callee)
+                if callee not in summaries:
+                    continue
+                args = _call_args(call_node)
+                for idx, arg in enumerate(args):
+                    if arg.type == "identifier":
+                        aname = _txt(arg)
+                        cnt = local_counts.get(aname)
+                        if cnt is not None:
+                            existing = summaries[callee].param_alloc_counts.get(idx)
+                            if existing is None or cnt < existing:
+                                summaries[callee].param_alloc_counts[idx] = cnt
+                                _a2_changed = True
+                        if aname in local_up:
+                            if idx not in summaries[callee].param_underpointed:
+                                summaries[callee].param_underpointed.add(idx)
+                                _a2_changed = True
+                    elif (arg.type == "pointer_expression"
+                            and arg.children
+                            and _txt(arg.children[0]) == "&"):
+                        # &var → pointer-to-buffer: propagate param_ptr_alloc_counts (V63)
+                        _pai = next((c for c in arg.named_children), None)
+                        if _pai and _pai.type == "identifier":
+                            _pac = local_counts.get(_txt(_pai))
+                            if _pac is not None:
+                                existing2 = summaries[callee].param_ptr_alloc_counts.get(idx)
+                                if existing2 is None or _pac < existing2:
+                                    summaries[callee].param_ptr_alloc_counts[idx] = _pac
+                                    _a2_changed = True
+                # Also propagate return value alloc_count: `var = callee()` → var gets alloc
+                if summaries[callee].returns_alloc_count is not None:
+                    _call_parent = call_node.parent
+                    if _call_parent is not None:
+                        _ret_var = None
+                        if _call_parent.type == "assignment_expression":
+                            _lhsn3 = _call_parent.child_by_field_name("left")
+                            if _lhsn3 and _lhsn3.type == "identifier":
+                                _ret_var = _txt(_lhsn3)
+                        elif _call_parent.type == "init_declarator":
+                            _ret_var = _decl_leaf_id(_call_parent.child_by_field_name("declarator"))
+                        if _ret_var:
+                            _rc2 = summaries[callee].returns_alloc_count
+                            if _ret_var not in local_counts or local_counts[_ret_var] > _rc2:
+                                local_counts[_ret_var] = _rc2
+                                # also update func_counts so next iteration sees it
+                                fc2 = func_counts.setdefault(fname, {})
+                                if _ret_var not in fc2 or fc2[_ret_var] > _rc2:
+                                    fc2[_ret_var] = _rc2
+                                    _a2_changed = True
 
 
 def _detect_sinks(body_node, tainted: set[str], lines: list[str],
@@ -1174,7 +1328,10 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                   summaries: dict[str, _FuncSummary] | None = None,
                   funcptr_map: dict[str, str] | None = None,
                   extra_alloc_counts: dict[str, int] | None = None,
-                  extra_underpointed: set[str] | None = None) -> None:
+                  extra_underpointed: set[str] | None = None,
+                  global_untrusted_int: set[str] | None = None,
+                  untrusted_int_ptr_names: set[str] | None = None,
+                  extra_ptr_alloc_counts: dict[str, int] | None = None) -> None:
     """Walk body and emit findings for tainted sinks and always-unsafe calls."""
     seen: set[tuple] = set()
 
@@ -1187,16 +1344,55 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     if extra_alloc_counts:
         for _ev, _ec in extra_alloc_counts.items():
             _alloc_counts[_ev] = _ec
+            # Also seed _alloc_sizes so identifier propagation fires for `x = seeded_var`.
+            _alloc_sizes[_ev] = _ec
+
+    # Seed pointer-to-buffer alloc counts: propagate deref `x = *ptr` where ptr is in extra_ptr_alloc.
+    # Enables V63: char** dataPtr param where *dataPtr has alloc_count N → char* data = *dataPtr.
+    if extra_ptr_alloc_counts:
+        for _psn in _walk(body_node):
+            _plhs: str | None = None; _prhs = None
+            if _psn.type == "declaration":
+                for _pdc in _psn.named_children:
+                    if _pdc.type == "init_declarator":
+                        _plhs = _decl_leaf_id(_pdc.child_by_field_name("declarator"))
+                        _prhs = _pdc.child_by_field_name("value")
+            elif _psn.type == "assignment_expression":
+                _plhsn = _psn.child_by_field_name("left")
+                if _plhsn and _plhsn.type == "identifier":
+                    _plhs = _txt(_plhsn)
+                _prhs = _psn.child_by_field_name("right")
+            if _plhs and _prhs:
+                _prhs_u = _prhs
+                for _ in range(2):
+                    if _prhs_u.type in ("cast_expression", "parenthesized_expression"):
+                        _pi = next((c for c in _prhs_u.named_children
+                                    if c.type not in ("type_descriptor", "comment")), None)
+                        if _pi: _prhs_u = _pi
+                        else: break
+                    else: break
+                if (_prhs_u.type == "pointer_expression"
+                        and _prhs_u.children
+                        and _txt(_prhs_u.children[0]) == "*"):
+                    _pinner = next((c for c in _prhs_u.named_children), None)
+                    if (_pinner and _pinner.type == "identifier"):
+                        _pcnt = extra_ptr_alloc_counts.get(_txt(_pinner))
+                        if _pcnt is not None and (_plhs not in _alloc_counts
+                                                   or _alloc_counts[_plhs] > _pcnt):
+                            _alloc_counts[_plhs] = _pcnt
 
     def _set_alloc(var: str, bytes_: int, count: int | None = None) -> None:
         """Update alloc maps taking minimum seen — handles if/else with different sizes."""
         ex_b = _alloc_sizes.get(var)
         if ex_b is None or bytes_ < ex_b:
             _alloc_sizes[var] = bytes_
-        if count is not None:
-            ex_c = _alloc_counts.get(var)
-            if ex_c is None or count < ex_c:
-                _alloc_counts[var] = count
+        # Fall back to bytes_ as element count when no sizeof info available.
+        # Enables CWE-129 detection for malloc(N) (e.g. malloc(10)) in addition
+        # to malloc(N*sizeof(T)).
+        eff_count = count if count is not None else bytes_
+        ex_c = _alloc_counts.get(var)
+        if ex_c is None or eff_count < ex_c:
+            _alloc_counts[var] = eff_count
 
     _ALLOC_FUNCS_SZ = frozenset({"malloc", "alloca", "ALLOCA", "_alloca",
                                   "VirtualAlloc", "HeapAlloc", "LocalAlloc",
@@ -1227,8 +1423,20 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                         _set_alloc(_var, _arr_n * _elem_sz, _arr_n)
                 elif _dc.type == "init_declarator":
                     # char *p = malloc(N) / (type*)ALLOCA(N) / calloc(N, M)
-                    _iv = _decl_leaf_id(_dc.child_by_field_name("declarator"))
+                    _dc_decl = _dc.child_by_field_name("declarator")
+                    _iv = _decl_leaf_id(_dc_decl)
                     _val = _dc.child_by_field_name("value")
+                    # int buf[10] = {0} → declarator is array_declarator; extract size
+                    if _iv and _dc_decl is not None and _dc_decl.type == "array_declarator":
+                        _arr_n_id = None
+                        for _ac_id in _dc_decl.named_children:
+                            if (_ac_id.type not in ("comment",)
+                                    and _ac_id != _dc_decl.named_children[0]):
+                                _arr_n_id = _eval_const(_ac_id)
+                                if _arr_n_id is not None:
+                                    break
+                        if _arr_n_id:
+                            _set_alloc(_iv, _arr_n_id * _elem_sz, _arr_n_id)
                     if _iv and _val:
                         # Unwrap cast layers: (wchar_t *)ALLOCA(...) → ALLOCA(...)
                         _val_u = _val
@@ -1264,6 +1472,14 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                             _src_cnt = _alloc_counts.get(_txt(_val_u))
                             if _src_sz:
                                 _set_alloc(_iv, _src_sz, _src_cnt)
+                        elif _val_u.type == "field_expression":
+                            # char *data = myStruct.field → field-insensitive: inherit struct alloc
+                            _fe_base_r = _val_u.child_by_field_name("argument")
+                            if _fe_base_r and _fe_base_r.type == "identifier":
+                                _src_sz = _alloc_sizes.get(_txt(_fe_base_r))
+                                _src_cnt = _alloc_counts.get(_txt(_fe_base_r))
+                                if _src_sz:
+                                    _set_alloc(_iv, _src_sz, _src_cnt)
         elif _st == "assignment_expression":
             _lhs = _sn.child_by_field_name("left")
             _rhs = _sn.child_by_field_name("right")
@@ -1275,6 +1491,14 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     _src_cnt = _alloc_counts.get(_txt(_rhs))
                     if _src_sz:
                         _set_alloc(_lvar, _src_sz, _src_cnt)
+                elif _rhs.type == "field_expression":
+                    # data = myStruct.field → field-insensitive: inherit struct alloc
+                    _fe_base_ar = _rhs.child_by_field_name("argument")
+                    if _fe_base_ar and _fe_base_ar.type == "identifier":
+                        _src_sz = _alloc_sizes.get(_txt(_fe_base_ar))
+                        _src_cnt = _alloc_counts.get(_txt(_fe_base_ar))
+                        if _src_sz:
+                            _set_alloc(_lvar, _src_sz, _src_cnt)
                 else:
                     # data = (type*)malloc(N) — unwrap cast layers first
                     _rhs_u = _rhs
@@ -1312,6 +1536,14 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                                     min(_alloc_counts[_lvar], _ret_cnt)
                                     if _lvar in _alloc_counts else _ret_cnt
                                 )
+            elif _lhs and _rhs and _lhs.type == "field_expression":
+                # myStruct.field = ptr_var → field-insensitive: mark struct with alloc
+                _fe_base_w = _lhs.child_by_field_name("argument")
+                if _fe_base_w and _fe_base_w.type == "identifier" and _rhs.type == "identifier":
+                    _src_sz = _alloc_sizes.get(_txt(_rhs))
+                    _src_cnt = _alloc_counts.get(_txt(_rhs))
+                    if _src_sz:
+                        _set_alloc(_txt(_fe_base_w), _src_sz, _src_cnt)
 
     # Pointer underwrite tracking: data = buffer - N → "underpointed"
     # Any write/read through such a pointer accesses memory before the allocation.
@@ -1355,6 +1587,119 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
             _val = _sn.child_by_field_name("value")
             if _iv and _val:
                 _check_underpointed(_iv, _val)
+
+    # CWE-129: untrusted integer index tracking
+    # Tracks integers derived from rand() / RAND32() / atoi(tainted) etc.
+    _INT_TAINT_FUNCS: frozenset[str] = frozenset({
+        "rand", "RAND32", "rand_r", "random", "lrand48", "mrand48",
+    })
+    _INT_CONV_FUNCS: frozenset[str] = frozenset({
+        "atoi", "atol", "atoll", "atof",
+        "strtol", "strtoll", "strtoul", "strtoull",
+        "wcstol", "wcstoll", "_wtoi", "_wtol",
+    })
+    _untrusted_int: set[str] = set(global_untrusted_int) if global_untrusted_int else set()
+    # Pointer params that point to untrusted_int values (V63/V64/V65 pattern)
+    _untrusted_int_ptrs: set[str] = set(untrusted_int_ptr_names) if untrusted_int_ptr_names else set()
+
+    def _check_untrusted_int(lvar: str, rhs_expr) -> None:
+        """Mark lvar as untrusted_int if rhs comes from rand/conversion of tainted."""
+        if rhs_expr is None:
+            return
+        node = rhs_expr
+        for _ in range(3):
+            if node.type in ("cast_expression", "parenthesized_expression"):
+                nxt = next((c for c in node.named_children
+                             if c.type not in ("type_descriptor", "comment")), None)
+                if nxt:
+                    node = nxt
+                else:
+                    break
+            else:
+                break
+        if node.type == "identifier":
+            # Propagation: var = another_untrusted_int (global or local)
+            src = _txt(node)
+            if (src in _untrusted_int
+                    or (global_untrusted_int and src in global_untrusted_int)):
+                _untrusted_int.add(lvar)
+            elif src in _untrusted_int_ptrs:
+                # Pointer alias propagation: int *p2 = p1 where p1 is ptr-to-untrusted_int
+                # (V64: int *dataPtr = (int *)dataVoidPtr after cast is unwrapped)
+                _untrusted_int_ptrs.add(lvar)
+            return
+        if node.type == "field_expression":
+            # V67: data = myStruct.structFirst where myStruct is untrusted_int
+            _fe_obj = node.child_by_field_name("argument")
+            if _fe_obj and _fe_obj.type == "identifier" and _txt(_fe_obj) in _untrusted_int:
+                _untrusted_int.add(lvar)
+            return
+        if node.type == "pointer_expression":
+            # *ptr where ptr points to an untrusted_int (V63/V64 pattern: int data = *dataPtr)
+            _ptr_op = node.children[0] if node.children else None
+            if _ptr_op and _txt(_ptr_op) == "*":
+                _ptr_inner = next((c for c in node.named_children), None)
+                if (_ptr_inner and _ptr_inner.type == "identifier"
+                        and _txt(_ptr_inner) in _untrusted_int_ptrs):
+                    _untrusted_int.add(lvar)
+            return
+        if node.type != "call_expression":
+            return
+        fn3 = _call_fname(node)
+        if not fn3:
+            return
+        if fn3 in _INT_TAINT_FUNCS:
+            _untrusted_int.add(lvar)
+        elif fn3 in _INT_CONV_FUNCS:
+            a3 = _call_args(node)
+            if a3 and a3[0].type == "identifier" and _txt(a3[0]) in tainted:
+                _untrusted_int.add(lvar)
+        elif summaries and fn3 in summaries and (
+                summaries[fn3].returns_tainted or summaries[fn3].returns_untrusted_int):
+            # User-defined function returning tainted/untrusted int (V42 pattern)
+            _untrusted_int.add(lvar)
+
+    for _sn in _walk(body_node):
+        if _sn.type == "assignment_expression":
+            _lhs3 = _sn.child_by_field_name("left")
+            _rhs3 = _sn.child_by_field_name("right")
+            if _lhs3 and _lhs3.type == "identifier":
+                _check_untrusted_int(_txt(_lhs3), _rhs3)
+        elif _sn.type == "init_declarator":
+            _iv3 = _decl_leaf_id(_sn.child_by_field_name("declarator"))
+            _val3 = _sn.child_by_field_name("value")
+            if _iv3 and _val3:
+                _check_untrusted_int(_iv3, _val3)
+        # V67: struct.field = untrusted_int_var → mark struct as untrusted_int
+        # This propagates the taint to the whole struct (field-insensitive).
+        if (_sn.type == "assignment_expression"):
+            _lhs3f = _sn.child_by_field_name("left")
+            _rhs3f = _sn.child_by_field_name("right")
+            if (_lhs3f and _lhs3f.type == "field_expression"
+                    and _rhs3f and _rhs3f.type == "identifier"
+                    and _txt(_rhs3f) in _untrusted_int):
+                _base3f = _lhs3f.child_by_field_name("argument")
+                if _base3f and _base3f.type == "identifier":
+                    _untrusted_int.add(_txt(_base3f))
+
+    # scanf/fscanf family: &var args receive user-controlled integers
+    _SCANF_UNTRUSTED: dict[str, int] = {
+        "scanf": 1, "wscanf": 1, "fscanf": 2, "fwscanf": 2, "sscanf": 2,
+    }
+    for _sn in _walk(body_node):
+        if _sn.type == "call_expression":
+            _fn_sc = _call_fname(_sn)
+            if _fn_sc in _SCANF_UNTRUSTED:
+                _base_sc = _SCANF_UNTRUSTED[_fn_sc]
+                _args_sc = _call_args(_sn)
+                for _arg_sc in _args_sc[_base_sc:]:
+                    # &var → var receives integer from user
+                    if (_arg_sc.type == "pointer_expression"
+                            and _arg_sc.children
+                            and _txt(_arg_sc.children[0]) == "&"):
+                        _inner_sc = next((c for c in _arg_sc.named_children), None)
+                        if _inner_sc and _inner_sc.type == "identifier":
+                            _untrusted_int.add(_txt(_inner_sc))
 
     # (size_arg_index, bytes_per_element)
     # Element size is 1 for byte-based functions, 2 for wchar_t-based functions.
@@ -1766,6 +2111,46 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                                 rule_id="CAST-BUF-001",
                             ))
 
+    # CWE-129: untrusted integer array index — buffer[rand_derived] = val
+    # where buffer has a statically known element count.
+    if _untrusted_int and _alloc_counts:
+        def _emit_cwe129(subscript_node, parent_stmt_node, var_n: str, idx_n: str, cnt_n: int) -> None:
+            _ln = parent_stmt_node.start_point[0] + 1
+            _tx = (lines[parent_stmt_node.start_point[0]].strip()
+                   if parent_stmt_node.start_point[0] < len(lines) else "")
+            _k = (file_path, _ln, "CAST-BUF-001")
+            if _k not in seen:
+                seen.add(_k)
+                findings.append(Finding(
+                    vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                    severity=Severity.HIGH,
+                    file_path=file_path,
+                    line_number=_ln,
+                    line_content=_tx,
+                    description=(
+                        f"Buffer access: array '{var_n}[{idx_n}]' "
+                        f"accessed with unvalidated index from rand/atoi "
+                        f"(CWE-129/126, alloc_count={cnt_n})"
+                    ),
+                    rule_id="CAST-BUF-001",
+                ))
+
+        # Walk ALL subscript expressions: catches both writes (lhs) and reads
+        # (rhs of assignment, function args, return values, etc.)
+        # CWE-129: OOB write;  CWE-126: OOB read
+        for _sn in _walk(body_node):
+            if _sn.type != "subscript_expression":
+                continue
+            _sarg = _sn.child_by_field_name("argument")
+            _sidx = _sn.child_by_field_name("index")
+            if (_sarg and _sarg.type == "identifier" and
+                    _sidx is not None and _sidx.type == "identifier"):
+                _svar_n = _txt(_sarg)
+                _sidx_n = _txt(_sidx)
+                _scnt_u = _alloc_counts.get(_svar_n)
+                if _scnt_u is not None and _sidx_n in _untrusted_int:
+                    _emit_cwe129(_sn, _sn, _svar_n, _sidx_n, _scnt_u)
+
     # C-7: Scoped UAF — free(p)/delete p followed by use in same function
     _freed: dict[str, int] = {}
     _FREE_FUNCS_UAF = frozenset({"free", "cfree", "_free", "kfree",
@@ -1997,6 +2382,18 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
     # Step 3: Interprocedural fixed-point analysis (with global variable taint)
     summaries: dict[str, _FuncSummary] = {name: _FuncSummary() for name in funcs}
     global_tainted: set[str] = set()  # file-scope variables written with tainted data
+    global_untrusted_int: set[str] = set()  # file-scope vars assigned from rand/atoi
+    _INT_TAINT_G: frozenset[str] = frozenset({
+        "rand", "RAND32", "rand_r", "random", "lrand48", "mrand48",
+    })
+    _INT_CONV_G: frozenset[str] = frozenset({
+        "atoi", "atol", "atoll", "atof",
+        "strtol", "strtoll", "strtoul", "strtoull",
+        "wcstol", "wcstoll", "_wtoi", "_wtol",
+    })
+    _INT_SCANF_G: dict[str, int] = {
+        "scanf": 1, "wscanf": 1, "fscanf": 2, "fwscanf": 2, "sscanf": 2,
+    }
 
     for _outer in range(7):
         changed = False
@@ -2022,6 +2419,192 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
                         summaries[fname].output_param_tainted.add(i)
                         changed = True
 
+            # Collect global variables assigned from rand/atoi → global_untrusted_int
+            # Also tracks per-function locals (for V45: local = atoi(); global = local)
+            _fbody = func_node.child_by_field_name("body")
+            _flocals = _collect_local_decls(func_node)
+            if _fbody:
+                # _flocalui: all untrusted-integer vars within this function (local OR global)
+                _flocalui: set[str] = set(global_untrusted_int)
+                # Seed from this function's untrusted_int_params → param variable names
+                for _fui_pi, _fui_pn in enumerate(_get_param_names(func_node)):
+                    if _fui_pi in summaries[fname].untrusted_int_params:
+                        _flocalui.add(_fui_pn)
+                for _fsn in _walk(_fbody):
+                    if _fsn.type == "assignment_expression":
+                        _flhs = _fsn.child_by_field_name("left")
+                        _frhs = _fsn.child_by_field_name("right")
+                        if _flhs and _flhs.type == "identifier":
+                            _fvar = _txt(_flhs)
+                            _fnode = _frhs
+                            for _ in range(3):
+                                if _fnode and _fnode.type in (
+                                        "cast_expression", "parenthesized_expression"):
+                                    _fnode = next((c for c in _fnode.named_children
+                                                   if c.type not in ("type_descriptor",)),
+                                                  None)
+                                else:
+                                    break
+                            _fmarked = False
+                            if _fnode and _fnode.type == "call_expression":
+                                _ffn = _call_fname(_fnode)
+                                if _ffn in _INT_TAINT_G:
+                                    _fmarked = True
+                                elif _ffn in _INT_CONV_G:
+                                    _fargs = _call_args(_fnode)
+                                    if (_fargs and _fargs[0].type == "identifier"
+                                            and _txt(_fargs[0]) in tainted):
+                                        _fmarked = True
+                            elif (_fnode and _fnode.type == "identifier"
+                                    and _txt(_fnode) in _flocalui):
+                                # Propagation: var = untrusted_int_var (V45: global = local_ui)
+                                _fmarked = True
+                            if _fmarked:
+                                _flocalui.add(_fvar)
+                                if _fvar not in _flocals and _fvar not in global_untrusted_int:
+                                    global_untrusted_int.add(_fvar)
+                                    changed = True
+                    elif _fsn.type == "call_expression":
+                        _fscfn = _call_fname(_fsn)
+                        if _fscfn in _INT_SCANF_G:
+                            _fsc_base = _INT_SCANF_G[_fscfn]
+                            _fsc_args = _call_args(_fsn)
+                            for _fsc_arg in _fsc_args[_fsc_base:]:
+                                if (_fsc_arg.type == "pointer_expression"
+                                        and _fsc_arg.children
+                                        and _txt(_fsc_arg.children[0]) == "&"):
+                                    _fsc_inner = next(
+                                        (c for c in _fsc_arg.named_children), None)
+                                    if _fsc_inner and _fsc_inner.type == "identifier":
+                                        _fsc_vn = _txt(_fsc_inner)
+                                        _flocalui.add(_fsc_vn)
+                                        if (_fsc_vn not in _flocals
+                                                and _fsc_vn not in global_untrusted_int):
+                                            global_untrusted_int.add(_fsc_vn)
+                                            changed = True
+
+        # Propagate untrusted-integer values interprocedurally (V41/V42/etc.)
+        # For each function, compute its local _func_untrusted_int set, then mark any
+        # call argument that is in that set as untrusted_int_params in the callee summary.
+        for _ui_fname, _ui_func_node in funcs.items():
+            _ui_fbody = _ui_func_node.child_by_field_name("body")
+            if not _ui_fbody:
+                continue
+            _ui_tainted = _analyze_func_with_summaries(
+                _ui_func_node, summaries, None, global_tainted
+            )
+            _ui_pnames = _get_param_names(_ui_func_node)
+            _ui_flocals = _collect_local_decls(_ui_func_node)
+            _func_ui: set[str] = set(global_untrusted_int)
+            # Seed from this function's own untrusted_int_params (params received as untrusted int)
+            for _ui_pi, _ui_pn in enumerate(_ui_pnames):
+                if _ui_pi in summaries[_ui_fname].untrusted_int_params:
+                    _func_ui.add(_ui_pn)
+            # Collect local assignments: var = rand/RAND32() or var = atoi(tainted)
+            for _ui_sn in _walk(_ui_fbody):
+                if _ui_sn.type in ("assignment_expression", "init_declarator"):
+                    if _ui_sn.type == "assignment_expression":
+                        _ui_lhs = _ui_sn.child_by_field_name("left")
+                        _ui_rhs = _ui_sn.child_by_field_name("right")
+                        _ui_lv = _txt(_ui_lhs) if _ui_lhs and _ui_lhs.type == "identifier" else None
+                    else:
+                        _ui_dl = _ui_sn.child_by_field_name("declarator")
+                        _ui_rhs = _ui_sn.child_by_field_name("value")
+                        _ui_lv = _decl_leaf_id(_ui_dl) if _ui_dl else None
+                    if _ui_lv and _ui_rhs:
+                        _ui_n = _ui_rhs
+                        for _ in range(3):
+                            if _ui_n and _ui_n.type in (
+                                    "cast_expression", "parenthesized_expression"):
+                                _ui_n = next((c for c in _ui_n.named_children
+                                              if c.type not in ("type_descriptor",)), None)
+                            else:
+                                break
+                        if _ui_n and _ui_n.type == "call_expression":
+                            _ui_fn = _call_fname(_ui_n)
+                            if _ui_fn in _INT_TAINT_G:
+                                _func_ui.add(_ui_lv)
+                            elif _ui_fn in _INT_CONV_G:
+                                _ui_fa = _call_args(_ui_n)
+                                if (_ui_fa and _ui_fa[0].type == "identifier"
+                                        and _txt(_ui_fa[0]) in _ui_tainted):
+                                    _func_ui.add(_ui_lv)
+                            elif (summaries and _call_fname(_ui_n) in summaries
+                                    and (summaries[_call_fname(_ui_n)].returns_tainted
+                                         or summaries[_call_fname(_ui_n)].returns_untrusted_int)):
+                                _func_ui.add(_ui_lv)
+                        elif (_ui_n and _ui_n.type == "identifier"
+                                and _txt(_ui_n) in _func_ui):
+                            # Propagation: x = func_ui_var (V31 copy chain, V67 struct read)
+                            _func_ui.add(_ui_lv)
+                        elif (_ui_n and _ui_n.type == "field_expression"):
+                            # V67 read: data = struct.field where struct ∈ _func_ui
+                            _fe_obj = _ui_n.child_by_field_name("argument")
+                            if (_fe_obj and _fe_obj.type == "identifier"
+                                    and _txt(_fe_obj) in _func_ui):
+                                _func_ui.add(_ui_lv)
+                # V67 write: struct.field = func_ui_var → struct ∈ _func_ui
+                if _ui_sn.type == "assignment_expression":
+                    _ui_lhsf = _ui_sn.child_by_field_name("left")
+                    _ui_rhsf = _ui_sn.child_by_field_name("right")
+                    if (_ui_lhsf and _ui_lhsf.type == "field_expression"
+                            and _ui_rhsf and _ui_rhsf.type == "identifier"
+                            and _txt(_ui_rhsf) in _func_ui):
+                        _ui_base = _ui_lhsf.child_by_field_name("argument")
+                        if _ui_base and _ui_base.type == "identifier":
+                            _func_ui.add(_txt(_ui_base))
+                elif _ui_sn.type == "call_expression":
+                    _ui_scfn = _call_fname(_ui_sn)
+                    if _ui_scfn in _INT_SCANF_G:
+                        _ui_sc_base = _INT_SCANF_G[_ui_scfn]
+                        _ui_sc_args = _call_args(_ui_sn)
+                        for _ui_sc_arg in _ui_sc_args[_ui_sc_base:]:
+                            if (_ui_sc_arg.type == "pointer_expression"
+                                    and _ui_sc_arg.children
+                                    and _txt(_ui_sc_arg.children[0]) == "&"):
+                                _ui_sc_in = next(
+                                    (c for c in _ui_sc_arg.named_children), None)
+                                if _ui_sc_in and _ui_sc_in.type == "identifier":
+                                    _func_ui.add(_txt(_ui_sc_in))
+            # Check if this function returns an untrusted int (V42 rand-source pattern)
+            if _func_ui and not summaries[_ui_fname].returns_untrusted_int:
+                for _ui_sn in _walk(_ui_fbody):
+                    if _ui_sn.type == "return_statement":
+                        _ui_ret = next((c for c in _ui_sn.named_children
+                                        if c.type not in ("comment",)), None)
+                        if _ui_ret and _ui_ret.type == "identifier" and _txt(_ui_ret) in _func_ui:
+                            summaries[_ui_fname].returns_untrusted_int = True
+                            changed = True
+                            break
+            # Propagate: any call arg that is an untrusted_int → callee.untrusted_int_params
+            if _func_ui:
+                _ui_fpm = _collect_funcptr_map(_ui_func_node)
+                for _ui_sn in _walk(_ui_fbody):
+                    if _ui_sn.type == "call_expression":
+                        _ui_cn = _call_fname(_ui_sn)
+                        # Resolve function pointer (V44 pattern: funcPtr = badSink; funcPtr(data))
+                        if _ui_cn and _ui_cn in _ui_fpm:
+                            _ui_cn = _ui_fpm[_ui_cn]
+                        if _ui_cn and _ui_cn in summaries:
+                            _ui_ca = _call_args(_ui_sn)
+                            for _ui_ci, _ui_carg in enumerate(_ui_ca):
+                                if (_ui_carg.type == "identifier"
+                                        and _txt(_ui_carg) in _func_ui
+                                        and _ui_ci not in summaries[_ui_cn].untrusted_int_params):
+                                    summaries[_ui_cn].untrusted_int_params.add(_ui_ci)
+                                    changed = True
+                                elif (_ui_carg.type == "pointer_expression"
+                                        and _ui_carg.children
+                                        and _txt(_ui_carg.children[0]) == "&"):
+                                    # &var passed as arg → mark callee param as untrusted_int_ptr
+                                    _ui_inner = next(
+                                        (c for c in _ui_carg.named_children), None)
+                                    if (_ui_inner and _ui_inner.type == "identifier"
+                                            and _txt(_ui_inner) in _func_ui
+                                            and _ui_ci not in summaries[_ui_cn].untrusted_int_ptr_params):
+                                        summaries[_ui_cn].untrusted_int_ptr_params.add(_ui_ci)
+                                        changed = True
+
         # Propagate call-site taint to callee param summaries
         for callee, tainted_indices in call_sites.items():
             new_indices = tainted_indices - summaries[callee].param_tainted
@@ -2043,6 +2626,37 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
     # Interprocedural alloc_count propagation: return values and parameters
     _update_alloc_summaries(funcs, summaries)
 
+    # Collect global alloc_counts for V68: global_ptr = local_small_buf in one function,
+    # then other function reads global_ptr and uses it with large index → OOB.
+    _global_alloc_counts: dict[str, int] = {}
+    for _g68_fname, _g68_fn in funcs.items():
+        _g68_body = _g68_fn.child_by_field_name("body")
+        if _g68_body is None:
+            continue
+        _g68_flocals = _collect_local_decls(_g68_fn)
+        _g68_counts: dict[str, int] = _compute_alloc_counts(_g68_body)
+        # Augment with param_alloc_counts
+        _g68_pnames = _get_param_names(_g68_fn)
+        for _g68_pi, _g68_pc in summaries[_g68_fname].param_alloc_counts.items():
+            if _g68_pi < len(_g68_pnames):
+                _pn68 = _g68_pnames[_g68_pi]
+                if _pn68 not in _g68_counts or _g68_counts[_pn68] > _g68_pc:
+                    _g68_counts[_pn68] = _g68_pc
+        for _g68_sn in _walk(_g68_body):
+            if _g68_sn.type == "assignment_expression":
+                _g68_lhs = _g68_sn.child_by_field_name("left")
+                _g68_rhs = _g68_sn.child_by_field_name("right")
+                if (_g68_lhs and _g68_lhs.type == "identifier"
+                        and _g68_rhs and _g68_rhs.type == "identifier"):
+                    _g68_lvar = _txt(_g68_lhs)
+                    _g68_rvar = _txt(_g68_rhs)
+                    if _g68_lvar not in _g68_flocals:  # it's a global/static
+                        _g68_cnt = _g68_counts.get(_g68_rvar)
+                        if _g68_cnt is not None:
+                            _g68_ex = _global_alloc_counts.get(_g68_lvar)
+                            if _g68_ex is None or _g68_cnt < _g68_ex:
+                                _global_alloc_counts[_g68_lvar] = _g68_cnt
+
     # Step 4: Final pass — emit findings
     for fname, func_node in funcs.items():
         tainted = _analyze_func_with_summaries(func_node, summaries, None, global_tainted)
@@ -2058,10 +2672,33 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
             for _pidx in summaries[fname].param_underpointed:
                 if _pidx < len(param_names):
                     _extra_up.add(param_names[_pidx])
+            # Also seed untrusted_int from interprocedural param tracking (V41/V42/V45)
+            _extra_ui: set[str] = set()
+            _extra_ui_ptrs: set[str] = set()
+            for _pidx in summaries[fname].untrusted_int_params:
+                if _pidx < len(param_names):
+                    _extra_ui.add(param_names[_pidx])
+            for _pidx in summaries[fname].untrusted_int_ptr_params:
+                if _pidx < len(param_names):
+                    _extra_ui_ptrs.add(param_names[_pidx])
+            _merged_ui = (global_untrusted_int | _extra_ui) if _extra_ui else global_untrusted_int
+            # Seed pointer-to-buffer alloc counts for V63 (char** dataPtr pattern)
+            _extra_ptr: dict[str, int] = {}
+            for _pidx, _pcnt in summaries[fname].param_ptr_alloc_counts.items():
+                if _pidx < len(param_names):
+                    _extra_ptr[param_names[_pidx]] = _pcnt
+            # Merge global alloc_counts (V68: global_ptr = small_buf in caller) into _extra
+            if _global_alloc_counts:
+                for _g68v, _g68c in _global_alloc_counts.items():
+                    if _g68v not in _extra or _extra[_g68v] > _g68c:
+                        _extra[_g68v] = _g68c
             _detect_sinks(body, tainted, lines, file_path, findings, summaries,
                           _collect_funcptr_map(func_node),
                           extra_alloc_counts=_extra if _extra else None,
-                          extra_underpointed=_extra_up if _extra_up else None)
+                          extra_underpointed=_extra_up if _extra_up else None,
+                          global_untrusted_int=_merged_ui or None,
+                          untrusted_int_ptr_names=_extra_ui_ptrs or None,
+                          extra_ptr_alloc_counts=_extra_ptr if _extra_ptr else None)
 
     # Step 5: C++ class member cross-method taint (constructor→destructor, etc.)
     # For each class, collect "free variables" (tainted but not locally declared) from
