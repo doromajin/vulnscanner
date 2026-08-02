@@ -371,6 +371,8 @@ class _FuncSummary:
     returns_alloc_count: int | None = None
     # Minimum element count for each parameter index (for interprocedural size tracking).
     param_alloc_counts: dict[int, int] = field(default_factory=dict)
+    # Parameter indices that receive underpointed pointers (= buf - N) at call sites.
+    param_underpointed: set[int] = field(default_factory=set)
 
 
 # ── AST helpers ───────────────────────────────────────────────────────────────
@@ -1049,22 +1051,65 @@ def _compute_alloc_counts(body_node) -> dict[str, int]:
     return alloc_counts
 
 
+def _compute_underpointed(body_node) -> set[str]:
+    """Return set of variables known to be underpointed (assigned buf - N) in body_node."""
+    up: set[str] = set()
+
+    def _check(lvar: str, rhs_expr) -> None:
+        if rhs_expr is None:
+            return
+        node = rhs_expr
+        for _ in range(3):
+            if node.type in ("cast_expression", "parenthesized_expression"):
+                nxt = next((c for c in node.named_children
+                             if c.type not in ("type_descriptor", "comment")), None)
+                if nxt:
+                    node = nxt
+                else:
+                    break
+            else:
+                break
+        if node.type != "binary_expression":
+            return
+        op_n = node.child_by_field_name("operator")
+        if not op_n or _txt(op_n) != "-":
+            return
+        bl = node.child_by_field_name("left")
+        br = node.child_by_field_name("right")
+        if bl and br and bl.type == "identifier" and _eval_const(br) is not None:
+            up.add(lvar)
+
+    for sn in _walk(body_node):
+        if sn.type == "assignment_expression":
+            lhs = sn.child_by_field_name("left")
+            rhs = sn.child_by_field_name("right")
+            if lhs and lhs.type == "identifier":
+                _check(_txt(lhs), rhs)
+        elif sn.type == "init_declarator":
+            iv = _decl_leaf_id(sn.child_by_field_name("declarator"))
+            val = sn.child_by_field_name("value")
+            if iv and val:
+                _check(iv, val)
+    return up
+
+
 def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -> None:
-    """Propagate alloc_counts through function call sites (return values and parameters).
+    """Propagate alloc_counts and underpointed info through function call sites.
 
     Two passes:
-      Pass 1: Compute per-function alloc_counts + infer returns_alloc_count.
-      Pass 2: At each call site, if the callee has returns_alloc_count, seed the
-              lhs variable; if an argument has known count, update param_alloc_counts.
+      Pass 1: Compute per-function alloc_counts + underpointed sets + returns_alloc_count.
+      Pass 2: At each call site propagate alloc counts and underpointed info to callees.
     """
-    # Pass 1: local alloc_counts + return value alloc_count for each function
+    # Pass 1: local alloc_counts + underpointed sets + return value alloc_count
     func_counts: dict[str, dict[str, int]] = {}
+    func_underpointed: dict[str, set[str]] = {}
     for fname, func_node in funcs.items():
         body = func_node.child_by_field_name("body")
         if body is None:
             continue
         counts = _compute_alloc_counts(body)
         func_counts[fname] = counts
+        func_underpointed[fname] = _compute_underpointed(body)
         # Infer returns_alloc_count: scan for `return var` where var has known count
         for ret_node in _walk(body):
             if ret_node.type != "return_statement":
@@ -1098,12 +1143,13 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
                 if existing is None or cnt < existing:
                     summaries[fname].returns_alloc_count = cnt
 
-    # Pass 2: propagate through call sites
+    # Pass 2: propagate alloc_counts and underpointed through call sites
     for fname, func_node in funcs.items():
         body = func_node.child_by_field_name("body")
         if body is None:
             continue
         local_counts = func_counts.get(fname, {})
+        local_up = func_underpointed.get(fname, set())
         for call_node in _walk(body):
             if call_node.type != "call_expression":
                 continue
@@ -1113,18 +1159,22 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
             args = _call_args(call_node)
             for idx, arg in enumerate(args):
                 if arg.type == "identifier":
-                    cnt = local_counts.get(_txt(arg))
+                    aname = _txt(arg)
+                    cnt = local_counts.get(aname)
                     if cnt is not None:
                         existing = summaries[callee].param_alloc_counts.get(idx)
                         if existing is None or cnt < existing:
                             summaries[callee].param_alloc_counts[idx] = cnt
+                    if aname in local_up:
+                        summaries[callee].param_underpointed.add(idx)
 
 
 def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                   file_path: str, findings: list[Finding],
                   summaries: dict[str, _FuncSummary] | None = None,
                   funcptr_map: dict[str, str] | None = None,
-                  extra_alloc_counts: dict[str, int] | None = None) -> None:
+                  extra_alloc_counts: dict[str, int] | None = None,
+                  extra_underpointed: set[str] | None = None) -> None:
     """Walk body and emit findings for tainted sinks and always-unsafe calls."""
     seen: set[tuple] = set()
 
@@ -1265,7 +1315,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
 
     # Pointer underwrite tracking: data = buffer - N → "underpointed"
     # Any write/read through such a pointer accesses memory before the allocation.
-    _underpointed: set[str] = set()
+    _underpointed: set[str] = set(extra_underpointed) if extra_underpointed else set()
 
     def _check_underpointed(lvar: str, rhs_expr) -> None:
         """Check if rhs_expr is 'identifier - constant' and mark lvar underpointed."""
@@ -1998,15 +2048,20 @@ def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
         tainted = _analyze_func_with_summaries(func_node, summaries, None, global_tainted)
         body = func_node.child_by_field_name("body")
         if body:
-            # Seed extra alloc_counts from interprocedural param summaries
+            # Seed extra alloc_counts and underpointed from interprocedural param summaries
             _extra: dict[str, int] = {}
+            _extra_up: set[str] = set()
             param_names = _get_param_names(func_node)
             for _pidx, _pcnt in summaries[fname].param_alloc_counts.items():
                 if _pidx < len(param_names):
                     _extra[param_names[_pidx]] = _pcnt
+            for _pidx in summaries[fname].param_underpointed:
+                if _pidx < len(param_names):
+                    _extra_up.add(param_names[_pidx])
             _detect_sinks(body, tainted, lines, file_path, findings, summaries,
                           _collect_funcptr_map(func_node),
-                          extra_alloc_counts=_extra if _extra else None)
+                          extra_alloc_counts=_extra if _extra else None,
+                          extra_underpointed=_extra_up if _extra_up else None)
 
     # Step 5: C++ class member cross-method taint (constructor→destructor, etc.)
     # For each class, collect "free variables" (tainted but not locally declared) from
