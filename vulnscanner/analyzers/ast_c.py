@@ -1088,12 +1088,20 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
 
     # (size_arg_index, bytes_per_element)
     # Element size is 1 for byte-based functions, 2 for wchar_t-based functions.
+    # For snprintf/sprintf_s family: size is args[1] (destination byte count).
     _BOUNDED_COPY_SINKS: dict[str, tuple[int, int]] = {
-        "memcpy":   (2, 1), "memmove":  (2, 1),
-        "wmemcpy":  (2, 2), "wmemmove": (2, 2),
-        "strncpy":  (2, 1), "wcsncpy":  (2, 2),
-        "strncat":  (2, 1), "wcsncat":  (2, 2),
-        "memcpy_s": (1, 1),  # memcpy_s(dst, dstSize, src, count)
+        "memcpy":    (2, 1), "memmove":   (2, 1),
+        "wmemcpy":   (2, 2), "wmemmove":  (2, 2),
+        "strncpy":   (2, 1), "wcsncpy":   (2, 2),
+        "strncat":   (2, 1), "wcsncat":   (2, 2),
+        "memcpy_s":  (1, 1),
+        # snprintf-family: dst at 0, dstSize at 1 (in chars, byte-sized)
+        "snprintf":   (1, 1), "_snprintf":  (1, 1),
+        "vsnprintf":  (1, 1), "_vsnprintf": (1, 1),
+        # wchar_t snprintf variants: dstSize is in wchar_t elements (×2 bytes)
+        "swprintf":   (1, 2), "_swprintf":  (1, 2),
+        "vswprintf":  (1, 2), "_vswprintf": (1, 2),
+        "_snwprintf": (1, 2), "_vsnwprintf": (1, 2),
     }
 
     for node in _walk(body_node):
