@@ -6684,3 +6684,116 @@ void good() {
         rule_ids = {f.rule_id for f in findings}
         assert "CAST-BUF-001" not in rule_ids, \
             "direct assignment (no negative offset) must NOT fire CAST-BUF-001"
+
+
+class TestLoopBoundOverflow:
+    """CWE-121: for(i=0; i<N; i++) { data[i]=...; } where N > alloc_count."""
+
+    def _az_c(self):
+        from vulnscanner.analyzers.ast_c import CASTAnalyzer
+        return CASTAnalyzer()
+
+    def test_loop_overflow_fires(self):
+        code = """
+#include <string.h>
+void bad(void) {
+    int i;
+    int dataBadBuffer[50];
+    int *data = dataBadBuffer;
+    int source[100] = {0};
+    for (i = 0; i < 100; i++) {
+        data[i] = source[i];
+    }
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" in rule_ids, \
+            "loop writing 100 elements to 50-element buffer must fire CAST-BUF-001"
+
+    def test_loop_within_bounds_no_fire(self):
+        code = """
+#include <string.h>
+void good(void) {
+    int i;
+    int dataGoodBuffer[100];
+    int *data = dataGoodBuffer;
+    int source[100] = {0};
+    for (i = 0; i < 100; i++) {
+        data[i] = source[i];
+    }
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" not in rule_ids, \
+            "loop writing 100 elements to 100-element buffer must NOT fire CAST-BUF-001"
+
+    def test_loop_le_overflow_fires(self):
+        code = """
+void bad(void) {
+    int i;
+    int buf[10];
+    int *data = buf;
+    for (i = 0; i <= 10; i++) {
+        data[i] = 0;
+    }
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" in rule_ids, \
+            "loop with '<= N' writing N+1 elements to N-element buffer must fire"
+
+    def test_malloc_loop_overflow_fires(self):
+        code = """
+#include <stdlib.h>
+void bad(void) {
+    int i;
+    int *data = (int *)malloc(50 * sizeof(int));
+    int source[100] = {0};
+    for (i = 0; i < 100; i++) {
+        data[i] = source[i];
+    }
+    free(data);
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" in rule_ids, \
+            "loop writing 100 elements to malloc(50*sizeof(int)) must fire CAST-BUF-001"
+
+    def test_calloc_loop_overflow_fires(self):
+        code = """
+#include <stdlib.h>
+void bad(void) {
+    int i;
+    int *data = (int *)calloc(50, sizeof(int));
+    for (i = 0; i < 100; i++) {
+        data[i] = i;
+    }
+    free(data);
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" in rule_ids, \
+            "loop writing 100 elements to calloc(50, sizeof(int)) must fire CAST-BUF-001"
+
+    def test_malloc_loop_within_bounds_no_fire(self):
+        code = """
+#include <stdlib.h>
+void good(void) {
+    int i;
+    int *data = (int *)malloc(100 * sizeof(int));
+    int source[100] = {0};
+    for (i = 0; i < 100; i++) {
+        data[i] = source[i];
+    }
+    free(data);
+}
+"""
+        findings = self._az_c().analyze("test.c", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "CAST-BUF-001" not in rule_ids, \
+            "loop writing 100 elements to malloc(100*sizeof(int)) must NOT fire"

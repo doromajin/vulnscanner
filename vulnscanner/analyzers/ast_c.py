@@ -891,6 +891,22 @@ def _decl_leaf_id(declarator_node) -> str | None:
     return None
 
 
+def _extract_elem_count(size_node) -> int | None:
+    """Extract element count N from malloc-size expressions like N*sizeof(T) or sizeof(T)*N."""
+    if size_node is None:
+        return None
+    if size_node.type == "binary_expression":
+        op_n = size_node.child_by_field_name("operator")
+        if op_n and _txt(op_n) == "*":
+            lv = size_node.child_by_field_name("left")
+            rv = size_node.child_by_field_name("right")
+            if lv and lv.type == "sizeof_expression":
+                return _eval_const(rv)
+            if rv and rv.type == "sizeof_expression":
+                return _eval_const(lv)
+    return None
+
+
 def _is_struct_memcpy_overrun(args: list) -> bool:
     """Detect memcpy(var.field, src, sizeof(var)) — dst is a member but size is the parent.
 
@@ -940,6 +956,18 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     # ── Pre-scan: build constant allocation-size map for CWE805 detection ───
     # Maps variable name → allocated byte count when statically determinable.
     _alloc_sizes: dict[str, int] = {}
+    _alloc_counts: dict[str, int] = {}  # variable → element count (stack arrays only)
+
+    def _set_alloc(var: str, bytes_: int, count: int | None = None) -> None:
+        """Update alloc maps taking minimum seen — handles if/else with different sizes."""
+        ex_b = _alloc_sizes.get(var)
+        if ex_b is None or bytes_ < ex_b:
+            _alloc_sizes[var] = bytes_
+        if count is not None:
+            ex_c = _alloc_counts.get(var)
+            if ex_c is None or count < ex_c:
+                _alloc_counts[var] = count
+
     _ALLOC_FUNCS_SZ = frozenset({"malloc", "alloca", "ALLOCA", "_alloca",
                                   "VirtualAlloc", "HeapAlloc", "LocalAlloc",
                                   "GlobalAlloc"})
@@ -966,7 +994,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                             if _arr_n is not None:
                                 break
                     if _var and _arr_n:
-                        _alloc_sizes[_var] = _arr_n * _elem_sz
+                        _set_alloc(_var, _arr_n * _elem_sz, _arr_n)
                 elif _dc.type == "init_declarator":
                     # char *p = malloc(N) / (type*)ALLOCA(N) / calloc(N, M)
                     _iv = _decl_leaf_id(_dc.child_by_field_name("declarator"))
@@ -992,28 +1020,31 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                             _a2 = _call_args(_val_u)
                             if _fn2 in _ALLOC_FUNCS_SZ and _a2:
                                 _sz2 = _eval_const(_a2[0])
+                                _cnt2 = _extract_elem_count(_a2[0])
                                 if _sz2:
-                                    _alloc_sizes[_iv] = _sz2
+                                    _set_alloc(_iv, _sz2, _cnt2)
                             elif _fn2 == "calloc" and len(_a2) >= 2:
                                 _n2 = _eval_const(_a2[0])
                                 _s2 = _eval_const(_a2[1])
                                 if _n2 and _s2:
-                                    _alloc_sizes[_iv] = _n2 * _s2
+                                    _set_alloc(_iv, _n2 * _s2, _n2)
                         elif _val_u.type == "identifier":
-                            # char *p = existingBuffer → inherit size
+                            # char *p = existingBuffer → inherit size and count
                             _src_sz = _alloc_sizes.get(_txt(_val_u))
+                            _src_cnt = _alloc_counts.get(_txt(_val_u))
                             if _src_sz:
-                                _alloc_sizes[_iv] = _src_sz
+                                _set_alloc(_iv, _src_sz, _src_cnt)
         elif _st == "assignment_expression":
             _lhs = _sn.child_by_field_name("left")
             _rhs = _sn.child_by_field_name("right")
             if _lhs and _rhs and _lhs.type == "identifier":
                 _lvar = _txt(_lhs)
                 if _rhs.type == "identifier":
-                    # data = dataBadBuffer → propagate known allocation size
+                    # data = dataBadBuffer → propagate known allocation size and count
                     _src_sz = _alloc_sizes.get(_txt(_rhs))
+                    _src_cnt = _alloc_counts.get(_txt(_rhs))
                     if _src_sz:
-                        _alloc_sizes[_lvar] = _src_sz
+                        _set_alloc(_lvar, _src_sz, _src_cnt)
                 else:
                     # data = (type*)malloc(N) — unwrap cast layers first
                     _rhs_u = _rhs
@@ -1035,13 +1066,14 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                         _a2 = _call_args(_rhs_u)
                         if _fn2 in _ALLOC_FUNCS_SZ and _a2:
                             _sz2 = _eval_const(_a2[0])
+                            _cnt2 = _extract_elem_count(_a2[0])
                             if _sz2:
-                                _alloc_sizes[_lvar] = _sz2
+                                _set_alloc(_lvar, _sz2, _cnt2)
                         elif _fn2 == "calloc" and len(_a2) >= 2:
                             _n2 = _eval_const(_a2[0])
                             _s2 = _eval_const(_a2[1])
                             if _n2 and _s2:
-                                _alloc_sizes[_lvar] = _n2 * _s2
+                                _set_alloc(_lvar, _n2 * _s2, _n2)
 
     # Pointer underwrite tracking: data = buffer - N → "underpointed"
     # Any write/read through such a pointer accesses memory before the allocation.
@@ -1092,6 +1124,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     _BOUNDED_COPY_SINKS: dict[str, tuple[int, int]] = {
         "memcpy":    (2, 1), "memmove":   (2, 1),
         "wmemcpy":   (2, 2), "wmemmove":  (2, 2),
+        "memset":    (2, 1), "wmemset":   (2, 2),
         "strncpy":   (2, 1), "wcsncpy":   (2, 2),
         "strncat":   (2, 1), "wcsncat":   (2, 2),
         "memcpy_s":  (1, 1),
@@ -1403,6 +1436,97 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                             ),
                             rule_id="CAST-BUF-001",
                         ))
+
+    # CWE-121: loop-based buffer overflow — for(i=0; i<N; i++) { data[i]=...; }
+    # where N > alloc_count(data). Detects element-count overflow on stack arrays.
+    if _alloc_counts:
+        for _fs in _walk(body_node):
+            if _fs.type != "for_statement":
+                continue
+            _cond = _fs.child_by_field_name("condition")
+            if _cond is None or _cond.type != "binary_expression":
+                continue
+            _op_n = _cond.child_by_field_name("operator")
+            if _op_n is None:
+                continue
+            _op = _txt(_op_n)
+            if _op not in ("<", "<="):
+                continue
+            _rbound_node = _cond.child_by_field_name("right")
+            _loop_bound = _eval_const(_rbound_node) if _rbound_node else None
+            if _loop_bound is None:
+                continue
+            if _op == "<=":
+                _loop_bound += 1
+            _for_body = _fs.child_by_field_name("body")
+            if _for_body is None:
+                continue
+            for _bn in _walk(_for_body):
+                if _bn.type != "assignment_expression":
+                    continue
+                _blhs = _bn.child_by_field_name("left")
+                if _blhs is None or _blhs.type != "subscript_expression":
+                    continue
+                _barg = _blhs.child_by_field_name("argument")
+                if _barg is None or _barg.type != "identifier":
+                    continue
+                _bvar = _txt(_barg)
+                _bcount = _alloc_counts.get(_bvar)
+                if _bcount is None or _loop_bound <= _bcount:
+                    continue
+                _bln = _bn.start_point[0] + 1
+                _btxt = (lines[_bn.start_point[0]].strip()
+                         if _bn.start_point[0] < len(lines) else "")
+                _bkey = (file_path, _bln, "CAST-BUF-001")
+                if _bkey not in seen:
+                    seen.add(_bkey)
+                    findings.append(Finding(
+                        vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=_bln,
+                        line_content=_btxt,
+                        description=(
+                            f"Buffer overflow: loop writes {_loop_bound} elements into "
+                            f"'{_bvar}' ({_bcount}-element buffer) — CWE-121"
+                        ),
+                        rule_id="CAST-BUF-001",
+                    ))
+
+    # CWE-121/122: constant-index out-of-bounds — data[99]=x where alloc_count=50
+    # Catches direct subscript accesses with a compile-time constant index >= alloc_count.
+    if _alloc_counts:
+        for _sn in _walk(body_node):
+            if _sn.type != "assignment_expression":
+                continue
+            # Check LHS subscript (write out of bounds)
+            _slhs = _sn.child_by_field_name("left")
+            if _slhs and _slhs.type == "subscript_expression":
+                _sarg = _slhs.child_by_field_name("argument")
+                _sidx = _slhs.child_by_field_name("index")
+                if (_sarg and _sarg.type == "identifier" and _sidx is not None):
+                    _svar = _txt(_sarg)
+                    _sidx_v = _eval_const(_sidx)
+                    _scnt = _alloc_counts.get(_svar)
+                    if _sidx_v is not None and _scnt is not None and _sidx_v >= _scnt:
+                        _sln = _sn.start_point[0] + 1
+                        _stxt = (lines[_sn.start_point[0]].strip()
+                                 if _sn.start_point[0] < len(lines) else "")
+                        _skey = (file_path, _sln, "CAST-BUF-001")
+                        if _skey not in seen:
+                            seen.add(_skey)
+                            findings.append(Finding(
+                                vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                                severity=Severity.HIGH,
+                                file_path=file_path,
+                                line_number=_sln,
+                                line_content=_stxt,
+                                description=(
+                                    f"Buffer overflow: write to '{_svar}[{_sidx_v}]' "
+                                    f"exceeds {_scnt}-element allocation — CWE-121/122"
+                                ),
+                                rule_id="CAST-BUF-001",
+                            ))
 
     # C-7: Scoped UAF — free(p)/delete p followed by use in same function
     _freed: dict[str, int] = {}
