@@ -1374,6 +1374,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     _alloc_sizes: dict[str, int] = {}
     _alloc_counts: dict[str, int] = {}  # variable → element count (stack arrays only)
     _const_ints: dict[str, int] = {}   # variable → constant integer value (for OOB detection)
+    _strlen_vars: dict[str, str] = {}  # variable → identifier whose strlen it stores
 
     # Seed from interprocedural parameter/return-value alloc counts
     if extra_alloc_counts:
@@ -1505,6 +1506,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                                 _s2 = _eval_const(_a2[1])
                                 if _n2 and _s2:
                                     _set_alloc(_iv, _n2 * _s2, _n2)
+                            elif _fn2 in {"strlen", "wcslen", "_tcslen", "_mbslen"} and _a2 and _a2[0].type == "identifier":
+                                _strlen_vars[_iv] = _txt(_a2[0])
                         elif _val_u.type == "identifier":
                             # char *p = existingBuffer → inherit size and count
                             _src_sz = _alloc_sizes.get(_txt(_val_u))
@@ -1593,6 +1596,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                             if _ret_cnt is not None:
                                 # Use _set_alloc so both _alloc_sizes AND _alloc_counts are set
                                 _set_alloc(_lvar, _ret_cnt, _ret_cnt)
+                        elif _fn2 in {"strlen", "wcslen", "_tcslen", "_mbslen"} and _a2 and _a2[0].type == "identifier":
+                            _strlen_vars[_lvar] = _txt(_a2[0])
                     elif _rhs_u.type == "new_expression":
                         # data = new T[N] — C++ heap allocation
                         _new_t2 = next((c for c in _rhs_u.named_children
@@ -2460,6 +2465,97 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                         ),
                         rule_id="CAST-BUF-001",
                     ))
+
+    # CWE-121/122/126/805: Loop-based buffer overflow/overread
+    # Detects: for (i=0; i<BOUND; i++) buf[i]=... where alloc_counts[buf] < BOUND
+    # Also handles: destLen = strlen(X); for (i=0; i<destLen; i++) smallBuf[i]=...
+    if _alloc_counts:
+        for _lp in _walk(body_node):
+            if _lp.type != "for_statement":
+                continue
+            _lp_cond_st = _lp.child_by_field_name("condition")
+            if _lp_cond_st is None:
+                continue
+            # condition field is expression_statement wrapping the actual expr
+            if _lp_cond_st.type == "expression_statement":
+                _lp_cond = next(
+                    (c for c in _lp_cond_st.named_children if c.type != "comment"),
+                    None)
+            else:
+                _lp_cond = _lp_cond_st
+            if _lp_cond is None:
+                continue
+            # Peel outer parentheses
+            while _lp_cond.type == "parenthesized_expression":
+                _lp_cond = next((c for c in _lp_cond.named_children
+                                 if c.type != "comment"), _lp_cond)
+            if _lp_cond.type != "binary_expression":
+                continue
+            _lp_op_nd = _lp_cond.child_by_field_name("operator")
+            _lp_op = _txt(_lp_op_nd) if _lp_op_nd else None
+            if _lp_op not in ("<", "<="):
+                continue
+            _lp_lch = _lp_cond.child_by_field_name("left")
+            _lp_rch = _lp_cond.child_by_field_name("right")
+            if _lp_lch is None or _lp_lch.type != "identifier":
+                continue
+            _lp_var = _txt(_lp_lch)  # loop variable, e.g. "i"
+
+            # Evaluate upper bound from the right side
+            _lp_bound = _eval_const(_lp_rch)
+            if _lp_bound is None and _lp_rch is not None:
+                if _lp_rch.type == "identifier":
+                    _lp_bv = _txt(_lp_rch)
+                    _lp_bound = _const_ints.get(_lp_bv)
+                    if _lp_bound is None:
+                        # destLen = strlen(X) → bound ≈ alloc_counts[X] (upper bound approx)
+                        _lp_sv = _strlen_vars.get(_lp_bv)
+                        if _lp_sv is not None:
+                            _lp_bound = _alloc_counts.get(_lp_sv)
+            if _lp_bound is None:
+                continue
+            # For <=: iterates 0..bound inclusive → effective element count = bound+1
+            _lp_eff = _lp_bound + 1 if _lp_op == "<=" else _lp_bound
+
+            _lp_body = _lp.child_by_field_name("body")
+            if _lp_body is None:
+                continue
+            for _lp_sub in _walk(_lp_body):
+                if _lp_sub.type != "subscript_expression":
+                    continue
+                _lp_arr = _lp_sub.child_by_field_name("argument")
+                _lp_idx = (_lp_sub.child_by_field_name("index")
+                           or _lp_sub.child_by_field_name("indices"))
+                if _lp_arr is None or _lp_idx is None:
+                    continue
+                if _lp_idx.type == "subscript_argument_list":
+                    _lp_idx = next((c for c in _lp_idx.named_children), _lp_idx)
+                if _lp_arr.type != "identifier" or _lp_idx.type != "identifier":
+                    continue
+                if _txt(_lp_idx) != _lp_var:
+                    continue
+                _lp_buf = _txt(_lp_arr)
+                _lp_cnt = _alloc_counts.get(_lp_buf)
+                if _lp_cnt is not None and _lp_cnt < _lp_eff:
+                    _lp_ln = _lp.start_point[0] + 1
+                    _lp_tx = (lines[_lp.start_point[0]].strip()
+                              if _lp.start_point[0] < len(lines) else "")
+                    _lp_key = (file_path, _lp_ln, "CAST-BUF-001")
+                    if _lp_key not in seen:
+                        seen.add(_lp_key)
+                        findings.append(Finding(
+                            vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                            severity=Severity.HIGH,
+                            file_path=file_path,
+                            line_number=_lp_ln,
+                            line_content=_lp_tx,
+                            description=(
+                                f"Buffer overflow/overread: loop iterates '{_lp_var}' "
+                                f"0..{_lp_eff - 1} but '{_lp_buf}' has only "
+                                f"{_lp_cnt} element(s) (CWE-121/122/126)"
+                            ),
+                            rule_id="CAST-BUF-001",
+                        ))
 
     # C-7: Scoped UAF — free(p)/delete p followed by use in same function
     _freed: dict[str, int] = {}
