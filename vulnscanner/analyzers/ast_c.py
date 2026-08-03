@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 from dataclasses import dataclass, field
 
 try:
@@ -24,9 +25,22 @@ try:
     from tree_sitter import Language, Parser as _TSParser
     _C_LANGUAGE = Language(_tsc.language())
     _CPP_LANGUAGE = Language(_tscpp.language())
-    _c_parser = _TSParser(_C_LANGUAGE)
-    _cpp_parser = _TSParser(_CPP_LANGUAGE)
     _TS_C_AVAILABLE = True
+    _parser_local = threading.local()
+
+    def _get_c_parser() -> _TSParser:
+        p = getattr(_parser_local, "c", None)
+        if p is None:
+            p = _TSParser(_C_LANGUAGE)
+            _parser_local.c = p
+        return p
+
+    def _get_cpp_parser() -> _TSParser:
+        p = getattr(_parser_local, "cpp", None)
+        if p is None:
+            p = _TSParser(_CPP_LANGUAGE)
+            _parser_local.cpp = p
+        return p
 except Exception:
     _TS_C_AVAILABLE = False
 
@@ -1050,6 +1064,16 @@ def _compute_alloc_counts(body_node) -> dict[str, int]:
                             src = alloc_counts.get(_txt(val_u))
                             if src:
                                 _set(iv, src)
+                        elif val_u.type == "new_expression":
+                            # new T[N] → element count N
+                            _new_decl_c = next((c for c in val_u.named_children
+                                                if c.type == "new_declarator"), None)
+                            if _new_decl_c is not None:
+                                _nd_child = next((c for c in _new_decl_c.named_children), None)
+                                if _nd_child is not None:
+                                    _cnt_ne = _eval_const(_nd_child)
+                                    if _cnt_ne:
+                                        _set(iv, _cnt_ne)
         elif st == "assignment_expression":
             lhs = sn.child_by_field_name("left"); rhs = sn.child_by_field_name("right")
             if lhs and rhs and lhs.type == "identifier":
@@ -1080,6 +1104,16 @@ def _compute_alloc_counts(body_node) -> dict[str, int]:
                             n2 = _eval_const(a2[0])
                             if n2:
                                 _set(lvar, n2)
+                    elif rhs_u.type == "new_expression":
+                        # new T[N] in assignment: data = new char[50]
+                        _new_decl_a = next((c for c in rhs_u.named_children
+                                            if c.type == "new_declarator"), None)
+                        if _new_decl_a is not None:
+                            _nd_child_a = next((c for c in _new_decl_a.named_children), None)
+                            if _nd_child_a is not None:
+                                _cnt_nea = _eval_const(_nd_child_a)
+                                if _cnt_nea:
+                                    _set(lvar, _cnt_nea)
             elif lhs and rhs and lhs.type == "field_expression":
                 # struct.field = ptr_var → field-insensitive: mark struct with alloc_count
                 _fe_base67 = lhs.child_by_field_name("argument")
@@ -1339,6 +1373,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     # Maps variable name → allocated byte count when statically determinable.
     _alloc_sizes: dict[str, int] = {}
     _alloc_counts: dict[str, int] = {}  # variable → element count (stack arrays only)
+    _const_ints: dict[str, int] = {}   # variable → constant integer value (for OOB detection)
 
     # Seed from interprocedural parameter/return-value alloc counts
     if extra_alloc_counts:
@@ -1438,6 +1473,10 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                         if _arr_n_id:
                             _set_alloc(_iv, _arr_n_id * _elem_sz, _arr_n_id)
                     if _iv and _val:
+                        # Track constant integer declarations: int data = 10
+                        _ci_v2 = _eval_const(_val)
+                        if _ci_v2 is not None:
+                            _const_ints[_iv] = _ci_v2
                         # Unwrap cast layers: (wchar_t *)ALLOCA(...) → ALLOCA(...)
                         _val_u = _val
                         for _ in range(3):
@@ -1480,11 +1519,31 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                                 _src_cnt = _alloc_counts.get(_txt(_fe_base_r))
                                 if _src_sz:
                                     _set_alloc(_iv, _src_sz, _src_cnt)
+                        elif _val_u.type == "new_expression":
+                            # new T[N] in init_declarator: char *data = new char[50]
+                            _new_t = next((c for c in _val_u.named_children
+                                           if c.type in ("primitive_type", "type_identifier",
+                                                         "qualified_identifier")), None)
+                            _new_d = next((c for c in _val_u.named_children
+                                           if c.type == "new_declarator"), None)
+                            if _new_d is not None:
+                                _nd_c = next((c for c in _new_d.named_children), None)
+                                if _nd_c is not None:
+                                    _cnt_ne2 = _eval_const(_nd_c)
+                                    if _cnt_ne2:
+                                        _esz = _sizeof_type_text(_txt(_new_t)) if _new_t else 1
+                                        _set_alloc(_iv, _cnt_ne2 * _esz, _cnt_ne2)
         elif _st == "assignment_expression":
             _lhs = _sn.child_by_field_name("left")
             _rhs = _sn.child_by_field_name("right")
             if _lhs and _rhs and _lhs.type == "identifier":
                 _lvar = _txt(_lhs)
+                # Constant integer tracking (CWE-129/large: data=10; buffer[data]=1)
+                _ci_v = _eval_const(_rhs)
+                if _ci_v is not None:
+                    _const_ints[_lvar] = _ci_v
+                else:
+                    _const_ints.pop(_lvar, None)
                 if _rhs.type == "identifier":
                     # data = dataBadBuffer → propagate known allocation size and count
                     _src_sz = _alloc_sizes.get(_txt(_rhs))
@@ -1532,10 +1591,22 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                             # data = badSource(data) where badSource returns alloc'd ptr
                             _ret_cnt = summaries[_fn2].returns_alloc_count
                             if _ret_cnt is not None:
-                                _alloc_counts[_lvar] = (
-                                    min(_alloc_counts[_lvar], _ret_cnt)
-                                    if _lvar in _alloc_counts else _ret_cnt
-                                )
+                                # Use _set_alloc so both _alloc_sizes AND _alloc_counts are set
+                                _set_alloc(_lvar, _ret_cnt, _ret_cnt)
+                    elif _rhs_u.type == "new_expression":
+                        # data = new T[N] — C++ heap allocation
+                        _new_t2 = next((c for c in _rhs_u.named_children
+                                        if c.type in ("primitive_type", "type_identifier",
+                                                      "qualified_identifier")), None)
+                        _new_d2 = next((c for c in _rhs_u.named_children
+                                        if c.type == "new_declarator"), None)
+                        if _new_d2 is not None:
+                            _nd_c2 = next((c for c in _new_d2.named_children), None)
+                            if _nd_c2 is not None:
+                                _cnt_ne3 = _eval_const(_nd_c2)
+                                if _cnt_ne3:
+                                    _esz2 = _sizeof_type_text(_txt(_new_t2)) if _new_t2 else 1
+                                    _set_alloc(_lvar, _cnt_ne3 * _esz2, _cnt_ne3)
             elif _lhs and _rhs and _lhs.type == "field_expression":
                 # myStruct.field = ptr_var → field-insensitive: mark struct with alloc
                 _fe_base_w = _lhs.child_by_field_name("argument")
@@ -2086,10 +2157,17 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
             _slhs = _sn.child_by_field_name("left")
             if _slhs and _slhs.type == "subscript_expression":
                 _sarg = _slhs.child_by_field_name("argument")
-                _sidx = _slhs.child_by_field_name("index")
+                _sidx_raw = (_slhs.child_by_field_name("index")
+                             or _slhs.child_by_field_name("indices"))
+                _sidx = (next((c for c in _sidx_raw.named_children), None)
+                         if _sidx_raw and _sidx_raw.type == "subscript_argument_list"
+                         else _sidx_raw)
                 if (_sarg and _sarg.type == "identifier" and _sidx is not None):
                     _svar = _txt(_sarg)
                     _sidx_v = _eval_const(_sidx)
+                    # Constant propagation: data=10; buffer[data]=1 (CWE-129_large)
+                    if _sidx_v is None and _sidx.type == "identifier":
+                        _sidx_v = _const_ints.get(_txt(_sidx))
                     _scnt = _alloc_counts.get(_svar)
                     if _sidx_v is not None and _scnt is not None and _sidx_v >= _scnt:
                         _sln = _sn.start_point[0] + 1
@@ -2142,7 +2220,11 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
             if _sn.type != "subscript_expression":
                 continue
             _sarg = _sn.child_by_field_name("argument")
-            _sidx = _sn.child_by_field_name("index")
+            _sidx_raw2 = (_sn.child_by_field_name("index")
+                          or _sn.child_by_field_name("indices"))
+            _sidx = (next((c for c in _sidx_raw2.named_children), None)
+                     if _sidx_raw2 and _sidx_raw2.type == "subscript_argument_list"
+                     else _sidx_raw2)
             if (_sarg and _sarg.type == "identifier" and
                     _sidx is not None and _sidx.type == "identifier"):
                 _svar_n = _txt(_sarg)
@@ -2150,6 +2232,234 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                 _scnt_u = _alloc_counts.get(_svar_n)
                 if _scnt_u is not None and _sidx_n in _untrusted_int:
                     _emit_cwe129(_sn, _sn, _svar_n, _sidx_n, _scnt_u)
+
+    # CWE-193: Off-by-one — dest = malloc(N); memcpy(dest, src, strlen(src)+1)
+    # where alloc_size["dest"] < alloc_size["src"] (no room for null terminator).
+    # Covers memcpy/memmove/strncpy/wcsncpy with strlen/wcslen+1 count.
+    if _alloc_sizes:
+        _STRLEN193 = frozenset({"strlen", "wcslen", "_mbslen", "_tcslen"})
+        _COPY193 = frozenset({"memcpy", "memmove", "strncpy", "wcsncpy",
+                               "wmemcpy", "wmemmove"})
+
+        def _strlen_arg(count_node) -> str | None:
+            """Return identifier X if count_node matches strlen(X)+1 or (wcslen(X)+1)*k."""
+            if count_node is None:
+                return None
+            n = count_node
+            for _ in range(3):
+                if n.type == "parenthesized_expression":
+                    n = next((c for c in n.named_children), None)
+                    if n is None:
+                        return None
+                else:
+                    break
+            if n.type != "binary_expression":
+                return None
+            op = _txt(n.child_by_field_name("operator"))
+            left = n.child_by_field_name("left")
+            right = n.child_by_field_name("right")
+            if op == "*":
+                return _strlen_arg(left) or _strlen_arg(right)
+            if op == "+":
+                rv = _eval_const(right)
+                if rv is not None and rv >= 1 and left and left.type == "call_expression":
+                    fn = _call_fname(left)
+                    if fn in _STRLEN193:
+                        a = _call_args(left)
+                        if a and a[0].type == "identifier":
+                            return _txt(a[0])
+            return None
+
+        for _c193 in _walk(body_node):
+            if _c193.type != "call_expression":
+                continue
+            if _call_fname(_c193) not in _COPY193:
+                continue
+            _c193_args = _call_args(_c193)
+            if len(_c193_args) < 3:
+                continue
+            _c193_dest = _c193_args[0]
+            _c193_src = _c193_args[2]  # count arg
+            if _c193_dest.type != "identifier":
+                continue
+            _c193_dest_n = _txt(_c193_dest)
+            _src_var = _strlen_arg(_c193_src)
+            if _src_var is None:
+                continue
+            _d_sz = _alloc_sizes.get(_c193_dest_n)
+            _s_sz = _alloc_sizes.get(_src_var)
+            if _d_sz is not None and _s_sz is not None and _d_sz < _s_sz:
+                _c193_ln = _c193.start_point[0] + 1
+                _c193_tx = (lines[_c193.start_point[0]].strip()
+                            if _c193.start_point[0] < len(lines) else "")
+                _c193_key = (file_path, _c193_ln, "CAST-BUF-001")
+                if _c193_key not in seen:
+                    seen.add(_c193_key)
+                    findings.append(Finding(
+                        vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=_c193_ln,
+                        line_content=_c193_tx,
+                        description=(
+                            f"Off-by-one: '{_c193_dest_n}' allocated {_d_sz}B but "
+                            f"'{_src_var}' has {_s_sz}B — no room for null terminator "
+                            f"(CWE-193)"
+                        ),
+                        rule_id="CAST-BUF-001",
+                    ))
+
+        # CWE-193/121/122: strcpy/wcscpy(dest, src) where alloc_size[dest] < alloc_size[src]
+        _STRCPY_FUNCS = frozenset({"strcpy", "wcscpy", "_tcscpy", "lstrcpy",
+                                    "strcat", "wcscat", "_tcscat"})
+        for _sc193 in _walk(body_node):
+            if _sc193.type != "call_expression":
+                continue
+            if _call_fname(_sc193) not in _STRCPY_FUNCS:
+                continue
+            _sc193_args = _call_args(_sc193)
+            if len(_sc193_args) < 2:
+                continue
+            _sc193_dest = _sc193_args[0]
+            _sc193_src = _sc193_args[1]
+            if _sc193_dest.type != "identifier" or _sc193_src.type != "identifier":
+                continue
+            _sc193_dest_n = _txt(_sc193_dest)
+            _sc193_src_n = _txt(_sc193_src)
+            _sc_d_sz = _alloc_sizes.get(_sc193_dest_n)
+            _sc_s_sz = _alloc_sizes.get(_sc193_src_n)
+            if _sc_d_sz is not None and _sc_s_sz is not None and _sc_d_sz < _sc_s_sz:
+                _sc193_ln = _sc193.start_point[0] + 1
+                _sc193_tx = (lines[_sc193.start_point[0]].strip()
+                             if _sc193.start_point[0] < len(lines) else "")
+                _sc193_key = (file_path, _sc193_ln, "CAST-BUF-001")
+                if _sc193_key not in seen:
+                    seen.add(_sc193_key)
+                    findings.append(Finding(
+                        vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=_sc193_ln,
+                        line_content=_sc193_tx,
+                        description=(
+                            f"Buffer overflow: '{_sc193_dest_n}' ({_sc_d_sz}B) too small "
+                            f"for '{_sc193_src_n}' ({_sc_s_sz}B) — no null terminator space "
+                            f"(CWE-193/122)"
+                        ),
+                        rule_id="CAST-BUF-001",
+                    ))
+
+    # CWE-126: Buffer Overread — memcpy(dest, src, strlen(dest)*sizeof)
+    # where alloc_size[src] < alloc_size[dest]: reads past end of src.
+    if _alloc_sizes:
+        def _count_uses_strlen_of(node, vid: str) -> bool:
+            """Return True if node contains strlen/wcslen(vid) as a subexpression."""
+            if node is None:
+                return False
+            n = node
+            for _ in range(4):
+                if n.type == "parenthesized_expression":
+                    inner = next((c for c in n.named_children), None)
+                    if inner:
+                        n = inner
+                    else:
+                        return False
+                else:
+                    break
+            if n.type == "call_expression":
+                fn = _call_fname(n)
+                if fn in _STRLEN193:
+                    a = _call_args(n)
+                    if a and a[0].type == "identifier" and _txt(a[0]) == vid:
+                        return True
+            if n.type == "binary_expression":
+                left = n.child_by_field_name("left")
+                right = n.child_by_field_name("right")
+                return (_count_uses_strlen_of(left, vid) or
+                        _count_uses_strlen_of(right, vid))
+            return False
+
+        for _c126 in _walk(body_node):
+            if _c126.type != "call_expression":
+                continue
+            if _call_fname(_c126) not in _COPY193:
+                continue
+            _c126_args = _call_args(_c126)
+            if len(_c126_args) < 3:
+                continue
+            _c126_dest = _c126_args[0]
+            _c126_src = _c126_args[1]
+            _c126_cnt = _c126_args[2]
+            if _c126_dest.type != "identifier" or _c126_src.type != "identifier":
+                continue
+            _c126_dest_n = _txt(_c126_dest)
+            _c126_src_n = _txt(_c126_src)
+            if not _count_uses_strlen_of(_c126_cnt, _c126_dest_n):
+                continue
+            _c126_src_sz = _alloc_sizes.get(_c126_src_n)
+            _c126_dest_sz = _alloc_sizes.get(_c126_dest_n)
+            if _c126_src_sz is not None and _c126_dest_sz is not None and _c126_src_sz < _c126_dest_sz:
+                _c126_ln = _c126.start_point[0] + 1
+                _c126_tx = (lines[_c126.start_point[0]].strip()
+                            if _c126.start_point[0] < len(lines) else "")
+                _c126_key = (file_path, _c126_ln, "CAST-BUF-001")
+                if _c126_key not in seen:
+                    seen.add(_c126_key)
+                    findings.append(Finding(
+                        vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=_c126_ln,
+                        line_content=_c126_tx,
+                        description=(
+                            f"Buffer overread: '{_c126_src_n}' ({_c126_src_sz}B) is smaller "
+                            f"than '{_c126_dest_n}' ({_c126_dest_sz}B) but copy count uses "
+                            f"length of dest (CWE-126)"
+                        ),
+                        rule_id="CAST-BUF-001",
+                    ))
+
+        # CWE-806: Buffer Overflow — memcpy(dest, src, wcslen(src)*sizeof)
+        # where alloc_size[src] > alloc_size[dest]: src longer than dest.
+        for _c806 in _walk(body_node):
+            if _c806.type != "call_expression":
+                continue
+            if _call_fname(_c806) not in _COPY193:
+                continue
+            _c806_args = _call_args(_c806)
+            if len(_c806_args) < 3:
+                continue
+            _c806_dest = _c806_args[0]
+            _c806_src = _c806_args[1]
+            _c806_cnt = _c806_args[2]
+            if _c806_dest.type != "identifier" or _c806_src.type != "identifier":
+                continue
+            _c806_dest_n = _txt(_c806_dest)
+            _c806_src_n = _txt(_c806_src)
+            if not _count_uses_strlen_of(_c806_cnt, _c806_src_n):
+                continue
+            _c806_src_sz = _alloc_sizes.get(_c806_src_n)
+            _c806_dest_sz = _alloc_sizes.get(_c806_dest_n)
+            if _c806_src_sz is not None and _c806_dest_sz is not None and _c806_src_sz > _c806_dest_sz:
+                _c806_ln = _c806.start_point[0] + 1
+                _c806_tx = (lines[_c806.start_point[0]].strip()
+                            if _c806.start_point[0] < len(lines) else "")
+                _c806_key = (file_path, _c806_ln, "CAST-BUF-001")
+                if _c806_key not in seen:
+                    seen.add(_c806_key)
+                    findings.append(Finding(
+                        vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=_c806_ln,
+                        line_content=_c806_tx,
+                        description=(
+                            f"Buffer overflow: copy count uses wcslen/strlen of "
+                            f"'{_c806_src_n}' ({_c806_src_sz}B) but dest '{_c806_dest_n}' "
+                            f"is only {_c806_dest_sz}B (CWE-806)"
+                        ),
+                        rule_id="CAST-BUF-001",
+                    ))
 
     # C-7: Scoped UAF — free(p)/delete p followed by use in same function
     _freed: dict[str, int] = {}
@@ -2360,12 +2670,13 @@ def _collect_class_methods(root_node) -> dict[str, list[tuple[str, object]]]:
     return result
 
 
-def _analyze_with_parser(parser, content: str, file_path: str) -> list[Finding]:
+def _analyze_with_parser(parser_fn, content: str, file_path: str) -> list[Finding]:
     # Step 1: Preprocess (macro expansion / clang -E)
     lang = "c++" if any(file_path.endswith(e) for e in _CPP_EXTS) else "c"
     processed = _preprocess(content, lang)
 
     try:
+        parser = parser_fn()
         tree = parser.parse(processed.encode("utf-8", errors="replace"))
     except Exception:
         return []
@@ -2767,7 +3078,7 @@ class CASTAnalyzer(BaseAnalyzer):
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         if not _TS_C_AVAILABLE:
             return []
-        return _analyze_with_parser(_c_parser, content, file_path)
+        return _analyze_with_parser(_get_c_parser, content, file_path)
 
 
 class CPPASTAnalyzer(BaseAnalyzer):
@@ -2778,4 +3089,4 @@ class CPPASTAnalyzer(BaseAnalyzer):
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         if not _TS_C_AVAILABLE:
             return []
-        return _analyze_with_parser(_cpp_parser, content, file_path)
+        return _analyze_with_parser(_get_cpp_parser, content, file_path)
