@@ -2174,7 +2174,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     if _sidx_v is None and _sidx.type == "identifier":
                         _sidx_v = _const_ints.get(_txt(_sidx))
                     _scnt = _alloc_counts.get(_svar)
-                    if _sidx_v is not None and _scnt is not None and _sidx_v >= _scnt:
+                    if _sidx_v is not None and _scnt is not None and (_sidx_v >= _scnt or _sidx_v < 0):
                         _sln = _sn.start_point[0] + 1
                         _stxt = (lines[_sn.start_point[0]].strip()
                                  if _sn.start_point[0] < len(lines) else "")
@@ -2237,6 +2237,74 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                 _scnt_u = _alloc_counts.get(_svar_n)
                 if _scnt_u is not None and _sidx_n in _untrusted_int:
                     _emit_cwe129(_sn, _sn, _svar_n, _sidx_n, _scnt_u)
+                # Negative constant index: data = -5; buf[data] (CWE-124/127)
+                _neg_cv = _const_ints.get(_sidx_n)
+                if _scnt_u is not None and _neg_cv is not None and _neg_cv < 0:
+                    _nln = _sn.start_point[0] + 1
+                    _ntx = (lines[_sn.start_point[0]].strip()
+                            if _sn.start_point[0] < len(lines) else "")
+                    _nkey = (file_path, _nln, "CAST-BUF-001")
+                    if _nkey not in seen:
+                        seen.add(_nkey)
+                        findings.append(Finding(
+                            vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                            severity=Severity.HIGH,
+                            file_path=file_path,
+                            line_number=_nln,
+                            line_content=_ntx,
+                            description=(
+                                f"Buffer underwrite/under-read: negative index {_neg_cv} "
+                                f"into '{_svar_n}' via '{_sidx_n}' (CWE-124/127)"
+                            ),
+                            rule_id="CAST-BUF-001",
+                        ))
+
+    # Constant-index OOB reads (CWE-126/127): data=10; buf[data] read where alloc=10
+    # Also negative index reads (CWE-127 under-read, CWE-124 underwrite via read)
+    # Note: writes are already caught by the assignment-LHS check above.
+    if _const_ints and _alloc_counts:
+        for _nr in _walk(body_node):
+            if _nr.type != "subscript_expression":
+                continue
+            _nr_arr = _nr.child_by_field_name("argument")
+            _nr_idx_raw = (_nr.child_by_field_name("index")
+                           or _nr.child_by_field_name("indices"))
+            if _nr_arr is None or _nr_idx_raw is None:
+                continue
+            if _nr_idx_raw.type == "subscript_argument_list":
+                _nr_idx = next((c for c in _nr_idx_raw.named_children), _nr_idx_raw)
+            else:
+                _nr_idx = _nr_idx_raw
+            if _nr_arr.type != "identifier" or _nr_idx.type != "identifier":
+                continue
+            _nr_arr_n = _txt(_nr_arr)
+            _nr_idx_n = _txt(_nr_idx)
+            _nr_cnt = _alloc_counts.get(_nr_arr_n)
+            if _nr_cnt is None:
+                continue
+            _nr_cv = _const_ints.get(_nr_idx_n)
+            if _nr_cv is None:
+                continue
+            if _nr_cv < 0 or _nr_cv >= _nr_cnt:
+                _nr_ln = _nr.start_point[0] + 1
+                _nr_tx = (lines[_nr.start_point[0]].strip()
+                          if _nr.start_point[0] < len(lines) else "")
+                _nr_key = (file_path, _nr_ln, "CAST-BUF-001")
+                if _nr_key not in seen:
+                    seen.add(_nr_key)
+                    findings.append(Finding(
+                        vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                        severity=Severity.HIGH,
+                        file_path=file_path,
+                        line_number=_nr_ln,
+                        line_content=_nr_tx,
+                        description=(
+                            f"Buffer OOB read: index {_nr_cv} "
+                            f"into '{_nr_arr_n}' ({_nr_cnt}-element buffer)"
+                            f" (CWE-124/126/127)"
+                        ),
+                        rule_id="CAST-BUF-001",
+                    ))
 
     # CWE-193: Off-by-one — dest = malloc(N); memcpy(dest, src, strlen(src)+1)
     # where alloc_size["dest"] < alloc_size["src"] (no room for null terminator).
