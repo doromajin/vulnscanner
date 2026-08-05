@@ -397,6 +397,8 @@ class _FuncSummary:
     param_ptr_alloc_counts: dict[int, int] = field(default_factory=dict)
     # Parameter indices that receive underpointed pointers (= buf - N) at call sites.
     param_underpointed: set[int] = field(default_factory=set)
+    # True if this function returns an underpointed pointer (return var where var = buf - N).
+    returns_underpointed: bool = False
     # Parameter indices that receive untrusted integer values (from rand/atoi) at call sites.
     # Used to propagate CWE-129 detection interprocedurally (V41/V42 patterns).
     untrusted_int_params: set[int] = field(default_factory=set)
@@ -1216,6 +1218,29 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
                 if existing is None or cnt < existing:
                     summaries[fname].returns_alloc_count = cnt
 
+        # Infer returns_underpointed: return var where var = buf - N
+        _up_set = func_underpointed.get(fname, set())
+        if _up_set and not summaries[fname].returns_underpointed:
+            for _rn in _walk(body):
+                if _rn.type != "return_statement":
+                    continue
+                _rv = next((c for c in _rn.named_children if c.type != "comment"), None)
+                if _rv is None:
+                    continue
+                for _ in range(3):
+                    if _rv.type in ("cast_expression", "parenthesized_expression"):
+                        _inner = next((c for c in _rv.named_children
+                                       if c.type not in ("type_descriptor", "comment")), None)
+                        if _inner:
+                            _rv = _inner
+                        else:
+                            break
+                    else:
+                        break
+                if _rv.type == "identifier" and _txt(_rv) in _up_set:
+                    summaries[fname].returns_underpointed = True
+                    break
+
     # Pass 2: fixpoint propagation of alloc_counts/underpointed/ptr_alloc through call sites.
     # Iterates until stable so multi-level chains (V52/53/54: a→b→c) are handled correctly.
     _a2_changed = True
@@ -1658,11 +1683,45 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
             _rhs = _sn.child_by_field_name("right")
             if _lhs and _lhs.type == "identifier":
                 _check_underpointed(_txt(_lhs), _rhs)
+                # Propagate returns_underpointed: data = badSource(data)
+                if _rhs and summaries:
+                    _rhs_uu = _rhs
+                    for _ in range(3):
+                        if _rhs_uu.type in ("cast_expression", "parenthesized_expression"):
+                            _uu_inner = next((c for c in _rhs_uu.named_children
+                                              if c.type not in ("type_descriptor", "comment")), None)
+                            if _uu_inner:
+                                _rhs_uu = _uu_inner
+                            else:
+                                break
+                        else:
+                            break
+                    if _rhs_uu.type == "call_expression":
+                        _fn_uu = _call_fname(_rhs_uu)
+                        if _fn_uu and _fn_uu in summaries and summaries[_fn_uu].returns_underpointed:
+                            _underpointed.add(_txt(_lhs))
         elif _sn.type == "init_declarator":
             _iv = _decl_leaf_id(_sn.child_by_field_name("declarator"))
             _val = _sn.child_by_field_name("value")
             if _iv and _val:
                 _check_underpointed(_iv, _val)
+                # Propagate returns_underpointed: char *data = badSource(data)
+                if summaries:
+                    _val_uu = _val
+                    for _ in range(3):
+                        if _val_uu.type in ("cast_expression", "parenthesized_expression"):
+                            _uu_inner2 = next((c for c in _val_uu.named_children
+                                               if c.type not in ("type_descriptor", "comment")), None)
+                            if _uu_inner2:
+                                _val_uu = _uu_inner2
+                            else:
+                                break
+                        else:
+                            break
+                    if _val_uu.type == "call_expression":
+                        _fn_uu2 = _call_fname(_val_uu)
+                        if _fn_uu2 and _fn_uu2 in summaries and summaries[_fn_uu2].returns_underpointed:
+                            _underpointed.add(_iv)
 
     # CWE-129: untrusted integer index tracking
     # Tracks integers derived from rand() / RAND32() / atoi(tainted) etc.
