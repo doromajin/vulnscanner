@@ -1906,7 +1906,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
         if fname in _BOUNDED_COPY_SINKS and len(args) >= 3:
             _csi, _bpe = _BOUNDED_COPY_SINKS[fname]
             _copy_n = _eval_const(args[_csi]) if _csi < len(args) else None
-            # CWE-806: strncat/snprintf(dst, strlen(src), ...) — estimate strlen from alloc_size
+            # CWE-806: strncat/snprintf(dst, strlen(src), ...) — estimate strlen from alloc_count
             if _copy_n is None and _csi < len(args):
                 _cnt_arg = args[_csi]
                 if _cnt_arg.type == "call_expression":
@@ -1914,9 +1914,9 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     _cnt_a = _call_args(_cnt_arg)
                     if (_cnt_fn in {"strlen", "wcslen", "_tcslen", "_mbslen"}
                             and _cnt_a and _cnt_a[0].type == "identifier"):
-                        _src_sz = _alloc_sizes.get(_txt(_cnt_a[0]))
-                        if _src_sz is not None:
-                            _copy_n = _src_sz - 1  # strlen(buf) ≈ alloc_size - 1
+                        _src_cnt = _alloc_counts.get(_txt(_cnt_a[0]))
+                        if _src_cnt is not None:
+                            _copy_n = _src_cnt - 1  # strlen/wcslen(buf) ≈ alloc_count - 1
             _copy_sz = _copy_n * _bpe if _copy_n is not None else None
             _dst_arg = args[0]
             _dst_var = (_txt(_dst_arg) if _dst_arg.type == "identifier"
@@ -2646,10 +2646,44 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     _lp_bv = _txt(_lp_rch)
                     _lp_bound = _const_ints.get(_lp_bv)
                     if _lp_bound is None:
-                        # destLen = strlen(X) → bound ≈ alloc_counts[X] (upper bound approx)
+                        # destLen = strlen(X) → bound ≈ alloc_counts[X] - 1 (upper bound approx)
                         _lp_sv = _strlen_vars.get(_lp_bv)
                         if _lp_sv is not None:
-                            _lp_bound = _alloc_counts.get(_lp_sv)
+                            _lp_ac = _alloc_counts.get(_lp_sv)
+                            if _lp_ac is not None:
+                                _lp_bound = _lp_ac - 1  # strlen ≈ alloc_count - 1
+                elif _lp_rch.type == "binary_expression":
+                    # CWE-193: sourceLen + 1 where sourceLen = strlen(X)
+                    _be_op_n = _lp_rch.child_by_field_name("operator")
+                    _be_op_s = _txt(_be_op_n) if _be_op_n else None
+                    if _be_op_s in ("+", "-"):
+                        _be_l = _lp_rch.child_by_field_name("left")
+                        _be_r = _lp_rch.child_by_field_name("right")
+                        # Try: identifier +/- constant
+                        for _be_id_n, _be_const_n in [(_be_l, _be_r), (_be_r, _be_l)]:
+                            if _be_id_n is None or _be_const_n is None:
+                                continue
+                            if _be_id_n.type != "identifier":
+                                continue
+                            _be_c = _eval_const(_be_const_n)
+                            if _be_c is None:
+                                continue
+                            _be_var = _txt(_be_id_n)
+                            # Try const_ints first
+                            _be_base = _const_ints.get(_be_var)
+                            if _be_base is not None:
+                                _lp_bound = (_be_base + _be_c if _be_op_s == "+"
+                                             else _be_base - _be_c)
+                                break
+                            # Try strlen_var: sourceLen = strlen(X) → sourceLen ≈ alloc_counts[X]-1
+                            _be_sv = _strlen_vars.get(_be_var)
+                            if _be_sv is not None:
+                                _be_ac = _alloc_counts.get(_be_sv)
+                                if _be_ac is not None:
+                                    _be_strlen = _be_ac - 1
+                                    _lp_bound = (_be_strlen + _be_c if _be_op_s == "+"
+                                                 else _be_strlen - _be_c)
+                                    break
             if _lp_bound is None:
                 continue
             # For <=: iterates 0..bound inclusive → effective element count = bound+1
