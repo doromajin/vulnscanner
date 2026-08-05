@@ -1906,6 +1906,17 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
         if fname in _BOUNDED_COPY_SINKS and len(args) >= 3:
             _csi, _bpe = _BOUNDED_COPY_SINKS[fname]
             _copy_n = _eval_const(args[_csi]) if _csi < len(args) else None
+            # CWE-806: strncat/snprintf(dst, strlen(src), ...) — estimate strlen from alloc_size
+            if _copy_n is None and _csi < len(args):
+                _cnt_arg = args[_csi]
+                if _cnt_arg.type == "call_expression":
+                    _cnt_fn = _call_fname(_cnt_arg)
+                    _cnt_a = _call_args(_cnt_arg)
+                    if (_cnt_fn in {"strlen", "wcslen", "_tcslen", "_mbslen"}
+                            and _cnt_a and _cnt_a[0].type == "identifier"):
+                        _src_sz = _alloc_sizes.get(_txt(_cnt_a[0]))
+                        if _src_sz is not None:
+                            _copy_n = _src_sz - 1  # strlen(buf) ≈ alloc_size - 1
             _copy_sz = _copy_n * _bpe if _copy_n is not None else None
             _dst_arg = args[0]
             _dst_var = (_txt(_dst_arg) if _dst_arg.type == "identifier"
