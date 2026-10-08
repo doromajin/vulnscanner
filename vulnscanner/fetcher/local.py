@@ -10,6 +10,7 @@ _SCAN_EXTENSIONS = {
     ".php", ".java", ".rb", ".go",
     ".html", ".htm", ".sh",
     ".env", ".yml", ".yaml", ".json", ".config", ".tf",
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx",
 }
 
 # Specific filenames to scan regardless of extension (dependency manifests)

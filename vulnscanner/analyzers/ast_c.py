@@ -402,6 +402,9 @@ class _FuncSummary:
     # Parameter indices that receive untrusted integer values (from rand/atoi) at call sites.
     # Used to propagate CWE-129 detection interprocedurally (V41/V42 patterns).
     untrusted_int_params: set[int] = field(default_factory=set)
+    # Constant integer value passed at each parameter index (CWE-129_large/CWE-839_negative).
+    # Enables detecting buffer[data] OOB/negative when 'data' is a constant from the caller.
+    param_const_ints: dict[int, int] = field(default_factory=dict)
     # True if the function returns an untrusted integer (rand or atoi).
     # Enables V42 (rand-source): data = badSource() where badSource returns RAND32().
     returns_untrusted_int: bool = False
@@ -1175,15 +1178,38 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
       Pass 1: Compute per-function alloc_counts + underpointed sets + returns_alloc_count.
       Pass 2: At each call site propagate alloc counts and underpointed info to callees.
     """
-    # Pass 1: local alloc_counts + underpointed sets + return value alloc_count
+    # Pass 1: local alloc_counts + underpointed sets + return value alloc_count + const ints
     func_counts: dict[str, dict[str, int]] = {}
     func_underpointed: dict[str, set[str]] = {}
+    func_const_ints: dict[str, dict[str, int]] = {}  # fname → {var → const_value}
     for fname, func_node in funcs.items():
         body = func_node.child_by_field_name("body")
         if body is None:
             continue
         counts = _compute_alloc_counts(body)
         func_counts[fname] = counts
+        # Collect constant integer assignments for CWE-129_large / CWE-839_negative propagation
+        _fci: dict[str, int] = {}
+        for _fcisn in _walk(body):
+            if _fcisn.type == "assignment_expression":
+                _fcilhs = _fcisn.child_by_field_name("left")
+                _fcirhs = _fcisn.child_by_field_name("right")
+                if (_fcilhs and _fcilhs.type == "identifier" and _fcirhs):
+                    _fciv = _eval_const(_fcirhs)
+                    if _fciv is not None:
+                        _fci[_txt(_fcilhs)] = _fciv
+                    else:
+                        _fci.pop(_txt(_fcilhs), None)
+            elif _fcisn.type == "declaration":
+                for _fcidc in _fcisn.named_children:
+                    if _fcidc.type == "init_declarator":
+                        _fcivar = _decl_leaf_id(_fcidc.child_by_field_name("declarator"))
+                        _fciexpr = _fcidc.child_by_field_name("value")
+                        if _fcivar and _fciexpr:
+                            _fciv2 = _eval_const(_fciexpr)
+                            if _fciv2 is not None:
+                                _fci[_fcivar] = _fciv2
+        func_const_ints[fname] = _fci
         func_underpointed[fname] = _compute_underpointed(body)
         # Infer returns_alloc_count: scan for `return var` where var has known count
         for ret_node in _walk(body):
@@ -1348,7 +1374,20 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
                             if idx not in summaries[callee].param_underpointed:
                                 summaries[callee].param_underpointed.add(idx)
                                 _a2_changed = True
-                    elif (arg.type == "pointer_expression"
+                        # Propagate constant integer (CWE-129_large / CWE-839_negative)
+                        _civ = func_const_ints.get(fname, {}).get(aname)
+                        if _civ is not None:
+                            if summaries[callee].param_const_ints.get(idx) != _civ:
+                                summaries[callee].param_const_ints[idx] = _civ
+                                _a2_changed = True
+                    else:
+                        # Literal constant arg: badSink(10) or badSink(-5)
+                        _civ2 = _eval_const(arg)
+                        if _civ2 is not None:
+                            if summaries[callee].param_const_ints.get(idx) != _civ2:
+                                summaries[callee].param_const_ints[idx] = _civ2
+                                _a2_changed = True
+                    if (arg.type == "pointer_expression"
                             and arg.children
                             and _txt(arg.children[0]) == "&"):
                         # &var → pointer-to-buffer: propagate param_ptr_alloc_counts (V63)
@@ -1390,7 +1429,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                   extra_underpointed: set[str] | None = None,
                   global_untrusted_int: set[str] | None = None,
                   untrusted_int_ptr_names: set[str] | None = None,
-                  extra_ptr_alloc_counts: dict[str, int] | None = None) -> None:
+                  extra_ptr_alloc_counts: dict[str, int] | None = None,
+                  extra_const_ints: dict[str, int] | None = None) -> None:
     """Walk body and emit findings for tainted sinks and always-unsafe calls."""
     seen: set[tuple] = set()
 
@@ -1400,6 +1440,11 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     _alloc_counts: dict[str, int] = {}  # variable → element count (stack arrays only)
     _const_ints: dict[str, int] = {}   # variable → constant integer value (for OOB detection)
     _strlen_vars: dict[str, str] = {}  # variable → identifier whose strlen it stores
+
+    # Seed interprocedural constant ints (CWE-129_large / CWE-839_negative)
+    if extra_const_ints:
+        for _eci_k, _eci_v in extra_const_ints.items():
+            _const_ints[_eci_k] = _eci_v
 
     # Seed from interprocedural parameter/return-value alloc counts
     if extra_alloc_counts:
@@ -3271,13 +3316,19 @@ def _analyze_with_parser(parser_fn, content: str, file_path: str) -> list[Findin
                 for _g68v, _g68c in _global_alloc_counts.items():
                     if _g68v not in _extra or _extra[_g68v] > _g68c:
                         _extra[_g68v] = _g68c
+            # Build extra_const_ints from interprocedural param_const_ints
+            _extra_ci: dict[str, int] = {}
+            for _ci_idx, _ci_val in summaries[fname].param_const_ints.items():
+                if _ci_idx < len(param_names):
+                    _extra_ci[param_names[_ci_idx]] = _ci_val
             _detect_sinks(body, tainted, lines, file_path, findings, summaries,
                           _collect_funcptr_map(func_node),
                           extra_alloc_counts=_extra if _extra else None,
                           extra_underpointed=_extra_up if _extra_up else None,
                           global_untrusted_int=_merged_ui or None,
                           untrusted_int_ptr_names=_extra_ui_ptrs or None,
-                          extra_ptr_alloc_counts=_extra_ptr if _extra_ptr else None)
+                          extra_ptr_alloc_counts=_extra_ptr if _extra_ptr else None,
+                          extra_const_ints=_extra_ci if _extra_ci else None)
 
     # Step 5: C++ class member cross-method taint (constructor→destructor, etc.)
     # For each class, collect "free variables" (tainted but not locally declared) from
