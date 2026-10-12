@@ -18,7 +18,10 @@ Rule IDs (RBAST-*):
   RBAST-SSRF-001  SSRF (URI.open, Net::HTTP, HTTParty, open())
   RBAST-REDIR-001 Open redirect (redirect_to tainted)
   RBAST-DESER-001 Insecure deserialization (Marshal.load/restore with user input)
+  RBAST-DESER-002 Insecure deserialization (YAML.load/unsafe_load with user input)
+  RBAST-CMD-002   Command injection (Process.exec/spawn, PTY.spawn, Open3.capture*)
   RBAST-EVAL-001  Code execution (eval/instance_eval/class_eval with user input)
+  RBAST-EVAL-002  Arbitrary dispatch via Object#send/public_send with tainted method name
   RBAST-MASS-001  Mass assignment (create/update with raw params hash)
   RBAST-SSTI-001  SSTI (ERB.new/Haml::Engine.new/Liquid::Template.parse with user input)
 """
@@ -377,7 +380,8 @@ def _check_sinks(
                   f"User-controlled data flows into {meth_text}() — OS command injection risk")
 
         # ── SQL injection ─────────────────────────────────────────────────
-        elif meth_text in _SQL_METHODS and arg_nodes:
+        elif meth_text in _SQL_METHODS and arg_nodes \
+                and recv_text not in ("Process", "PTY", "Open3"):
             first = arg_nodes[0]
             # `where` / `having` with Hash arg is safe; string or interpolation is not
             if first.type not in ("hash", "bare_hash") and taint(first):
@@ -392,6 +396,28 @@ def _check_sinks(
                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                   "RBAST-CMD-001",
                   f"User-controlled data flows into {recv_text}.{meth_text}() — OS command injection risk")
+
+        # Process.exec/spawn, PTY.spawn, Open3.capture2/2e/3
+        elif recv_text == "Process" and meth_text in ("exec", "spawn") \
+                and arg_nodes and taint(arg_nodes[0]):
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.COMMAND_INJECTION, Severity.CRITICAL,
+                  "RBAST-CMD-002",
+                  f"User-controlled data flows into Process.{meth_text}() — OS command injection risk")
+
+        elif recv_text == "PTY" and meth_text == "spawn" \
+                and arg_nodes and taint(arg_nodes[0]):
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.COMMAND_INJECTION, Severity.CRITICAL,
+                  "RBAST-CMD-002",
+                  "User-controlled data flows into PTY.spawn() — OS command injection risk")
+
+        elif recv_text == "Open3" and meth_text in ("capture2", "capture2e", "capture3") \
+                and arg_nodes and taint(arg_nodes[0]):
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.COMMAND_INJECTION, Severity.CRITICAL,
+                  "RBAST-CMD-002",
+                  f"User-controlled data flows into Open3.{meth_text}() — OS command injection risk")
 
         # ── Path traversal ────────────────────────────────────────────────
         elif recv_text in ("File", "IO") and meth_text in _FILE_METHODS:
@@ -449,12 +475,29 @@ def _check_sinks(
                       "RBAST-DESER-001",
                       "User-controlled data flows into Marshal.load() — deserialization / RCE risk")
 
+        # ── Insecure deserialization: YAML.load(tainted) ─────────────────
+        # YAML.load with user-controlled input enables arbitrary object instantiation (Psych gadgets)
+        elif recv_text == "YAML" and meth_text in ("load", "unsafe_load") \
+                and arg_nodes and taint(arg_nodes[0]):
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
+                  "RBAST-DESER-002",
+                  "User-controlled data flows into YAML.load() — arbitrary object instantiation / RCE risk")
+
         # ── Code execution: eval(tainted) ─────────────────────────────────
         elif meth_text in _EVAL_METHODS and arg_nodes and taint(arg_nodes[0]):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                   "RBAST-EVAL-001",
                   f"User-controlled data flows into {meth_text}() — arbitrary code execution risk")
+
+        # ── Arbitrary method dispatch: obj.send(tainted_method) ──────────
+        # Object#send with a tainted method name allows calling any method on the receiver
+        elif meth_text in ("send", "public_send") and arg_nodes and taint(arg_nodes[0]):
+            _emit(findings, seen, file_path, line, lines, repo_url,
+                  VulnType.COMMAND_INJECTION, Severity.CRITICAL,
+                  "RBAST-EVAL-002",
+                  f"User-controlled method name in .{meth_text}() — arbitrary method dispatch / RCE risk")
 
         # ── SSTI: ERB.new(tainted), Haml::Engine.new(tainted) ────────────
         # Checked BEFORE mass-assignment since "new" appears in both and SSTI is more specific.

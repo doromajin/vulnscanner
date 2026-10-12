@@ -4724,6 +4724,114 @@ end
         xxe = [f for f in findings if f.rule_id == "RBAST-XXE-001"]
         assert not xxe, "Nokogiri::XML.parse(literal) must not FP"
 
+    # ── YAML.load deserialization ─────────────────────────────────────────────
+
+    @_skip_no_tsrb
+    def test_yaml_load_tainted(self):
+        """YAML.load with user input — RBAST-DESER-002."""
+        code = """
+def import_config
+  raw = params[:config]
+  YAML.load(raw)
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-DESER-002" in rule_ids, "YAML.load(tainted) not detected"
+
+    @_skip_no_tsrb
+    def test_yaml_unsafe_load_tainted(self):
+        """YAML.unsafe_load with user input — RBAST-DESER-002."""
+        code = """
+def parse
+  data = request.body.read
+  YAML.unsafe_load(data)
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-DESER-002" in rule_ids, "YAML.unsafe_load(tainted) not detected"
+
+    @_skip_no_tsrb
+    def test_yaml_load_literal_no_fp(self):
+        """YAML.load with literal string must not fire."""
+        code = 'config = YAML.load("key: value")'
+        findings = _RBAST.analyze("app.rb", code)
+        deser = [f for f in findings if f.rule_id == "RBAST-DESER-002"]
+        assert not deser, "YAML.load(literal) must not FP"
+
+    # ── Object#send arbitrary dispatch ───────────────────────────────────────
+
+    @_skip_no_tsrb
+    def test_send_tainted_method(self):
+        """obj.send(tainted_method_name) — RBAST-EVAL-002."""
+        code = """
+def dispatch
+  method_name = params[:action]
+  @model.send(method_name)
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-EVAL-002" in rule_ids, "obj.send(tainted) not detected"
+
+    @_skip_no_tsrb
+    def test_public_send_tainted_method(self):
+        """public_send with tainted method name — RBAST-EVAL-002."""
+        code = """
+def call
+  m = params[:method]
+  service.public_send(m, params[:arg])
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-EVAL-002" in rule_ids, "public_send(tainted) not detected"
+
+    # ── Process/PTY/Open3 command injection ──────────────────────────────────
+
+    @_skip_no_tsrb
+    def test_process_exec_tainted(self):
+        """Process.exec with user input — RBAST-CMD-002."""
+        code = """
+def run
+  cmd = params[:command]
+  Process.exec(cmd)
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-CMD-002" in rule_ids, "Process.exec(tainted) not detected"
+
+    @_skip_no_tsrb
+    def test_open3_capture2_tainted(self):
+        """Open3.capture2 with user input — RBAST-CMD-002."""
+        code = """
+def capture
+  cmd = params[:cmd]
+  output, status = Open3.capture2(cmd)
+  output
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-CMD-002" in rule_ids, "Open3.capture2(tainted) not detected"
+
+    @_skip_no_tsrb
+    def test_pty_spawn_tainted(self):
+        """PTY.spawn with user input — RBAST-CMD-002."""
+        code = """
+def interactive
+  cmd = params[:prog]
+  PTY.spawn(cmd) do |r, w, pid|
+    w.puts "hello"
+  end
+end
+"""
+        findings = _RBAST.analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-CMD-002" in rule_ids, "PTY.spawn(tainted) not detected"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PhpASTAnalyzer tests
@@ -5047,6 +5155,49 @@ $dom->loadXML($xml);
         findings = _PHPAST.analyze("api.php", code)
         xxe = [f for f in findings if f.rule_id == "PHAST-XXE-001"]
         assert not xxe, "simplexml_load_string(literal) must not FP"
+
+    # ── Backtick shell execution ──────────────────────────────────────────────
+
+    @_skip_no_tsphp
+    def test_backtick_cmd_injection(self):
+        """Backtick shell execution with tainted input — PHAST-CMD-002."""
+        code = """<?php
+$cmd = $_GET['cmd'];
+$output = `ls $cmd`;
+echo $output;
+"""
+        findings = _PHPAST.analyze("shell.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-CMD-002" in rule_ids, "Backtick execution with tainted input not detected"
+
+    @_skip_no_tsphp
+    def test_backtick_literal_no_fp(self):
+        """Backtick with literal must not fire."""
+        code = "<?php\n$out = `ls -la`;\n"
+        findings = _PHPAST.analyze("shell.php", code)
+        cmd2 = [f for f in findings if f.rule_id == "PHAST-CMD-002"]
+        assert not cmd2, "Backtick with literal must not FP"
+
+    # ── assert() code injection ───────────────────────────────────────────────
+
+    @_skip_no_tsphp
+    def test_assert_code_injection(self):
+        """assert(tainted) with user input — PHAST-EVAL-002."""
+        code = """<?php
+$expr = $_GET['expr'];
+assert($expr);
+"""
+        findings = _PHPAST.analyze("eval.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-EVAL-002" in rule_ids, "assert(tainted) code injection not detected"
+
+    @_skip_no_tsphp
+    def test_assert_literal_no_fp(self):
+        """assert with literal must not fire."""
+        code = "<?php\nassert(strlen($s) > 0);\n"
+        findings = _PHPAST.analyze("eval.php", code)
+        eval2 = [f for f in findings if f.rule_id == "PHAST-EVAL-002"]
+        assert not eval2, "assert(literal) must not FP"
 
 
 # ── Exploitability filter ─────────────────────────────────────────────────────

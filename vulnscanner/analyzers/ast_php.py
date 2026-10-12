@@ -18,6 +18,8 @@ Rule IDs (PHAST-*):
   PHAST-LDAP-001  LDAP injection (ldap_search filter arg is user-controlled)
   PHAST-LOG-001   Log injection (error_log with user input)
   PHAST-EVAL-001  Code injection (eval() with user input)
+  PHAST-EVAL-002  Code injection (assert() with user input — PHP < 8.0 evaluates strings)
+  PHAST-CMD-002   Command injection (backtick shell execution `$cmd`)
   PHAST-SSTI-001  SSTI (Twig createTemplate, Smarty fetch with tainted template)
 """
 from __future__ import annotations
@@ -484,6 +486,12 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                       VulnType.SSTI, Severity.CRITICAL, 'PHAST-EVAL-001',
                       "User-controlled data flows into eval() — arbitrary PHP code execution")
 
+            # Code injection: assert(tainted) — PHP < 8.0 evaluates string args as code
+            elif fname == 'assert' and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.SSTI, Severity.CRITICAL, 'PHAST-EVAL-002',
+                      "User-controlled data flows into assert() — arbitrary PHP code execution (PHP < 8.0)")
+
             # SSTI: Smarty->fetch(tainted), Smarty->display(tainted)
             elif fname in ('smarty_fetch', 'fetch', 'display') and args and taint(args[0]):
                 _emit(findings, seen, file_path, line, lines, repo_url,
@@ -581,6 +589,16 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                     _emit(findings, seen, file_path, line, lines, repo_url,
                           VulnType.PATH_TRAVERSAL, Severity.CRITICAL, 'PHAST-PATH-001',
                           f"User-controlled path in {kw}() — remote/local file inclusion risk")
+
+        # ── Backtick shell execution: `ls $cmd` ───────────────────────────────
+        elif node.type == 'shell_command_expression':
+            line = node.start_point[0] + 1
+            for child in node.children:
+                if taint(child):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.COMMAND_INJECTION, Severity.CRITICAL, 'PHAST-CMD-002',
+                          "User-controlled data in backtick shell execution — OS command injection risk")
+                    break
 
     return findings
 
