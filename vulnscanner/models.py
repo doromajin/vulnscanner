@@ -42,6 +42,7 @@ class VulnType(str, Enum):
     JWT_MISCONFIGURATION = "JWT Misconfiguration"
     REDOS = "Regular Expression Denial of Service (ReDoS)"
     INTENT_INJECTION = "Android Intent Injection"
+    EXPOSED_ENDPOINT = "Exposed API Endpoint"
 
 
 @dataclass

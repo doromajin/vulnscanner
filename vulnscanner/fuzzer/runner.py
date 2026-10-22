@@ -60,11 +60,16 @@ def run_fuzz(
     # Step 2: Payload generation (always runs)
     result.payloads = generate_all_payloads(actionable)
 
-    # Step 3: Dynamic execution (Python only, optional)
+    # Step 3: Dynamic execution (Python + PHP + Ruby + Node.js), optional
     if execute and actionable:
-        from vulnscanner.fuzzer import python_harness
-        fuzz_findings, skipped = python_harness.run(target, actionable)
-        result.fuzz_findings = fuzz_findings
-        result.skipped_functions = skipped
+        from vulnscanner.fuzzer import python_harness, php_harness, ruby_harness, node_harness
+
+        py_findings,   py_skipped   = python_harness.run(target, actionable)
+        php_findings,  php_skipped  = php_harness.run(target, actionable)
+        rb_findings,   rb_skipped   = ruby_harness.run(target, actionable)
+        node_findings, node_skipped = node_harness.run(target, actionable)
+
+        result.fuzz_findings = py_findings + php_findings + rb_findings + node_findings
+        result.skipped_functions = py_skipped + php_skipped + rb_skipped + node_skipped
 
     return result

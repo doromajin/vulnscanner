@@ -297,6 +297,158 @@ class TestHardcodedSecrets:
         findings = HardcodedSecretsAnalyzer().analyze("AuthControllerTest.java", code)
         assert findings and findings[0].severity == Severity.HIGH
 
+    # ── New service tokens (SEC-011 through SEC-014) ──────────────────────────
+
+    def test_detects_slack_bot_token(self):
+        _tok = "xoxb-" + "12345678901-12345678901-abcdefghijklmnopqrstuvwx"
+        code = f'SLACK_TOKEN = "{_tok}"'
+        findings = HardcodedSecretsAnalyzer().analyze("config.py", code)
+        assert any(f.rule_id == "SEC-011" for f in findings)
+        assert any(f.severity == Severity.CRITICAL for f in findings)
+
+    def test_detects_stripe_live_key(self):
+        _key = "sk_live_" + "abcdefghijklmnopqrstuvwx"
+        code = f'stripe.api_key = "{_key}"'
+        findings = HardcodedSecretsAnalyzer().analyze("payment.py", code)
+        assert any(f.rule_id == "SEC-012" for f in findings)
+        assert any(f.severity == Severity.CRITICAL for f in findings)
+
+    def test_detects_stripe_test_key(self):
+        _key = "sk_test_" + "abcdefghijklmnopqrstuvwx"
+        code = f'STRIPE_KEY = "{_key}"'
+        findings = HardcodedSecretsAnalyzer().analyze("test_payment.py", code)
+        assert any(f.rule_id == "SEC-012" for f in findings)
+
+    def test_detects_sendgrid_key(self):
+        # First segment: 22 chars, second segment: 43 chars (SendGrid key format)
+        _key = "SG." + "abcdefghijklmnopqrstuv." + "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
+        code = f'SG_KEY = "{_key}"'
+        findings = HardcodedSecretsAnalyzer().analyze("mail.js", code)
+        assert any(f.rule_id == "SEC-013" for f in findings)
+        assert any(f.severity == Severity.CRITICAL for f in findings)
+
+    def test_detects_npm_token(self):
+        code = 'NPM_TOKEN=npm_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij'
+        findings = HardcodedSecretsAnalyzer().analyze(".env", code)
+        assert any(f.rule_id == "SEC-014" for f in findings)
+        assert any(f.severity == Severity.CRITICAL for f in findings)
+
+    def test_no_fp_xoxb_in_comment(self):
+        code = "# xoxb-000000000-000000000-placeholder token here"
+        findings = HardcodedSecretsAnalyzer().analyze("docs.py", code)
+        assert not any(f.rule_id == "SEC-011" for f in findings)
+
+
+# ── JS endpoint extractor ─────────────────────────────────────────────────────
+
+class TestJSEndpointAnalyzer:
+    def setup_method(self):
+        from vulnscanner.analyzers.js_endpoint import JSEndpointAnalyzer
+        self.ep = JSEndpointAnalyzer()
+
+    def test_supports_js_ts(self):
+        assert self.ep.supports("app.js")
+        assert self.ep.supports("service.ts")
+        assert self.ep.supports("component.tsx")
+        assert not self.ep.supports("main.py")
+
+    def test_detects_fetch_endpoint(self):
+        code = "const data = await fetch('/api/v1/users');"
+        findings = self.ep.analyze("app.js", code)
+        assert any(f.rule_id == "JSEP-001" for f in findings)
+        assert any("/api/v1/users" in f.description for f in findings)
+
+    def test_detects_sensitive_endpoint_medium(self):
+        code = "axios.get('/admin/settings');"
+        findings = self.ep.analyze("api.js", code)
+        assert any(f.rule_id == "JSEP-002" for f in findings)
+        assert any(f.severity.value == "MEDIUM" for f in findings)
+
+    def test_detects_internal_endpoint(self):
+        code = "fetch('/internal/debug/config');"
+        findings = self.ep.analyze("client.js", code)
+        assert any(f.rule_id == "JSEP-002" for f in findings)
+
+    def test_detects_credential_in_url_high(self):
+        code = "const url = 'https://admin:password123@api.example.com/data';"
+        findings = self.ep.analyze("config.js", code)
+        assert any(f.rule_id == "JSEP-003" for f in findings)
+        assert any(f.severity.value == "HIGH" for f in findings)
+
+    def test_detects_express_route(self):
+        code = "app.get('/api/v2/admin/users', authMiddleware, handler);"
+        findings = self.ep.analyze("routes.js", code)
+        assert any(f.rule_id == "JSEP-002" for f in findings)
+
+    def test_no_fp_cdn_url(self):
+        code = "const cdn = 'https://cdn.jsdelivr.net/npm/vue@3/dist/vue.cjs.js';"
+        findings = self.ep.analyze("index.js", code)
+        assert findings == []
+
+    def test_deduplicates_same_endpoint(self):
+        code = (
+            "fetch('/api/v1/users');\n"
+            "fetch('/api/v1/users');\n"
+            "fetch('/api/v1/users');\n"
+        )
+        findings = self.ep.analyze("app.js", code)
+        api_findings = [f for f in findings if "/api/v1/users" in f.description]
+        assert len(api_findings) == 1
+
+    def test_jquery_ajax(self):
+        code = "$.ajax({ url: '/api/internal/export', method: 'POST' });"
+        findings = self.ep.analyze("legacy.js", code)
+        assert any(f.rule_id == "JSEP-002" for f in findings)
+
+    def test_xhr_open(self):
+        code = "xhr.open('GET', '/api/v1/reports/download');"
+        findings = self.ep.analyze("xhr.js", code)
+        assert any(f.rule_id == "JSEP-001" for f in findings)
+
+
+# ── PHP fuzzer harness ────────────────────────────────────────────────────────
+
+class TestPhpHarness:
+    def test_find_enclosing_function(self):
+        from vulnscanner.fuzzer.php_harness import _find_enclosing_function
+        source = (
+            "<?php\n"
+            "function greet($name) {\n"
+            "    echo 'Hello ' . $name;\n"
+            "    system($name);\n"
+            "}\n"
+        )
+        result = _find_enclosing_function(source, 4)
+        assert result is not None
+        func_name, params, body = result
+        assert func_name == "greet"
+        assert "$name" in params
+
+    def test_select_payloads_cmd(self):
+        from vulnscanner.fuzzer.php_harness import _select_payloads
+        body = "system($input);"
+        payloads = _select_payloads(body)
+        assert len(payloads) > 0
+        assert all(vt.value == "Command Injection" for _, _, vt in payloads)
+
+    def test_select_payloads_eval(self):
+        from vulnscanner.fuzzer.php_harness import _select_payloads
+        body = "eval($code);"
+        payloads = _select_payloads(body)
+        assert len(payloads) > 0
+
+    def test_select_payloads_safe(self):
+        from vulnscanner.fuzzer.php_harness import _select_payloads
+        body = "$result = htmlspecialchars($input);"
+        payloads = _select_payloads(body)
+        assert payloads == []
+
+    def test_build_php_script(self):
+        from vulnscanner.fuzzer.php_harness import _build_php_script
+        script = _build_php_script("vuln", "function vuln($x){system($x);}", "$x", "; echo TEST")
+        assert "<?php" in script
+        assert "vuln(" in script
+
 
 # ── AST-based Python analyzer ─────────────────────────────────────────────────
 
@@ -1403,6 +1555,60 @@ class TestDependencyParsers:
         assert da.supports("go.mod")
         assert not da.supports("main.py")
         assert not da.supports("app.js")
+
+    # ── PHP runtime version checks (CVE-2026-109618/109619) ──────────────────
+
+    def test_php_version_file_vulnerable(self):
+        da = DependencyAnalyzer()
+        findings = da.analyze(".php-version", "8.3.20\n", "")
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.rule_id == "PHP-ENV-001"
+        assert f.severity.value == "CRITICAL"
+        assert "CVE-2026-109618" in f.description
+        assert "8.3.36" in f.description
+
+    def test_php_version_file_patched(self):
+        da = DependencyAnalyzer()
+        assert da.analyze(".php-version", "8.3.36\n", "") == []
+        assert da.analyze(".php-version", "8.4.27\n", "") == []
+        assert da.analyze(".php-version", "8.5.12\n", "") == []
+
+    def test_php_version_file_eol(self):
+        da = DependencyAnalyzer()
+        findings = da.analyze(".php-version", "8.1.29\n", "")
+        assert len(findings) == 1
+        assert "EOL" in findings[0].description
+
+    def test_composer_lock_platform_vulnerable(self):
+        import json as _json
+        da = DependencyAnalyzer()
+        lock = _json.dumps({"platform": {"php": "8.2.10"}, "packages": []})
+        findings = da.analyze("composer.lock", lock, "")
+        assert len(findings) == 1
+        assert "8.2.35" in findings[0].description
+
+    def test_composer_lock_platform_override_takes_precedence(self):
+        import json as _json
+        da = DependencyAnalyzer()
+        lock = _json.dumps({
+            "platform": {"php": "8.2.10"},
+            "platform-overrides": {"php": "8.4.26"},
+        })
+        findings = da.analyze("composer.lock", lock, "")
+        assert len(findings) == 1
+        assert "8.4.27" in findings[0].description
+
+    def test_composer_lock_patched(self):
+        import json as _json
+        da = DependencyAnalyzer()
+        lock = _json.dumps({"platform": {"php": "8.2.35"}})
+        assert da.analyze("composer.lock", lock, "") == []
+
+    def test_php_supports(self):
+        da = DependencyAnalyzer()
+        assert da.supports(".php-version")
+        assert da.supports("path/to/composer.lock")
 
 
 # ── --exclude glob patterns ───────────────────────────────────────────────────
@@ -6948,3 +7154,216 @@ void good(void) {
         rule_ids = {f.rule_id for f in findings}
         assert "CAST-BUF-001" not in rule_ids, \
             "loop writing 100 elements to malloc(100*sizeof(int)) must NOT fire"
+
+
+# ── PROBE-008: rate limit check ───────────────────────────────────────────────
+
+class TestCheckRateLimit:
+    def test_flags_no_rate_limit(self):
+        from vulnscanner.http_probe.checks import check_rate_limit
+        responses = [(200, {}) for _ in range(12)]
+        f = check_rate_limit("https://example.com/login", responses, None)
+        assert f is not None
+        assert f.rule_id == "PROBE-008"
+        assert f.severity.value == "HIGH"  # auth path → HIGH
+
+    def test_flags_non_auth_medium(self):
+        from vulnscanner.http_probe.checks import check_rate_limit
+        responses = [(200, {}) for _ in range(12)]
+        f = check_rate_limit("https://example.com/api/items", responses, None)
+        assert f is not None
+        assert f.severity.value == "MEDIUM"
+
+    def test_passes_when_429_returned(self):
+        from vulnscanner.http_probe.checks import check_rate_limit
+        responses = [(200, {})] * 8 + [(429, {})] * 4
+        f = check_rate_limit("https://example.com/login", responses, None)
+        assert f is None
+
+    def test_passes_when_ratelimit_header_present(self):
+        from vulnscanner.http_probe.checks import check_rate_limit
+        responses = [(200, {"X-RateLimit-Limit": "60"})] * 12
+        f = check_rate_limit("https://example.com/login", responses, None)
+        assert f is None
+
+    def test_passes_when_not_all_succeed(self):
+        from vulnscanner.http_probe.checks import check_rate_limit
+        responses = [(200, {})] * 8 + [(500, {})] * 4
+        f = check_rate_limit("https://example.com/login", responses, None)
+        assert f is None
+
+    def test_empty_responses_returns_none(self):
+        from vulnscanner.http_probe.checks import check_rate_limit
+        f = check_rate_limit("https://example.com/login", [], None)
+        assert f is None
+
+    def test_passes_retry_after_header(self):
+        from vulnscanner.http_probe.checks import check_rate_limit
+        responses = [(200, {"Retry-After": "60"})] * 12
+        f = check_rate_limit("https://example.com/api/data", responses, None)
+        assert f is None
+
+
+# ── Ruby fuzzer harness ───────────────────────────────────────────────────────
+
+class TestRubyHarness:
+    def test_find_enclosing_method(self):
+        from vulnscanner.fuzzer.ruby_harness import _find_enclosing_method
+        source = (
+            "def greet(name)\n"
+            "  puts 'Hello'\n"
+            "  system(name)\n"
+            "end\n"
+        )
+        result = _find_enclosing_method(source, 3)
+        assert result is not None
+        method_name, params, body = result
+        assert method_name == "greet"
+        assert "name" in params
+
+    def test_find_enclosing_method_not_found(self):
+        from vulnscanner.fuzzer.ruby_harness import _find_enclosing_method
+        source = "x = 1\ny = 2\n"
+        assert _find_enclosing_method(source, 1) is None
+
+    def test_select_payloads_system(self):
+        from vulnscanner.fuzzer.ruby_harness import _select_payloads
+        body = "def run(cmd)\n  system(cmd)\nend\n"
+        payloads = _select_payloads(body)
+        assert len(payloads) > 0
+        assert all(vt.value == "Command Injection" for _, _, vt in payloads)
+
+    def test_select_payloads_eval(self):
+        from vulnscanner.fuzzer.ruby_harness import _select_payloads
+        body = "def execute(code)\n  eval(code)\nend\n"
+        payloads = _select_payloads(body)
+        assert len(payloads) > 0
+
+    def test_select_payloads_safe(self):
+        from vulnscanner.fuzzer.ruby_harness import _select_payloads
+        body = "def greet(name)\n  puts name.upcase\nend\n"
+        assert _select_payloads(body) == []
+
+    def test_build_ruby_script(self):
+        from vulnscanner.fuzzer.ruby_harness import _build_ruby_script
+        script = _build_ruby_script("run", "def run(cmd)\n  system(cmd)\nend", "cmd", "; echo TEST")
+        assert "def run" in script
+        assert "run(" in script
+        assert "rescue" in script
+
+    def test_extract_first_param(self):
+        from vulnscanner.fuzzer.ruby_harness import _extract_first_param
+        assert _extract_first_param("name, age") == "name"
+        assert _extract_first_param("") == ""
+        assert _extract_first_param("name") == "name"
+
+    def test_run_skips_without_ruby(self, monkeypatch):
+        import shutil
+        monkeypatch.setattr(shutil, "which", lambda _: None)
+        from vulnscanner.fuzzer.ruby_harness import run
+        from vulnscanner.fuzzer.base import FuzzTarget
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            target = FuzzTarget(d)
+            findings, skipped = run(target, [])
+            assert findings == []
+            assert any("ruby not found" in s for s in skipped)
+
+
+# ── Node.js fuzzer harness ────────────────────────────────────────────────────
+
+class TestNodeHarness:
+    def test_find_enclosing_function_declaration(self):
+        from vulnscanner.fuzzer.node_harness import _find_enclosing_function
+        source = (
+            "function greet(name) {\n"
+            "  const cmd = 'echo ' + name;\n"
+            "  execSync(cmd);\n"
+            "}\n"
+        )
+        result = _find_enclosing_function(source, 3)
+        assert result is not None
+        func_name, params, body = result
+        assert func_name == "greet"
+        assert "name" in params
+
+    def test_find_enclosing_arrow_function(self):
+        from vulnscanner.fuzzer.node_harness import _find_enclosing_function
+        source = (
+            "const handler = (input) => {\n"
+            "  exec(input);\n"
+            "};\n"
+        )
+        result = _find_enclosing_function(source, 2)
+        assert result is not None
+        func_name, params, body = result
+        assert func_name == "handler"
+
+    def test_find_enclosing_function_not_found(self):
+        from vulnscanner.fuzzer.node_harness import _find_enclosing_function
+        source = "const x = 1;\nconst y = 2;\n"
+        assert _find_enclosing_function(source, 1) is None
+
+    def test_select_payloads_exec(self):
+        from vulnscanner.fuzzer.node_harness import _select_payloads
+        body = "function run(cmd) {\n  execSync(cmd);\n}\n"
+        payloads = _select_payloads(body)
+        assert len(payloads) > 0
+        assert all(vt.value == "Command Injection" for _, _, vt in payloads)
+
+    def test_select_payloads_eval(self):
+        from vulnscanner.fuzzer.node_harness import _select_payloads
+        body = "function run(code) {\n  eval(code);\n}\n"
+        payloads = _select_payloads(body)
+        assert len(payloads) > 0
+
+    def test_select_payloads_new_function(self):
+        from vulnscanner.fuzzer.node_harness import _select_payloads
+        body = "function dynamic(src) {\n  return new Function(src)();\n}\n"
+        payloads = _select_payloads(body)
+        assert len(payloads) > 0
+
+    def test_select_payloads_safe(self):
+        from vulnscanner.fuzzer.node_harness import _select_payloads
+        body = "function greet(name) {\n  console.log('Hello ' + name);\n}\n"
+        assert _select_payloads(body) == []
+
+    def test_extract_first_param_plain(self):
+        from vulnscanner.fuzzer.node_harness import _extract_first_param
+        assert _extract_first_param("name, age") == "name"
+        assert _extract_first_param("") == ""
+
+    def test_extract_first_param_typescript(self):
+        from vulnscanner.fuzzer.node_harness import _extract_first_param
+        assert _extract_first_param("name: string, age: number") == "name"
+
+    def test_extract_first_param_default(self):
+        from vulnscanner.fuzzer.node_harness import _extract_first_param
+        assert _extract_first_param("name = 'anonymous'") == "name"
+
+    def test_extract_first_param_destructure_skipped(self):
+        from vulnscanner.fuzzer.node_harness import _extract_first_param
+        assert _extract_first_param("{ id, name }") == ""
+
+    def test_build_node_script(self):
+        from vulnscanner.fuzzer.node_harness import _build_node_script
+        script = _build_node_script(
+            "run",
+            "function run(cmd) {\n  execSync(cmd);\n}",
+            "cmd",
+            "; echo TEST",
+        )
+        assert "require('child_process')" in script
+        assert "run(" in script
+
+    def test_run_skips_without_node(self, monkeypatch):
+        import shutil
+        monkeypatch.setattr(shutil, "which", lambda _: None)
+        from vulnscanner.fuzzer.node_harness import run
+        from vulnscanner.fuzzer.base import FuzzTarget
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            target = FuzzTarget(d)
+            findings, skipped = run(target, [])
+            assert findings == []
+            assert any("node not found" in s for s in skipped)

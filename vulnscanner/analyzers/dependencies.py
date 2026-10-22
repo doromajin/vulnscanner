@@ -10,6 +10,10 @@ Supported manifests:
   Gemfile.lock                                                       (RubyGems)
   go.mod                                                             (Go)
   Pipfile / Pipfile.lock                                             (PyPI)
+
+PHP runtime version check:
+  .php-version                                                       (phpenv/phpbrew)
+  composer.lock  (platform section)                                  (Composer)
 """
 from __future__ import annotations
 
@@ -29,7 +33,44 @@ _DEPENDENCY_FILENAMES = frozenset({
     "package.json",
     "Gemfile.lock",
     "go.mod",
+    ".php-version",
+    "composer.lock",
 })
+
+# CVE-2026-109618 / CVE-2026-109619 (php2shell): first patched version per branch.
+# PHP 8.1 and below are EOL — no patch released.
+_PHP_PATCHED: dict[tuple[int, int], tuple[int, int, int]] = {
+    (8, 2): (8, 2, 35),
+    (8, 3): (8, 3, 36),
+    (8, 4): (8, 4, 27),
+    (8, 5): (8, 5, 12),
+}
+_PHP_CVE_IDS = "CVE-2026-109618, CVE-2026-109619"
+
+
+def _php_vuln_reason(version_str: str) -> str | None:
+    """Return a human-readable reason if *version_str* is vulnerable, else None."""
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", version_str.strip())
+    if not m:
+        return None
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    branch = (major, minor)
+    ver = (major, minor, patch)
+
+    if major < 8 or (major == 8 and minor < 2):
+        return (
+            f"PHP {version_str} is EOL; no official patch for {_PHP_CVE_IDS} (php2shell RCE, CVSS 9.2). "
+            "Upgrade to PHP 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 or later."
+        )
+    if branch in _PHP_PATCHED:
+        patched = _PHP_PATCHED[branch]
+        if ver < patched:
+            fixed = ".".join(str(x) for x in patched)
+            return (
+                f"PHP {version_str} is vulnerable to {_PHP_CVE_IDS} (php2shell unauthenticated RCE, CVSS 9.2). "
+                f"Upgrade to PHP {fixed} or later."
+            )
+    return None
 
 _OSV_API = "https://api.osv.dev/v1/querybatch"
 _OSV_TIMEOUT = 15  # seconds
@@ -47,10 +88,56 @@ class DependencyAnalyzer(BaseAnalyzer):
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         filename = os.path.basename(file_path.replace("\\", "/"))
+
+        if filename in (".php-version", "composer.lock"):
+            return self._check_php_runtime(filename, content, file_path, repo_url)
+
         packages = self._parse(filename, content)
         if not packages:
             return []
         return self._check_osv(packages, file_path, repo_url)
+
+    def _check_php_runtime(
+        self,
+        filename: str,
+        content: str,
+        file_path: str,
+        repo_url: str,
+    ) -> list[Finding]:
+        """Detect a PHP runtime version and warn if vulnerable to php2shell."""
+        entries: list[tuple[str, int]] = []  # (version_string, lineno)
+
+        if filename == ".php-version":
+            ver = content.strip().splitlines()[0].strip() if content.strip() else ""
+            if ver:
+                entries.append((ver, 1))
+
+        elif filename == "composer.lock":
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                return []
+            for section in ("platform-overrides", "platform"):
+                php_ver = data.get(section, {}).get("php", "")
+                if php_ver:
+                    entries.append((php_ver, 1))
+                    break
+
+        findings: list[Finding] = []
+        for ver_str, lineno in entries:
+            reason = _php_vuln_reason(ver_str)
+            if reason:
+                findings.append(Finding(
+                    vuln_type=VulnType.VULNERABLE_DEPENDENCY,
+                    severity=Severity.CRITICAL,
+                    file_path=file_path,
+                    line_number=lineno,
+                    line_content=ver_str,
+                    description=reason,
+                    rule_id="PHP-ENV-001",
+                    repo_url=repo_url,
+                ))
+        return findings
 
     # ── parsers ───────────────────────────────────────────────────────────────
 

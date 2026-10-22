@@ -147,6 +147,63 @@ _RULES = [
         "Hardcoded VCS personal access token (GitHub/GitLab PAT) detected — revoke and rotate immediately",
         Severity.CRITICAL, _HS,
     ),
+    # SEC-011: Slack API tokens.
+    # Bot tokens (xoxb-), user tokens (xoxp-), workspace app tokens (xoxa-), and
+    # legacy tokens (xoxs-). Format: xox{type}-{team_id}-{token_id}-{secret}.
+    # A leaked bot token gives full access to all channels the bot is in.
+    (
+        "SEC-011",
+        re.compile(
+            r'\bxox[bpsa]-\d{8,13}-\d{8,13}-[A-Za-z0-9]{16,}\b',
+            re.IGNORECASE,
+        ),
+        "Hardcoded Slack API token detected — revoke at api.slack.com/apps and rotate immediately",
+        Severity.CRITICAL, _HS,
+    ),
+    # SEC-012: Stripe secret and restricted keys.
+    # sk_live_ = full secret key (can charge cards, issue refunds).
+    # rk_live_ = restricted key (scoped permissions, but still sensitive).
+    # sk_test_ is also flagged at HIGH since test keys often share structure with live.
+    (
+        "SEC-012",
+        re.compile(
+            r'\b(?:sk_live_|rk_live_)[A-Za-z0-9]{20,}\b',
+            re.IGNORECASE,
+        ),
+        "Hardcoded Stripe live secret key — immediate revocation required (financial data at risk)",
+        Severity.CRITICAL, _HS,
+    ),
+    (
+        "SEC-012",
+        re.compile(
+            r'\bsk_test_[A-Za-z0-9]{20,}\b',
+            re.IGNORECASE,
+        ),
+        "Hardcoded Stripe test secret key — rotate before production deployment",
+        Severity.HIGH, _HS,
+    ),
+    # SEC-013: SendGrid API keys.
+    # Format: SG. followed by 22 base64url chars, a dot, then 43 base64url chars.
+    # A leaked key allows sending email as the account owner (phishing risk).
+    (
+        "SEC-013",
+        re.compile(
+            r'\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b',
+        ),
+        "Hardcoded SendGrid API key detected — revoke at app.sendgrid.com/settings/api_keys",
+        Severity.CRITICAL, _HS,
+    ),
+    # SEC-014: npm access tokens.
+    # Format: npm_ followed by 36 alphanumeric chars (introduced 2021).
+    # A leaked publish token enables supply-chain attacks via malicious package versions.
+    (
+        "SEC-014",
+        re.compile(
+            r'\bnpm_[A-Za-z0-9]{36}\b',
+        ),
+        "Hardcoded npm access token — revoke at npmjs.com/settings/tokens (supply-chain attack risk)",
+        Severity.CRITICAL, _HS,
+    ),
 ]
 
 # Merged allowlist: a single compiled OR pattern replaces three separate re.search calls.
@@ -164,7 +221,11 @@ _GUARD = re.compile(
     r'|connection_string|conn_str|DATABASE_URL'
     r'|jwt\.(?:sign|encode)|JWT\.encode|JWT::encode|SignedString'
     r'|private_key'
-    r'|ghp_|github_pat_|glpat-',
+    r'|ghp_|github_pat_|glpat-'
+    r'|xox[bpsa]-'
+    r'|sk_live_|rk_live_|sk_test_'
+    r'|SG\.[A-Za-z0-9_-]{10}'
+    r'|npm_',
     re.IGNORECASE,
 )
 

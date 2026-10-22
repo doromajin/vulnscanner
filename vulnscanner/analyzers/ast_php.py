@@ -24,6 +24,9 @@ Rule IDs (PHAST-*):
 """
 from __future__ import annotations
 
+import threading as _threading
+from dataclasses import dataclass as _dataclass, field as _field
+
 try:
     import tree_sitter_php as _tsp
     from tree_sitter import Language, Parser as _TSParser
@@ -35,6 +38,43 @@ except Exception:
 
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
+
+
+# ── Cross-file taint context ──────────────────────────────────────────────────
+
+@_dataclass
+class PhpCrossFileContext:
+    """PHP function names (from any .php file) that return tainted data."""
+    tainted_func_names: frozenset[str] = _field(default_factory=frozenset)
+
+
+_php_cf_local = _threading.local()
+
+
+def set_php_cross_file_context(ctx: "PhpCrossFileContext | None") -> None:
+    _php_cf_local.ctx = ctx
+
+
+def _get_php_cf_ctx() -> "PhpCrossFileContext | None":
+    return getattr(_php_cf_local, "ctx", None)
+
+
+def build_php_cross_file_context(all_contents: dict[str, str]) -> PhpCrossFileContext:
+    """Pre-pass: collect all PHP function names that return tainted data."""
+    if not _TS_AVAILABLE:
+        return PhpCrossFileContext()
+
+    global_tainted: set[str] = set()
+    for path, content in all_contents.items():
+        if not path.endswith(".php"):
+            continue
+        try:
+            tree = _php_parser.parse(content.encode("utf-8", errors="replace"))
+            _, file_funcs, _ = _build_taint(tree.root_node)
+            global_tainted.update(file_funcs)
+        except Exception:
+            pass
+    return PhpCrossFileContext(tainted_func_names=frozenset(global_tainted))
 
 # ── Source definitions ────────────────────────────────────────────────────────
 
@@ -358,10 +398,16 @@ def _collect_pass(root, tainted: dict, tainted_funcs: set, tainted_props: set) -
     return changed
 
 
-def _build_taint(root) -> tuple[dict, set, set]:
-    """Fixed-point taint propagation, max 8 passes."""
+def _build_taint(
+    root,
+    seed_funcs: "frozenset[str] | None" = None,
+) -> tuple[dict, set, set]:
+    """Fixed-point taint propagation, max 8 passes.
+
+    seed_funcs: pre-known tainted function names from cross-file analysis.
+    """
     tainted: dict[str, tuple[int, str]] = {}
-    tainted_funcs: set[str] = set()
+    tainted_funcs: set[str] = set(seed_funcs or ())
     tainted_props: set[str] = set()
     for _ in range(8):
         if not _collect_pass(root, tainted, tainted_funcs, tainted_props):
@@ -625,7 +671,9 @@ class PhpASTAnalyzer(BaseAnalyzer):
             return []
 
         lines = content.splitlines()
-        tainted, tainted_funcs, tainted_props = _build_taint(tree.root_node)
+        cf_ctx = _get_php_cf_ctx()
+        seed = cf_ctx.tainted_func_names if cf_ctx else None
+        tainted, tainted_funcs, tainted_props = _build_taint(tree.root_node, seed)
 
         return _check_sinks(
             tree.root_node, tainted, tainted_funcs, tainted_props, file_path, lines, repo_url

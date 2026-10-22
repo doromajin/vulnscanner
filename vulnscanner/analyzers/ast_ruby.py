@@ -27,6 +27,9 @@ Rule IDs (RBAST-*):
 """
 from __future__ import annotations
 
+import threading as _threading
+from dataclasses import dataclass as _dataclass, field as _field
+
 try:
     import tree_sitter_ruby as _tsrb
     from tree_sitter import Language, Parser as _TSParser
@@ -38,6 +41,43 @@ except Exception:
 
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
+
+
+# ── Cross-file taint context ──────────────────────────────────────────────────
+
+@_dataclass
+class RubyCrossFileContext:
+    """Method names (from any .rb file in the project) that return tainted data."""
+    tainted_method_names: frozenset[str] = _field(default_factory=frozenset)
+
+
+_ruby_cf_local = _threading.local()
+
+
+def set_ruby_cross_file_context(ctx: "RubyCrossFileContext | None") -> None:
+    _ruby_cf_local.ctx = ctx
+
+
+def _get_ruby_cf_ctx() -> "RubyCrossFileContext | None":
+    return getattr(_ruby_cf_local, "ctx", None)
+
+
+def build_ruby_cross_file_context(all_contents: dict[str, str]) -> RubyCrossFileContext:
+    """Pre-pass: collect all method names that return tainted data across all .rb files."""
+    if not _TS_RUBY_AVAILABLE:
+        return RubyCrossFileContext()
+
+    global_tainted: set[str] = set()
+    for path, content in all_contents.items():
+        if not path.endswith(".rb"):
+            continue
+        try:
+            tree = _ruby_parser.parse(content.encode("utf-8", errors="replace"))
+            _, file_methods, _ = _build_taint(tree.root_node)
+            global_tainted.update(file_methods)
+        except Exception:
+            pass
+    return RubyCrossFileContext(tainted_method_names=frozenset(global_tainted))
 
 _RUBY_EXTS = (".rb",)
 
@@ -233,10 +273,16 @@ def _collect_method_taint(root, tainted: set[str], tainted_methods: set[str],
     return changed
 
 
-def _build_taint(root) -> tuple[set[str], set[str], set[str]]:
-    """Fixed-point taint collection, max 8 passes."""
+def _build_taint(
+    root,
+    seed_methods: "frozenset[str] | None" = None,
+) -> tuple[set[str], set[str], set[str]]:
+    """Fixed-point taint collection, max 8 passes.
+
+    seed_methods: pre-known tainted method names from cross-file analysis.
+    """
     tainted: set[str] = set()
-    tainted_methods: set[str] = set()
+    tainted_methods: set[str] = set(seed_methods or ())
     tainted_ivars: set[str] = set()
     for _ in range(8):
         c1 = _collect_assignments(root, tainted, tainted_methods, tainted_ivars)
@@ -571,7 +617,9 @@ class RubyASTAnalyzer(BaseAnalyzer):
             return []
 
         lines = content.splitlines()
-        tainted, tainted_methods, tainted_ivars = _build_taint(tree.root_node)
+        cf_ctx = _get_ruby_cf_ctx()
+        seed = cf_ctx.tainted_method_names if cf_ctx else None
+        tainted, tainted_methods, tainted_ivars = _build_taint(tree.root_node, seed)
         # Do not bail out when tainted is empty — direct request-source-to-sink flows
         # (e.g. User.create(params[:user])) are still detected by _is_request_source
         # inside _is_tainted, so _check_sinks must run even with no variable assignments.

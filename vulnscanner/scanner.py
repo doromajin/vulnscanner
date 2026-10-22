@@ -29,6 +29,14 @@ from vulnscanner.analyzers.ast_js import (
     build_js_cross_file_context,
     set_js_cross_file_context,
 )
+from vulnscanner.analyzers.ast_ruby import (
+    build_ruby_cross_file_context,
+    set_ruby_cross_file_context,
+)
+from vulnscanner.analyzers.ast_php import (
+    build_php_cross_file_context,
+    set_php_cross_file_context,
+)
 from vulnscanner.analyzers.file_context import (
     INCLUDE_TEST_FILES,
     INCLUDE_VENDOR_FILES,
@@ -202,6 +210,8 @@ class VulnScanner:
         java_cf_ctx = build_java_cross_file_context(all_contents)
         go_cf_ctx = build_go_cross_file_context(all_contents)
         js_cf_ctx = build_js_cross_file_context(all_contents)
+        ruby_cf_ctx = build_ruby_cross_file_context(all_contents)
+        php_cf_ctx = build_php_cross_file_context(all_contents)
 
         start = time.perf_counter()
         with Progress(
@@ -216,7 +226,7 @@ class VulnScanner:
 
             with ThreadPoolExecutor(max_workers=self._workers) as pool:
                 futures = {
-                    pool.submit(self._analyze_file_pure, fp, content, directory, all_contents, cf_summary, java_cf_ctx, go_cf_ctx, js_cf_ctx): fp
+                    pool.submit(self._analyze_file_pure, fp, content, directory, all_contents, cf_summary, java_cf_ctx, go_cf_ctx, js_cf_ctx, ruby_cf_ctx, php_cf_ctx): fp
                     for fp, content in files
                 }
                 for future in as_completed(futures):
@@ -244,6 +254,8 @@ class VulnScanner:
         java_cf_ctx=None,
         go_cf_ctx=None,
         js_cf_ctx=None,
+        ruby_cf_ctx=None,
+        php_cf_ctx=None,
     ) -> _FileResult:
         """Analyze a single file; returns results without mutating shared state."""
         # Provide cross-file content map and Phase C summary via thread-local storage.
@@ -253,6 +265,8 @@ class VulnScanner:
         set_java_cross_file_context(java_cf_ctx)
         set_go_cross_file_context(go_cf_ctx)
         set_js_cross_file_context(js_cf_ctx)
+        set_ruby_cross_file_context(ruby_cf_ctx)
+        set_php_cross_file_context(php_cf_ctx)
 
         partial = _FileResult(scanned_lines=content.count("\n") + 1)
         lines = content.splitlines()

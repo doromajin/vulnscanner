@@ -909,6 +909,292 @@ def init(target_dir: str, force: bool, with_precommit: bool, with_gitlab: bool) 
     )
 
 
+# ── probe ─────────────────────────────────────────────────────────────────────
+
+_PROBE_LEGAL = """
+╔══════════════════════════════════════════════════════════════╗
+║        VulnScanner Probe — Legal & Safety Notice             ║
+╠══════════════════════════════════════════════════════════════╣
+║  This command sends REAL HTTP requests to a live target.     ║
+║                                                              ║
+║  By proceeding you confirm:                                  ║
+║   • You own the target or have written permission to test it ║
+║   • The target is listed in a bug bounty scope you accept    ║
+║   • You will use findings only for responsible disclosure    ║
+║   • Testing outside authorized scope is illegal              ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+
+@main.command()
+@click.argument("target")
+@click.option("--scope", "-s", multiple=True, required=True, metavar="DOMAIN",
+              help="Authorized domain(s) to test (required, repeatable). "
+                   "E.g. --scope api.example.com --scope example.com")
+@click.option("--base-url", required=True, metavar="URL",
+              help="Base URL to prepend to relative endpoint paths. "
+                   "E.g. https://api.example.com")
+@click.option("--timeout", default=10, show_default=True, type=int,
+              help="Per-request timeout in seconds")
+@click.option("--header", "-H", multiple=True, metavar="NAME:VALUE",
+              help="Extra HTTP header to include (e.g. -H 'Authorization: Bearer TOKEN'). "
+                   "Use this to test authenticated endpoints.")
+@click.option("--output", "-o", default=None, help="Write JSON probe report to this file")
+@click.option("--yes", "-y", is_flag=True, help="Skip legal confirmation prompt")
+@click.option("--min-severity", default="INFO", type=_SEVERITY_CHOICES,
+              help="Minimum static-analysis severity to probe (default: INFO)")
+def probe(
+    target: str,
+    scope: tuple[str, ...],
+    base_url: str,
+    timeout: int,
+    header: tuple[str, ...],
+    output: str | None,
+    yes: bool,
+    min_severity: str,
+) -> None:
+    """Probe discovered endpoints against a live target.
+
+    Runs static analysis on TARGET (local repo), extracts API endpoints
+    found by JSEndpointAnalyzer, then sends authorized HTTP requests to
+    verify access controls and detect common vulnerabilities.
+
+    All requests are validated against the declared --scope before sending.
+    Out-of-scope URLs are never probed.
+
+    Example:\n
+        vulnscan probe ./repos/myapp \\
+          --scope api.example.com \\
+          --base-url https://api.example.com \\
+          --header "Authorization: Bearer $TOKEN"
+    """
+    import json as _json
+    from vulnscanner.models import Severity
+    from vulnscanner.http_probe import Scope, HttpProber
+    from vulnscanner.http_probe.scope import ScopeViolation
+
+    # Legal confirmation
+    if not yes:
+        console.print(_PROBE_LEGAL)
+        if not click.confirm("Proceed with active HTTP probing?"):
+            console.print("[yellow]Probe cancelled.[/yellow]")
+            sys.exit(0)
+
+    # Validate target is a local directory
+    if not os.path.isdir(target):
+        console.print(
+            "[red]TARGET must be a local directory. "
+            "Clone the repository first: git clone <url> && vulnscan probe <local_path>[/red]"
+        )
+        sys.exit(1)
+
+    # Parse extra headers
+    extra_headers: dict[str, str] = {}
+    for h in header:
+        if ":" not in h:
+            console.print(f"[red]Invalid header format {h!r} — use NAME:VALUE[/red]")
+            sys.exit(1)
+        name, _, value = h.partition(":")
+        extra_headers[name.strip()] = value.strip()
+
+    # Build scope
+    try:
+        scope_obj = Scope(list(scope))
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    console.print(
+        f"\n[bold]VulnScanner Probe[/bold]\n"
+        f"  Target   : [cyan]{target}[/cyan]\n"
+        f"  Scope    : [cyan]{', '.join(scope_obj.domains)}[/cyan]\n"
+        f"  Base URL : [cyan]{base_url}[/cyan]"
+    )
+    if extra_headers:
+        console.print(f"  Headers  : {', '.join(extra_headers.keys())}")
+
+    # Step 1: static analysis — extract JSEP findings
+    console.print("\n[dim]Step 1/2: Static analysis (endpoint extraction)...[/dim]")
+    from vulnscanner.analyzers.js_endpoint import JSEndpointAnalyzer
+    from vulnscanner.scanner import VulnScanner
+
+    severity_order = list(Severity)
+    min_sev = Severity(min_severity.upper())
+    cutoff = severity_order.index(min_sev)
+
+    scanner = VulnScanner(analyzers=[JSEndpointAnalyzer()])
+    scan_result = scanner.scan(target)
+    endpoint_findings = [
+        f for f in scan_result.findings
+        if f.rule_id in ("JSEP-001", "JSEP-002")
+        and severity_order.index(f.severity) <= cutoff
+    ]
+
+    console.print(
+        f"  Found [bold]{len(endpoint_findings)}[/bold] endpoint reference(s) "
+        f"({sum(1 for f in endpoint_findings if f.rule_id == 'JSEP-002')} sensitive)"
+    )
+
+    if not endpoint_findings:
+        console.print("[yellow]No endpoints found to probe. Ensure the repository contains JS/TS files.[/yellow]")
+        sys.exit(0)
+
+    # Step 2: probe
+    console.print("\n[dim]Step 2/2: Active probing...[/dim]")
+    prober = HttpProber(scope=scope_obj, timeout=timeout, headers=extra_headers)
+    probe_results = prober.probe_all(base_url, endpoint_findings)
+
+    # Display results
+    all_findings = [f for r in probe_results for f in r.findings]
+    errors = [r for r in probe_results if r.error and not r.skipped]
+    skipped = [r for r in probe_results if r.skipped]
+    probed = [r for r in probe_results if not r.skipped and not r.error]
+
+    console.print(
+        f"\n[bold]Probe complete:[/bold] {len(probed)} probed, "
+        f"{len(skipped)} skipped (out of scope), {len(errors)} errors"
+    )
+
+    if all_findings:
+        _SEV_COLOR = {
+            "CRITICAL": "red bold", "HIGH": "red", "MEDIUM": "yellow",
+            "LOW": "blue", "INFO": "dim",
+        }
+        console.print(f"\n[bold red]Probe findings: {len(all_findings)}[/bold red]")
+        for f in sorted(all_findings, key=lambda x: severity_order.index(x.severity)):
+            sev = f.severity.value
+            col = _SEV_COLOR.get(sev, "white")
+            console.print(
+                f"  [{col}]{sev}[/{col}] [{f.rule_id}] "
+                f"{f.description[:100]}"
+            )
+    else:
+        console.print("\n[green]No vulnerabilities detected in probed endpoints.[/green]")
+
+    if errors:
+        console.print(f"\n[dim]Errors ({len(errors)}):[/dim]")
+        for r in errors[:5]:
+            console.print(f"  [dim]{r.url}: {r.error}[/dim]")
+
+    # JSON output
+    if output:
+        report = {
+            "target": target,
+            "base_url": base_url,
+            "scope": scope_obj.domains,
+            "summary": {
+                "probed": len(probed),
+                "skipped": len(skipped),
+                "errors": len(errors),
+                "findings": len(all_findings),
+            },
+            "findings": [
+                {
+                    "rule_id": f.rule_id,
+                    "severity": f.severity.value,
+                    "vuln_type": f.vuln_type.value,
+                    "description": f.description,
+                    "file_path": f.file_path,
+                    "line_number": f.line_number,
+                }
+                for f in all_findings
+            ],
+            "probe_results": [
+                {
+                    "url": r.url,
+                    "status_code": r.status_code,
+                    "response_size": r.response_size,
+                    "response_time_ms": round(r.response_time_ms, 1),
+                    "findings": len(r.findings),
+                    "error": r.error,
+                    "skipped": r.skipped,
+                }
+                for r in probe_results
+            ],
+        }
+        Path(output).write_text(
+            _json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        console.print(f"\n[green]Probe report written to {output}[/green]")
+
+    sys.exit(1 if any(
+        f.severity.value in ("CRITICAL", "HIGH") for f in all_findings
+    ) else 0)
+
+
+# ── report ────────────────────────────────────────────────────────────────────
+
+@main.command("report")
+@click.argument("scan_json", metavar="SCAN_JSON")
+@click.option("--format", "fmt", default="markdown",
+              type=click.Choice(["markdown", "hackerone", "bugcrowd"], case_sensitive=False),
+              show_default=True, help="Report format")
+@click.option("--output", "-o", default=None, help="Write report to this file (default: stdout)")
+@click.option("--min-severity", default="LOW", type=_SEVERITY_CHOICES,
+              help="Only include findings at or above this severity (default: LOW)")
+@click.option("--target", default="", metavar="NAME",
+              help="Target name to include in the report header")
+@click.option("--researcher", default="", metavar="NAME",
+              help="Your name / handle for the report")
+@click.option("--program", default="", metavar="NAME",
+              help="Bug bounty program name (e.g. 'HackerOne - ExampleCorp')")
+def report(
+    scan_json: str,
+    fmt: str,
+    output: str | None,
+    min_severity: str,
+    target: str,
+    researcher: str,
+    program: str,
+) -> None:
+    """Generate a bug bounty report from a JSON scan result.
+
+    SCAN_JSON is the output of `vulnscan scan --output` or `vulnscan probe --output`.
+
+    Example:\n
+        vulnscan scan ./myapp -o results.json\n
+        vulnscan report results.json --format hackerone --output report.md \\
+          --target "api.example.com" --researcher "yourhandle" --program "HackerOne - ExampleCorp"
+    """
+    from vulnscanner.models import Severity
+    from vulnscanner.http_probe.report import BugBountyReport, from_json_report
+
+    severity_order = list(Severity)
+    min_sev = Severity(min_severity.upper())
+    cutoff = severity_order.index(min_sev)
+
+    try:
+        findings = from_json_report(scan_json)
+    except FileNotFoundError:
+        console.print(f"[red]File not found: {scan_json}[/red]")
+        sys.exit(1)
+    except Exception as exc:
+        console.print(f"[red]Failed to load {scan_json}: {exc}[/red]")
+        sys.exit(1)
+
+    findings = [f for f in findings if severity_order.index(f.severity) <= cutoff]
+
+    if not findings:
+        console.print(f"[yellow]No findings at {min_severity}+ severity in {scan_json}.[/yellow]")
+        sys.exit(0)
+
+    rpt = BugBountyReport(
+        target=target or scan_json,
+        findings=findings,
+        researcher=researcher,
+        program=program,
+    )
+    text = rpt.render(fmt=fmt)  # type: ignore[arg-type]
+
+    if output:
+        Path(output).write_text(text, encoding="utf-8")
+        console.print(f"[green]Report written to {output}[/green]")
+        console.print(f"  Format   : {fmt}")
+        console.print(f"  Findings : {len(findings)}")
+    else:
+        click.echo(text)
+
+
 # ── diff ──────────────────────────────────────────────────────────────────────
 
 @main.command("diff")

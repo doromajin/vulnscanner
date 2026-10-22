@@ -12,6 +12,7 @@ from vulnscanner.analyzers.csrf import CSRFAnalyzer
 from vulnscanner.analyzers.missing_auth import MissingAuthAnalyzer
 from vulnscanner.analyzers.nosql_injection import NoSQLInjectionAnalyzer
 from vulnscanner.analyzers.ast_php import PhpASTAnalyzer
+from vulnscanner.analyzers.js_endpoint import JSEndpointAnalyzer
 from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.analyzers.client_side import ClientSideAnalyzer
@@ -55,6 +56,8 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     HardcodedSecretsAnalyzer(),
     # Checks dependency manifests against OSV.dev CVE database
     DependencyAnalyzer(),
+    # Extracts API endpoints from JS/TS for bug bounty reconnaissance
+    JSEndpointAnalyzer(),
     # Language-specific analyzers
     JavaASTAnalyzer(),
     JavaAnalyzer(),
