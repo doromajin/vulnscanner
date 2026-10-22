@@ -160,6 +160,12 @@ _STRING_METHODS = frozenset({
     "CGI.escape", "URI.encode",
 })
 
+# Numeric coercions return a non-injectable integer/float — clears taint.
+# An Integer/Float value cannot be used for SQL/command/path injection.
+_TAINT_CLEAR_METHODS = frozenset({"to_i", "to_f", "to_r", "to_c"})
+# Receiver-less numeric constructors: Integer(x), Float(x), etc.
+_TAINT_CLEAR_FUNCTIONS = frozenset({"Integer", "Float", "Rational", "Complex"})
+
 
 # ── Taint state helpers ───────────────────────────────────────────────────────
 
@@ -200,14 +206,19 @@ def _is_tainted(node, tainted: set[str], tainted_methods: set[str],
             return True
         recv = node.child_by_field_name("receiver")
         meth = node.child_by_field_name("method")
+        mname = meth.text.decode("utf-8", errors="replace") if meth else ""
+        # Numeric coercion produces a non-injectable value — clears taint
+        if mname in _TAINT_CLEAR_METHODS:
+            return False
+        # Receiver-less numeric constructor: Integer(x), Float(x)
+        if recv is None and mname in _TAINT_CLEAR_FUNCTIONS:
+            return False
         # Method on tainted receiver propagates (e.g. id.to_s, name.strip)
         if recv is not None and _is_tainted(recv, tainted, tainted_methods, tainted_ivars):
             return True
         # Named method whose body returns tainted data
-        if meth is not None:
-            mname = meth.text.decode("utf-8", errors="replace")
-            if mname in tainted_methods:
-                return True
+        if mname in tainted_methods:
+            return True
         return False
 
     # element_reference: tainted[x]
@@ -455,6 +466,99 @@ def _emit(
     ))
 
 
+# ── Branch-sensitive taint guard ─────────────────────────────────────────────
+
+def _build_parent_map(root) -> dict:
+    """Build {node.id -> parent_node} for the entire parse tree."""
+    parents: dict = {}
+    for node in _walk(root):
+        for child in node.children:
+            parents[child.id] = node
+    return parents
+
+
+def _tainted_idents(node, tainted: set[str]) -> set[str]:
+    """Return set of tainted identifier names directly referenced in node."""
+    result: set[str] = set()
+    for sub in _walk(node):
+        if sub.type == "identifier":
+            name = sub.text.decode("utf-8", errors="replace")
+            if name in tainted:
+                result.add(name)
+    return result
+
+
+def _condition_validates(cond_node, var_name: str) -> bool:
+    """Return True if condition node validates/sanitizes var_name.
+
+    Recognises: var =~ /regex/, var.match?(/r/), var.match(/r/),
+                var.is_a?(Integer/Float/Numeric).
+    """
+    text = cond_node.text.decode("utf-8", errors="replace")
+    if var_name not in text:
+        return False
+
+    t = cond_node.type
+
+    # var =~ /regex/  (binary node with =~ operator)
+    if t == "binary":
+        has_match_op = any(c.type == "=~" for c in cond_node.children)
+        nc = cond_node.named_children
+        if has_match_op and nc and nc[0].type == "identifier":
+            if nc[0].text.decode("utf-8", errors="replace") == var_name:
+                return True
+
+    # var.match?(/r/), var.match(/r/), var.is_a?(Integer/...)
+    if t == "call":
+        recv = cond_node.child_by_field_name("receiver")
+        meth = cond_node.child_by_field_name("method")
+        if recv and meth and recv.type == "identifier":
+            recv_name = recv.text.decode("utf-8", errors="replace")
+            mname = meth.text.decode("utf-8", errors="replace")
+            if recv_name == var_name:
+                if mname in ("match?", "match"):
+                    return True
+                if mname == "is_a?":
+                    args = cond_node.child_by_field_name("arguments")
+                    if args:
+                        for arg in args.named_children:
+                            if arg.text.decode("utf-8", errors="replace") in (
+                                    "Integer", "Float", "Numeric", "Fixnum", "Bignum"):
+                                return True
+
+    # Recurse into &&, ||, and, or sub-expressions
+    for child in cond_node.named_children:
+        if _condition_validates(child, var_name):
+            return True
+
+    return False
+
+
+def _is_branch_guarded(sink_node, tainted_vars: set[str], parent_map: dict) -> bool:
+    """Return True if sink is inside an if-then branch that validates tainted vars.
+
+    Traverses the parent chain from sink_node.  When an `if`/`elsif` ancestor
+    is found whose condition validates any of the tainted_vars, checks that we
+    are in the THEN body (not the else clause) before suppressing the finding.
+    """
+    if not tainted_vars:
+        return False
+    cur = sink_node
+    while cur.id in parent_map:
+        parent_node = parent_map[cur.id]
+        if parent_node.type in ("if", "elsif"):
+            condition = parent_node.child_by_field_name("condition")
+            if condition:
+                for var_name in tainted_vars:
+                    if _condition_validates(condition, var_name):
+                        # cur is the child of if we came from.
+                        # If it's an else/elsif node we're in the else branch.
+                        if cur.type not in ("else", "elsif"):
+                            return True
+        cur = parent_node
+    return False
+
+
 # ── Sink checking ─────────────────────────────────────────────────────────────
 
 def _arg_nodes(call_node) -> list:
@@ -473,12 +577,19 @@ def _check_sinks(
     file_path: str,
     lines: list[str],
     repo_url: str,
+    parent_map: dict,
 ) -> list[Finding]:
     findings: list[Finding] = []
     seen: set[tuple] = set()
 
     def taint(n):
         return _is_tainted(n, tainted, tainted_methods, tainted_ivars)
+
+    def taint_guarded(n, ctx):
+        """Like taint() but suppresses findings inside validated if-branches."""
+        if not _is_tainted(n, tainted, tainted_methods, tainted_ivars):
+            return False
+        return not _is_branch_guarded(ctx, _tainted_idents(n, tainted), parent_map)
 
     for node in _walk(root):
         # ── Backtick / subshell execution: `ls #{user_input}` ────────────────
@@ -487,7 +598,7 @@ def _check_sinks(
             for child in node.children:
                 if child.type == "interpolation":
                     for expr in child.named_children:
-                        if taint(expr):
+                        if taint_guarded(expr, node):
                             _emit(findings, seen, file_path, line, lines, repo_url,
                                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                                   "RBAST-CMD-001",
@@ -509,7 +620,7 @@ def _check_sinks(
 
         # ── Command injection (checked before SQL: exec/system/spawn without receiver)
         # system("ls " + id), exec(cmd), spawn(cmd)
-        if meth_text in _CMD_METHODS and not recv_text and arg_nodes and taint(arg_nodes[0]):
+        if meth_text in _CMD_METHODS and not recv_text and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                   "RBAST-CMD-001",
@@ -520,14 +631,14 @@ def _check_sinks(
                 and recv_text not in ("Process", "PTY", "Open3"):
             first = arg_nodes[0]
             # `where` / `having` with Hash arg is safe; string or interpolation is not
-            if first.type not in ("hash", "bare_hash") and taint(first):
+            if first.type not in ("hash", "bare_hash") and taint_guarded(first, node):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.SQL_INJECTION, Severity.HIGH,
                       "RBAST-SQL-001",
                       f"User-controlled data flows into .{meth_text}() — SQL injection risk")
 
         # IO.popen(cmd), Open3.popen3(cmd)
-        elif meth_text in ("popen", "popen2", "popen3", "popen2e") and arg_nodes and taint(arg_nodes[0]):
+        elif meth_text in ("popen", "popen2", "popen3", "popen2e") and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                   "RBAST-CMD-001",
@@ -535,21 +646,21 @@ def _check_sinks(
 
         # Process.exec/spawn, PTY.spawn, Open3.capture2/2e/3
         elif recv_text == "Process" and meth_text in ("exec", "spawn") \
-                and arg_nodes and taint(arg_nodes[0]):
+                and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                   "RBAST-CMD-002",
                   f"User-controlled data flows into Process.{meth_text}() — OS command injection risk")
 
         elif recv_text == "PTY" and meth_text == "spawn" \
-                and arg_nodes and taint(arg_nodes[0]):
+                and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                   "RBAST-CMD-002",
                   "User-controlled data flows into PTY.spawn() — OS command injection risk")
 
         elif recv_text == "Open3" and meth_text in ("capture2", "capture2e", "capture3") \
-                and arg_nodes and taint(arg_nodes[0]):
+                and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                   "RBAST-CMD-002",
@@ -557,14 +668,14 @@ def _check_sinks(
 
         # ── Path traversal ────────────────────────────────────────────────
         elif recv_text in ("File", "IO") and meth_text in _FILE_METHODS:
-            if arg_nodes and taint(arg_nodes[0]):
+            if arg_nodes and taint_guarded(arg_nodes[0], node):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.PATH_TRAVERSAL, Severity.HIGH,
                       "RBAST-PATH-001",
                       f"User-controlled path flows into {recv_text}.{meth_text}() — path traversal risk")
 
         elif recv_text in ("Dir", "FileUtils") and meth_text in _DIR_METHODS | {"cp", "rm", "mv"}:
-            if arg_nodes and taint(arg_nodes[0]):
+            if arg_nodes and taint_guarded(arg_nodes[0], node):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.PATH_TRAVERSAL, Severity.MEDIUM,
                       "RBAST-PATH-001",
@@ -578,7 +689,7 @@ def _check_sinks(
                     val_node = arg.named_children[1] if len(arg.named_children) > 1 else None
                     if key_node and val_node:
                         key_text = key_node.text.decode("utf-8", errors="replace").strip(": ")
-                        if key_text in _RENDER_UNSAFE_KEYS and taint(val_node):
+                        if key_text in _RENDER_UNSAFE_KEYS and taint_guarded(val_node, node):
                             _emit(findings, seen, file_path, line, lines, repo_url,
                                   VulnType.XSS, Severity.HIGH,
                                   "RBAST-XSS-001",
@@ -586,14 +697,14 @@ def _check_sinks(
 
         # ── Open redirect: redirect_to tainted ───────────────────────────
         elif meth_text == "redirect_to" and not recv_text:
-            if arg_nodes and taint(arg_nodes[0]):
+            if arg_nodes and taint_guarded(arg_nodes[0], node):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.OPEN_REDIRECT, Severity.MEDIUM,
                       "RBAST-REDIR-001",
                       "User-controlled URL in redirect_to — open redirect risk")
 
         # ── SSRF: URI.open, Net::HTTP.get, HTTParty.get ──────────────────
-        elif meth_text in _HTTP_METHODS and arg_nodes and taint(arg_nodes[0]):
+        elif meth_text in _HTTP_METHODS and arg_nodes and taint_guarded(arg_nodes[0], node):
             if recv_text in ("URI", "Net::HTTP", "HTTParty", "Faraday",
                              "RestClient", "Typhoeus", "HTTP", "Excon") or (
                 not recv_text and meth_text == "open"
@@ -605,7 +716,7 @@ def _check_sinks(
 
         # ── Insecure deserialization: Marshal.load / Marshal.restore ─────
         elif recv_text == "Marshal" and meth_text in ("load", "restore"):
-            if arg_nodes and taint(arg_nodes[0]):
+            if arg_nodes and taint_guarded(arg_nodes[0], node):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
                       "RBAST-DESER-001",
@@ -614,14 +725,14 @@ def _check_sinks(
         # ── Insecure deserialization: YAML.load(tainted) ─────────────────
         # YAML.load with user-controlled input enables arbitrary object instantiation (Psych gadgets)
         elif recv_text == "YAML" and meth_text in ("load", "unsafe_load") \
-                and arg_nodes and taint(arg_nodes[0]):
+                and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
                   "RBAST-DESER-002",
                   "User-controlled data flows into YAML.load() — arbitrary object instantiation / RCE risk")
 
         # ── Code execution: eval(tainted) ─────────────────────────────────
-        elif meth_text in _EVAL_METHODS and arg_nodes and taint(arg_nodes[0]):
+        elif meth_text in _EVAL_METHODS and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                   "RBAST-EVAL-001",
@@ -629,7 +740,7 @@ def _check_sinks(
 
         # ── Arbitrary method dispatch: obj.send(tainted_method) ──────────
         # Object#send with a tainted method name allows calling any method on the receiver
-        elif meth_text in ("send", "public_send") and arg_nodes and taint(arg_nodes[0]):
+        elif meth_text in ("send", "public_send") and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                   "RBAST-EVAL-002",
@@ -638,7 +749,7 @@ def _check_sinks(
         # ── SSTI: ERB.new(tainted), Haml::Engine.new(tainted) ────────────
         # Checked BEFORE mass-assignment since "new" appears in both and SSTI is more specific.
         elif recv_text in _SSTI_RECEIVERS and meth_text == "new":
-            if arg_nodes and taint(arg_nodes[0]):
+            if arg_nodes and taint_guarded(arg_nodes[0], node):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.SSTI, Severity.CRITICAL,
                       "RBAST-SSTI-001",
@@ -646,7 +757,7 @@ def _check_sinks(
 
         # ── SSTI: Liquid::Template.parse(tainted) ────────────────────────
         elif recv_text in _SSTI_PARSE_RECEIVERS and meth_text == "parse":
-            if arg_nodes and taint(arg_nodes[0]):
+            if arg_nodes and taint_guarded(arg_nodes[0], node):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.SSTI, Severity.CRITICAL,
                       "RBAST-SSTI-001",
@@ -654,21 +765,21 @@ def _check_sinks(
 
         # ── ReDoS: Regexp.new(tainted) — user-controlled regex pattern ────
         # Checked BEFORE mass-assignment since "new" appears in _MASS_ASSIGN_METHODS.
-        elif recv_text == "Regexp" and meth_text == "new" and arg_nodes and taint(arg_nodes[0]):
+        elif recv_text == "Regexp" and meth_text == "new" and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.REDOS, Severity.HIGH,
                   "RBAST-REDOS-001",
                   "User-controlled data flows into Regexp.new() — ReDoS / regex injection risk")
 
         # ── ReDoS: str.match(tainted_pattern) — receiver-less or tainted arg ─
-        elif meth_text == "match" and arg_nodes and taint(arg_nodes[0]) and not recv_text:
+        elif meth_text == "match" and arg_nodes and taint_guarded(arg_nodes[0], node) and not recv_text:
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.REDOS, Severity.MEDIUM,
                   "RBAST-REDOS-001",
                   "User-controlled regex pattern in .match() — ReDoS risk")
 
         # ── Mass assignment: Model.create(params) / model.update(params) ─
-        elif meth_text in _MASS_ASSIGN_METHODS and arg_nodes and taint(arg_nodes[0]):
+        elif meth_text in _MASS_ASSIGN_METHODS and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.SQL_INJECTION, Severity.MEDIUM,
                   "RBAST-MASS-001",
@@ -677,7 +788,7 @@ def _check_sinks(
         # ── XXE: Nokogiri::XML.parse(tainted) without NOENT option ──────────
         elif recv_text in ("Nokogiri::XML", "Nokogiri::HTML", "Nokogiri") \
                 and meth_text in ("parse", "read", "from_memory") \
-                and arg_nodes and taint(arg_nodes[0]):
+                and arg_nodes and taint_guarded(arg_nodes[0], node):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.XXE, Severity.HIGH,
                   "RBAST-XXE-001",
@@ -713,6 +824,8 @@ class RubyASTAnalyzer(BaseAnalyzer):
         # Do not bail out when tainted is empty — direct request-source-to-sink flows
         # (e.g. User.create(params[:user])) are still detected by _is_request_source
         # inside _is_tainted, so _check_sinks must run even with no variable assignments.
+        parent_map = _build_parent_map(tree.root_node)
         return _check_sinks(
-            tree.root_node, tainted, tainted_methods, tainted_ivars, file_path, lines, repo_url
+            tree.root_node, tainted, tainted_methods, tainted_ivars,
+            file_path, lines, repo_url, parent_map,
         )

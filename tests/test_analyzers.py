@@ -7431,6 +7431,114 @@ class TestRubyInterproceduralTaint:
         assert "RBAST-SQL-001" in rule_ids, "two-hop interprocedural must be detected"
 
 
+# ── Conditional branch taint: Ruby ────────────────────────────────────────────
+
+@_skip_no_tsrb
+class TestRubyBranchTaint:
+    """Verify that branch-sensitive taint (numeric coercion + branch guard) works."""
+
+    def _az(self):
+        return RubyASTAnalyzer()
+
+    # ── Part 1: numeric coercion clears taint ─────────────────────────────
+
+    def test_to_i_clears_taint(self):
+        code = (
+            'id = params[:id].to_i\n'
+            'Model.where("SELECT * FROM t WHERE id = #{id}")\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        assert not any(f.rule_id == "RBAST-SQL-001" for f in findings), \
+            ".to_i should clear taint — integer result is not SQL-injectable"
+
+    def test_to_f_clears_taint(self):
+        code = (
+            'price = params[:price].to_f\n'
+            'Model.where("amount > #{price}")\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        assert not any(f.rule_id == "RBAST-SQL-001" for f in findings), \
+            ".to_f should clear taint"
+
+    def test_integer_function_clears_taint(self):
+        code = (
+            'n = Integer(params[:page])\n'
+            'Model.where("LIMIT #{n}")\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        assert not any(f.rule_id == "RBAST-SQL-001" for f in findings), \
+            "Integer() constructor should clear taint"
+
+    def test_raw_param_without_coercion_still_tainted(self):
+        code = (
+            'id = params[:id]\n'
+            'Model.where("SELECT * FROM t WHERE id = #{id}")\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        assert any(f.rule_id == "RBAST-SQL-001" for f in findings), \
+            "without coercion, param assignment must still be flagged"
+
+    # ── Part 2: if-branch guard suppresses findings inside validated branch ─
+
+    def test_regex_guard_suppresses_sql(self):
+        code = (
+            'id = params[:id]\n'
+            'if id =~ /\\A\\d+\\z/\n'
+            '  Model.where("SELECT * FROM t WHERE id = #{id}")\n'
+            'end\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        assert not any(f.rule_id == "RBAST-SQL-001" for f in findings), \
+            "sink inside regex-validated if-branch should be suppressed"
+
+    def test_match_guard_suppresses_sql(self):
+        code = (
+            'id = params[:id]\n'
+            'if id.match?(/\\A\\d+\\z/)\n'
+            '  Model.where("SELECT * FROM t WHERE id = #{id}")\n'
+            'end\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        assert not any(f.rule_id == "RBAST-SQL-001" for f in findings), \
+            "sink inside match?-guarded branch should be suppressed"
+
+    def test_is_a_integer_guard_suppresses_sql(self):
+        code = (
+            'id = params[:id]\n'
+            'if id.is_a?(Integer)\n'
+            '  Model.where("SELECT * FROM t WHERE id = #{id}")\n'
+            'end\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        assert not any(f.rule_id == "RBAST-SQL-001" for f in findings), \
+            "sink inside is_a?(Integer)-guarded branch should be suppressed"
+
+    def test_sink_outside_guard_still_flagged(self):
+        code = (
+            'id = params[:id]\n'
+            'if id.match?(/\\A\\d+\\z/)\n'
+            '  safe = 1\n'
+            'end\n'
+            'Model.where("SELECT * FROM t WHERE id = #{id}")\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        assert any(f.rule_id == "RBAST-SQL-001" for f in findings), \
+            "sink OUTSIDE the if-block must still be flagged"
+
+    def test_else_branch_still_flagged(self):
+        code = (
+            'id = params[:id]\n'
+            'if id.match?(/\\A\\d+\\z/)\n'
+            '  x = 1\n'
+            'else\n'
+            '  Model.where("SELECT * FROM t WHERE id = #{id}")\n'
+            'end\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        assert any(f.rule_id == "RBAST-SQL-001" for f in findings), \
+            "sink in the else branch must still be flagged"
+
+
 # ── Interprocedural taint: PHP caller-param seeding ───────────────────────────
 
 class TestPhpInterproceduralTaint:
