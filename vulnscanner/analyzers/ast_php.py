@@ -398,6 +398,82 @@ def _collect_pass(root, tainted: dict, tainted_funcs: set, tainted_props: set) -
     return changed
 
 
+def _build_php_func_param_map(root) -> dict[str, list[str]]:
+    """Build {func_name: [param_var_names (no $)]} for all function defs."""
+    result: dict[str, list[str]] = {}
+    for node in _walk(root):
+        if node.type != 'function_definition':
+            continue
+        name_nodes = [c for c in node.children if c.type == 'name']
+        if not name_nodes:
+            continue
+        fname = name_nodes[0].text.decode('utf-8', errors='replace')
+        formal = next((c for c in node.children if c.type == 'formal_parameters'), None)
+        params: list[str] = []
+        if formal:
+            for child in formal.named_children:
+                # simple_parameter, variadic_parameter, property_promotion_parameter
+                var_node = next(
+                    (c for c in child.children if c.type == 'variable_name'), None
+                )
+                if var_node:
+                    vname = _var_name(var_node)
+                    if vname:
+                        params.append(vname)
+        result[fname] = params
+    return result
+
+
+def _collect_php_call_site_taint(
+    root,
+    tainted: dict,
+    tainted_funcs: set,
+    tainted_props: set,
+    func_param_map: dict[str, list[str]],
+) -> bool:
+    """Seed callee param vars when a call site passes a tainted argument.
+
+    When `vulnerable_func($tainted_var)` is found and `vulnerable_func` is
+    defined locally, add the corresponding parameter variable to `tainted`.
+    """
+    changed = False
+    for node in _walk(root):
+        if node.type != 'function_call_expression':
+            continue
+        fname = _call_name(node)
+        if not fname or fname not in func_param_map:
+            continue
+        param_names = func_param_map[fname]
+        if not param_names:
+            continue
+        args_node = next(
+            (c for c in node.children if c.type == 'arguments'), None
+        )
+        if args_node is None:
+            continue
+        # Each child may be an `argument` wrapper or a direct expression
+        raw_args = [c for c in args_node.named_children
+                    if c.type not in ('(', ')', ',')]
+        args = []
+        for c in raw_args:
+            if c.type == 'argument':
+                # unwrap: first named child is the actual expression
+                expr = c.named_children[0] if c.named_children else c
+                args.append(expr)
+            else:
+                args.append(c)
+        for i, arg in enumerate(args):
+            if i >= len(param_names):
+                break
+            if _is_tainted_node(arg, tainted, tainted_funcs, tainted_props):
+                pname = param_names[i]
+                if pname not in tainted:
+                    line = arg.start_point[0] + 1
+                    tainted[pname] = (line, f"arg #{i} of {fname}()")
+                    changed = True
+    return changed
+
+
 def _build_taint(
     root,
     seed_funcs: "frozenset[str] | None" = None,
@@ -405,12 +481,17 @@ def _build_taint(
     """Fixed-point taint propagation, max 8 passes.
 
     seed_funcs: pre-known tainted function names from cross-file analysis.
+    Includes interprocedural caller→callee param seeding.
     """
     tainted: dict[str, tuple[int, str]] = {}
     tainted_funcs: set[str] = set(seed_funcs or ())
     tainted_props: set[str] = set()
+    func_param_map = _build_php_func_param_map(root)
     for _ in range(8):
-        if not _collect_pass(root, tainted, tainted_funcs, tainted_props):
+        c1 = _collect_pass(root, tainted, tainted_funcs, tainted_props)
+        c2 = _collect_php_call_site_taint(root, tainted, tainted_funcs,
+                                           tainted_props, func_param_map)
+        if not c1 and not c2:
             break
     return tainted, tainted_funcs, tainted_props
 

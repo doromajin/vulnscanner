@@ -7367,3 +7367,113 @@ class TestNodeHarness:
             findings, skipped = run(target, [])
             assert findings == []
             assert any("node not found" in s for s in skipped)
+
+
+# ── Interprocedural taint: Ruby caller-param seeding ──────────────────────────
+
+class TestRubyInterproceduralTaint:
+    """Verify that taint passes through same-file caller-param chains."""
+
+    def _az(self):
+        from vulnscanner.analyzers.ast_ruby import RubyASTAnalyzer, _TS_RUBY_AVAILABLE
+        if not _TS_RUBY_AVAILABLE:
+            pytest.skip("tree-sitter-ruby not installed")
+        return RubyASTAnalyzer()
+
+    def test_callee_param_sql_injection(self):
+        code = (
+            'def run_query(user_input)\n'
+            '  ActiveRecord::Base.connection.execute'
+            '("SELECT * FROM t WHERE id = #{user_input}")\n'
+            'end\n'
+            'run_query(params[:id])\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SQL-001" in rule_ids, "callee param must be tainted via call site"
+
+    def test_callee_param_cmd_injection(self):
+        code = (
+            'def run_cmd(user_cmd)\n'
+            '  system(user_cmd)\n'
+            'end\n'
+            'run_cmd(params[:cmd])\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-CMD-001" in rule_ids
+
+    def test_no_fp_safe_param_not_tainted(self):
+        code = (
+            'def run_query(user_input)\n'
+            '  ActiveRecord::Base.connection.execute'
+            '("SELECT * FROM t WHERE id = #{user_input}")\n'
+            'end\n'
+            "run_query('hardcoded')\n"
+        )
+        findings = self._az().analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SQL-001" not in rule_ids, "literal arg must NOT propagate taint"
+
+    def test_two_hop_interprocedural(self):
+        code = (
+            'def build_query(val)\n'
+            '  "SELECT * FROM t WHERE id = #{val}"\n'
+            'end\n'
+            'def execute_it(q)\n'
+            '  ActiveRecord::Base.connection.execute(q)\n'
+            'end\n'
+            'raw = build_query(params[:id])\n'
+            'execute_it(raw)\n'
+        )
+        findings = self._az().analyze("app.rb", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "RBAST-SQL-001" in rule_ids, "two-hop interprocedural must be detected"
+
+
+# ── Interprocedural taint: PHP caller-param seeding ───────────────────────────
+
+class TestPhpInterproceduralTaint:
+    """Verify that PHP interprocedural caller-param taint seeding works."""
+
+    def _az(self):
+        from vulnscanner.analyzers.ast_php import PhpASTAnalyzer, _TS_AVAILABLE
+        if not _TS_AVAILABLE:
+            pytest.skip("tree-sitter-php not installed")
+        return PhpASTAnalyzer()
+
+    def test_callee_param_sql_injection(self):
+        code = (
+            "<?php\n"
+            "function run_query($user_input) {\n"
+            "    mysql_query(\"SELECT * FROM t WHERE id = \" . $user_input);\n"
+            "}\n"
+            "run_query($_GET[\"id\"]);\n"
+        )
+        findings = self._az().analyze("app.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-SQL-001" in rule_ids, "callee param must be tainted via call site"
+
+    def test_callee_param_cmd_injection(self):
+        code = (
+            "<?php\n"
+            "function run_cmd($cmd) {\n"
+            "    system($cmd);\n"
+            "}\n"
+            "run_cmd($_POST[\"command\"]);\n"
+        )
+        findings = self._az().analyze("app.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-CMD-001" in rule_ids
+
+    def test_no_fp_safe_param_not_tainted(self):
+        code = (
+            "<?php\n"
+            "function run_query($user_input) {\n"
+            "    mysql_query(\"SELECT * FROM t WHERE id = \" . $user_input);\n"
+            "}\n"
+            "run_query('hardcoded_value');\n"
+        )
+        findings = self._az().analyze("app.php", code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "PHAST-SQL-001" not in rule_ids, "literal arg must NOT propagate taint"

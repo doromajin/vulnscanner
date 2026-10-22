@@ -63,7 +63,7 @@ def _get_ruby_cf_ctx() -> "RubyCrossFileContext | None":
 
 
 def build_ruby_cross_file_context(all_contents: dict[str, str]) -> RubyCrossFileContext:
-    """Pre-pass: collect all method names that return tainted data across all .rb files."""
+    """Pre-pass: collect all method names that return OR receive tainted data."""
     if not _TS_RUBY_AVAILABLE:
         return RubyCrossFileContext()
 
@@ -73,8 +73,13 @@ def build_ruby_cross_file_context(all_contents: dict[str, str]) -> RubyCrossFile
             continue
         try:
             tree = _ruby_parser.parse(content.encode("utf-8", errors="replace"))
-            _, file_methods, _ = _build_taint(tree.root_node)
+            tainted, file_methods, tainted_ivars = _build_taint(tree.root_node)
             global_tainted.update(file_methods)
+            # Also collect methods whose params appear in tainted (callee-param seeding)
+            param_map = _build_method_param_map(tree.root_node)
+            for mname, params in param_map.items():
+                if any(p in tainted for p in params):
+                    global_tainted.add(mname)
         except Exception:
             pass
     return RubyCrossFileContext(tainted_method_names=frozenset(global_tainted))
@@ -262,14 +267,95 @@ def _collect_method_taint(root, tainted: set[str], tainted_methods: set[str],
         body = node.child_by_field_name("body")
         if body is None:
             continue
-        # Check explicit return statements and last expression
+
+        found = False
+        # Check explicit return statements
         for sub in _walk(body):
             if sub.type == "return":
                 for child in sub.named_children:
                     if _is_tainted(child, tainted, tainted_methods, tainted_ivars):
-                        tainted_methods.add(mname)
-                        changed = True
+                        found = True
                         break
+            if found:
+                break
+
+        # Check implicit return: last named child of body_statement
+        if not found and body.named_children:
+            last_stmt = body.named_children[-1]
+            if _is_tainted(last_stmt, tainted, tainted_methods, tainted_ivars):
+                found = True
+
+        if found:
+            tainted_methods.add(mname)
+            changed = True
+    return changed
+
+
+def _build_method_param_map(root) -> dict[str, list[str]]:
+    """Build {method_name: [param_names]} for all method defs in this file."""
+    result: dict[str, list[str]] = {}
+    for node in _walk(root):
+        if node.type != "method":
+            continue
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            continue
+        mname = name_node.text.decode("utf-8", errors="replace")
+        params_node = node.child_by_field_name("parameters")
+        param_names: list[str] = []
+        if params_node:
+            for child in params_node.named_children:
+                if child.type == "identifier":
+                    param_names.append(child.text.decode("utf-8", errors="replace"))
+                elif child.type in ("optional_parameter", "keyword_parameter"):
+                    nm = child.child_by_field_name("name")
+                    if nm:
+                        param_names.append(nm.text.decode("utf-8", errors="replace"))
+                elif child.type == "splat_parameter":
+                    nm = child.named_children[0] if child.named_children else None
+                    if nm:
+                        param_names.append(nm.text.decode("utf-8", errors="replace"))
+        result[mname] = param_names
+    return result
+
+
+def _collect_call_site_taint(
+    root,
+    tainted: set[str],
+    tainted_methods: set[str],
+    tainted_ivars: set[str],
+    method_param_map: dict[str, list[str]],
+) -> bool:
+    """Seed callee param names when a call site passes a tainted argument.
+
+    When `vulnerable_method(tainted_var)` is found and `vulnerable_method` is
+    defined locally, add the corresponding parameter name to `tainted`.
+    This propagates taint into method bodies that receive user-controlled data
+    from their call site (interprocedural caller→callee seeding).
+    """
+    changed = False
+    for node in _walk(root):
+        if node.type != "call":
+            continue
+        _recv, mname = _call_receiver_method(node)
+        if mname not in method_param_map:
+            continue
+        param_names = method_param_map[mname]
+        if not param_names:
+            continue
+        args_node = node.child_by_field_name("arguments")
+        if args_node is None:
+            continue
+        args = [c for c in args_node.named_children
+                if c.type not in (")", "(", ",")]
+        for i, arg in enumerate(args):
+            if i >= len(param_names):
+                break
+            if _is_tainted(arg, tainted, tainted_methods, tainted_ivars):
+                pname = param_names[i]
+                if pname not in tainted:
+                    tainted.add(pname)
+                    changed = True
     return changed
 
 
@@ -280,14 +366,18 @@ def _build_taint(
     """Fixed-point taint collection, max 8 passes.
 
     seed_methods: pre-known tainted method names from cross-file analysis.
+    Includes interprocedural caller→callee param seeding.
     """
     tainted: set[str] = set()
     tainted_methods: set[str] = set(seed_methods or ())
     tainted_ivars: set[str] = set()
+    method_param_map = _build_method_param_map(root)
     for _ in range(8):
         c1 = _collect_assignments(root, tainted, tainted_methods, tainted_ivars)
         c2 = _collect_method_taint(root, tainted, tainted_methods, tainted_ivars)
-        if not c1 and not c2:
+        c3 = _collect_call_site_taint(root, tainted, tainted_methods, tainted_ivars,
+                                       method_param_map)
+        if not c1 and not c2 and not c3:
             break
     return tainted, tainted_methods, tainted_ivars
 
