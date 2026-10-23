@@ -2070,6 +2070,16 @@ def _build_method_scope_tainted(method_node, tree, const_ints: dict, dead_lines:
                                 init.member, init.arguments or [], m_tainted, m_ci)
                             if _rmr is True:
                                 m_tainted.add(vn); chg = True; continue
+                    # ClassCreator+selector: (new Foo()).source(args) — _is_tainted only
+                    # checks constructor args and misses selector-based taint sources.
+                    if (isinstance(init, jt.ClassCreator)
+                            and init.selectors
+                            and isinstance(init.selectors[-1], jt.MethodInvocation)):
+                        _ccs_mi = init.selectors[-1]
+                        _rcc = _analyze_remote_method(
+                            _ccs_mi.member, _ccs_mi.arguments or [], m_tainted, m_ci)
+                        if _rcc is True:
+                            m_tainted.add(vn); chg = True; continue
                     if _is_tainted(init, m_tainted, m_ci):
                         m_tainted.add(vn); chg = True
         except Exception:
@@ -2090,6 +2100,14 @@ def _build_method_scope_tainted(method_node, tree, const_ints: dict, dead_lines:
                 rhs = assign.value
                 if isinstance(rhs, jt.MethodInvocation) and _is_request_source(rhs):
                     m_tainted.add(vn); chg = True; continue
+                if (isinstance(rhs, jt.ClassCreator)
+                        and rhs.selectors
+                        and isinstance(rhs.selectors[-1], jt.MethodInvocation)):
+                    _ccs_a = rhs.selectors[-1]
+                    _rcc2 = _analyze_remote_method(
+                        _ccs_a.member, _ccs_a.arguments or [], m_tainted, m_ci)
+                    if _rcc2 is True:
+                        m_tainted.add(vn); chg = True; continue
                 if _is_tainted(rhs, m_tainted, m_ci):
                     m_tainted.add(vn); chg = True
         except Exception:
