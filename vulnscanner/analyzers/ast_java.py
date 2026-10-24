@@ -265,6 +265,47 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                         break
             except Exception:
                 pass
+        # XSS sinks: response.getWriter().println/print(tainted_arg)
+        # Registered independently — a method could have SQL + XSS sinks simultaneously.
+        try:
+            # Collect local PrintWriter names from response.getWriter() assignments
+            _pw_locals: set = set()
+            for _, _pw_lvd in mnode.filter(jt.LocalVariableDeclaration):
+                for _pw_decl in _pw_lvd.declarators:
+                    _pw_init = _pw_decl.initializer
+                    if (isinstance(_pw_init, jt.MethodInvocation)
+                            and _pw_init.member == "getWriter"
+                            and str(_pw_init.qualifier or "") in _RESPONSE_OBJECTS):
+                        _pw_locals.add(_pw_decl.name)
+            for _, mi in mnode.filter(jt.MethodInvocation):
+                _xss_hit = False
+                # Pattern 1: response.getWriter().println(tainted)
+                if (mi.member == "getWriter"
+                        and str(mi.qualifier or "") in _RESPONSE_OBJECTS):
+                    for _xsel in (mi.selectors or []):
+                        if (isinstance(_xsel, jt.MethodInvocation)
+                                and _xsel.member in _XSS_SINK_METHODS
+                                and any(_is_tainted(a, tl) for a in (_xsel.arguments or []))):
+                            _xss_hit = True
+                            break
+                # Pattern 2: writer.println(tainted) where writer = response.getWriter()
+                if (not _xss_hit
+                        and mi.member in _XSS_SINK_METHODS
+                        and str(mi.qualifier or "") in _pw_locals
+                        and any(_is_tainted(a, tl) for a in (mi.arguments or []))):
+                    _xss_hit = True
+                if _xss_hit:
+                    for pn, pidx in pbyn.items():
+                        if pn in tl:
+                            result.setdefault(pidx, (
+                                "JAST-XSS-001", VulnType.XSS, Severity.HIGH,
+                                f"cross-file: tainted arg passed to {mnode.name}() "
+                                "which outputs to HTTP response — reflected XSS; "
+                                "encode output with ESAPI or escapeHtml",
+                            ))
+                    break
+        except Exception:
+            pass
         return result
 
     for tree, _fp in parsed_trees:
