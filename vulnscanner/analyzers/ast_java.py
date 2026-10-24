@@ -2100,6 +2100,14 @@ def _build_method_scope_tainted(method_node, tree, const_ints: dict, dead_lines:
                 rhs = assign.value
                 if isinstance(rhs, jt.MethodInvocation) and _is_request_source(rhs):
                     m_tainted.add(vn); chg = True; continue
+                # Unqualified local method call: data = bad_source(args)
+                if (isinstance(rhs, jt.MethodInvocation)
+                        and rhs.qualifier == ""
+                        and not _is_request_source(rhs)):
+                    _loc_se = _analyze_local_method(
+                        tree, rhs.member, rhs.arguments or [], m_tainted, m_ci)
+                    if _loc_se is True:
+                        m_tainted.add(vn); chg = True; continue
                 if (isinstance(rhs, jt.ClassCreator)
                         and rhs.selectors
                         and isinstance(rhs.selectors[-1], jt.MethodInvocation)):
