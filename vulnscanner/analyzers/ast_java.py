@@ -705,6 +705,12 @@ def _is_request_source(node) -> bool:
         return True  # tainted regardless of what object it is called on
     if _is_android_source(node):
         return True
+    # Properties.getProperty() reads from external files (potentially user-controlled).
+    # Excluded: System.getProperty() is JVM configuration, not user input (cf. os.environ).
+    if node.member == "getProperty":
+        q = str(node.qualifier or "")
+        if q and q != "System":
+            return True
     if node.member not in _REQUEST_METHODS:
         return False
     q = node.qualifier or ""
@@ -2374,6 +2380,35 @@ def _compute_method_local_clean(
     #  Juliet _42: data=goodG2BSource() is locally clean but global tainted from badSource())
     # Only suppresses LOCAL VARIABLES (LVD names within the method body) — never instance
     # fields, to avoid suppressing legitimate inter-method field-taint (e.g., SecuriBench Inter4).
+
+    # Pre-compute class fields that receive ACTUAL taint (via per-method scope analysis).
+    # Used in Pass 3 to avoid suppressing LVDs initialized from those fields.
+    # (Juliet _45: badSink() does `data = dataBad` where dataBad is set by bad() from readLine.
+    #  _build_method_scope_tainted runs fresh so it can't see dataBad is tainted, causing FN.)
+    _class_field_taints: set = set()
+    try:
+        _cft_declared: set = set()
+        for _, _fd in tree.filter(jt.FieldDeclaration):
+            for _fdecl in (_fd.declarators or []):
+                _cft_declared.add(_fdecl.name)
+        if _cft_declared:
+            for _, _cft_m in tree.filter(jt.MethodDeclaration):
+                _cft_scope = _build_method_scope_tainted(_cft_m, tree, const_ints, dead_lines)
+                if not _cft_scope:
+                    continue
+                for _, _cft_se in _cft_m.filter(jt.StatementExpression):
+                    if not isinstance(getattr(_cft_se, "expression", None), jt.Assignment):
+                        continue
+                    _cft_lhs = _cft_se.expression.expressionl
+                    _cft_rhs = _cft_se.expression.value
+                    if (isinstance(_cft_lhs, jt.MemberReference)
+                            and not str(_cft_lhs.qualifier or "")
+                            and _cft_lhs.member in _cft_declared
+                            and _is_tainted(_cft_rhs, _cft_scope, const_ints)):
+                        _class_field_taints.add(_cft_lhs.member)
+    except Exception:
+        pass
+
     try:
         sorted_methods = sorted(
             (m for _, m in tree.filter(jt.MethodDeclaration)),
@@ -2405,7 +2440,23 @@ def _compute_method_local_clean(
             # paths (e.g., enhanced-for variables, nested constructors). Being conservative:
             # if any local taint was found, don't suppress anything in this method.
             if not m_scope_tainted:
-                for vn in local_lvd_vars:
+                # Don't suppress LVDs initialized from class fields that carry actual taint.
+                # Juliet _45: `data = dataBad` where dataBad was set from readLine() in bad().
+                _field_seeded: set = set()
+                if _class_field_taints:
+                    try:
+                        for _, _fs_lvd in method_node.filter(jt.LocalVariableDeclaration):
+                            for _fs_decl in _fs_lvd.declarators:
+                                if _fs_decl.name not in local_lvd_vars:
+                                    continue
+                                _fs_init = _fs_decl.initializer
+                                if (isinstance(_fs_init, jt.MemberReference)
+                                        and not str(_fs_init.qualifier or "")
+                                        and _fs_init.member in _class_field_taints):
+                                    _field_seeded.add(_fs_decl.name)
+                    except Exception:
+                        pass
+                for vn in local_lvd_vars - _field_seeded:
                     method_local_clean.setdefault(m_idx, set()).add(vn)
     except Exception:
         pass
