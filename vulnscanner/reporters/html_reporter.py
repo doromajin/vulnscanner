@@ -97,6 +97,12 @@ tbody td { padding: 9px 12px; vertical-align: middle; }
 .file-group-chevron.open { transform: rotate(90deg); }
 .file-group-body { border-left: 2px solid #30363d; margin-left: 12px; padding-left: 8px; overflow: hidden; max-height: 0; transition: max-height .2s; }
 .file-group-body.open { max-height: 9999px; }
+.type-stats { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; min-width: 200px; }
+.type-stats .bar-title { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
+.export-btn { background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #8b949e; cursor: pointer; font-size: 0.78rem; padding: 4px 10px; }
+.export-btn:hover { border-color: #3fb950; color: #3fb950; }
+.group-ctrl { font-size: 0.78rem; color: #58a6ff; cursor: pointer; background: none; border: none; padding: 0; }
+.group-ctrl:hover { text-decoration: underline; }
 """
 
 _JS = """
@@ -168,13 +174,16 @@ const groupView = document.getElementById('view-group');
 const tableWrap = document.getElementById('table-wrap');
 const groupWrap = document.getElementById('group-wrap');
 
+const groupControls = document.getElementById('group-controls');
 flatView.addEventListener('click', () => {
   flatView.classList.add('active'); groupView.classList.remove('active');
   tableWrap.style.display = ''; groupWrap.style.display = 'none';
+  if (groupControls) groupControls.style.display = 'none';
 });
 groupView.addEventListener('click', () => {
   groupView.classList.add('active'); flatView.classList.remove('active');
   tableWrap.style.display = 'none'; groupWrap.style.display = '';
+  if (groupControls) groupControls.style.display = 'flex';
 });
 
 // Group accordion
@@ -185,6 +194,86 @@ document.querySelectorAll('.file-group-header').forEach(hdr => {
     body.classList.toggle('open');
     chev.classList.toggle('open');
   });
+});
+
+// Expand / Collapse all
+document.getElementById('expand-all')?.addEventListener('click', () => {
+  document.querySelectorAll('.file-group-body').forEach(b => b.classList.add('open'));
+  document.querySelectorAll('.file-group-chevron').forEach(c => c.classList.add('open'));
+});
+document.getElementById('collapse-all')?.addEventListener('click', () => {
+  document.querySelectorAll('.file-group-body').forEach(b => b.classList.remove('open'));
+  document.querySelectorAll('.file-group-chevron').forEach(c => c.classList.remove('open'));
+});
+
+// Type filter
+document.querySelectorAll('.type-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    btn.classList.toggle('active');
+    applyFilters();
+  });
+});
+
+// Override applyFilters to also handle type filter
+const _baseApplyFilters = applyFilters;
+applyFilters = function() {
+  const activeSevs = [...document.querySelectorAll('.filter-btn.active')].map(b => b.dataset.sev);
+  const activeTypes = [...document.querySelectorAll('.type-btn.active')].map(b => b.dataset.type);
+  const q = document.getElementById('search').value.toLowerCase();
+  let visible = 0;
+  rows.forEach((row, i) => {
+    const sev = row.dataset.sev;
+    const type = row.dataset.type || '';
+    const text = row.textContent.toLowerCase();
+    const sevOk = activeSevs.length === 0 || activeSevs.includes(sev);
+    const typeOk = activeTypes.length === 0 || activeTypes.includes(type);
+    const qOk = !q || text.includes(q);
+    const hide = !sevOk || !typeOk || !qOk;
+    row.classList.toggle('hidden', hide);
+    details[i].classList.toggle('hidden', hide);
+    if (!hide) visible++;
+  });
+  document.getElementById('visible-count').textContent = visible;
+};
+// Re-wire existing listeners to new applyFilters
+document.getElementById('search').removeEventListener('input', _baseApplyFilters);
+document.getElementById('search').addEventListener('input', applyFilters);
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.removeEventListener('click', () => {}); // can't cleanly unbind, but new handler is correct
+});
+
+// CSV export
+document.getElementById('export-csv')?.addEventListener('click', () => {
+  const cols = ['Severity','Rule','Type','File','Line','Confidence','Description'];
+  const csvRows = [cols.join(',')];
+  rows.forEach((row, i) => {
+    if (row.classList.contains('hidden')) return;
+    const cells = row.cells;
+    const vals = [
+      cells[0]?.textContent.trim().replace(/NEW/g,''),
+      cells[1]?.textContent.trim(),
+      cells[2]?.textContent.trim(),
+      cells[3]?.title || cells[3]?.textContent.trim(),
+      cells[4]?.textContent.trim(),
+      cells[5]?.textContent.trim(),
+      cells[6]?.textContent.trim(),
+    ].map(v => '"' + (v||'').replace(/"/g,'""') + '"');
+    csvRows.push(vals.join(','));
+  });
+  const blob = new Blob([csvRows.join('\\n')], {type:'text/csv;charset=utf-8;'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'vulnscanner_findings.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+// Keyboard: Esc to close all open detail rows
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    details.forEach(d => d.classList.remove('open'));
+    rows.forEach(r => r.classList.remove('expanded'));
+  }
 });
 """
 
@@ -256,8 +345,9 @@ def _build_finding_rows(findings, new_finding_keys) -> str:
         rule = html.escape(f.rule_id)
         vuln = html.escape(f.vuln_type.value if hasattr(f.vuln_type, "value") else str(f.vuln_type))
 
+        vt_val = html.escape(f.vuln_type.value if hasattr(f.vuln_type, "value") else str(f.vuln_type))
         rows_html += (
-            f'<tr class="finding-row" data-sev="{sev}">'
+            f'<tr class="finding-row" data-sev="{sev}" data-type="{vt_val}">'
             f'<td>{_sev_badge(sev)}{new_badge}</td>'
             f'<td><span class="rule-id">{rule}</span></td>'
             f'<td>{vuln}</td>'
@@ -424,6 +514,30 @@ def write_html(
         f'</div>\n'
     ) if bar_rows else ""
 
+    # ── type stats ──────────────────────────────────────────────────────────
+    type_counts: dict[str, int] = defaultdict(int)
+    for f in findings:
+        vt = f.vuln_type.value if hasattr(f.vuln_type, "value") else str(f.vuln_type)
+        type_counts[vt] += 1
+
+    type_bar_rows = ""
+    max_type = max(type_counts.values(), default=1) or 1
+    for vt, n in sorted(type_counts.items(), key=lambda x: -x[1]):
+        pct = int(n / max_type * 100)
+        type_bar_rows += (
+            f'<div class="bar-row">'
+            f'<span class="bar-label" style="width:130px;font-size:0.72rem">{html.escape(vt[:22])}</span>'
+            f'<span class="bar-track"><span class="bar-fill" style="width:{pct}%;background:#388bfd"></span></span>'
+            f'<span class="bar-count">{n}</span>'
+            f'</div>\n'
+        )
+    type_chart = (
+        f'<div class="type-stats">'
+        f'<div class="bar-title">By Type</div>'
+        f'{type_bar_rows}'
+        f'</div>\n'
+    ) if type_bar_rows else ""
+
     # ── filter buttons ───────────────────────────────────────────────────────
     filter_btns = ""
     for sev in Severity:
@@ -432,6 +546,17 @@ def write_html(
                 f'<button class="filter-btn" data-sev="{sev.value}">'
                 f'{sev.value} ({counts[sev]})</button>\n'
             )
+
+    # ── type filter buttons ──────────────────────────────────────────────────
+    type_filter_btns = ""
+    for vt, n in sorted(type_counts.items(), key=lambda x: -x[1]):
+        vt_e = html.escape(vt)
+        # Short label: use first word of type name
+        short = vt.split("(")[0].strip()[:18]
+        type_filter_btns += (
+            f'<button class="type-btn filter-btn" data-type="{vt_e}" '
+            f'title="{vt_e}">{html.escape(short)} ({n})</button>\n'
+        )
 
     # ── findings table rows ──────────────────────────────────────────────────
     rows_html = _build_finding_rows(findings, new_finding_keys)
@@ -465,17 +590,30 @@ def write_html(
     <div class="meta">{target} &nbsp;·&nbsp; {now} &nbsp;·&nbsp; scanned in {elapsed}</div>
   </div>
 </header>
-<div class="summary">{cards_html}{sev_chart}</div>
+<div class="summary">{cards_html}{sev_chart}{type_chart}</div>
 {baseline_note}
 <div class="filters">
-  <label>Filter:</label>
+  <label>Severity:</label>
   {filter_btns}
-  <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+</div>
+<div class="filters" style="padding-top:0">
+  <label>Type:</label>
+  {type_filter_btns}
+</div>
+<div class="filters" style="padding-top:4px">
+  <span style="display:flex;gap:6px;align-items:center">
     <button id="view-flat" class="view-btn active">Flat</button>
     <button id="view-group" class="view-btn">By File</button>
-    &nbsp;
-    <input id="search" class="search-box" placeholder="Search rule / file / description…" type="text">
   </span>
+  <span id="group-controls" style="display:none;gap:6px;align-items:center">
+    &nbsp;
+    <button id="expand-all" class="group-ctrl">Expand all</button>
+    <span style="color:#30363d">|</span>
+    <button id="collapse-all" class="group-ctrl">Collapse all</button>
+  </span>
+  &nbsp;
+  <input id="search" class="search-box" placeholder="Search rule / file / description…" type="text">
+  <button id="export-csv" class="export-btn" title="Download visible findings as CSV">&#8595; CSV</button>
   <span style="font-size:0.8rem;color:#8b949e;margin-left:8px">
     Showing <b id="visible-count">{total}</b> finding(s)
   </span>

@@ -81,6 +81,9 @@ class JavaCrossFileCtx:
     sink_registry: dict[str, dict[int, tuple]] = field(default_factory=dict)
     # method_name-only reverse index for variable-qualifier MI lookup (no type inference)
     sink_registry_by_method: dict[str, dict[int, tuple]] = field(default_factory=dict)
+    # (class_name, method_name) pairs that are ACTUALLY called with tainted data —
+    # used to emit callee-side findings without FPs from always-safe callers.
+    callee_taint_sink: set = field(default_factory=set)
 
 
 _java_cf_local = threading.local()
@@ -419,11 +422,104 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
     for (ck, mk), sv in sink_registry.items():
         sink_registry_by_method.setdefault(mk, {}).update(sv)
 
+    # Phase 3 — callee taint sink: find registered-sink methods that are ACTUALLY
+    # invoked with tainted data.  Uses a lightweight inline taint check (3 iters,
+    # direct sources only) to avoid the cost of _build_method_scope_tainted.
+    callee_taint_sink: set = set()
+    _sr_keys_p3 = set(sink_registry.keys())
+    _sr_method_names_p3 = {mk for (_, mk) in _sr_keys_p3}
+    for tree, _fp in parsed_trees:
+        try:
+            for _, cls in tree.filter(jt.ClassDeclaration):
+                for method in (cls.methods or []):
+                    # Lightweight taint: direct request/socket sources only, 3 iters.
+                    # Handles both LVD initializers AND assignment statements so that
+                    # patterns like `data = readerBuffered.readLine()` are captured.
+                    _p3_tl: set = set()
+                    try:
+                        for _ in range(3):
+                            _chg3 = False
+                            for _, lvd in method.filter(jt.LocalVariableDeclaration):
+                                for decl in lvd.declarators:
+                                    if decl.name in _p3_tl:
+                                        continue
+                                    init = decl.initializer
+                                    if init is None:
+                                        continue
+                                    if _is_request_source(init):
+                                        _p3_tl.add(decl.name); _chg3 = True
+                                    elif _is_tainted(init, _p3_tl):
+                                        _p3_tl.add(decl.name); _chg3 = True
+                            for _, se in method.filter(jt.StatementExpression):
+                                asgn = getattr(se, "expression", None)
+                                if not isinstance(asgn, jt.Assignment):
+                                    continue
+                                lhs = asgn.expressionl
+                                if (not isinstance(lhs, jt.MemberReference)
+                                        or str(lhs.qualifier or "")):
+                                    continue
+                                vn = lhs.member
+                                if vn in _p3_tl:
+                                    continue
+                                rhs = asgn.value
+                                if _is_request_source(rhs):
+                                    _p3_tl.add(vn); _chg3 = True
+                                elif _is_tainted(rhs, _p3_tl):
+                                    _p3_tl.add(vn); _chg3 = True
+                            if not _chg3:
+                                break
+                    except Exception:
+                        pass
+                    if not _p3_tl:
+                        continue
+                    # ClassCreator+selector: (new Callee()).badSink(tainted_arg)
+                    try:
+                        for _, cc in method.filter(jt.ClassCreator):
+                            c_cls = _type_name(cc.type)
+                            for sel in (cc.selectors or []):
+                                if not isinstance(sel, jt.MethodInvocation):
+                                    continue
+                                if sel.member not in _sr_method_names_p3:
+                                    continue
+                                _ckey = (c_cls, sel.member)
+                                if _ckey not in _sr_keys_p3:
+                                    continue
+                                _c_reg = sink_registry[_ckey]
+                                _c_args = sel.arguments or []
+                                for _pidx in _c_reg:
+                                    if _pidx < len(_c_args) and _is_tainted(_c_args[_pidx], _p3_tl):
+                                        callee_taint_sink.add(_ckey)
+                                        break
+                    except Exception:
+                        pass
+                    # Plain MI: Callee.badSink(tainted_arg) with uppercase qualifier
+                    try:
+                        for _, mi in method.filter(jt.MethodInvocation):
+                            if mi.member not in _sr_method_names_p3:
+                                continue
+                            q = str(mi.qualifier or "")
+                            if not q or not q[0].isupper():
+                                continue
+                            _mkey = (q, mi.member)
+                            if _mkey not in _sr_keys_p3:
+                                continue
+                            _m_reg = sink_registry[_mkey]
+                            _m_args = mi.arguments or []
+                            for _pidx in _m_reg:
+                                if _pidx < len(_m_args) and _is_tainted(_m_args[_pidx], _p3_tl):
+                                    callee_taint_sink.add(_mkey)
+                                    break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     return JavaCrossFileCtx(
         remote_methods=remote_methods,
         tainted_callee_params=tainted_callee_params,
         sink_registry=sink_registry,
         sink_registry_by_method=sink_registry_by_method,
+        callee_taint_sink=callee_taint_sink,
     )
 
 
@@ -3373,6 +3469,131 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                 break
                 except Exception:
                     pass
+
+        # Pattern C: callee-side detection — emit findings IN the sink method when
+        # it is known (from Phase 3 analysis) to be called with tainted data.
+        # This covers _51b, _52b-e, _53b-d, _54b-e, _66b, _67a, _67b, _68a, _68b,
+        # _71b, _72b, _73b, _74a, _74b cross-class patterns without adding FPs.
+        if _cf_sr and _cf_sr.callee_taint_sink:
+            try:
+                for _, _pc_cls in tree.filter(jt.ClassDeclaration):
+                    _pc_cname = _pc_cls.name
+                    for _pc_m in (_pc_cls.methods or []):
+                        _pc_key = (_pc_cname, _pc_m.name)
+                        if _pc_key not in _cf_sr.callee_taint_sink:
+                            continue
+                        _pc_sr = _cf_sr.sink_registry.get(_pc_key, {})
+                        if not _pc_sr:
+                            continue
+                        # Seed registered params as tainted
+                        _pc_params = _pc_m.parameters or []
+                        _pc_tl: set = set()
+                        for _pi, _pp in enumerate(_pc_params):
+                            _ppn = getattr(_pp, "name", "")
+                            if _ppn and _pi in _pc_sr:
+                                _pc_tl.add(_ppn)
+                        if not _pc_tl:
+                            continue
+                        # Propagate taint (3 iters)
+                        for _ in range(3):
+                            try:
+                                for _, _pc_lvd in _pc_m.filter(jt.LocalVariableDeclaration):
+                                    for _pc_d in _pc_lvd.declarators:
+                                        if _pc_d.name not in _pc_tl and _pc_d.initializer:
+                                            if _is_tainted(_pc_d.initializer, _pc_tl):
+                                                _pc_tl.add(_pc_d.name)
+                            except Exception:
+                                pass
+                        # XSS sinks
+                        try:
+                            _pc_pw: set = set()
+                            for _, _pc_plvd in _pc_m.filter(jt.LocalVariableDeclaration):
+                                for _pc_pd in _pc_plvd.declarators:
+                                    _pc_pi = _pc_pd.initializer
+                                    if (isinstance(_pc_pi, jt.MethodInvocation)
+                                            and _pc_pi.member == "getWriter"
+                                            and str(_pc_pi.qualifier or "") in _RESPONSE_OBJECTS):
+                                        _pc_pw.add(_pc_pd.name)
+                            for _pc_xp, _pc_xmi in _pc_m.filter(jt.MethodInvocation):
+                                _pc_xhit = False
+                                if (_pc_xmi.member == "getWriter"
+                                        and str(_pc_xmi.qualifier or "") in _RESPONSE_OBJECTS):
+                                    for _pc_xs in (_pc_xmi.selectors or []):
+                                        if (isinstance(_pc_xs, jt.MethodInvocation)
+                                                and _pc_xs.member in _XSS_SINK_METHODS
+                                                and any(_is_tainted(a, _pc_tl)
+                                                        for a in (_pc_xs.arguments or []))):
+                                            _pc_xhit = True
+                                            break
+                                if (not _pc_xhit
+                                        and _pc_xmi.member in _XSS_SINK_METHODS
+                                        and str(_pc_xmi.qualifier or "") in _pc_pw
+                                        and any(_is_tainted(a, _pc_tl)
+                                                for a in (_pc_xmi.arguments or []))):
+                                    _pc_xhit = True
+                                if _pc_xhit:
+                                    _pc_xl = _node_line(_pc_xmi)
+                                    if not _pc_xl:
+                                        for _pc_xa in reversed(_pc_xp):
+                                            _pc_xl = _node_line(_pc_xa)
+                                            if _pc_xl:
+                                                break
+                                    _add(None, VulnType.XSS, Severity.HIGH, "JAST-XSS-001",
+                                         f"callee: tainted arg in {_pc_m.name}() reaches HTTP response"
+                                         " — reflected XSS; encode output with ESAPI or escapeHtml",
+                                         line_override=_pc_xl or 0)
+                                    break
+                        except Exception:
+                            pass
+                        # Path sinks
+                        try:
+                            for _pc_ppath, _pc_pcc in _pc_m.filter(jt.ClassCreator):
+                                if _type_name(_pc_pcc.type) not in _FILE_CLASSES:
+                                    continue
+                                if any(_is_tainted(a, _pc_tl) for a in (_pc_pcc.arguments or [])):
+                                    _pc_pl = _node_line(_pc_pcc)
+                                    if not _pc_pl:
+                                        for _pc_pa in reversed(_pc_ppath):
+                                            _pc_pl = _node_line(_pc_pa)
+                                            if _pc_pl:
+                                                break
+                                    _add(None, VulnType.PATH_TRAVERSAL, Severity.HIGH,
+                                         "JAST-PATH-001",
+                                         f"callee: tainted arg in {_pc_m.name}() opens a file"
+                                         " — path traversal; validate and normalize path",
+                                         line_override=_pc_pl or 0)
+                                    break
+                        except Exception:
+                            pass
+                        # Intermediate cross-file sink calls (_52b calling _52c etc.)
+                        try:
+                            for _pc_ip, _pc_icc in _pc_m.filter(jt.ClassCreator):
+                                _pc_icls = _type_name(_pc_icc.type)
+                                for _pc_isel in (_pc_icc.selectors or []):
+                                    if not isinstance(_pc_isel, jt.MethodInvocation):
+                                        continue
+                                    _pc_ikey = (_pc_icls, _pc_isel.member)
+                                    _pc_ics = _cf_sr.sink_registry.get(_pc_ikey)
+                                    if not _pc_ics:
+                                        continue
+                                    _pc_iargs = _pc_isel.arguments or []
+                                    for _pc_ipipdx, (_pc_irid, _pc_ivt, _pc_isv, _pc_idesc) \
+                                            in _pc_ics.items():
+                                        if (_pc_ipipdx < len(_pc_iargs)
+                                                and _is_tainted(_pc_iargs[_pc_ipipdx], _pc_tl)):
+                                            _pc_il = _node_line(_pc_isel)
+                                            if not _pc_il:
+                                                for _pc_ia in reversed(_pc_ip):
+                                                    _pc_il = _node_line(_pc_ia)
+                                                    if _pc_il:
+                                                        break
+                                            _add(None, _pc_ivt, _pc_isv, _pc_irid, _pc_idesc,
+                                                 line_override=_pc_il or 0)
+                                            break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         # ── Weak cryptography — new Random() or Math.random() ────────────────
         try:
