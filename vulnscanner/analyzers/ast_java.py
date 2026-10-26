@@ -243,6 +243,21 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                                 tl.add(decl.name)
             except Exception:
                 pass
+            # Also propagate through SE Assignments (var declared null then assigned).
+            # e.g.: ByteArrayInputStream x = null; ... x = new ByteArrayInputStream(tainted);
+            try:
+                for _, se in mnode.filter(jt.StatementExpression):
+                    asgn = getattr(se, "expression", None)
+                    if not isinstance(asgn, jt.Assignment):
+                        continue
+                    lhs = asgn.expressionl
+                    if not isinstance(lhs, jt.MemberReference) or str(lhs.qualifier or ""):
+                        continue
+                    vn = lhs.member
+                    if vn not in tl and _is_tainted(asgn.value, tl):
+                        tl.add(vn)
+            except Exception:
+                pass
         result: dict[int, tuple] = {}
         # SQL sinks (JDBC execute methods with tainted args)
         try:
@@ -445,6 +460,39 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                     # Handles both LVD initializers AND assignment statements so that
                     # patterns like `data = readerBuffered.readLine()` are captured.
                     _p3_tl: set = set()
+                    # Pre-collect ObjectOutputStream var → backing ByteArrayOutputStream var.
+                    # Needed to propagate writeObject(tainted) → backing stream tainted.
+                    _p3_oos_backing: dict = {}
+                    try:
+                        for _, _oos_lvd in method.filter(jt.LocalVariableDeclaration):
+                            for _oos_d in _oos_lvd.declarators:
+                                if not isinstance(_oos_d.initializer, jt.ClassCreator):
+                                    continue
+                                if _type_name(_oos_d.initializer.type) not in (
+                                        "ObjectOutputStream", "ObjectOutput"):
+                                    continue
+                                _oos_args = _oos_d.initializer.arguments or []
+                                if (_oos_args and isinstance(_oos_args[0], jt.MemberReference)
+                                        and not _oos_args[0].qualifier):
+                                    _p3_oos_backing[_oos_d.name] = _oos_args[0].member
+                        for _, _oos_se in method.filter(jt.StatementExpression):
+                            _oos_asgn = getattr(_oos_se, "expression", None)
+                            if not isinstance(_oos_asgn, jt.Assignment):
+                                continue
+                            _oos_lhs = _oos_asgn.expressionl
+                            if not isinstance(_oos_lhs, jt.MemberReference) or str(_oos_lhs.qualifier or ""):
+                                continue
+                            _oos_rhs = _oos_asgn.value
+                            if not isinstance(_oos_rhs, jt.ClassCreator):
+                                continue
+                            if _type_name(_oos_rhs.type) not in ("ObjectOutputStream", "ObjectOutput"):
+                                continue
+                            _oos_cargs = _oos_rhs.arguments or []
+                            if (_oos_cargs and isinstance(_oos_cargs[0], jt.MemberReference)
+                                    and not _oos_cargs[0].qualifier):
+                                _p3_oos_backing[_oos_lhs.member] = _oos_cargs[0].member
+                    except Exception:
+                        pass
                     try:
                         for _ in range(3):
                             _chg3 = False
@@ -474,6 +522,16 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                                                 _is_request_source(_val_arg)
                                                 or _is_tainted(_val_arg, _p3_tl)):
                                             _p3_tl.add(_se_q); _chg3 = True
+                                    # Fix 12: writeObject(tainted) → qualifier + backing stream tainted
+                                    if (_se_q and asgn.member == "writeObject"):
+                                        _wo_args = asgn.arguments or []
+                                        if _wo_args and (_is_request_source(_wo_args[0])
+                                                         or _is_tainted(_wo_args[0], _p3_tl)):
+                                            if _se_q not in _p3_tl:
+                                                _p3_tl.add(_se_q); _chg3 = True
+                                            _p3_back = _p3_oos_backing.get(_se_q)
+                                            if _p3_back and _p3_back not in _p3_tl:
+                                                _p3_tl.add(_p3_back); _chg3 = True
                                 if not isinstance(asgn, jt.Assignment):
                                     continue
                                 lhs = asgn.expressionl
@@ -1721,6 +1779,38 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
         except Exception:
             pass
 
+    # Pre-collect ObjectOutputStream var → backing ByteArrayOutputStream var (Fix 12).
+    _oos_backing: dict = {}
+    try:
+        for _, _oos_node in tree.filter(jt.LocalVariableDeclaration):
+            for _oos_d in _oos_node.declarators:
+                if not isinstance(_oos_d.initializer, jt.ClassCreator):
+                    continue
+                if _type_name(_oos_d.initializer.type) not in ("ObjectOutputStream", "ObjectOutput"):
+                    continue
+                _oos_args = _oos_d.initializer.arguments or []
+                if (_oos_args and isinstance(_oos_args[0], jt.MemberReference)
+                        and not _oos_args[0].qualifier):
+                    _oos_backing[_oos_d.name] = _oos_args[0].member
+        for _, _oos_se in tree.filter(jt.StatementExpression):
+            _oos_asgn = getattr(_oos_se, "expression", None)
+            if not isinstance(_oos_asgn, jt.Assignment):
+                continue
+            _oos_lhs = _oos_asgn.expressionl
+            if not isinstance(_oos_lhs, jt.MemberReference) or str(_oos_lhs.qualifier or ""):
+                continue
+            _oos_rhs = _oos_asgn.value
+            if not isinstance(_oos_rhs, jt.ClassCreator):
+                continue
+            if _type_name(_oos_rhs.type) not in ("ObjectOutputStream", "ObjectOutput"):
+                continue
+            _oos_cargs = _oos_rhs.arguments or []
+            if (_oos_cargs and isinstance(_oos_cargs[0], jt.MemberReference)
+                    and not _oos_cargs[0].qualifier):
+                _oos_backing[_oos_lhs.member] = _oos_cargs[0].member
+    except Exception:
+        pass
+
     for _ in range(6):
         changed = False
 
@@ -2077,6 +2167,34 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                     if q not in tainted:
                         tainted.add(q)
                         changed = True
+        except Exception:
+            pass
+
+        # Fix 12: writeObject(tainted_arg) → mark ObjectOutputStream + backing ByteArrayOutputStream.
+        try:
+            for _, _wo_se in tree.filter(jt.StatementExpression):
+                if _line_of(_wo_se) in dead_lines:
+                    continue
+                _wo_expr = getattr(_wo_se, "expression", None)
+                if not isinstance(_wo_expr, jt.MethodInvocation):
+                    continue
+                if _wo_expr.member != "writeObject":
+                    continue
+                _wo_q = str(_wo_expr.qualifier or "")
+                if not _wo_q:
+                    continue
+                _wo_args = _wo_expr.arguments or []
+                if not _wo_args:
+                    continue
+                if not _is_tainted(_wo_args[0], tainted, const_ints):
+                    continue
+                if _wo_q not in tainted:
+                    tainted.add(_wo_q)
+                    changed = True
+                _wo_back = _oos_backing.get(_wo_q)
+                if _wo_back and _wo_back not in tainted:
+                    tainted.add(_wo_back)
+                    changed = True
         except Exception:
             pass
 
@@ -2535,7 +2653,7 @@ def _compute_method_local_clean(
                 init = decl.initializer
                 if init is None:
                     continue
-                if isinstance(init, jt.Literal):
+                if isinstance(init, jt.Literal) and str(getattr(init, "value", "") or "") != "null":
                     _has_literal_pm[(vn, m)] = True
                 elif _is_tainted(init, tainted, const_ints):
                     _has_taint_pm[(vn, m)] = True
@@ -3910,7 +4028,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                 _pc_tl.add(_ppn)
                         if not _pc_tl:
                             continue
-                        # Propagate taint (3 iters) with field-insensitive obj.field
+                        # Propagate taint (3 iters) with field-insensitive obj.field.
+                        # Also handle SE Assignments (var declared null then assigned later).
                         for _ in range(3):
                             try:
                                 for _, _pc_lvd in _pc_m.filter(jt.LocalVariableDeclaration):
@@ -3923,6 +4042,20 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                                     and str(_pc_init.qualifier or "") in _pc_tl
                                                     and "." not in str(_pc_init.qualifier or "")):
                                                 _pc_tl.add(_pc_d.name)
+                            except Exception:
+                                pass
+                            try:
+                                for _, _pc_se in _pc_m.filter(jt.StatementExpression):
+                                    _pc_asgn = getattr(_pc_se, "expression", None)
+                                    if not isinstance(_pc_asgn, jt.Assignment):
+                                        continue
+                                    _pc_lhs = _pc_asgn.expressionl
+                                    if (not isinstance(_pc_lhs, jt.MemberReference)
+                                            or str(_pc_lhs.qualifier or "")):
+                                        continue
+                                    _pc_vn = _pc_lhs.member
+                                    if _pc_vn not in _pc_tl and _is_tainted(_pc_asgn.value, _pc_tl):
+                                        _pc_tl.add(_pc_vn)
                             except Exception:
                                 pass
                         # XSS sinks
