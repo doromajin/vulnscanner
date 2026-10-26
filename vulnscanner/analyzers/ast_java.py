@@ -84,6 +84,9 @@ class JavaCrossFileCtx:
     # (class_name, method_name) pairs that are ACTUALLY called with tainted data —
     # used to emit callee-side findings without FPs from always-safe callers.
     callee_taint_sink: set = field(default_factory=set)
+    # classname → set of public static field names that are assigned from taint sources
+    # (e.g. 68a.data = readLine()).  Used to seed taint when another class reads those fields.
+    tainted_static_fields: dict = field(default_factory=dict)
 
 
 _java_cf_local = threading.local()
@@ -624,12 +627,65 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                 except Exception:
                     pass
 
+    # Detect public static fields that can receive tainted data (v68 pattern).
+    # When bad() assigns readLine() to a public static field, and another class
+    # reads that field and uses it in a SQL/path/XSS sink, we must propagate taint.
+    tainted_static_fields: dict = {}
+    for _tsf_tree, _tsf_fp in parsed_trees:
+        try:
+            for _, _tsf_cls in _tsf_tree.filter(jt.ClassDeclaration):
+                _tsf_cname = _tsf_cls.name
+                _tsf_statics: set = set()
+                for _tsf_fd in (_tsf_cls.fields or []):
+                    _tsf_mods = getattr(_tsf_fd, "modifiers", None) or set()
+                    if "public" in _tsf_mods and "static" in _tsf_mods:
+                        for _tsf_fdecl in (_tsf_fd.declarators or []):
+                            _tsf_statics.add(_tsf_fdecl.name)
+                if not _tsf_statics:
+                    continue
+                for _tsf_m in (_tsf_cls.methods or []):
+                    _tsf_tl: set = set()
+                    try:
+                        for _ in range(3):
+                            _tsf_chg = False
+                            for _, _tsf_lvd in _tsf_m.filter(jt.LocalVariableDeclaration):
+                                for _tsf_d in _tsf_lvd.declarators:
+                                    if _tsf_d.name in _tsf_tl or not _tsf_d.initializer:
+                                        continue
+                                    if (_is_request_source(_tsf_d.initializer)
+                                            or _is_tainted(_tsf_d.initializer, _tsf_tl)):
+                                        _tsf_tl.add(_tsf_d.name); _tsf_chg = True
+                            for _, _tsf_se in _tsf_m.filter(jt.StatementExpression):
+                                _tsf_asgn = getattr(_tsf_se, "expression", None)
+                                if not isinstance(_tsf_asgn, jt.Assignment):
+                                    continue
+                                _tsf_lhs = _tsf_asgn.expressionl
+                                if (isinstance(_tsf_lhs, jt.MemberReference)
+                                        and not str(_tsf_lhs.qualifier or "")):
+                                    _tsf_vn = _tsf_lhs.member
+                                    if _tsf_vn in _tsf_tl:
+                                        continue
+                                    _tsf_rhs = _tsf_asgn.value
+                                    if (_is_request_source(_tsf_rhs)
+                                            or _is_tainted(_tsf_rhs, _tsf_tl)):
+                                        _tsf_tl.add(_tsf_vn); _tsf_chg = True
+                            if not _tsf_chg:
+                                break
+                    except Exception:
+                        pass
+                    for _tsf_sf in _tsf_statics:
+                        if _tsf_sf in _tsf_tl:
+                            tainted_static_fields.setdefault(_tsf_cname, set()).add(_tsf_sf)
+        except Exception:
+            pass
+
     return JavaCrossFileCtx(
         remote_methods=remote_methods,
         tainted_callee_params=tainted_callee_params,
         sink_registry=sink_registry,
         sink_registry_by_method=sink_registry_by_method,
         callee_taint_sink=callee_taint_sink,
+        tainted_static_fields=tainted_static_fields,
     )
 
 
@@ -2753,6 +2809,28 @@ def _compute_method_local_clean(
                                     _field_seeded.add(_fs_decl.name)
                     except Exception:
                         pass
+                # Don't suppress LVDs initialized from cross-file tainted static fields
+                # (v68 pattern: `data = OtherClass.data` where OtherClass.data is tainted).
+                _static_seeded: set = set()
+                try:
+                    _cf_for_pass3 = _get_java_cf_ctx()
+                    if _cf_for_pass3 and _cf_for_pass3.tainted_static_fields:
+                        for _, _ss_lvd in method_node.filter(jt.LocalVariableDeclaration):
+                            for _ss_decl in _ss_lvd.declarators:
+                                if _ss_decl.name not in local_lvd_vars:
+                                    continue
+                                _ss_init = _ss_decl.initializer
+                                if not isinstance(_ss_init, jt.MemberReference):
+                                    continue
+                                _ss_cls = str(_ss_init.qualifier or "")
+                                _ss_fld = _ss_init.member
+                                if (not _ss_cls or not _ss_cls[0].isupper()):
+                                    continue
+                                if _ss_fld in _cf_for_pass3.tainted_static_fields.get(
+                                        _ss_cls, set()):
+                                    _static_seeded.add(_ss_decl.name)
+                except Exception:
+                    pass
                 # Don't suppress LVDs that derive from parameters that receive taint
                 # at intra-file call sites.  Use caller-effective tainted
                 # (global − mlc[caller]) to distinguish badSink(tainted_data) from
@@ -2801,7 +2879,7 @@ def _compute_method_local_clean(
                 # Transitively extend: any LVD whose init depends on a seeded var
                 # is also seeded (e.g. _45: names = data.split("-") where data
                 # is field-seeded).
-                _seeded = _field_seeded | _param_seeded
+                _seeded = _field_seeded | _param_seeded | _static_seeded
                 if _seeded:
                     _seed_changed = True
                     while _seed_changed:
@@ -2992,6 +3070,30 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # Remove format-validated variables (guarded by early-exit if-throw/return).
         # These are provably safe after the guard; keeping them in tainted causes FP.
         tainted -= _collect_java_guards(tree)
+        # Seed taint from cross-file static fields (v68 pattern: ClassName.data = readLine()
+        # in one file; String data = ClassName.data in another).
+        _cf_for_sf = _get_java_cf_ctx()
+        if _cf_for_sf and _cf_for_sf.tainted_static_fields:
+            try:
+                for _ in range(3):
+                    _sf_chg = False
+                    for _, _sf_lvd in tree.filter(jt.LocalVariableDeclaration):
+                        for _sf_decl in _sf_lvd.declarators:
+                            if _sf_decl.name in tainted:
+                                continue
+                            _sf_init = _sf_decl.initializer
+                            if not isinstance(_sf_init, jt.MemberReference):
+                                continue
+                            _sf_cls = str(_sf_init.qualifier or "")
+                            _sf_fld = _sf_init.member
+                            if (not _sf_cls or not _sf_cls[0].isupper()):
+                                continue
+                            if _sf_fld in _cf_for_sf.tainted_static_fields.get(_sf_cls, set()):
+                                tainted.add(_sf_decl.name); _sf_chg = True
+                    if not _sf_chg:
+                        break
+            except Exception:
+                pass
         writers = _collect_writers(tree)
         _const_ints, _const_strings = _collect_const_context(tree, _props)
 
