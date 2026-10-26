@@ -3910,6 +3910,36 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                             break
                         except Exception:
                             pass
+                        # Direct JDBC sink calls (e.g. 53d.badSink → sqlStatement.addBatch)
+                        try:
+                            for _pc_jp, _pc_jmi in _pc_m.filter(jt.MethodInvocation):
+                                if _pc_jmi.member not in _JDBC_EXEC_METHODS:
+                                    continue
+                                _pc_jargs = _pc_jmi.arguments or []
+                                _pc_jq = str(_pc_jmi.qualifier or "")
+                                _pc_jhit = (any(_is_tainted(a, _pc_tl) for a in _pc_jargs)
+                                            or _pc_jq in _pc_tl)
+                                if _pc_jhit:
+                                    _pc_jl = _node_line(_pc_jmi)
+                                    if not _pc_jl:
+                                        for _pc_ja in reversed(_pc_jp):
+                                            _pc_jl = _node_line(_pc_ja)
+                                            if _pc_jl:
+                                                break
+                                    _add(None, VulnType.SQL_INJECTION, Severity.HIGH,
+                                         "JAST-SQL-001",
+                                         f"callee: tainted arg in {_pc_m.name}() reaches"
+                                         " SQL execution — SQL injection; use PreparedStatement",
+                                         line_override=_pc_jl or 0)
+                                    break
+                                # Safe PreparedStatement path: emit suppression sentinel
+                                _pc_jps_q = str(_pc_jmi.qualifier or "")
+                                if (_pc_jmi.member in ("setString", "setInt", "setLong",
+                                                        "setObject", "setDate")
+                                        and not any(_is_tainted(a, _pc_tl) for a in _pc_jargs)):
+                                    pass  # genuine safe use — no sentinel needed
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
