@@ -2657,7 +2657,8 @@ def _compute_method_local_clean(
             if not q or (q, m) not in _fresh_coll:
                 continue
             args = mi.arguments or []
-            chk_idx = 1 if mi.member == "add" and len(args) == 2 else 0
+            # put(key,val)/set(idx,val)/add(idx,val): value is arg[1]; add(val): arg[0]
+            chk_idx = 1 if (mi.member in ("add", "put", "set") and len(args) == 2) else 0
             if chk_idx >= len(args):
                 continue
             eff_tainted_m = tainted - method_local_clean.get(m, set())
