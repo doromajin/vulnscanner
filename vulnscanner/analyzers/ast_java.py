@@ -230,7 +230,13 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                 for _, lvd in mnode.filter(jt.LocalVariableDeclaration):
                     for decl in lvd.declarators:
                         if decl.name not in tl and decl.initializer:
-                            if _is_tainted(decl.initializer, tl):
+                            init = decl.initializer
+                            if _is_tainted(init, tl):
+                                tl.add(decl.name)
+                            elif (isinstance(init, jt.MemberReference)
+                                    and str(init.qualifier or "") in tl
+                                    and "." not in str(init.qualifier or "")):
+                                # field-insensitive: taintedContainer.field → tainted
                                 tl.add(decl.name)
             except Exception:
                 pass
@@ -452,20 +458,41 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                                         _p3_tl.add(decl.name); _chg3 = True
                             for _, se in method.filter(jt.StatementExpression):
                                 asgn = getattr(se, "expression", None)
+                                # Fix 6: collection.add/put(k, tainted) → collection tainted
+                                # Handles variant_72 Vector and variant_74 HashMap.
+                                if isinstance(asgn, jt.MethodInvocation):
+                                    _se_q = str(asgn.qualifier or "")
+                                    if (_se_q and _se_q not in _p3_tl
+                                            and asgn.member in _COLLECTION_MUTATE_METHODS):
+                                        _se_args = asgn.arguments or []
+                                        _val_arg = (_se_args[1] if len(_se_args) >= 2
+                                                    else _se_args[0] if _se_args else None)
+                                        if _val_arg is not None and (
+                                                _is_request_source(_val_arg)
+                                                or _is_tainted(_val_arg, _p3_tl)):
+                                            _p3_tl.add(_se_q); _chg3 = True
                                 if not isinstance(asgn, jt.Assignment):
                                     continue
                                 lhs = asgn.expressionl
-                                if (not isinstance(lhs, jt.MemberReference)
-                                        or str(lhs.qualifier or "")):
+                                if not isinstance(lhs, jt.MemberReference):
                                     continue
-                                vn = lhs.member
-                                if vn in _p3_tl:
-                                    continue
-                                rhs = asgn.value
-                                if _is_request_source(rhs):
-                                    _p3_tl.add(vn); _chg3 = True
-                                elif _is_tainted(rhs, _p3_tl):
-                                    _p3_tl.add(vn); _chg3 = True
+                                lhs_q = str(lhs.qualifier or "")
+                                if lhs_q:
+                                    # Fix 3: field-to-object taint: obj.field = tainted → obj
+                                    # Handles variant_67 Container: dataContainer.containerOne = data
+                                    if lhs_q not in _p3_tl:
+                                        rhs3 = asgn.value
+                                        if _is_request_source(rhs3) or _is_tainted(rhs3, _p3_tl):
+                                            _p3_tl.add(lhs_q); _chg3 = True
+                                else:
+                                    vn = lhs.member
+                                    if vn in _p3_tl:
+                                        continue
+                                    rhs = asgn.value
+                                    if _is_request_source(rhs):
+                                        _p3_tl.add(vn); _chg3 = True
+                                    elif _is_tainted(rhs, _p3_tl):
+                                        _p3_tl.add(vn); _chg3 = True
                             if not _chg3:
                                 break
                     except Exception:
@@ -513,6 +540,89 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                         pass
         except Exception:
             pass
+
+    # Transitive expansion: if (cls, method) is in callee_taint_sink and its body
+    # calls another sink_registry method with its registered tainted param, propagate.
+    # This handles multi-hop chains: 53a→53b (Phase 3) then 53b→53c→53d (here).
+    _cts_changed = True
+    while _cts_changed:
+        _cts_changed = False
+        for (_cts_cls, _cts_mname) in list(callee_taint_sink):
+            _cts_sr = sink_registry.get((_cts_cls, _cts_mname), {})
+            if not _cts_sr:
+                continue
+            for _cts_tree, _cts_fp2 in parsed_trees:
+                try:
+                    for _, _cts_cls_node in _cts_tree.filter(jt.ClassDeclaration):
+                        if _cts_cls_node.name != _cts_cls:
+                            continue
+                        for _cts_m in (_cts_cls_node.methods or []):
+                            if _cts_m.name != _cts_mname:
+                                continue
+                            _cts_tl: set = set()
+                            for _cts_pi, _cts_pp in enumerate(_cts_m.parameters or []):
+                                _cts_ppn = getattr(_cts_pp, "name", "")
+                                if _cts_ppn and _cts_pi in _cts_sr:
+                                    _cts_tl.add(_cts_ppn)
+                            if not _cts_tl:
+                                continue
+                            for _ in range(3):
+                                try:
+                                    for _, _cts_lvd in _cts_m.filter(jt.LocalVariableDeclaration):
+                                        for _cts_d in _cts_lvd.declarators:
+                                            if _cts_d.name not in _cts_tl and _cts_d.initializer:
+                                                _cts_init = _cts_d.initializer
+                                                if _is_tainted(_cts_init, _cts_tl):
+                                                    _cts_tl.add(_cts_d.name)
+                                                elif (isinstance(_cts_init, jt.MemberReference)
+                                                        and str(_cts_init.qualifier or "") in _cts_tl
+                                                        and "." not in str(_cts_init.qualifier or "")):
+                                                    _cts_tl.add(_cts_d.name)
+                                except Exception:
+                                    pass
+                            try:
+                                for _, _cts_cc in _cts_m.filter(jt.ClassCreator):
+                                    _cts_icls = _type_name(_cts_cc.type)
+                                    for _cts_sel in (_cts_cc.selectors or []):
+                                        if not isinstance(_cts_sel, jt.MethodInvocation):
+                                            continue
+                                        _cts_nkey = (_cts_icls, _cts_sel.member)
+                                        if (_cts_nkey not in _sr_keys_p3
+                                                or _cts_nkey in callee_taint_sink):
+                                            continue
+                                        _cts_nsr = sink_registry.get(_cts_nkey, {})
+                                        _cts_nargs = _cts_sel.arguments or []
+                                        for _pidx in _cts_nsr:
+                                            if (_pidx < len(_cts_nargs)
+                                                    and _is_tainted(_cts_nargs[_pidx], _cts_tl)):
+                                                callee_taint_sink.add(_cts_nkey)
+                                                _cts_changed = True
+                                                break
+                            except Exception:
+                                pass
+                            try:
+                                for _, _cts_mi in _cts_m.filter(jt.MethodInvocation):
+                                    if _cts_mi.member not in _sr_method_names_p3:
+                                        continue
+                                    _cts_q = str(_cts_mi.qualifier or "")
+                                    if not _cts_q or not _cts_q[0].isupper():
+                                        continue
+                                    _cts_mkey = (_cts_q, _cts_mi.member)
+                                    if (_cts_mkey not in _sr_keys_p3
+                                            or _cts_mkey in callee_taint_sink):
+                                        continue
+                                    _cts_msr = sink_registry.get(_cts_mkey, {})
+                                    _cts_margs = _cts_mi.arguments or []
+                                    for _pidx in _cts_msr:
+                                        if (_pidx < len(_cts_margs)
+                                                and _is_tainted(_cts_margs[_pidx], _cts_tl)):
+                                            callee_taint_sink.add(_cts_mkey)
+                                            _cts_changed = True
+                                            break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
     return JavaCrossFileCtx(
         remote_methods=remote_methods,
@@ -1145,6 +1255,13 @@ _LIST_ADD_METHODS = frozenset({
     "offerLast", "offerFirst",
 })
 
+# Collection / map mutation methods where a tainted VALUE arg taints the container.
+# Used by Phase 3 to propagate taint into Vector/HashMap/List passed cross-file.
+_COLLECTION_MUTATE_METHODS = frozenset({
+    "add", "addLast", "addFirst", "push", "offer",
+    "offerLast", "offerFirst", "set", "put", "putIfAbsent",
+})
+
 
 def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> bool:
     """Recursively check whether a javalang expression node carries taint."""
@@ -1735,7 +1852,16 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                 lhs = node.expressionl
                 if not isinstance(lhs, jt.MemberReference):
                     continue
-                if str(lhs.qualifier or ""):
+                _lhs_q = str(lhs.qualifier or "")
+                if _lhs_q:
+                    # Fix 4: field-to-object taint: obj.field = tainted → obj is tainted.
+                    # Only for simple (no-dot) qualifiers to avoid chained FPs.
+                    if ("." not in _lhs_q and _lhs_q not in tainted):
+                        _rhs_ft = node.value
+                        if (_is_tainted(_rhs_ft, tainted, const_ints)
+                                or _is_request_source(_rhs_ft)):
+                            tainted.add(_lhs_q)
+                            changed = True
                     continue  # skip field assignments (w.value = x); only track bare locals
                 _vname = lhs.member
                 rhs = node.value
@@ -1882,13 +2008,18 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                 if len(args) < 2:
                     continue
                 key_lit = _literal_str(args[0])
-                if key_lit is None:
-                    continue
                 if _is_tainted(args[1], tainted, const_ints):
-                    if q not in map_tainted_keys:
-                        map_tainted_keys[q] = set()
-                    if key_lit not in map_tainted_keys[q]:
-                        map_tainted_keys[q].add(key_lit)
+                    if key_lit is not None:
+                        # String-key tracking for precise get() propagation
+                        if q not in map_tainted_keys:
+                            map_tainted_keys[q] = set()
+                        if key_lit not in map_tainted_keys[q]:
+                            map_tainted_keys[q].add(key_lit)
+                            changed = True
+                    # Fix 5: non-string key (int, var) → treat the map itself as tainted
+                    # so (new X()).badSink(map) is caught by Pattern A via sink_registry.
+                    if q not in tainted:
+                        tainted.add(q)
                         changed = True
         except Exception:
             pass
@@ -2372,6 +2503,31 @@ def _compute_method_local_clean(
     except Exception:
         pass
 
+    # Conditional SE lines: assignments inside if/else branches cannot guarantee
+    # the variable is clean (only one path executes). Mirror the logic from the
+    # strong-update cleanup in _collect_tainted so that "data = null" inside an
+    # else branch does NOT mark data as locally-clean (fix for variant_21/41/45).
+    _mlc_cond_se: set = set()
+    try:
+        for _, _mif in tree.filter(jt.IfStatement):
+            for _blk in (_mif.then_statement, _mif.else_statement):
+                if _blk is None:
+                    continue
+                if isinstance(_blk, jt.StatementExpression):
+                    _bl = getattr(getattr(_blk, "position", None), "line", -1)
+                    if _bl > 0:
+                        _mlc_cond_se.add(_bl)
+                else:
+                    try:
+                        for _, _se2 in _blk.filter(jt.StatementExpression):
+                            _bl = getattr(getattr(_se2, "position", None), "line", -1)
+                            if _bl > 0:
+                                _mlc_cond_se.add(_bl)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     try:
         for _, se in tree.filter(jt.StatementExpression):
             if not isinstance(getattr(se, "expression", None), jt.Assignment):
@@ -2391,7 +2547,10 @@ def _compute_method_local_clean(
                 continue
             rhs = assign.value
             if isinstance(rhs, jt.Literal):
-                _has_literal_pm[(vn, m)] = True
+                # Skip conditional assignments — they only execute on one path and
+                # cannot prove the variable is clean at the sink.
+                if ln not in _mlc_cond_se:
+                    _has_literal_pm[(vn, m)] = True
             elif _is_tainted(rhs, tainted, const_ints):
                 _has_taint_pm[(vn, m)] = True
                 _taint_inits.setdefault((vn, m), []).append(rhs)
@@ -2593,7 +2752,73 @@ def _compute_method_local_clean(
                                     _field_seeded.add(_fs_decl.name)
                     except Exception:
                         pass
-                for vn in local_lvd_vars - _field_seeded:
+                # Don't suppress LVDs that derive from parameters that receive taint
+                # at intra-file call sites.  Use caller-effective tainted
+                # (global − mlc[caller]) to distinguish badSink(tainted_data) from
+                # goodB2GSink(clean_literal).  Fixes Juliet _21/41/45 executeBatch FNs.
+                _param_seeded: set = set()
+                _m_name = getattr(method_node, "name", "")
+                _m_params = method_node.parameters or []
+                if _m_params and _m_name:
+                    _receives_taint_params: set = set()
+                    try:
+                        for _, _caller in tree.filter(jt.MethodDeclaration):
+                            _c_ln = getattr(
+                                getattr(_caller, "position", None), "line", -1)
+                            if _c_ln < 0:
+                                continue
+                            _c_idx = _midx(_c_ln)
+                            _c_clean = method_local_clean.get(_c_idx, set())
+                            _c_eff = tainted - _c_clean
+                            for _, _cmi in _caller.filter(jt.MethodInvocation):
+                                if _cmi.member != _m_name:
+                                    continue
+                                _cq = str(_cmi.qualifier or "")
+                                if _cq and _cq not in ("this",):
+                                    continue
+                                for _pi, _pa in enumerate(_cmi.arguments or []):
+                                    if _pi >= len(_m_params):
+                                        break
+                                    if _is_tainted(_pa, _c_eff, const_ints):
+                                        _receives_taint_params.add(
+                                            _m_params[_pi].name)
+                    except Exception:
+                        pass
+                    if _receives_taint_params:
+                        try:
+                            for _, _ps_lvd in method_node.filter(
+                                    jt.LocalVariableDeclaration):
+                                for _ps_decl in _ps_lvd.declarators:
+                                    if _ps_decl.name not in local_lvd_vars:
+                                        continue
+                                    if _is_tainted(_ps_decl.initializer,
+                                                   _receives_taint_params,
+                                                   const_ints):
+                                        _param_seeded.add(_ps_decl.name)
+                        except Exception:
+                            pass
+                # Transitively extend: any LVD whose init depends on a seeded var
+                # is also seeded (e.g. _45: names = data.split("-") where data
+                # is field-seeded).
+                _seeded = _field_seeded | _param_seeded
+                if _seeded:
+                    _seed_changed = True
+                    while _seed_changed:
+                        _seed_changed = False
+                        try:
+                            for _, _ts_lvd in method_node.filter(
+                                    jt.LocalVariableDeclaration):
+                                for _ts_decl in _ts_lvd.declarators:
+                                    if (_ts_decl.name not in local_lvd_vars
+                                            or _ts_decl.name in _seeded):
+                                        continue
+                                    if _is_tainted(_ts_decl.initializer,
+                                                   _seeded, const_ints):
+                                        _seeded.add(_ts_decl.name)
+                                        _seed_changed = True
+                        except Exception:
+                            break
+                for vn in local_lvd_vars - _seeded:
                     method_local_clean.setdefault(m_idx, set()).add(vn)
     except Exception:
         pass
@@ -2776,6 +3001,83 @@ class JavaASTAnalyzer(BaseAnalyzer):
             tree, tainted, _const_ints, dead_lines
         )
         _eff_cache: dict = {}
+
+        # Per-method literal-only variable set: variables assigned ONLY from literals
+        # (string/number constants) with NO method-call assignments in that method.
+        # Used to emit JAST-SQL-SAFE for goodG2B patterns where data = "foo" (literal)
+        # is used in a raw SQL call even though no global taint exists (Environment source
+        # files where the source is policy-excluded).
+        def _midx_of(ln: int) -> int:
+            idx = -1
+            for _i, _s in enumerate(_mstarts_mlc):
+                if ln >= _s:
+                    idx = _i
+                else:
+                    break
+            return idx
+
+        _lit_only_m: dict[int, set] = {}   # midx → vars with at least one literal assign
+        _nonlit_m: dict[int, set] = {}     # midx → vars with at least one non-literal assign
+        try:
+            for _, _lo_lvd in tree.filter(jt.LocalVariableDeclaration):
+                _lo_ln = getattr(getattr(_lo_lvd, "position", None), "line", -1)
+                if _lo_ln < 0 or _lo_ln in dead_lines:
+                    continue
+                _lo_midx = _midx_of(_lo_ln)
+                if _lo_midx < 0:
+                    continue
+                for _lo_d in _lo_lvd.declarators:
+                    _lo_vn = _lo_d.name
+                    _lo_init = _lo_d.initializer
+                    if _lo_init is None:
+                        continue
+                    if isinstance(_lo_init, jt.Literal):
+                        _lit_only_m.setdefault(_lo_midx, set()).add(_lo_vn)
+                    else:
+                        _nonlit_m.setdefault(_lo_midx, set()).add(_lo_vn)
+        except Exception:
+            pass
+        try:
+            for _, _lo_se in tree.filter(jt.StatementExpression):
+                _lo_asgn = getattr(_lo_se, "expression", None)
+                if not isinstance(_lo_asgn, jt.Assignment):
+                    continue
+                _lo_lhs = _lo_asgn.expressionl
+                if not isinstance(_lo_lhs, jt.MemberReference) or str(_lo_lhs.qualifier or ""):
+                    continue
+                _lo_se_ln = getattr(getattr(_lo_se, "position", None), "line", -1)
+                if _lo_se_ln < 0 or _lo_se_ln in dead_lines:
+                    continue
+                _lo_se_midx = _midx_of(_lo_se_ln)
+                if _lo_se_midx < 0:
+                    continue
+                _lo_vn = _lo_lhs.member
+                _lo_rhs = _lo_asgn.value
+                if isinstance(_lo_rhs, jt.Literal):
+                    _lit_only_m.setdefault(_lo_se_midx, set()).add(_lo_vn)
+                else:
+                    _nonlit_m.setdefault(_lo_se_midx, set()).add(_lo_vn)
+        except Exception:
+            pass
+        # Confirmed literal-only: has literal assign AND no non-literal assign in same method
+        _confirmed_lit: dict[int, set] = {
+            midx: (lits - _nonlit_m.get(midx, set()))
+            for midx, lits in _lit_only_m.items()
+        }
+
+        def _sql_arg_is_literal_only(node, midx: int) -> bool:
+            """True if node consists entirely of literals and confirmed-literal-only vars."""
+            if node is None:
+                return True
+            if isinstance(node, jt.Literal):
+                return True
+            if isinstance(node, jt.MemberReference) and not node.qualifier:
+                return node.member in _confirmed_lit.get(midx, set())
+            if isinstance(node, jt.BinaryOperation):
+                return (_sql_arg_is_literal_only(node.operandl, midx)
+                        and _sql_arg_is_literal_only(node.operandr, midx))
+            return False
+
         # A-1: In-file interprocedural extra taint — callee params seeded from call sites.
         # Populated below before any _eff_tainted call; read by closure.
         _infile_extra_taint: dict[int, set] = {}
@@ -2908,6 +3210,17 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         if _would_fire:
                             _add(node, VulnType.SQL_INJECTION, Severity.LOW, "JAST-SQL-SAFE",
                                  "safe — method-local clean analysis")
+                        else:
+                            # Also suppress regex findings when all SQL args are provably
+                            # literal-only in this method (goodG2B with literal source like
+                            # data = "foo" in Environment-source files where global taint is empty).
+                            _sql_node_ln = _node_line(node)
+                            _sql_midx = _midx_of(_sql_node_ln)
+                            if _sql_midx >= 0 and (node.arguments or []):
+                                if all(_sql_arg_is_literal_only(a, _sql_midx)
+                                       for a in (node.arguments or [])):
+                                    _add(node, VulnType.SQL_INJECTION, Severity.LOW,
+                                         "JAST-SQL-SAFE", "safe — literal-only SQL arguments")
                 elif node.member in _SPRING_JDBC_METHODS:
                     # Only the FIRST argument is the SQL string; subsequent args are bound
                     # parameters and are safe (e.g. queryForObject(sql, type, param...)).
@@ -3494,13 +3807,18 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                 _pc_tl.add(_ppn)
                         if not _pc_tl:
                             continue
-                        # Propagate taint (3 iters)
+                        # Propagate taint (3 iters) with field-insensitive obj.field
                         for _ in range(3):
                             try:
                                 for _, _pc_lvd in _pc_m.filter(jt.LocalVariableDeclaration):
                                     for _pc_d in _pc_lvd.declarators:
                                         if _pc_d.name not in _pc_tl and _pc_d.initializer:
-                                            if _is_tainted(_pc_d.initializer, _pc_tl):
+                                            _pc_init = _pc_d.initializer
+                                            if _is_tainted(_pc_init, _pc_tl):
+                                                _pc_tl.add(_pc_d.name)
+                                            elif (isinstance(_pc_init, jt.MemberReference)
+                                                    and str(_pc_init.qualifier or "") in _pc_tl
+                                                    and "." not in str(_pc_init.qualifier or "")):
                                                 _pc_tl.add(_pc_d.name)
                             except Exception:
                                 pass
