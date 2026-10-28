@@ -87,6 +87,10 @@ class JavaCrossFileCtx:
     # classname → set of public static field names that are assigned from taint sources
     # (e.g. 68a.data = readLine()).  Used to seed taint when another class reads those fields.
     tainted_static_fields: dict = field(default_factory=dict)
+    # (class_b_name, method_name) → [(class_a_name, field_name, rule_id, vuln_type, severity, desc)]
+    # Methods that read a tainted static field from class_a and flow it to a direct sink.
+    # Used to emit findings in class_a's bad() when it calls (new ClassB()).badSink() (v68a pattern).
+    static_consumer_sinks: dict = field(default_factory=dict)
 
 
 _java_cf_local = threading.local()
@@ -737,6 +741,136 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
         except Exception:
             pass
 
+    # Phase 4b: methods in class_b that read a tainted static field (from class_a)
+    # and flow it to a direct sink → register as static_consumer_sinks so callers
+    # (68a.bad()) can be detected even when the sink is only in 68b.
+    static_consumer_sinks: dict = {}
+    if tainted_static_fields:
+        for _scs_tree, _scs_fp in parsed_trees:
+            try:
+                for _, _scs_cls in _scs_tree.filter(jt.ClassDeclaration):
+                    _scs_cname = _scs_cls.name
+                    for _scs_m in (_scs_cls.methods or []):
+                        _scs_tl: set = set()
+                        _scs_fsrcs: list = []  # (var_name, class_a, field_name)
+                        try:
+                            for _, _scs_lvd in _scs_m.filter(jt.LocalVariableDeclaration):
+                                for _scs_d in _scs_lvd.declarators:
+                                    if not _scs_d.initializer:
+                                        continue
+                                    _scs_init = _scs_d.initializer
+                                    if not isinstance(_scs_init, jt.MemberReference):
+                                        continue
+                                    _scs_clsq = str(_scs_init.qualifier or "")
+                                    _scs_fld = _scs_init.member
+                                    if (not _scs_clsq or not _scs_clsq[0].isupper()):
+                                        continue
+                                    if _scs_fld in tainted_static_fields.get(_scs_clsq, set()):
+                                        _scs_tl.add(_scs_d.name)
+                                        _scs_fsrcs.append((_scs_d.name, _scs_clsq, _scs_fld))
+                        except Exception:
+                            pass
+                        if not _scs_tl:
+                            continue
+                        for _ in range(3):
+                            try:
+                                for _, _scs_lvd2 in _scs_m.filter(jt.LocalVariableDeclaration):
+                                    for _scs_d2 in _scs_lvd2.declarators:
+                                        if _scs_d2.name not in _scs_tl and _scs_d2.initializer:
+                                            if (_is_tainted(_scs_d2.initializer, _scs_tl)
+                                                    or (isinstance(_scs_d2.initializer,
+                                                                   jt.MemberReference)
+                                                        and str(_scs_d2.initializer.qualifier
+                                                                or "") in _scs_tl)):
+                                                _scs_tl.add(_scs_d2.name)
+                            except Exception:
+                                pass
+                            try:
+                                for _, _scs_se in _scs_m.filter(jt.StatementExpression):
+                                    _scs_asgn = getattr(_scs_se, "expression", None)
+                                    if not isinstance(_scs_asgn, jt.Assignment):
+                                        continue
+                                    _scs_lhs = _scs_asgn.expressionl
+                                    if (isinstance(_scs_lhs, jt.MemberReference)
+                                            and not str(_scs_lhs.qualifier or "")
+                                            and _scs_lhs.member not in _scs_tl
+                                            and _is_tainted(_scs_asgn.value, _scs_tl)):
+                                        _scs_tl.add(_scs_lhs.member)
+                            except Exception:
+                                pass
+                        _scs_key = (_scs_cname, _scs_m.name)
+                        try:
+                            for _, _scs_mi in _scs_m.filter(jt.MethodInvocation):
+                                if _scs_mi.member not in _JDBC_EXEC_METHODS:
+                                    continue
+                                if any(_is_tainted(a, _scs_tl) for a in (_scs_mi.arguments or [])):
+                                    for _fsrc_vn, _fsrc_ca, _fsrc_fn in _scs_fsrcs:
+                                        if _fsrc_vn in _scs_tl:
+                                            static_consumer_sinks.setdefault(_scs_key, []).append((
+                                                _fsrc_ca, _fsrc_fn, "JAST-SQL-001",
+                                                VulnType.SQL_INJECTION, Severity.HIGH,
+                                                f"static field {_fsrc_ca}.{_fsrc_fn} tainted via"
+                                                " v68 pattern flows to SQL — SQL injection;"
+                                                " use PreparedStatement"))
+                                    break
+                        except Exception:
+                            pass
+                        try:
+                            for _, _scs_cc in _scs_m.filter(jt.ClassCreator):
+                                if _type_name(_scs_cc.type) not in _FILE_CLASSES:
+                                    continue
+                                if any(_is_tainted(a, _scs_tl) for a in (_scs_cc.arguments or [])):
+                                    for _fsrc_vn, _fsrc_ca, _fsrc_fn in _scs_fsrcs:
+                                        if _fsrc_vn in _scs_tl:
+                                            static_consumer_sinks.setdefault(_scs_key, []).append((
+                                                _fsrc_ca, _fsrc_fn, "JAST-PATH-001",
+                                                VulnType.PATH_TRAVERSAL, Severity.HIGH,
+                                                f"static field {_fsrc_ca}.{_fsrc_fn} tainted via"
+                                                " v68 pattern flows to file — path traversal;"
+                                                " validate path"))
+                                    break
+                        except Exception:
+                            pass
+                        try:
+                            _scs_pw: set = set()
+                            for _, _scs_plvd in _scs_m.filter(jt.LocalVariableDeclaration):
+                                for _scs_pd in _scs_plvd.declarators:
+                                    _scs_pi = _scs_pd.initializer
+                                    if (isinstance(_scs_pi, jt.MethodInvocation)
+                                            and _scs_pi.member == "getWriter"
+                                            and str(_scs_pi.qualifier or "") in _RESPONSE_OBJECTS):
+                                        _scs_pw.add(_scs_pd.name)
+                            for _, _scs_xmi in _scs_m.filter(jt.MethodInvocation):
+                                _scs_xhit = False
+                                if (_scs_xmi.member == "getWriter"
+                                        and str(_scs_xmi.qualifier or "") in _RESPONSE_OBJECTS):
+                                    for _scs_xsel in (_scs_xmi.selectors or []):
+                                        if (isinstance(_scs_xsel, jt.MethodInvocation)
+                                                and _scs_xsel.member in _XSS_SINK_METHODS
+                                                and any(_is_tainted(a, _scs_tl)
+                                                        for a in (_scs_xsel.arguments or []))):
+                                            _scs_xhit = True; break
+                                if (not _scs_xhit
+                                        and _scs_xmi.member in _XSS_SINK_METHODS
+                                        and str(_scs_xmi.qualifier or "") in _scs_pw
+                                        and any(_is_tainted(a, _scs_tl)
+                                                for a in (_scs_xmi.arguments or []))):
+                                    _scs_xhit = True
+                                if _scs_xhit:
+                                    for _fsrc_vn, _fsrc_ca, _fsrc_fn in _scs_fsrcs:
+                                        if _fsrc_vn in _scs_tl:
+                                            static_consumer_sinks.setdefault(_scs_key, []).append((
+                                                _fsrc_ca, _fsrc_fn, "JAST-XSS-001",
+                                                VulnType.XSS, Severity.HIGH,
+                                                f"static field {_fsrc_ca}.{_fsrc_fn} tainted via"
+                                                " v68 pattern flows to HTTP response — XSS;"
+                                                " encode output"))
+                                    break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
     return JavaCrossFileCtx(
         remote_methods=remote_methods,
         tainted_callee_params=tainted_callee_params,
@@ -744,6 +878,7 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
         sink_registry_by_method=sink_registry_by_method,
         callee_taint_sink=callee_taint_sink,
         tainted_static_fields=tainted_static_fields,
+        static_consumer_sinks=static_consumer_sinks,
     )
 
 
@@ -4003,6 +4138,37 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                 break
                 except Exception:
                     pass
+
+        # Pattern D: static field consumer sinks (v68a pattern).
+        # (new ClassB()).badSink() where badSink reads tainted ClassA.field → sink.
+        # Emit finding here in ClassA's caller (68a) when field is tainted at call site.
+        if _cf_sr and getattr(_cf_sr, 'static_consumer_sinks', None):
+            try:
+                for _scd_path, _scd_node in tree.filter(jt.ClassCreator):
+                    for _scd_sel in (_scd_node.selectors or []):
+                        if not isinstance(_scd_sel, jt.MethodInvocation):
+                            continue
+                        _scd_key = (_type_name(_scd_node.type), _scd_sel.member)
+                        _scd_entries = _cf_sr.static_consumer_sinks.get(_scd_key)
+                        if not _scd_entries:
+                            continue
+                        _scd_line = _node_line(_scd_node)
+                        if not _scd_line:
+                            for _scd_anc in reversed(_scd_path):
+                                _scd_line = _node_line(_scd_anc)
+                                if _scd_line:
+                                    break
+                        if not _scd_line or _scd_line in dead_lines:
+                            continue
+                        _et_scd = _eff_tainted(_scd_line)
+                        for (_scd_ca, _scd_fn, _scd_rid, _scd_vt, _scd_sv, _scd_desc) \
+                                in _scd_entries:
+                            if _scd_fn in _et_scd:
+                                _add(_scd_node, _scd_vt, _scd_sv, _scd_rid, _scd_desc,
+                                     line_override=_scd_line)
+                                break
+            except Exception:
+                pass
 
         # Pattern C: callee-side detection — emit findings IN the sink method when
         # it is known (from Phase 3 analysis) to be called with tainted data.
