@@ -1226,6 +1226,51 @@ def _is_request_source(node) -> bool:
     return (not q) or str(q) in _REQUEST_OBJECTS
 
 
+def _is_excluded_jvm_source(node) -> bool:
+    """True if node is System.getenv() or System.getProperty() — JVM config, not user input."""
+    if not isinstance(node, jt.MethodInvocation):
+        return False
+    if node.member not in ("getenv", "getProperty"):
+        return False
+    return str(node.qualifier or "") == "System"
+
+
+def _concat_varnames(node) -> "set[str]":
+    """Collect bare (unqualified) MemberReference names from a + concat expression tree."""
+    result: set[str] = set()
+    if isinstance(node, jt.BinaryOperation) and node.operator == "+":
+        result |= _concat_varnames(node.operandl)
+        result |= _concat_varnames(node.operandr)
+    elif isinstance(node, jt.MemberReference) and not str(node.qualifier or ""):
+        result.add(node.member)
+    return result
+
+
+def _var_from_excluded_only(varname: str, tree) -> bool:
+    """True if every assignment of *varname* in *tree* is from System.getenv/getProperty."""
+    found = False
+    for _, lvd in tree.filter(jt.LocalVariableDeclaration):
+        for decl in (lvd.declarators or []):
+            if decl.name == varname:
+                init = getattr(decl, "initializer", None)
+                if init is not None:
+                    found = True
+                    if not _is_excluded_jvm_source(init):
+                        return False
+    for _, se in tree.filter(jt.StatementExpression):
+        asgn = getattr(se, "expression", None)
+        if not isinstance(asgn, jt.Assignment):
+            continue
+        lhs = asgn.expressionl
+        if (isinstance(lhs, jt.MemberReference)
+                and not str(lhs.qualifier or "")
+                and lhs.member == varname):
+            found = True
+            if not _is_excluded_jvm_source(asgn.value):
+                return False
+    return found
+
+
 # ── Constant expression evaluator (for dead-code elimination) ──────────────────
 
 def _eval_const_expr(node, const_ints: dict, const_strings: dict) -> "int | None":
@@ -1590,6 +1635,10 @@ def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> 
                 if any(_is_tainted(a, tainted, const_ints) for a in (sel.arguments or [])):
                     return True
         return False
+    if isinstance(node, jt.Assignment):
+        # Chain assignment: o1 = o2 = ... = source; the value is the rhs which may itself
+        # be an Assignment — propagate through the chain to the ultimate value.
+        return _is_tainted(node.value, tainted, const_ints)
     if hasattr(node, "expression"):
         return _is_tainted(node.expression, tainted, const_ints)
     return False
@@ -2270,6 +2319,15 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                         tainted.add(_vname)
                         tainted_raw.add(_vname)
                         changed = True
+                        # Chain assignment: o1 = o2 = ... = src — taint every intermediate lhs.
+                        _inner = rhs
+                        while isinstance(_inner, jt.Assignment):
+                            _ilhs = _inner.expressionl
+                            if (isinstance(_ilhs, jt.MemberReference)
+                                    and not str(_ilhs.qualifier or "")):
+                                tainted.add(_ilhs.member)
+                                tainted_raw.add(_ilhs.member)
+                            _inner = _inner.value
                     elif (isinstance(rhs, jt.MethodInvocation)
                           and rhs.member in _URL_DECODE_METHODS
                           and str(rhs.qualifier or "").endswith("Decoder")
@@ -3625,21 +3683,24 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                     _add(node, VulnType.SQL_INJECTION, Severity.LOW,
                                          "JAST-SQL-SAFE", "safe — literal-only SQL arguments")
                                     _emitted_safe = True
-                            # Final fallback: suppress regex SQL-001 when the AST found no taint
-                            # but the arg has string concat ("..."+var — the regex SQL-001 pattern).
-                            # Handles excluded taint sources (System.getenv/getProperty) that flow
-                            # through copy variables in _31/_42 variants; the AST correctly treats
-                            # them as untainted but needs to block the regex's false positive.
+                            # Targeted fallback: suppress regex SQL-001 ONLY when the SQL arg
+                            # is a concat whose variable is exclusively from System.getenv/
+                            # getProperty (_31/_42 variants).  A blanket concat-SAFE suppressor
+                            # would kill 300+ regex TPs where AST misses taint; checking the
+                            # variable's declaration site keeps the suppression precise.
                             if not _emitted_safe and (node.arguments or []):
-                                _safe_has_concat = any(
-                                    isinstance(_sca, jt.BinaryOperation)
-                                    and _sca.operator == "+"
-                                    for _sca in (node.arguments or [])
-                                )
-                                if _safe_has_concat:
-                                    _add(node, VulnType.SQL_INJECTION, Severity.LOW,
-                                         "JAST-SQL-SAFE",
-                                         "safe — AST: no taint in SQL concat expression")
+                                for _sca in (node.arguments or []):
+                                    if (isinstance(_sca, jt.BinaryOperation)
+                                            and _sca.operator == "+"):
+                                        _cvars = _concat_varnames(_sca)
+                                        if (_cvars
+                                                and all(_var_from_excluded_only(v, tree)
+                                                        for v in _cvars)):
+                                            _add(node, VulnType.SQL_INJECTION, Severity.LOW,
+                                                 "JAST-SQL-SAFE",
+                                                 "safe — excluded JVM source "
+                                                 "(getenv/getProperty) in SQL concat")
+                                            break
                 elif node.member in _SPRING_JDBC_METHODS:
                     # Only the FIRST argument is the SQL string; subsequent args are bound
                     # parameters and are safe (e.g. queryForObject(sql, type, param...)).
