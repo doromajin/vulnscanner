@@ -746,7 +746,14 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
     # (68a.bad()) can be detected even when the sink is only in 68b.
     static_consumer_sinks: dict = {}
     if tainted_static_fields:
+        # Pre-compute string tokens so we can skip files that don't reference
+        # any tainted static field class (fast path: string search before AST walk).
+        _scs_cls_names = set(tainted_static_fields.keys())
         for _scs_tree, _scs_fp in parsed_trees:
+            # Quick string-level filter: skip files with no mention of any tainted class.
+            _scs_raw = all_contents.get(_scs_fp, "")
+            if not any(_cn in _scs_raw for _cn in _scs_cls_names):
+                continue
             try:
                 for _, _scs_cls in _scs_tree.filter(jt.ClassDeclaration):
                     _scs_cname = _scs_cls.name
