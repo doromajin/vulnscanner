@@ -3433,6 +3433,34 @@ class JavaASTAnalyzer(BaseAnalyzer):
             midx: (lits - _nonlit_m.get(midx, set()))
             for midx, lits in _lit_only_m.items()
         }
+        # Extend confirmed-lit with vars derived from confirmed-lit vars via method calls.
+        # e.g. data = "foo"; names = data.split("-") → names is derived-literal-only.
+        # This handles goodG2B() patterns where the safe value is split into an array.
+        # Important: only extend if the qualifier IS confirmed-lit (data="foo") — not when
+        # the qualifier itself comes from a taint source (data=getenv → names=data.split).
+        try:
+            for _, _dl_lvd in tree.filter(jt.LocalVariableDeclaration):
+                _dl_ln = getattr(getattr(_dl_lvd, "position", None), "line", -1)
+                if _dl_ln < 0 or _dl_ln in dead_lines:
+                    continue
+                _dl_midx = _midx_of(_dl_ln)
+                if _dl_midx < 0:
+                    continue
+                _dl_cl = _confirmed_lit.get(_dl_midx)
+                if not _dl_cl:
+                    continue
+                for _dl_d in _dl_lvd.declarators:
+                    _dl_vn = _dl_d.name
+                    if _dl_vn in _dl_cl:
+                        continue
+                    _dl_init = _dl_d.initializer
+                    if not isinstance(_dl_init, jt.MethodInvocation):
+                        continue
+                    _dl_q = str(_dl_init.qualifier or "")
+                    if _dl_q and _dl_q in _dl_cl and not _is_request_source(_dl_init):
+                        _dl_cl.add(_dl_vn)
+        except Exception:
+            pass
 
         def _sql_arg_is_literal_only(node, midx: int) -> bool:
             """True if node consists entirely of literals and confirmed-literal-only vars."""
