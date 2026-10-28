@@ -131,6 +131,17 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
         except Exception:
             pass
 
+    # (class_name, method_name) → [MethodDeclaration] — O(1) lookup used in the
+    # transitive-expansion while-loop below to avoid scanning all parsed_trees per entry.
+    _cm_idx: dict[tuple, list] = {}
+    for _cmi_tree, _cmi_fp in parsed_trees:
+        try:
+            for _, _cmi_cls in _cmi_tree.filter(jt.ClassDeclaration):
+                for _cmi_m in (_cmi_cls.methods or []):
+                    _cm_idx.setdefault((_cmi_cls.name, _cmi_m.name), []).append(_cmi_m)
+        except Exception:
+            pass
+
     # Second pass: find controller methods with Spring-annotated params,
     # then record which callee methods are invoked with those tainted params.
     tainted_callee_params: dict[str, set[int]] = {}
@@ -616,76 +627,71 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
             _cts_sr = sink_registry.get((_cts_cls, _cts_mname), {})
             if not _cts_sr:
                 continue
-            for _cts_tree, _cts_fp2 in parsed_trees:
+            # O(1) lookup via _cm_idx instead of scanning all parsed_trees.
+            for _cts_m in _cm_idx.get((_cts_cls, _cts_mname), []):
                 try:
-                    for _, _cts_cls_node in _cts_tree.filter(jt.ClassDeclaration):
-                        if _cts_cls_node.name != _cts_cls:
-                            continue
-                        for _cts_m in (_cts_cls_node.methods or []):
-                            if _cts_m.name != _cts_mname:
+                    _cts_tl: set = set()
+                    for _cts_pi, _cts_pp in enumerate(_cts_m.parameters or []):
+                        _cts_ppn = getattr(_cts_pp, "name", "")
+                        if _cts_ppn and _cts_pi in _cts_sr:
+                            _cts_tl.add(_cts_ppn)
+                    if not _cts_tl:
+                        continue
+                    for _ in range(3):
+                        try:
+                            for _, _cts_lvd in _cts_m.filter(jt.LocalVariableDeclaration):
+                                for _cts_d in _cts_lvd.declarators:
+                                    if _cts_d.name not in _cts_tl and _cts_d.initializer:
+                                        _cts_init = _cts_d.initializer
+                                        if _is_tainted(_cts_init, _cts_tl):
+                                            _cts_tl.add(_cts_d.name)
+                                        elif (isinstance(_cts_init, jt.MemberReference)
+                                                and str(_cts_init.qualifier or "") in _cts_tl
+                                                and "." not in str(_cts_init.qualifier or "")):
+                                            _cts_tl.add(_cts_d.name)
+                        except Exception:
+                            pass
+                    try:
+                        for _, _cts_cc in _cts_m.filter(jt.ClassCreator):
+                            _cts_icls = _type_name(_cts_cc.type)
+                            for _cts_sel in (_cts_cc.selectors or []):
+                                if not isinstance(_cts_sel, jt.MethodInvocation):
+                                    continue
+                                _cts_nkey = (_cts_icls, _cts_sel.member)
+                                if (_cts_nkey not in _sr_keys_p3
+                                        or _cts_nkey in callee_taint_sink):
+                                    continue
+                                _cts_nsr = sink_registry.get(_cts_nkey, {})
+                                _cts_nargs = _cts_sel.arguments or []
+                                for _pidx in _cts_nsr:
+                                    if (_pidx < len(_cts_nargs)
+                                            and _is_tainted(_cts_nargs[_pidx], _cts_tl)):
+                                        callee_taint_sink.add(_cts_nkey)
+                                        _cts_changed = True
+                                        break
+                    except Exception:
+                        pass
+                    try:
+                        for _, _cts_mi in _cts_m.filter(jt.MethodInvocation):
+                            if _cts_mi.member not in _sr_method_names_p3:
                                 continue
-                            _cts_tl: set = set()
-                            for _cts_pi, _cts_pp in enumerate(_cts_m.parameters or []):
-                                _cts_ppn = getattr(_cts_pp, "name", "")
-                                if _cts_ppn and _cts_pi in _cts_sr:
-                                    _cts_tl.add(_cts_ppn)
-                            if not _cts_tl:
+                            _cts_q = str(_cts_mi.qualifier or "")
+                            if not _cts_q or not _cts_q[0].isupper():
                                 continue
-                            for _ in range(3):
-                                try:
-                                    for _, _cts_lvd in _cts_m.filter(jt.LocalVariableDeclaration):
-                                        for _cts_d in _cts_lvd.declarators:
-                                            if _cts_d.name not in _cts_tl and _cts_d.initializer:
-                                                _cts_init = _cts_d.initializer
-                                                if _is_tainted(_cts_init, _cts_tl):
-                                                    _cts_tl.add(_cts_d.name)
-                                                elif (isinstance(_cts_init, jt.MemberReference)
-                                                        and str(_cts_init.qualifier or "") in _cts_tl
-                                                        and "." not in str(_cts_init.qualifier or "")):
-                                                    _cts_tl.add(_cts_d.name)
-                                except Exception:
-                                    pass
-                            try:
-                                for _, _cts_cc in _cts_m.filter(jt.ClassCreator):
-                                    _cts_icls = _type_name(_cts_cc.type)
-                                    for _cts_sel in (_cts_cc.selectors or []):
-                                        if not isinstance(_cts_sel, jt.MethodInvocation):
-                                            continue
-                                        _cts_nkey = (_cts_icls, _cts_sel.member)
-                                        if (_cts_nkey not in _sr_keys_p3
-                                                or _cts_nkey in callee_taint_sink):
-                                            continue
-                                        _cts_nsr = sink_registry.get(_cts_nkey, {})
-                                        _cts_nargs = _cts_sel.arguments or []
-                                        for _pidx in _cts_nsr:
-                                            if (_pidx < len(_cts_nargs)
-                                                    and _is_tainted(_cts_nargs[_pidx], _cts_tl)):
-                                                callee_taint_sink.add(_cts_nkey)
-                                                _cts_changed = True
-                                                break
-                            except Exception:
-                                pass
-                            try:
-                                for _, _cts_mi in _cts_m.filter(jt.MethodInvocation):
-                                    if _cts_mi.member not in _sr_method_names_p3:
-                                        continue
-                                    _cts_q = str(_cts_mi.qualifier or "")
-                                    if not _cts_q or not _cts_q[0].isupper():
-                                        continue
-                                    _cts_mkey = (_cts_q, _cts_mi.member)
-                                    if (_cts_mkey not in _sr_keys_p3
-                                            or _cts_mkey in callee_taint_sink):
-                                        continue
-                                    _cts_msr = sink_registry.get(_cts_mkey, {})
-                                    _cts_margs = _cts_mi.arguments or []
-                                    for _pidx in _cts_msr:
-                                        if (_pidx < len(_cts_margs)
-                                                and _is_tainted(_cts_margs[_pidx], _cts_tl)):
-                                            callee_taint_sink.add(_cts_mkey)
-                                            _cts_changed = True
-                                            break
-                            except Exception:
-                                pass
+                            _cts_mkey = (_cts_q, _cts_mi.member)
+                            if (_cts_mkey not in _sr_keys_p3
+                                    or _cts_mkey in callee_taint_sink):
+                                continue
+                            _cts_msr = sink_registry.get(_cts_mkey, {})
+                            _cts_margs = _cts_mi.arguments or []
+                            for _pidx in _cts_msr:
+                                if (_pidx < len(_cts_margs)
+                                        and _is_tainted(_cts_margs[_pidx], _cts_tl)):
+                                    callee_taint_sink.add(_cts_mkey)
+                                    _cts_changed = True
+                                    break
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
