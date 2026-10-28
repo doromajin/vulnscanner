@@ -18,7 +18,7 @@
 
 - `--no-verify` / `--gpg-sign=false` は使わない
 - `git amend` は既存コミットへの破壊的操作なので原則禁止（ユーザーが明示的に指示した場合のみ）
-- コミットメッセージは英語、末尾に `Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>`
+- コミットメッセージは英語、末尾に `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`
 
 ---
 
