@@ -3019,7 +3019,10 @@ class TestJavaCFGGuards:
     )
 
     def _sql_findings(self, code: str) -> list:
-        return [f for f in JavaASTAnalyzer().analyze("C.java", code) if "SQL" in f.rule_id]
+        # SAFE sentinels (JAST-SQL-SAFE) are internal suppression markers stripped by
+        # the scanner pipeline; filter them so tests verify user-visible behavior only.
+        return [f for f in JavaASTAnalyzer().analyze("C.java", code)
+                if "SQL" in f.rule_id and not f.rule_id.endswith("-SAFE")]
 
     def test_regex_matches_guard_suppresses_sql(self):
         code = self._IMPORTS + r"""

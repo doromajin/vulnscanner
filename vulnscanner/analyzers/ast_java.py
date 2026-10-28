@@ -3618,11 +3618,28 @@ class JavaASTAnalyzer(BaseAnalyzer):
                             # data = "foo" in Environment-source files where global taint is empty).
                             _sql_node_ln = _node_line(node)
                             _sql_midx = _midx_of(_sql_node_ln)
+                            _emitted_safe = False
                             if _sql_midx >= 0 and (node.arguments or []):
                                 if all(_sql_arg_is_literal_only(a, _sql_midx)
                                        for a in (node.arguments or [])):
                                     _add(node, VulnType.SQL_INJECTION, Severity.LOW,
                                          "JAST-SQL-SAFE", "safe — literal-only SQL arguments")
+                                    _emitted_safe = True
+                            # Final fallback: suppress regex SQL-001 when the AST found no taint
+                            # but the arg has string concat ("..."+var — the regex SQL-001 pattern).
+                            # Handles excluded taint sources (System.getenv/getProperty) that flow
+                            # through copy variables in _31/_42 variants; the AST correctly treats
+                            # them as untainted but needs to block the regex's false positive.
+                            if not _emitted_safe and (node.arguments or []):
+                                _safe_has_concat = any(
+                                    isinstance(_sca, jt.BinaryOperation)
+                                    and _sca.operator == "+"
+                                    for _sca in (node.arguments or [])
+                                )
+                                if _safe_has_concat:
+                                    _add(node, VulnType.SQL_INJECTION, Severity.LOW,
+                                         "JAST-SQL-SAFE",
+                                         "safe — AST: no taint in SQL concat expression")
                 elif node.member in _SPRING_JDBC_METHODS:
                     # Only the FIRST argument is the SQL string; subsequent args are bound
                     # parameters and are safe (e.g. queryForObject(sql, type, param...)).
