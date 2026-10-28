@@ -3593,7 +3593,12 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     flagged = any(_is_tainted(a, _et) for a in (node.arguments or []))
                     # Case 2: tainted qualifier/statement object
                     # e.g. stmt = conn.prepareCall(taintedSql); stmt.executeQuery()
-                    if not flagged and q in _et:
+                    # Skip for no-arg execute(): always PreparedStatement.execute() — the SQL
+                    # was set at prepareStatement() which is caught separately; re-checking the
+                    # qualifier here causes FPs in goodB2G() where stmt was globally tainted
+                    # by bad() but locally re-assigned to a safe parameterized statement.
+                    _is_noarg_exec = (node.member == "execute" and not (node.arguments or []))
+                    if not flagged and q in _et and not _is_noarg_exec:
                         flagged = True
                     if flagged:
                         _add(node, VulnType.SQL_INJECTION, Severity.HIGH, "JAST-SQL-001",
