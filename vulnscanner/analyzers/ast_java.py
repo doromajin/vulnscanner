@@ -1562,6 +1562,10 @@ _LIST_ADD_METHODS = frozenset({
     "offerLast", "offerFirst",
 })
 
+# List retrieval methods that return the last / first element (no index arg).
+_LIST_GET_LAST  = frozenset({"getLast", "peekLast", "pollLast"})
+_LIST_GET_FIRST = frozenset({"getFirst", "peekFirst", "pollFirst", "peek", "element", "pop", "poll"})
+
 # Collection / map mutation methods where a tainted VALUE arg taints the container.
 # Used by Phase 3 to propagate taint into Vector/HashMap/List passed cross-file.
 _COLLECTION_MUTATE_METHODS = frozenset({
@@ -2062,17 +2066,29 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                                         tainted.add(decl.name)
                                         changed = True
                                     continue
-                        # Ordered list.get(idx) taint propagation.  If the collection
-                        # itself is in tainted (has any tainted element), fall through so
-                        # qualifier-in-tainted can fire (over-approximation).
+                        # Ordered list.get(idx) / getLast() / getFirst() taint propagation.
+                        # If the collection itself is in tainted (has any tainted element),
+                        # fall through so qualifier-in-tainted can fire (over-approximation).
                         _li_inner = init.expression if isinstance(init, jt.Cast) else init
                         if (isinstance(_li_inner, jt.MethodInvocation)
-                                and _li_inner.member == "get"
+                                and _li_inner.member in {"get"} | _LIST_GET_LAST | _LIST_GET_FIRST
                                 and str(_li_inner.qualifier or "") in list_contents):
                             _liq = str(_li_inner.qualifier)
                             _lia = _li_inner.arguments or []
                             _lii_resolved = False
-                            if _lia:
+                            if _li_inner.member in _LIST_GET_LAST:
+                                _lst2 = list_contents[_liq]
+                                if _lst2:
+                                    _lii_resolved = True
+                                    if _lst2[-1]:
+                                        tainted.add(decl.name); changed = True
+                            elif _li_inner.member in _LIST_GET_FIRST:
+                                _lst2 = list_contents[_liq]
+                                if _lst2:
+                                    _lii_resolved = True
+                                    if _lst2[0]:
+                                        tainted.add(decl.name); changed = True
+                            elif _lia:
                                 _lii = _eval_const_expr(_lia[0], const_ints, const_strings)
                                 if (_lii is not None
                                         and 0 <= _lii < len(list_contents[_liq])):
@@ -2232,15 +2248,27 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
 
                 # General propagation: only add taint (never remove).
                 if _vname not in tainted:
-                    # Ordered list.get(idx) taint propagation (see LVD section above).
+                    # Ordered list.get(idx) / getLast() / getFirst() taint propagation.
                     _li_rhs = rhs.expression if isinstance(rhs, jt.Cast) else rhs
                     if (isinstance(_li_rhs, jt.MethodInvocation)
-                            and _li_rhs.member == "get"
+                            and _li_rhs.member in {"get"} | _LIST_GET_LAST | _LIST_GET_FIRST
                             and str(_li_rhs.qualifier or "") in list_contents):
                         _liq2 = str(_li_rhs.qualifier)
                         _lia2 = _li_rhs.arguments or []
                         _lii2_resolved = False
-                        if _lia2:
+                        if _li_rhs.member in _LIST_GET_LAST:
+                            _lst3 = list_contents[_liq2]
+                            if _lst3:
+                                _lii2_resolved = True
+                                if _lst3[-1]:
+                                    tainted.add(_vname); changed = True
+                        elif _li_rhs.member in _LIST_GET_FIRST:
+                            _lst3 = list_contents[_liq2]
+                            if _lst3:
+                                _lii2_resolved = True
+                                if _lst3[0]:
+                                    tainted.add(_vname); changed = True
+                        elif _lia2:
                             _lii2 = _eval_const_expr(_lia2[0], const_ints, const_strings)
                             if (_lii2 is not None
                                     and 0 <= _lii2 < len(list_contents[_liq2])):
@@ -2448,8 +2476,18 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                 args = expr.arguments or []
                 if expr.member in _LIST_ADD_METHODS:
                     if len(args) == 1:
+                        _elem_tainted = _is_tainted(args[0], tainted, const_ints)
                         if len(lst) <= 32:
-                            lst.append(_is_tainted(args[0], tainted, const_ints))
+                            lst.append(_elem_tainted)
+                        else:
+                            _elem_tainted = True  # conservative once tracking overflows
+                        # Mark the list variable as tainted when any element is tainted.
+                        # This allows getLast()/iterator().next() as direct sink args to
+                        # propagate via the qualifier-in-tainted path in _is_tainted.
+                        # Assignment-path retrievals (String s = c.get(0)) still resolve
+                        # precisely via _lii_resolved → continue, preventing FPs there.
+                        if _elem_tainted and q not in tainted:
+                            tainted.add(q); changed = True
                     elif len(args) == 2 and expr.member == "add":
                         # add(index, element)
                         idx = _eval_const_expr(args[0], const_ints, const_strings)
@@ -2465,6 +2503,8 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                         )
                         if src_tainted and len(lst) <= 32:
                             lst.append(True)
+                        if src_tainted and q not in tainted:
+                            tainted.add(q); changed = True
                 elif expr.member == "remove":
                     if len(args) == 1:
                         idx = _eval_const_expr(args[0], const_ints, const_strings)
@@ -3025,7 +3065,9 @@ def _compute_method_local_clean(
             if not isinstance(getattr(se, "expression", None), jt.MethodInvocation):
                 continue
             mi = se.expression
-            if mi.member not in ("add", "addAll", "set", "put"):
+            if mi.member not in ("add", "addAll", "set", "put",
+                                 "addFirst", "addLast", "push",
+                                 "offer", "offerFirst", "offerLast"):
                 continue
             ln = getattr(getattr(se, "position", None), "line", -1)
             if ln < 0 or ln in dead_lines:
