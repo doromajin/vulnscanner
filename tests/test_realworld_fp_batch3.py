@@ -210,3 +210,57 @@ class TestTemplateLiteralVariables:
     def test_other_variable_on_same_line_still_flagged(self):
         code = "{% cycle 'a' 'b' as row silent %}\n<p>{{ row|safe }}{{ body|safe }}</p>\n"
         assert "XSS-004" in self._ids(code)
+
+
+class TestMarkSafeSanitizedValues:
+    def test_escaped_then_edited_string_is_neutral(self):
+        code = (
+            "from django.utils.html import escape\nfrom django.utils.safestring import mark_safe\n"
+            "def mangle(s):\n    escaped = str(escape(s))\n    for f in ('.', '://'):\n"
+            "        escaped = escaped.replace(f, f'<span>{f}</span>')\n    return mark_safe(escaped)\n"
+        )
+        assert "AST-XSS-001" not in _py_ids(code)
+
+    def test_unescaped_edited_string_still_flagged(self):
+        code = (
+            "from django.utils.safestring import mark_safe\n"
+            "def mangle(s):\n    escaped = s\n    for f in ('.', '://'):\n"
+            "        escaped = escaped.replace(f, f'<span>{f}</span>')\n    return mark_safe(escaped)\n"
+        )
+        assert "AST-XSS-001" in _py_ids(code)
+
+    def test_reassigned_from_unrelated_value_still_flagged(self):
+        code = (
+            "from django.utils.html import escape\nfrom django.utils.safestring import mark_safe\n"
+            "def f(s, other):\n    x = escape(s)\n    x = other\n    return mark_safe(x)\n"
+        )
+        assert "AST-XSS-001" in _py_ids(code)
+
+    def test_urlencoded_query_is_neutral(self):
+        code = (
+            "from django.utils.safestring import mark_safe\n"
+            "def sort_url(request):\n    q = request.GET.copy()\n    u = q.urlencode()\n    return mark_safe('?' + u)\n"
+        )
+        assert "AST-XSS-001" not in _py_ids(code)
+
+    def test_raw_request_value_in_concatenation_still_flagged(self):
+        code = (
+            "from django.utils.safestring import mark_safe\n"
+            "def f(request):\n    return mark_safe('?' + request.GET['x'])\n"
+        )
+        assert "AST-XSS-001" in _py_ids(code)
+
+    def test_format_html_constant_template_is_neutral(self):
+        code = (
+            "from django.conf import settings\nfrom django.utils.html import format_html\n"
+            "TMPL = (f'<span>{settings.PING_ENDPOINT}</span>{{}}')\n"
+            "def f(tail):\n    return format_html(TMPL, tail)\n"
+        )
+        assert "AST-XSS-001" not in _py_ids(code)
+
+    def test_format_html_request_format_string_still_flagged(self):
+        code = (
+            "from django.utils.html import format_html\n"
+            "def f(request):\n    return format_html(request.GET['t'], 1)\n"
+        )
+        assert "AST-XSS-001" in _py_ids(code)

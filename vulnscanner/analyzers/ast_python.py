@@ -973,6 +973,10 @@ _REDIRECT_VALIDATOR_NAME_RE = re.compile(
 )
 
 
+def _contains_name(node: ast.AST, name: str) -> bool:
+    return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
+
+
 def _fstring_parts_are_safe(node: ast.JoinedStr) -> bool:
     for v in node.values:
         if isinstance(v, ast.Constant):
@@ -980,8 +984,28 @@ def _fstring_parts_are_safe(node: ast.JoinedStr) -> bool:
         if (isinstance(v, ast.FormattedValue) and isinstance(v.value, ast.Call)
                 and _full_name(v.value.func) in _SAFE_FSTRING_WRAPPERS):
             continue
+        if isinstance(v, ast.FormattedValue) and _rooted_at_settings(v.value):
+            continue
         return False
     return True
+
+
+def _rooted_at_settings(node: ast.expr) -> bool:
+    """`settings.PING_ENDPOINT` / `django.conf.settings.X.Y` — operator configuration."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return isinstance(node, ast.Name) and node.id == "settings"
+
+
+def _is_html_or_url_sanitizer_call(node: ast.expr) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    full, attr = _full_name(node.func), _attr_name(node.func)
+    return (
+        full in _HTML_SANITIZER_FUNCS | _URL_SANITIZER_FUNCS
+        or attr in _HTML_SANITIZER_METHODS | _URL_SANITIZER_METHODS
+        or (full or "") .rsplit(".", 1)[-1] in {"escape", "conditional_escape"}
+    )
 
 
 def _mark_safe_arg_is_safe(arg: ast.expr) -> bool:
@@ -1020,6 +1044,7 @@ class _VulnVisitor(ast.NodeVisitor):
         self._call_stack: set[str] = set()  # recursion guard for interprocedural re-analysis
         self._interproc_visited: set[tuple] = set()  # dedup: (func_name, tainted_param_indices)
         self._current_func_is_web_entry: bool = False  # exploitability filter
+        self._current_func_node: ast.AST | None = None
 
     # ── scope tracking ─────────────────────────────────────────────────────────
 
@@ -1050,6 +1075,8 @@ class _VulnVisitor(ast.NodeVisitor):
         saved = self._assignments
         saved_canon = self._canonicalized_paths
         saved_web = self._current_func_is_web_entry
+        saved_fn = self._current_func_node
+        self._current_func_node = node
         self._assignments = dict(_collect_scope_assignments(node))
         # CLI entry functions: parameters come from the operator command line,
         # not from untrusted web input.  Inject CLEAN sentinels for any
@@ -1124,6 +1151,7 @@ class _VulnVisitor(ast.NodeVisitor):
         self._assignments = saved
         self._canonicalized_paths = saved_canon
         self._current_func_is_web_entry = saved_web
+        self._current_func_node = saved_fn
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
@@ -1512,7 +1540,7 @@ class _VulnVisitor(ast.NodeVisitor):
         if not node.args:
             return
         arg = node.args[0]
-        if _is_const(arg) or _mark_safe_arg_is_safe(arg):
+        if _is_const(arg) or self._xss_value_is_neutral(arg):
             return
         taint = _taint_of(arg, self._assignments, self._class_attrs)
         if taint.status == TaintStatus.CLEAN:
@@ -1526,6 +1554,54 @@ class _VulnVisitor(ast.NodeVisitor):
             self._add(node, VulnType.XSS, Severity.MEDIUM, "AST-XSS-001",
                       f"[needs_review] {name}() called with a non-literal value —"
                       " verify no user input reaches this")
+
+    def _xss_value_is_neutral(self, node: ast.expr, _depth: int = 0) -> bool:
+        """True if marking *node* safe cannot inject markup: literals, numeric / escaped f-strings,
+        concatenations of those, HTML-escaped or URL-encoded values, and module-level constants
+        built from them."""
+        if _depth > 6:
+            return False
+        if _mark_safe_arg_is_safe(node):
+            return True
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return (self._xss_value_is_neutral(node.left, _depth + 1)
+                    and self._xss_value_is_neutral(node.right, _depth + 1))
+        if _is_html_or_url_sanitizer_call(node):
+            return True
+        if isinstance(node, ast.Call) and _full_name(node.func) in ("str", "SafeString") and len(node.args) == 1:
+            return self._xss_value_is_neutral(node.args[0], _depth + 1)
+        if isinstance(node, ast.Name):
+            value = self._assignments.get(node.id)
+            if value is None and node.id.isupper():
+                value = getattr(_cross_file_local, "module_level_assignments", {}).get(node.id)
+            if value is not None and node.id.isupper():          # module constant
+                return self._xss_value_is_neutral(value, _depth + 1)
+            if value is not None and not _contains_name(value, node.id):
+                if self._xss_value_is_neutral(value, _depth + 1):
+                    return True
+            return self._name_always_derived_from_sanitizer(node.id)
+        return False
+
+    def _name_always_derived_from_sanitizer(self, name: str) -> bool:
+        """`x = escape(s)` followed only by self-referential edits (`x = x.replace(…)`)."""
+        fn = self._current_func_node
+        if fn is None:
+            return False
+        sanitized = False
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Assign):
+                targets, value = sub.targets, sub.value
+            elif isinstance(sub, ast.AnnAssign) and sub.value is not None:
+                targets, value = [sub.target], sub.value
+            else:
+                continue
+            if not any(isinstance(t, ast.Name) and t.id == name for t in targets):
+                continue
+            if any(_is_html_or_url_sanitizer_call(c) for c in ast.walk(value)):
+                sanitized = True
+            elif not _contains_name(value, name):
+                return False          # reassigned from something unrelated
+        return sanitized
 
     # ── insecure deserialization ───────────────────────────────────────────────
 
