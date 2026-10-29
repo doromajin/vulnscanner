@@ -36,7 +36,7 @@
   vuln_type: OPEN_REDIRECT
   cwe: 601
   languages: [javascript, typescript]
-  regex: "window\\.location\\s*="
+  regex: "window\\.location\\s*=(?!\\s*(?:window\\.)?location(?:\\.href)?\\s*;?\\s*(?://.*)?$)"
   evidence_regex: '\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)|window\.name|URLSearchParams|postMessage|\baddEventListener\s*\(\s*[\x22\x27]message|\bonmessage\b|\bevent\.data\b'
   no_evidence_severity: LOW
 

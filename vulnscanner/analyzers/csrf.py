@@ -65,6 +65,28 @@ _GUARD = re.compile(
 )
 
 
+# A view that never looks at the logged-in user / session has no ambient credentials for a
+# cross-site request to ride on (webhooks, token- or signature-authenticated APIs).
+_SESSION_USE_RE = re.compile(
+    r"request\.user|login_required|permission_required|user_passes_test|is_authenticated"
+    r"|request\.session|LoginRequired|IsAuthenticated|@staff_member_required",
+)
+
+
+def _view_uses_session(lines: list[str], lineno: int) -> bool:
+    """True if the view decorated at 1-based *lineno* touches the session / current user."""
+    start = max(0, lineno - 4)
+    seg: list[str] = []
+    seen_def = False
+    for text in lines[start: lineno + 120]:
+        is_def = bool(re.match(r"\s*(?:async\s+)?(?:def|class)\s", text))
+        if seen_def and re.match(r"(?:@|def\s|async\s+def\s|class\s)", text):
+            break                      # next top-level definition / decorator
+        seen_def = seen_def or is_def
+        seg.append(text)
+    return bool(_SESSION_USE_RE.search("\n".join(seg)))
+
+
 class CSRFAnalyzer(BaseAnalyzer):
     supported_extensions = (
         ".py", ".html", ".js", ".ts", ".java", ".rb", ".php",
@@ -84,11 +106,21 @@ class CSRFAnalyzer(BaseAnalyzer):
 
             # Django: @csrf_exempt decorator
             if file_path.endswith(".py") and _DJANGO_EXEMPT_RE.search(line):
-                findings.append(self._make(
-                    "CSRF-001", Severity.HIGH,
-                    "Django @csrf_exempt disables CSRF protection on this view",  # vulnscanner: ignore[CSRF-001]
-                    file_path, lineno, stripped, lines, repo_url,
-                ))
+                if _view_uses_session(lines, lineno):
+                    findings.append(self._make(
+                        "CSRF-001", Severity.HIGH,
+                        "Django @csrf_exempt disables CSRF protection on this view",  # vulnscanner: ignore[CSRF-001]
+                        file_path, lineno, stripped, lines, repo_url,
+                    ))
+                else:
+                    f = self._make(
+                        "CSRF-001", Severity.LOW,
+                        "Django @csrf_exempt on a view that does not use the session or current user "  # vulnscanner: ignore[CSRF-001]
+                        "[low_reach: token/signature-authenticated endpoints are not CSRF targets]",
+                        file_path, lineno, stripped, lines, repo_url,
+                    )
+                    f.taint_status, f.confidence = "unknown", 0.3
+                    findings.append(f)
 
             # Django HTML template: POST form without {% csrf_token %}
             if file_path.endswith((".html", ".htm")) and _DJANGO_FORM_RE.search(line):

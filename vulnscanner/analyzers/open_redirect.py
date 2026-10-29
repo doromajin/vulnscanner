@@ -68,7 +68,7 @@ _RULES = [
     (
         "REDIR-010",
         re.compile(
-            r'redirect\s*\(\s*request\.(?:args|form|values|GET|POST)\s*(?:\.get\s*\(|\[)',
+            r'(?<![A-Za-z0-9_])redirect\s*\(\s*request\.(?:args|form|values|GET|POST)\s*(?:\.get\s*\(|\[)',
             re.IGNORECASE,
         ),
         "Python redirect() with user-controlled request parameter - open redirect allows phishing attacks",

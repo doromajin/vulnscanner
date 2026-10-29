@@ -779,7 +779,8 @@ def _check_sinks(
                   "User-controlled regex pattern in .match() — ReDoS risk")
 
         # ── Mass assignment: Model.create(params) / model.update(params) ─
-        elif meth_text in _MASS_ASSIGN_METHODS and arg_nodes and taint_guarded(arg_nodes[0], node):
+        elif (meth_text in _MASS_ASSIGN_METHODS and arg_nodes and taint_guarded(arg_nodes[0], node)
+              and not arg_nodes[0].text.decode("utf-8", errors="replace").lstrip().startswith("session")):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.SQL_INJECTION, Severity.MEDIUM,
                   "RBAST-MASS-001",

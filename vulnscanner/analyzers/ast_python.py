@@ -440,6 +440,8 @@ _SECURITY_SENSITIVE_RNG_RE = re.compile(
 # Covers datetime/time (server clock) and OS-path helpers (system dirs, PID, etc.)
 _CLEAN_SERVER_FUNCS = frozenset({
     # datetime / date / time — system clock values
+    # Django URL reversal yields host-relative URLs from the URLconf — never attacker-chosen hosts
+    "reverse", "reverse_lazy", "django.urls.reverse", "django.urls.reverse_lazy",
     "datetime.now", "datetime.utcnow", "datetime.today",
     "date.today",
     "time.time", "time.monotonic", "time.perf_counter",
@@ -956,6 +958,46 @@ class PythonASTAnalyzer(BaseAnalyzer):
 
 # ── AST visitor ────────────────────────────────────────────────────────────────
 
+_SAFE_FSTRING_WRAPPERS = frozenset({
+    "ord", "int", "len", "escape", "conditional_escape", "format_html",
+    "html.escape", "django.utils.html.escape", "urlencode", "quote",
+})
+
+# Names of user-defined / library redirect-target validators:
+#   url_has_allowed_host_and_scheme, is_safe_url, _allow_redirect, safe_redirect_url, valid_next …
+_REDIRECT_VALIDATOR_NAME_RE = re.compile(
+    r"^_?(?:url_has_allowed_host_and_scheme|is_safe_(?:redirect_)?url|is_safe_redirect\w*|safe_redirect\w*"
+    r"|(?:is_)?(?:allow|allowed|safe|valid|trusted)_?(?:redirect|url|next|target|location)\w*"
+    r"|(?:redirect|next|url)_?(?:allowed|is_safe|is_valid|valid|safe)\w*)$",
+    re.IGNORECASE,
+)
+
+
+def _fstring_parts_are_safe(node: ast.JoinedStr) -> bool:
+    for v in node.values:
+        if isinstance(v, ast.Constant):
+            continue
+        if (isinstance(v, ast.FormattedValue) and isinstance(v.value, ast.Call)
+                and _full_name(v.value.func) in _SAFE_FSTRING_WRAPPERS):
+            continue
+        return False
+    return True
+
+
+def _mark_safe_arg_is_safe(arg: ast.expr) -> bool:
+    """mark_safe()/Markup() argument that cannot carry markup from data: literal, or an
+    f-string / "".join(f-string …) whose substitutions are numeric or escaped."""
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return True
+    if isinstance(arg, ast.JoinedStr):
+        return _fstring_parts_are_safe(arg)
+    if (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute) and arg.func.attr == "join"
+            and isinstance(arg.func.value, ast.Constant) and len(arg.args) == 1):
+        elt = getattr(arg.args[0], "elt", None)   # generator expression / list comprehension
+        return elt is not None and _mark_safe_arg_is_safe(elt)
+    return False
+
+
 class _VulnVisitor(ast.NodeVisitor):
     def __init__(
         self,
@@ -1436,6 +1478,11 @@ class _VulnVisitor(ast.NodeVisitor):
             obj_taint = _taint_of(path_obj, self._assignments, self._class_attrs)
             if obj_taint.status == TaintStatus.CLEAN:
                 return
+            # `.exists()` / `.is_file()` on a receiver of unknown type in a module that never
+            # touches pathlib is overwhelmingly an ORM call (QuerySet.exists()), not a Path.
+            if (attr in ("exists", "is_file", "is_dir") and obj_taint.status != TaintStatus.TAINTED
+                    and "pathlib" not in self.content and "Path(" not in self.content):
+                return
             sev = Severity.HIGH if obj_taint.status == TaintStatus.TAINTED else Severity.MEDIUM
             prefix = "" if obj_taint.status == TaintStatus.TAINTED else "[needs_review] "
             self._add(node, VulnType.PATH_TRAVERSAL, sev, "AST-PATH-004",
@@ -1465,7 +1512,7 @@ class _VulnVisitor(ast.NodeVisitor):
         if not node.args:
             return
         arg = node.args[0]
-        if _is_const(arg):
+        if _is_const(arg) or _mark_safe_arg_is_safe(arg):
             return
         taint = _taint_of(arg, self._assignments, self._class_attrs)
         if taint.status == TaintStatus.CLEAN:
@@ -1996,6 +2043,11 @@ class _VulnVisitor(ast.NodeVisitor):
             or (attr in _LOG_INSTANCE_METHODS and isinstance(node.func, ast.Attribute))
         )
         if not is_log_call or not node.args:
+            return
+        # Django contrib.messages: messages.warning(request, "...") shows a flash message to the
+        # user (HTML-escaped on render); it is not a log sink.
+        if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "messages"):
             return
         taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
         if taint.status != TaintStatus.TAINTED:
@@ -3446,7 +3498,11 @@ def _extract_guard_var(test: ast.expr) -> str | None:
       var.isdigit() / var.isnumeric() / var.isalpha() / var.isalnum()
       re.match/fullmatch/search(pattern, var)          — regex validation
       var in [allowlist]                               — allowlist membership
+      url_has_allowed_host_and_scheme(var) / _allow_redirect(var) — redirect-target validator
     """
+    if (isinstance(test, ast.Call) and test.args and isinstance(test.args[0], ast.Name)
+            and _REDIRECT_VALIDATOR_NAME_RE.match(_attr_name(test.func) or _full_name(test.func) or "")):
+        return test.args[0].id
     if (isinstance(test, ast.Call)
             and isinstance(test.func, ast.Name)
             and test.func.id == "isinstance"

@@ -102,10 +102,15 @@ _VENDOR_FILENAME_RE = re.compile(
     r"jquery[.\-]|bootstrap[.\-]|html5shiv|modernizr|respond[.\-]|polyfill|"
     r"lodash[.\-]|underscore|backbone|ember|angular|react|vue[.\-]|"
     r"moment[.\-]|chart\.js|d3[.\-]|leaflet|tinymce|ckeditor|codemirror|"
-    r"font-awesome|normalize|reset\.css"
+    r"font-awesome|normalize|reset\.css|datatables|select2|popper|prism[.\-]|highlight(?:\.min)?\.js|"
+    r"flatpickr|swagger-ui|sortable(?:js)?[.\-]|bootstrap-\w+|jquery-\w+"
     r")",
     re.IGNORECASE,
 )
+
+
+# Minified bundles (`app.min.js`, `site.min.css`) are build output / third-party code.
+_MINIFIED_RE = re.compile(r"\.min\.(?:js|css)$", re.IGNORECASE)
 
 
 def is_vendor_file(path: str) -> bool:
@@ -114,7 +119,7 @@ def is_vendor_file(path: str) -> bool:
     parts = norm.lower().split("/")
     if any(p in _VENDOR_SEGMENTS for p in parts):
         return True
-    return bool(_VENDOR_FILENAME_RE.search(norm))
+    return bool(_VENDOR_FILENAME_RE.search(norm) or _MINIFIED_RE.search(norm))
 
 
 # ── Combined classifier ────────────────────────────────────────────────────────

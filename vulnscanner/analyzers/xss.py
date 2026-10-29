@@ -60,6 +60,25 @@ _SIMPLE_GUARD = re.compile(
     re.IGNORECASE,
 )
 
+# Django / Jinja template with no HTML markup at all (notification subjects, plain-text bodies):
+# `{{ x|safe }}` there only stops HTML-escaping of text, it cannot inject markup.
+_HTML_TAG_RE = re.compile(r"<\s*/?\s*[A-Za-z][^<>]*>|<!--")
+_FORMAT_HTML_CONCAT_RE = re.compile(r"format_html\s*\(.*\+", re.IGNORECASE)
+# Template variables that the template itself defines from string literals:
+#   {% cycle '' '</tr><tr>' as trtr silent %}   {% with sep="<br>" %}
+# `{{ trtr|safe }}` on those cannot carry request data.
+_TPL_CYCLE_AS_RE = re.compile(r"\{%-?\s*cycle\s+((?:'[^']*'|\"[^\"]*\"|\s)+?)\s+as\s+(\w+)")
+_TPL_WITH_LITERAL_RE = re.compile(r"\{%-?\s*with\s+(?:\w+\s*=\s*(?:'[^']*'|\"[^\"]*\")\s*)*?(\w+)\s*=\s*(?:'[^']*'|\"[^\"]*\")")
+_TPL_SAFE_VAR_RE = re.compile(r"\{\{\s*(\w+)\s*(?:\|\s*\w+(?::[^|}]*)?\s*)*\|\s*safe\b")
+
+
+def _template_literal_vars(content: str) -> set[str]:
+    names = {m.group(2) for m in _TPL_CYCLE_AS_RE.finditer(content)}
+    names |= {m.group(1) for m in _TPL_WITH_LITERAL_RE.finditer(content)}
+    return names
+# Simple DOM-sink rules that, like innerHTML, only matter when the page has an attacker-controlled input
+_DOM_GATED_RULES = frozenset({"XSS-002", "XSS-003", "XSS-006"})
+
 # ── XSS-001: innerHTML smart analysis ─────────────────────────────────────────
 
 # Browser-controlled input sources.  Keep in sync with evidence_regex in
@@ -217,6 +236,12 @@ class XSSAnalyzer(BaseAnalyzer):
         if _SIMPLE_GUARD.search(content):
             is_js_html = file_path.endswith(_JS_HTML_EXTS)
             is_php = file_path.endswith(".php")
+            is_py = file_path.endswith(".py")
+            plain_text_template = file_path.endswith((".html", ".htm")) and not _HTML_TAG_RE.search(content)
+            tpl_literal_vars = (
+                _template_literal_vars(content) if file_path.endswith((".html", ".htm")) else set()
+            )
+            dom_reachable = bool(_DOM_SOURCE_RE.search(content))
             simple_rules = [
                 (rid, pat, desc, sev)
                 for rid, pat, desc, sev in _SIMPLE_RULES
@@ -229,9 +254,24 @@ class XSSAnalyzer(BaseAnalyzer):
                 stripped = line.strip()
                 for rule_id, pattern_re, description, severity in simple_rules:
                     if pattern_re.search(line):
+                        if rule_id == "XSS-004":
+                            # mark_safe() in .py is judged by PythonASTAnalyzer (AST-XSS-001)
+                            if is_py and not _FORMAT_HTML_CONCAT_RE.search(line):
+                                continue
+                            if plain_text_template:
+                                continue
+                            if tpl_literal_vars:
+                                safe_vars = _TPL_SAFE_VAR_RE.findall(line)
+                                if safe_vars and all(v in tpl_literal_vars for v in safe_vars):
+                                    continue
+                        sev, ts, conf = severity, None, 1.0
+                        if rule_id in _DOM_GATED_RULES and is_js_html and not dom_reachable:
+                            sev, ts, conf = Severity.LOW, "unknown", 0.3
                         findings.append(Finding(
                             vuln_type=VulnType.XSS,
-                            severity=severity,
+                            severity=sev,
+                            taint_status=ts,
+                            confidence=conf,
                             file_path=file_path,
                             line_number=lineno,
                             line_content=stripped,
