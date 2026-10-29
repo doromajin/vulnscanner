@@ -162,3 +162,36 @@ class TestPhpEchoSanitizers:
 
     def test_isset_alone_with_raw_value_flagged(self):
         assert self._scan("echo isset($_GET['a']) ? $_GET['a'] : '';\n")
+
+
+# ── 6. SSTI-003: Twig render with the sandbox actually enabled ────────────────
+
+class TestTwigSandbox:
+    def _scan(self, code):
+        from vulnscanner.analyzers.ssti import SSTIAnalyzer
+        return [f for f in SSTIAnalyzer().analyze("src/Renderer.php", code) if f.rule_id == "SSTI-003"]
+
+    def test_enable_sandbox_suppresses(self):
+        code = (
+            "$sandbox = $twig->getExtension(SandboxExtension::class);\n"
+            "$sandbox->enableSandbox();\n"
+            "$content = $twig->render($template, $options);\n"
+        )
+        assert not self._scan(code)
+
+    def test_global_sandbox_flag_suppresses(self):
+        code = (
+            "$twig->addExtension(new SandboxExtension($policy, true));\n"
+            "$content = $twig->render($template, $options);\n"
+        )
+        assert not self._scan(code)
+
+    def test_extension_registered_but_not_enabled_still_flagged(self):
+        code = (
+            "$twig->addExtension(new SandboxExtension($policy));\n"
+            "$content = $twig->render($template, $options);\n"
+        )
+        assert self._scan(code)
+
+    def test_no_sandbox_still_flagged(self):
+        assert self._scan("$content = $twig->render($template, $options);\n")
