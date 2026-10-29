@@ -214,6 +214,7 @@ def _collect_files_classic(juliet_root: Path) -> dict[str, list[Path]]:
 
 
 # ── slow-unit tracing (--trace-slow) ────────────────────────────────────────────────────────
+DUMP_MISSES: str | None = None   # --dump-misses PATH: append "CWE<TAB>file" for every missed file
 _RUNNING: dict[str, float] = {}
 _DURATIONS: list[tuple[float, str]] = []
 
@@ -315,6 +316,10 @@ def run(juliet_root: Path, verbose: bool = False, max_workers: int = 4,
                         fn += 1
                         misses.append(fpath)
 
+        if DUMP_MISSES and misses:
+            with open(DUMP_MISSES, "a", encoding="utf-8") as _mf:
+                _mf.write("".join(f"{cwe}\t{m}\n" for m in misses))
+
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         rule_str = "/".join(sorted(expected_rules))
         print(f"{cwe:<10} {rule_str:<22} {len(files):>6} {tp:>5} {fn:>5} {recall:>7.1%}")
@@ -355,6 +360,8 @@ if __name__ == "__main__":
                     help="Score only shard i of N (0-based); run N processes and sum TP/FN")
     ap.add_argument("--trace-slow", type=float, default=None, metavar="SECONDS",
                     help="Print every scoring unit that runs longer than SECONDS, while it runs")
+    ap.add_argument("--dump-misses", metavar="PATH", default=None,
+                    help="Append every missed (FN) file to PATH as 'CWE<TAB>path'")
     ap.add_argument("--low-priority", action="store_true",
                     help="Lower the process priority (Windows) so the PC stays responsive")
     args = ap.parse_args()
@@ -388,6 +395,8 @@ if __name__ == "__main__":
     print(f"Juliet C/C++ root : {root.resolve()}")
     print(f"Packages found    : {pkg_count}")
     print(f"Scoring CWEs      : {', '.join(CWE_RULES)}")
+    if args.dump_misses:
+        DUMP_MISSES = args.dump_misses
     if args.trace_slow:
         _start_watchdog(args.trace_slow)
     run(root, verbose=args.verbose, max_workers=args.workers, shard=shard)

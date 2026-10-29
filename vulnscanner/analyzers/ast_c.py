@@ -392,6 +392,10 @@ class _FuncSummary:
     returns_alloc_count: int | None = None
     # Minimum element count for each parameter index (for interprocedural size tracking).
     param_alloc_counts: dict[int, int] = field(default_factory=dict)
+    # bytes (not elements) every caller allocates for the buffer passed as parameter i (CWE-131)
+    param_alloc_bytes: dict[int, int] = field(default_factory=dict)
+    # bytes the function's returned buffer holds (`return data;` after `data = malloc(10)`)
+    returns_alloc_bytes: int | None = None
     # Minimum element count for parameters receiving pointer-to-buffer (&var where var has alloc).
     # Enables V63: &data passed where data is small → callee does *dataPtr[i] OOB.
     param_ptr_alloc_counts: dict[int, int] = field(default_factory=dict)
@@ -876,6 +880,135 @@ def _sizeof_type_text(type_text: str) -> int:
     return 4
 
 
+_BASIC_TYPE_SIZES: dict[str, int] = {
+    "char": 1, "int8_t": 1, "uint8_t": 1, "byte": 1, "bool": 1,
+    "short": 2, "int16_t": 2, "uint16_t": 2, "wchar_t": 2, "char16_t": 2,
+    "int": 4, "int32_t": 4, "uint32_t": 4, "float": 4, "char32_t": 4, "long": 4,
+    "double": 8, "int64_t": 8, "uint64_t": 8, "size_t": 8, "ssize_t": 8,
+    "intptr_t": 8, "uintptr_t": 8, "ptrdiff_t": 8,
+}
+_TYPE_QUALIFIERS = frozenset({"unsigned", "signed", "const", "volatile", "static", "register", "extern"})
+
+
+def _known_sizeof_type(type_text: str) -> int | None:
+    """sizeof(T) when *every* word of the type is a basic type, else None.
+
+    Unlike _sizeof_type_text() there is no "4 bytes" default and no substring matching
+    (`twoIntsStruct` contains "int" but is a struct): a byte-based overflow check on a guessed
+    element size would flag correct code.
+    """
+    t = type_text.strip().lower()
+    words = [w for w in re.findall(r"[a-z_][a-z0-9_]*", t) if w not in _TYPE_QUALIFIERS]
+    if not words:
+        return 4 if re.search(r"\b(?:unsigned|signed)\b", t) else None     # bare `unsigned`
+    if words[:2] == ["long", "long"]:
+        return 8
+    if "short" in words and all(w in ("short", "int") for w in words):
+        return 2
+    if all(w in _BASIC_TYPE_SIZES for w in words):
+        return max(_BASIC_TYPE_SIZES[w] for w in words)
+    return None
+
+
+def _compute_alloc_bytes(body_node, seed: dict[str, int] | None = None,
+                         returns: dict[str, int] | None = None) -> dict[str, int]:
+    """var → allocated BYTES for malloc/alloca(const), calloc(n, m) and fixed-size arrays.
+
+    Unlike _compute_alloc_counts()/_alloc_sizes, a size written without sizeof is never
+    reinterpreted as an element count and interprocedural element counts are never mixed in, so
+    the numbers can be compared with (loop bound × element size).  *seed* holds bytes already
+    known for parameters (propagated from callers); *returns* maps callee name → bytes of the
+    buffer it returns.  Smallest value wins (worst case).
+    """
+    out: dict[str, int] = dict(seed or {})
+    alloc_funcs = {"malloc", "alloca", "ALLOCA", "_alloca", "VirtualAlloc", "HeapAlloc",
+                   "LocalAlloc", "GlobalAlloc"}
+
+    def _set(var: str, nbytes: int) -> None:
+        cur = out.get(var)
+        if cur is None or nbytes < cur:
+            out[var] = nbytes
+
+    def _unwrap(n):
+        for _ in range(4):
+            if n is not None and n.type in ("cast_expression", "parenthesized_expression"):
+                n = next((c for c in n.named_children if c.type not in ("type_descriptor", "comment")), None)
+            else:
+                break
+        return n
+
+    def _value_bytes(val) -> int | None:
+        val = _unwrap(val)
+        if val is None:
+            return None
+        if val.type == "call_expression":
+            fn, args = _call_fname(val), _call_args(val)
+            if fn in alloc_funcs and args:
+                return _eval_const(args[0])
+            if fn == "calloc" and len(args) >= 2:
+                n, m = _eval_const(args[0]), _eval_const(args[1])
+                return n * m if n and m else None
+            if returns and fn in returns:
+                return returns[fn]
+            return None
+        if val.type == "identifier":
+            return out.get(_txt(val))
+        return None
+
+    for sn in _walk(body_node):
+        if sn.type == "declaration":
+            ty = sn.child_by_field_name("type")
+            esz = _known_sizeof_type(_txt(ty)) if ty is not None else None
+            for dc in sn.named_children:
+                decl = dc.child_by_field_name("declarator") if dc.type == "init_declarator" else dc
+                if decl is not None and decl.type == "array_declarator":
+                    n = None
+                    for ac in decl.named_children[1:]:
+                        n = _eval_const(ac)
+                        if n is not None:
+                            break
+                    var = _decl_leaf_id(decl)
+                    if var and n and esz:
+                        _set(var, n * esz)
+                elif dc.type == "init_declarator":
+                    var = _decl_leaf_id(decl)
+                    nbytes = _value_bytes(dc.child_by_field_name("value"))
+                    if var and nbytes:
+                        _set(var, nbytes)
+        elif sn.type == "assignment_expression":
+            lhs = sn.child_by_field_name("left")
+            if lhs is not None and lhs.type == "identifier":
+                nbytes = _value_bytes(sn.child_by_field_name("right"))
+                if nbytes:
+                    _set(_txt(lhs), nbytes)
+    return out
+
+
+def _param_elem_sizes(body_node) -> dict[str, int]:
+    """Declared element size of each pointer / array PARAMETER of the function owning *body_node*."""
+    fn = body_node.parent
+    out: dict[str, int] = {}
+    if fn is None:
+        return out
+    decl = fn.child_by_field_name("declarator")
+    if decl is None:
+        return out
+    for pd in _walk(decl):
+        if pd.type != "parameter_declaration":
+            continue
+        ty = pd.child_by_field_name("type")
+        esz = _known_sizeof_type(_txt(ty)) if ty is not None else None
+        d = pd.child_by_field_name("declarator")
+        if esz is None or d is None or d.type not in ("pointer_declarator", "array_declarator"):
+            continue
+        if any(c.type in ("pointer_declarator", "array_declarator") for c in d.named_children):
+            continue
+        name = _decl_leaf_id(d)
+        if name:
+            out[name] = esz
+    return out
+
+
 def _eval_const(node) -> int | None:
     """Evaluate a constant-foldable size expression to an integer byte count.
 
@@ -1312,6 +1445,25 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
             # as parameters (V52: 52b receives data from 52a, passes to 52c).
             local_counts: dict[str, int] = dict(func_counts.get(fname, {}))
             _pnames = _get_param_names(func_node)
+            local_bytes = _compute_alloc_bytes(body, seed={
+                _pnames[_bi]: _bb
+                for _bi, _bb in summaries[fname].param_alloc_bytes.items() if _bi < len(_pnames)
+            }, returns={_k: _v.returns_alloc_bytes for _k, _v in summaries.items()
+                        if _v.returns_alloc_bytes is not None})
+            for _rt in _walk(body):
+                if _rt.type != "return_statement":
+                    continue
+                _rtv = next((c for c in _rt.named_children if c.type != "comment"), None)
+                for _ in range(3):
+                    if _rtv is not None and _rtv.type in ("cast_expression", "parenthesized_expression"):
+                        _rtv = next((c for c in _rtv.named_children
+                                     if c.type not in ("type_descriptor", "comment")), None)
+                if _rtv is not None and _rtv.type == "identifier":
+                    _rb = local_bytes.get(_txt(_rtv))
+                    _cur_rb = summaries[fname].returns_alloc_bytes
+                    if _rb is not None and (_cur_rb is None or _rb < _cur_rb):
+                        summaries[fname].returns_alloc_bytes = _rb
+                        _a2_changed = True
             for _pidx2, _pcnt2 in summaries[fname].param_alloc_counts.items():
                 if _pidx2 < len(_pnames):
                     _pn2 = _pnames[_pidx2]
@@ -1401,6 +1553,12 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
                             if existing is None or cnt < existing:
                                 summaries[callee].param_alloc_counts[idx] = cnt
                                 _a2_changed = True
+                        _nbytes = local_bytes.get(aname)
+                        if _nbytes is not None:
+                            _ebytes = summaries[callee].param_alloc_bytes.get(idx)
+                            if _ebytes is None or _nbytes < _ebytes:
+                                summaries[callee].param_alloc_bytes[idx] = _nbytes
+                                _a2_changed = True
                         if aname in local_up:
                             if idx not in summaries[callee].param_underpointed:
                                 summaries[callee].param_underpointed.add(idx)
@@ -1459,7 +1617,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                   global_untrusted_int: set[str] | None = None,
                   untrusted_int_ptr_names: set[str] | None = None,
                   extra_ptr_alloc_counts: dict[str, int] | None = None,
-                  extra_const_ints: dict[str, int] | None = None) -> None:
+                  extra_const_ints: dict[str, int] | None = None,
+                  extra_alloc_bytes: dict[str, int] | None = None) -> None:
     """Walk body and emit findings for tainted sinks and always-unsafe calls."""
     seen: set[tuple] = set()
 
@@ -1469,6 +1628,33 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     _alloc_counts: dict[str, int] = {}  # variable → element count (stack arrays only)
     _const_ints: dict[str, int] = {}   # variable → constant integer value (for OOB detection)
     _strlen_vars: dict[str, str] = {}  # variable → identifier whose strlen it stores
+    # variable → declared element size (`int *p` → 4, `char buf[8]` → 1).  `p = malloc(10)` holds
+    # 10 *bytes*; whether `for (i < 10) p[i] = …` overflows depends on the element size (CWE-131).
+    _decl_elem_sz: dict[str, int] = {}
+    for _dn in _walk(body_node):
+        if _dn.type != "declaration":
+            continue
+        _dty = _dn.child_by_field_name("type")
+        _desz = _known_sizeof_type(_txt(_dty)) if _dty is not None else None
+        if _desz is None:
+            continue
+        for _dd in _dn.named_children:
+            _dec = _dd.child_by_field_name("declarator") if _dd.type == "init_declarator" else _dd
+            if _dec is None or _dec.type not in ("pointer_declarator", "array_declarator"):
+                continue
+            # `T **pp`, `T *arr[4]`, `T m[2][3]` hold pointers / rows, not plain T elements
+            if any(_c.type in ("pointer_declarator", "array_declarator") for _c in _dec.named_children):
+                continue
+            _dname = _decl_leaf_id(_dec)
+            if _dname:
+                _decl_elem_sz[_dname] = _desz
+    for _pn, _pesz in _param_elem_sizes(body_node).items():
+        _decl_elem_sz.setdefault(_pn, _pesz)
+    # Pure byte sizes (see _compute_alloc_bytes): local allocations plus what callers passed in.
+    _true_bytes = _compute_alloc_bytes(
+        body_node, seed=extra_alloc_bytes,
+        returns={_k: _v.returns_alloc_bytes for _k, _v in (summaries or {}).items()
+                 if _v.returns_alloc_bytes is not None})
 
     # Seed interprocedural constant ints (CWE-129_large / CWE-839_negative)
     if extra_const_ints:
@@ -2242,7 +2428,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
 
     # CWE-121: loop-based buffer overflow — for(i=0; i<N; i++) { data[i]=...; }
     # where N > alloc_count(data). Detects element-count overflow on stack arrays.
-    if _alloc_counts:
+    if _alloc_counts or _true_bytes:
         for _fs in _walk(body_node):
             if _fs.type != "for_statement":
                 continue
@@ -2275,7 +2461,14 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     continue
                 _bvar = _txt(_barg)
                 _bcount = _alloc_counts.get(_bvar)
-                if _bcount is None or _loop_bound <= _bcount:
+                _over_count = _bcount is not None and _loop_bound > _bcount
+                # CWE-131: the buffer was sized in bytes without sizeof (`(int *)malloc(10)`), so
+                # its element count is unknown; compare bytes written with bytes allocated.
+                _bbytes = _true_bytes.get(_bvar)
+                _besz = _decl_elem_sz.get(_bvar)
+                _over_bytes = (_bbytes is not None and _besz is not None
+                               and _loop_bound * _besz > _bbytes)
+                if not (_over_count or _over_bytes):
                     continue
                 _bln = _bn.start_point[0] + 1
                 _btxt = (lines[_bn.start_point[0]].strip()
@@ -2292,6 +2485,9 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                         description=(
                             f"Buffer overflow: loop writes {_loop_bound} elements into "
                             f"'{_bvar}' ({_bcount}-element buffer) — CWE-121"
+                            if _over_count else
+                            f"Buffer overflow: loop writes {_loop_bound} x {_besz}-byte elements "
+                            f"({_loop_bound * _besz} bytes) into '{_bvar}' ({_bbytes}-byte buffer) — CWE-131"
                         ),
                         rule_id="CAST-BUF-001",
                     ))
@@ -3322,6 +3518,10 @@ def _analyze_with_parser(parser_fn, content: str, file_path: str) -> list[Findin
             for _pidx, _pcnt in summaries[fname].param_alloc_counts.items():
                 if _pidx < len(param_names):
                     _extra[param_names[_pidx]] = _pcnt
+            _extra_bytes: dict[str, int] = {
+                param_names[_pidx]: _pb
+                for _pidx, _pb in summaries[fname].param_alloc_bytes.items() if _pidx < len(param_names)
+            }
             for _pidx in summaries[fname].param_underpointed:
                 if _pidx < len(param_names):
                     _extra_up.add(param_names[_pidx])
@@ -3367,7 +3567,8 @@ def _analyze_with_parser(parser_fn, content: str, file_path: str) -> list[Findin
                               global_untrusted_int=_merged_ui or None,
                               untrusted_int_ptr_names=_extra_ui_ptrs or None,
                               extra_ptr_alloc_counts=_extra_ptr if _extra_ptr else None,
-                              extra_const_ints=_ci_variant if _ci_variant else None)
+                              extra_const_ints=_ci_variant if _ci_variant else None,
+                              extra_alloc_bytes=_extra_bytes or None)
 
     # Step 5: C++ class member cross-method taint (constructor→destructor, etc.)
     # For each class, collect "free variables" (tainted but not locally declared) from
