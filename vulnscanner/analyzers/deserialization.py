@@ -13,7 +13,7 @@ _PHP_SAFE_UNSERIALIZE_RE = re.compile(
 # Method-call/definition form of unserialize is a user-defined method, not PHP's built-in.
 # Confirmed FP: bludit dbjson.class.php has private method named unserialize() wrapping json_decode().
 _PHP_USER_UNSERIALIZE_RE = re.compile(
-    r'(?:->\s*unserialize\s*\(|function\s+unserialize\s*\()',
+    r'(?:(?:->|::)\s*unserialize\s*\(|function\s+unserialize\s*\()',
     re.IGNORECASE,
 )
 

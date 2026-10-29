@@ -76,6 +76,12 @@ _FETCH_CALL_RE = re.compile(
 
 # ── CLIENT-MSG-001 ─────────────────────────────────────────────────────────────
 
+# Service worker scripts: `self.addEventListener('install' | 'activate' | 'fetch', …)`, skipWaiting, clients.claim
+_SERVICE_WORKER_RE = re.compile(
+    r"""self\.addEventListener\s*\(\s*['"](?:install|activate|fetch|push|notificationclick|sync)['"]"""
+    r"|\bself\.skipWaiting\s*\(|\bclients\.claim\s*\("
+)
+
 _MSG_LISTENER_RE = re.compile(
     r"""addEventListener\s*\(\s*['"]message['"]\s*,""",
     re.IGNORECASE,
@@ -261,6 +267,8 @@ class ClientSideAnalyzer(BaseAnalyzer):
         self, file_path: str, lines: list[str], repo_url: str
     ) -> list[Finding]:
         findings = []
+        if _SERVICE_WORKER_RE.search("\n".join(lines)):
+            return findings
         for i, line in enumerate(lines):
             if self._is_comment(line) or not _MSG_LISTENER_RE.search(line):
                 continue

@@ -27,6 +27,7 @@ Rule IDs (RBAST-*):
 """
 from __future__ import annotations
 
+import re
 import threading as _threading
 from dataclasses import dataclass as _dataclass, field as _field
 
@@ -428,6 +429,13 @@ _EVAL_METHODS = frozenset({"eval", "instance_eval", "class_eval", "module_eval",
 _SSTI_RECEIVERS = frozenset({"ERB", "Haml::Engine"})
 _SSTI_PARSE_RECEIVERS = frozenset({"Liquid::Template", "Mustache"})
 # Mass assignment sinks: AR/Mongoid methods that accept a hash of attributes
+# params[:period], params[:page] … are scalars (filters, paging, sort); passing one to a
+# constructor is not mass assignment.  Hash-valued params (params[:user]) still are.
+_SCALAR_PARAM_RE = re.compile(
+    r"params\[:(?:period|page|per_page|q|query|search|sort|order|filter|id|format|limit|offset"
+    r"|interval|length|from|to|since|until|tag|what|by|dir|direction|locale|lang)\]"
+)
+
 _MASS_ASSIGN_METHODS = frozenset({
     "create", "create!", "update", "update!", "update_all",
     "new", "build", "assign_attributes", "attributes=",
@@ -780,7 +788,9 @@ def _check_sinks(
 
         # ── Mass assignment: Model.create(params) / model.update(params) ─
         elif (meth_text in _MASS_ASSIGN_METHODS and arg_nodes and taint_guarded(arg_nodes[0], node)
-              and not arg_nodes[0].text.decode("utf-8", errors="replace").lstrip().startswith("session")):
+              and not arg_nodes[0].text.decode("utf-8", errors="replace").lstrip().startswith("session")
+              and not (meth_text in ("new", "build")
+                       and _SCALAR_PARAM_RE.fullmatch(arg_nodes[0].text.decode("utf-8", errors="replace").strip()))):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.SQL_INJECTION, Severity.MEDIUM,
                   "RBAST-MASS-001",

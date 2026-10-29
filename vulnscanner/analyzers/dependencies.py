@@ -255,6 +255,7 @@ def _parse_package_json(content: str) -> list[_Package]:
 
 def _parse_gemfile_lock(content: str) -> list[_Package]:
     packages: list[_Package] = []
+    seen: set[tuple[str, str]] = set()
     in_gems = False
     for lineno, line in enumerate(content.splitlines(), start=1):
         stripped = line.strip()
@@ -266,7 +267,13 @@ def _parse_gemfile_lock(content: str) -> list[_Package]:
         if in_gems:
             m = re.match(r"^\s{4}([A-Za-z0-9_.-]+)\s+\(([0-9][^)]*)\)", line)
             if m:
-                packages.append((m.group(1), m.group(2), "RubyGems", lineno))
+                # RubyGems versions never contain "-": anything after it is the platform
+                # (1.19.4-x86_64-linux-gnu, 1.0.0-java) and the same version is listed once per platform.
+                version = m.group(2).split("-", 1)[0]
+                if (m.group(1), version) in seen:
+                    continue
+                seen.add((m.group(1), version))
+                packages.append((m.group(1), version, "RubyGems", lineno))
     return packages
 
 

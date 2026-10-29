@@ -973,6 +973,19 @@ _REDIRECT_VALIDATOR_NAME_RE = re.compile(
 )
 
 
+_INTERNAL_URL_BUILDERS = frozenset({
+    "reverse", "reverse_lazy", "django.urls.reverse", "django.urls.reverse_lazy",
+    "url_for", "flask.url_for",
+})
+
+# random.* is only a problem when the value protects something.
+_SECURITY_CONTEXT_RE = re.compile(
+    r"token|secret|passw|pwd|salt|nonce|otp|session|csrf|auth|api_?key|\bkey\b|_key\b|sign|verif|reset"
+    r"|invite|captcha|\bpin\b|credential|uuid|unguessable|one_?time|magic|activation|code",
+    re.IGNORECASE,
+)
+
+
 def _contains_name(node: ast.AST, name: str) -> bool:
     return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
 
@@ -1508,7 +1521,7 @@ class _VulnVisitor(ast.NodeVisitor):
                 return
             # `.exists()` / `.is_file()` on a receiver of unknown type in a module that never
             # touches pathlib is overwhelmingly an ORM call (QuerySet.exists()), not a Path.
-            if (attr in ("exists", "is_file", "is_dir") and obj_taint.status != TaintStatus.TAINTED
+            if (attr in ("exists", "is_file", "is_dir")
                     and "pathlib" not in self.content and "Path(" not in self.content):
                 return
             sev = Severity.HIGH if obj_taint.status == TaintStatus.TAINTED else Severity.MEDIUM
@@ -1581,6 +1594,25 @@ class _VulnVisitor(ast.NodeVisitor):
                     return True
             return self._name_always_derived_from_sanitizer(node.id)
         return False
+
+    def _name_is_internal_url_prefix(self, name: str) -> bool:
+        fn = self._current_func_node
+        if fn is None:
+            return False
+        events: list[tuple[int, ast.AST]] = []
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in sub.targets):
+                events.append((sub.lineno, sub))
+            elif isinstance(sub, ast.AugAssign) and isinstance(sub.target, ast.Name) and sub.target.id == name:
+                events.append((sub.lineno, sub))
+        events.sort(key=lambda e: e[0])
+        if not events or not isinstance(events[0][1], ast.Assign):
+            return False
+        first = events[0][1].value
+        if not (isinstance(first, ast.Call)
+                and _full_name(first.func) in _INTERNAL_URL_BUILDERS):
+            return False
+        return all(isinstance(e, ast.AugAssign) and isinstance(e.op, ast.Add) for _, e in events[1:])
 
     def _name_always_derived_from_sanitizer(self, name: str) -> bool:
         """`x = escape(s)` followed only by self-referential edits (`x = x.replace(…)`)."""
@@ -1725,6 +1757,11 @@ class _VulnVisitor(ast.NodeVisitor):
         if taint.status == TaintStatus.CLEAN:
             return
 
+        # `url = reverse(...)` followed only by `url += suffix`: scheme and host are fixed, so a
+        # request-derived suffix (query string, fragment) cannot redirect off-site.
+        if isinstance(url_arg, ast.Name) and self._name_is_internal_url_prefix(url_arg.id):
+            return
+
         # Suppress when the URL is validated via urlparse+allowlist or Django guard —
         # applies for both TAINTED and UNKNOWN taint.
         _REDIRECT_VALIDATORS = {
@@ -1853,9 +1890,17 @@ class _VulnVisitor(ast.NodeVisitor):
         qualifier = node.func.value
         if not isinstance(qualifier, ast.Name) or qualifier.id != "random":
             return
-        self._add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "AST-CRYPTO-003",
-                  f"random.{attr}() is not cryptographically secure — "
-                  "use secrets.token_bytes() or secrets.token_hex() for session tokens and nonces")
+        fn_name = getattr(self._current_func_node, "name", "") or ""
+        line_text = self.lines[node.lineno - 1] if 0 < node.lineno <= len(self.lines) else ""
+        if _SECURITY_CONTEXT_RE.search(fn_name) or _SECURITY_CONTEXT_RE.search(line_text):
+            self._add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "AST-CRYPTO-003",
+                      f"random.{attr}() is not cryptographically secure — "
+                      "use secrets.token_bytes() or secrets.token_hex() for session tokens and nonces")
+        else:
+            self._add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.LOW, "AST-CRYPTO-003",
+                      f"random.{attr}() is not cryptographically secure [low_reach: no security-sensitive "
+                      "name in this function / statement — fine for jitter, sampling, shuffling; "
+                      "use secrets.* if the value protects anything]")
 
     # ── XXE ───────────────────────────────────────────────────────────────────
 
@@ -3126,6 +3171,9 @@ def _taint_of(
         # os.environ is server configuration, not user input (see CLAUDE.md).
         if (isinstance(node.value, ast.Name) and node.value.id == "os"
                 and attr == "environ"):
+            return CLEAN_LITERAL
+        # Django `settings.X` is server configuration, not request data.
+        if _rooted_at_settings(node):
             return CLEAN_LITERAL
         if attr in _TAINTED_ATTR_NAMES:
             return TaintInfo(TaintStatus.TAINTED,

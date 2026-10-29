@@ -32,7 +32,7 @@ _RULES = [
     (
         "PROTO-004",
         re.compile(
-            r'(?:_\.merge|_\.extend|jQuery\.extend|deepmerge|lodash\.merge)\s*\(\s*(?:true\s*,\s*)?\w+\s*,\s*(?:req\.|JSON\.parse)',
+            r'(?:_\.merge|_\.extend|jQuery\.extend|deepmerge|lodash\.merge)\s*\(\s*(?:true\s*,\s*)?\w+\s*,\s*(?:req\.|JSON\.parse\s*\(\s*(?!(?:await\s+)?(?:\w+\.)?readFile(?:Sync)?\b))',
             re.IGNORECASE,
         ),
         "Deep merge with user-controlled object - prototype pollution risk",

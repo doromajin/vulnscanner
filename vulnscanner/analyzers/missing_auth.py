@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 
 from vulnscanner.analyzers.base import BaseAnalyzer
+from vulnscanner.analyzers.csrf import _SESSION_USE_RE
 from vulnscanner.models import Finding, Severity, VulnType
 
 _MA = VulnType.MISSING_AUTHORIZATION
@@ -274,9 +275,17 @@ class MissingAuthAnalyzer(BaseAnalyzer):
                             return None
                     break
 
+        # @csrf_exempt + never reading the session / current user = webhook or token- /
+        # signature-authenticated endpoint: authentication is not session based, so a missing
+        # login decorator is expected.
+        severity, note = Severity.HIGH, ""
+        if "csrf_exempt" in dec_text and not _SESSION_USE_RE.search("\n".join(lines[func_idx: func_idx + 120])):
+            severity = Severity.LOW
+            note = " [low_reach: csrf_exempt endpoint that never uses the session — webhook / token-authenticated]"
+
         return Finding(
             vuln_type=_MA,
-            severity=Severity.HIGH,
+            severity=severity,
             file_path=file_path,
             line_number=lineno,
             line_content=lines[func_idx].strip(),
@@ -284,6 +293,7 @@ class MissingAuthAnalyzer(BaseAnalyzer):
                 f"Route handler '{func_name}' accepts state-changing requests "
                 f"(POST/PUT/DELETE/PATCH) without an authentication guard. "
                 f"Add @login_required, @permission_classes([IsAuthenticated]), or equivalent."
+                + note
             ),
             rule_id="AUTH-001",
             repo_url=repo_url,
