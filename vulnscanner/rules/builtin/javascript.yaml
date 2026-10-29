@@ -6,7 +6,9 @@
   vuln_type: XSS
   cwe: 79
   languages: [javascript, typescript]
-  regex: "\\.innerHTML\\s*="
+  # Skip when the whole right-hand side is one complete string literal with no
+  # concatenation or ${} interpolation (e.g. el.innerHTML = '<b>static</b>';).
+  regex: '\.innerHTML\s*=(?!\s*(?:''[^''\\]*''|"[^"\\]*"|`[^`$\\]*`)\s*[;,]?\s*(?://.*)?$)'
 
 - id: JS-XSS-002
   message: "document.write() with dynamic content — XSS risk; prefer DOM manipulation methods"

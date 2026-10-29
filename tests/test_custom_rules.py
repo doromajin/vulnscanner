@@ -250,6 +250,31 @@ class TestBuiltinRules:
         matches = [r.id for r in js_rules if r.matches("el.innerHTML = userInput")]
         assert "JS-XSS-001" in matches
 
+    @pytest.mark.parametrize("line", [
+        "el.innerHTML = userInput",
+        "template.innerHTML = html.trim();",
+        "temp.innerHTML = text;",
+        "p.innerHTML = '<p>' + msg + '</p>';",
+        'p.innerHTML = "<p>" + msg;',
+        "p.innerHTML = `<p>${name}</p>`;",
+        "p.innerHTML = '<b>a</b>'; send(x);",
+        "p.innerHTML = cond ? '<a>' : other;",
+    ])
+    def test_innerHTML_dynamic_still_detected(self, builtin_rules, line):
+        js_rules = [r for r in builtin_rules if "javascript" in r.languages]
+        assert "JS-XSS-001" in [r.id for r in js_rules if r.matches(line)]
+
+    @pytest.mark.parametrize("line", [
+        "temp.innerHTML = '<div class=\"overlay\"><div></div></div>';",
+        'el.innerHTML = "static text";',
+        "el.innerHTML = `<svg></svg>`;",
+        "render: node => node.innerHTML = \"Here sits a map\",",
+        "el.innerHTML = '';  // clear",
+    ])
+    def test_innerHTML_pure_literal_not_detected(self, builtin_rules, line):
+        js_rules = [r for r in builtin_rules if "javascript" in r.languages]
+        assert "JS-XSS-001" not in [r.id for r in js_rules if r.matches(line)]
+
     def test_java_readobject_detected(self, builtin_rules):
         java_rules = [r for r in builtin_rules if "java" in r.languages]
         matches = [r.id for r in java_rules if r.matches("Object obj = ois.readObject()")]
