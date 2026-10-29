@@ -66,54 +66,6 @@
             "type": "command",
             "shell": "bash",
             "command": "python -c \"import sys,json; d=json.load(sys.stdin); sys.stderr.write('[自動実行] $ ' + d['tool_input']['command'] + '\\n')\" 2>/dev/null || true"
-          },
-          {
-            "type": "command",
-            "shell": "bash",
-            "command": "python C:/VulnScanner/.claude/notify_hook.py pre"
-          }
-        ]
-      },
-      {
-        "matcher": "PowerShell",
-        "hooks": [
-          {
-            "type": "command",
-            "shell": "bash",
-            "command": "python C:/VulnScanner/.claude/notify_hook.py pre"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "shell": "bash",
-            "command": "python C:/VulnScanner/.claude/notify_hook.py post"
-          }
-        ]
-      },
-      {
-        "matcher": "PowerShell",
-        "hooks": [
-          {
-            "type": "command",
-            "shell": "bash",
-            "command": "python C:/VulnScanner/.claude/notify_hook.py post"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "shell": "bash",
-            "command": "python C:/VulnScanner/.claude/notify_hook.py stop"
           }
         ]
       }

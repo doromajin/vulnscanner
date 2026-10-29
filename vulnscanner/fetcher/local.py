@@ -3,7 +3,7 @@ from __future__ import annotations
 import fnmatch
 import os
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 _SCAN_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx",
@@ -26,8 +26,6 @@ _SCAN_FILENAMES = frozenset({
 _SKIP_DIRS = {
     "node_modules", ".git", "vendor", "dist", "build",
     "__pycache__", ".mvn", "bower_components",
-    # Common frontend third-party asset dirs inside Java/Rails/etc. projects
-    "plugins", "libs", "lib",
 }
 
 # Additional path-segment pairs: skip when BOTH parent and child match
@@ -44,8 +42,15 @@ _MAX_FILE_BYTES = 500_000
 
 
 class LocalFetcher:
-    def __init__(self, root: str) -> None:
+    def __init__(
+        self,
+        root: str,
+        is_excluded: Callable[[str], bool] | None = None,
+    ) -> None:
         self._root = Path(root).resolve()
+        # Predicate on a root-relative path; used to prune excluded directories
+        # and to skip excluded files before they are read.
+        self._is_excluded = is_excluded or (lambda _p: False)
 
     def ignore_file_path(self) -> Path:
         """Return the path to .vulnscannerignore if it exists in the root."""
@@ -65,12 +70,17 @@ class LocalFetcher:
 
         for dirpath, dirnames, filenames in os.walk(str(self._root)):
             # Prune directories in-place to avoid traversing excluded subtrees.
+            rel_dir = os.path.relpath(dirpath, str(self._root)).replace("\\", "/")
+            rel_dir = "" if rel_dir == "." else rel_dir + "/"
             dirnames[:] = [
                 d for d in dirnames
                 if d.lower() not in _SKIP_DIRS
                 and not any(fnmatch.fnmatch(d, pat) for pat in ignore_patterns)
+                and not self._is_excluded(rel_dir + d)
             ]
             for filename in filenames:
+                if self._is_excluded(rel_dir + filename):
+                    continue
                 full_path = Path(dirpath) / filename
                 if self._should_skip(full_path):
                     continue
@@ -86,9 +96,13 @@ class LocalFetcher:
                     continue
 
     def _should_skip(self, path: Path) -> bool:
-        # Skip if any directory component is a known vendor dir
-        parts = {p.lower() for p in path.parts}
-        if parts & _SKIP_DIRS:
+        # Skip if any directory component *below the scan root* is a known vendor
+        # dir. Components of the root itself (e.g. ~/build/myrepo) must not count.
+        try:
+            rel_parts = path.relative_to(self._root).parts[:-1]
+        except ValueError:
+            rel_parts = path.parts[:-1]
+        if {p.lower() for p in rel_parts} & _SKIP_DIRS:
             return True
 
         # Skip minified/bundled files by filename suffix
@@ -96,9 +110,14 @@ class LocalFetcher:
         if any(name_lower.endswith(s) for s in _SKIP_FILENAME_SUFFIXES):
             return True
 
-        # Skip well-known third-party library filenames
+        # Skip well-known third-party library filenames (jquery.js, jquery-3.6.0.js,
+        # bootstrap.bundle.js) but not names that merely share a letter prefix
+        # (reactor.py, underscored_helpers.py). A non-letter must follow the name.
         stem_lower = path.stem.lower()
-        if any(stem_lower.startswith(lib) for lib in _SKIP_PATH_SEGMENTS):
+        if any(
+            stem_lower == lib or (stem_lower.startswith(lib) and not stem_lower[len(lib)].isalpha())
+            for lib in _SKIP_PATH_SEGMENTS
+        ):
             return True
 
         return False

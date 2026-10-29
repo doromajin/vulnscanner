@@ -190,6 +190,10 @@ class VulnScanner:
         else:
             excludes = list(self._cli_excludes)
 
+        # Re-create the fetcher with the final exclude list so excluded directories
+        # are pruned during the walk and excluded files are never read.
+        fetcher = LocalFetcher(directory, is_excluded=lambda p: _is_excluded(p, excludes))
+
         # Collect all files upfront so the progress bar knows the total
         files = [
             (fp, content)
