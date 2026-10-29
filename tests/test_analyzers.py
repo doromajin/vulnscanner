@@ -7588,3 +7588,22 @@ class TestPhpInterproceduralTaint:
         findings = self._az().analyze("app.php", code)
         rule_ids = {f.rule_id for f in findings}
         assert "PHAST-SQL-001" not in rule_ids, "literal arg must NOT propagate taint"
+
+
+class TestPath005ModuleImports:
+    """PATH-005 must not fire on relative module specifiers, only on literal traversal sequences."""
+
+    def _ids(self, name, content):
+        return [f.rule_id for f in PathTraversalAnalyzer().analyze(name, content)]
+
+    def test_es_import_not_flagged(self):
+        src = 'import KimaiPlugin from "../KimaiPlugin";\nimport {a} from \'../../x\';\n'
+        assert "PATH-005" not in self._ids("a.js", src)
+
+    def test_multiline_import_tail_and_require_not_flagged(self):
+        src = 'import {\n  a,\n} from "../util";\nconst b = require("../b");\nconst c = await import("../c");\n'
+        assert "PATH-005" not in self._ids("a.js", src)
+
+    def test_literal_traversal_still_flagged(self):
+        src = 'const p = base + "/../../etc/passwd";\nfs.readFile("../secret", cb);\n'
+        assert self._ids("a.js", src).count("PATH-005") == 2

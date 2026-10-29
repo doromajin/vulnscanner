@@ -34,7 +34,12 @@ _RULES = [
     ),
     (
         "PATH-005",
-        re.compile(r'\.\./|\.\.\\\\', re.IGNORECASE),
+        re.compile(
+            r'^(?!\s*(?:import\b|export\b[^\n]*\bfrom\b)|[^\n]*\bfrom\s+[\'"]\.\.?/'
+            r'|[^\n]*\b(?:require|import)\s*\(\s*[\'"]\.\.?/)'
+            r'[^\n]*(?:\.\./|\.\.\\\\)',
+            re.IGNORECASE,
+        ),
         "Literal path traversal sequence in source code",
         Severity.INFO, _PT, (".py", ".rb", ".php", ".js", ".ts"),
     ),
