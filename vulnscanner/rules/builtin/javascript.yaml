@@ -9,7 +9,7 @@
   # Skip when the whole right-hand side is one complete string literal with no
   # concatenation or ${} interpolation (e.g. el.innerHTML = '<b>static</b>';).
   regex: '\.innerHTML\s*=(?!\s*(?:''[^''\\]*''|"[^"\\]*"|`[^`$\\]*`)\s*[;,]?\s*(?://.*)?$)'
-  evidence_regex: '\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)|window\.name|URLSearchParams|postMessage|\b(?:local|session)Storage\.getItem|\bevent\.data\b'
+  evidence_regex: '\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)|window\.name|URLSearchParams|postMessage|\baddEventListener\s*\(\s*[\x22\x27]message|\bonmessage\b|\bevent\.data\b'
   no_evidence_severity: LOW
 
 - id: JS-XSS-002
@@ -27,7 +27,7 @@
   cwe: 79
   languages: [javascript, typescript]
   regex: "\\.outerHTML\\s*="
-  evidence_regex: '\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)|window\.name|URLSearchParams|postMessage|\b(?:local|session)Storage\.getItem|\bevent\.data\b'
+  evidence_regex: '\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)|window\.name|URLSearchParams|postMessage|\baddEventListener\s*\(\s*[\x22\x27]message|\bonmessage\b|\bevent\.data\b'
   no_evidence_severity: LOW
 
 - id: JS-REDIR-001
@@ -37,7 +37,7 @@
   cwe: 601
   languages: [javascript, typescript]
   regex: "window\\.location\\s*="
-  evidence_regex: '\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)|window\.name|URLSearchParams|postMessage|\b(?:local|session)Storage\.getItem|\bevent\.data\b'
+  evidence_regex: '\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)|window\.name|URLSearchParams|postMessage|\baddEventListener\s*\(\s*[\x22\x27]message|\bonmessage\b|\bevent\.data\b'
   no_evidence_severity: LOW
 
 - id: JS-STORAGE-001

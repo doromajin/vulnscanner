@@ -43,6 +43,7 @@ _FIXTURE_SEGMENTS = frozenset({
     "testdata", "test_data",
     "sample", "samples",
     "dummy",
+    "example", "examples",   # demo / tutorial code, not the shipped product
 })
 
 # File-name patterns that identify test files without a dedicated directory.
@@ -55,6 +56,8 @@ _TEST_FILENAME_RE = re.compile(
     r"|\.test\.[jt]sx?$"                     # JS/TS        *.test.js/ts
     r"|\.spec\.[jt]sx?$"                     # JS/TS        *.spec.js/ts
     r"|_spec\.rb$"                           # Ruby         foo_spec.rb
+    r"|_test\.(?:go|rb)$"                    # Go / minitest foo_test.go, foo_test.rb
+    r"|(?-i:[a-z0-9_]Tests?\.(?:java|kt|groovy|cs)$)"  # JUnit / xUnit UserTests.cs
     r")",
     re.IGNORECASE,
 )

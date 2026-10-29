@@ -234,20 +234,41 @@ _GUARD = re.compile(
 # whose value is a lowercase label naming the field, not a credential.
 _CONST_DECL_RE = re.compile(r'\b(?:const|case)\b|^\s*(?:[A-Za-z_]+\s+)*[A-Z][A-Z0-9_]{2,}\s*=')
 _LABEL_VALUE_RE = re.compile(
-    r'(?:password|passwd|pwd)\s*=\s*["\']([a-z]+(?:[-_.][a-z0-9]+)*)["\']', re.IGNORECASE
+    r'(?:password|passwd|pwd)\s*=\s*["\']([a-z]+(?:[-_./][a-z0-9]+)*)["\']', re.IGNORECASE
 )
 _LABEL_WORD_RE = re.compile(r'password|passwd|pwd')
 
 
 def _is_password_label(line: str) -> bool:
     """True for constant declarations whose value is a slug that names the field itself."""
-    if not _CONST_DECL_RE.search(line):
-        return False
     m = _LABEL_VALUE_RE.search(line)
     if not m:
         return False
     value = m.group(1)
-    return value == value.lower() and bool(_LABEL_WORD_RE.search(value))
+    if value != value.lower():
+        return False
+    # `tmplResetPassword = "auth/reset_passwd"`: a template / route path is never a credential,
+    # whatever the declaration looks like (Go const blocks have no `const` on the line).
+    if "/" in value:
+        return True
+    return bool(_CONST_DECL_RE.search(line)) and bool(_LABEL_WORD_RE.search(value))
+
+
+def _python_docstring_lines(content: str) -> set[int]:
+    """1-based line numbers covered by module / class / function docstrings."""
+    import ast
+    try:
+        tree = ast.parse(content)
+    except (SyntaxError, ValueError):
+        return set()
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                lines.update(range(body[0].lineno, (body[0].end_lineno or body[0].lineno) + 1))
+    return lines
 
 
 class HardcodedSecretsAnalyzer(BaseAnalyzer):
@@ -303,8 +324,9 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
         # Pattern D which is the second-to-last entry).                        #
         # ------------------------------------------------------------------ #
         rules_except_d = [r for r in _RULES if not (r[0] == "SEC-009" and r[1].flags & re.MULTILINE and r[1].pattern.startswith(r'\bprivate_key\s*:\s*[|>]'))]
+        doc_lines = _python_docstring_lines(content) if file_path.endswith(".py") else set()
         for lineno, line in enumerate(lines, 1):
-            if self._is_comment(line):
+            if self._is_comment(line) or lineno in doc_lines:
                 continue
             stripped = line.strip()
             for rule_id, pattern_re, description, severity, vuln_type in rules_except_d:

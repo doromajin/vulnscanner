@@ -245,3 +245,170 @@ class TestRedirectReach:
     ])
     def test_request_input_keeps_medium(self, src):
         assert self._sev(f"{src}\nheader('Location: ' . $t);\n") == {Severity.MEDIUM}
+
+
+# ── 9. second OSS batch (flask, gogs, BookStack, node-red, petclinic) ──────────
+
+class TestExampleAndTestPaths:
+    @pytest.mark.parametrize("path", ["examples/celery/views.py", "src/example/a.php", "docs/examples/x.js"])
+    def test_example_dirs_are_fixture_like(self, path):
+        assert is_fixture_path(path)
+
+    @pytest.mark.parametrize("path", ["src/exemplar/a.py", "src/examplesuite/a.py", "app/Counterexamples.php"])
+    def test_lookalike_dirs_are_not(self, path):
+        assert not is_fixture_path(path)
+
+    @pytest.mark.parametrize("path", [
+        "internal/dbx/dsn_test.go", "tests/helper_test.rb", "src/UserTests.cs", "src/UserTest.cs".replace("UserTest", "OrderTests"),
+    ])
+    def test_more_test_file_names(self, path):
+        from vulnscanner.analyzers.file_context import is_test_path
+        assert is_test_path(path)
+
+    @pytest.mark.parametrize("path", ["internal/dbx/dsn.go", "src/Contest.cs", "src/Latests.cs", "src/protest.go"])
+    def test_non_test_file_names(self, path):
+        from vulnscanner.analyzers.file_context import is_test_path
+        assert not is_test_path(path)
+
+
+class TestGoPathSources:
+    def _ids(self, code):
+        from vulnscanner.analyzers.go_analyzer import GoAnalyzer
+        return {f.rule_id for f in GoAnalyzer().analyze("h.go", code)}
+
+    @pytest.mark.parametrize("code", [
+        'RemoveAll(filepath.Join(conf.Server.AppDataPath, "tmp"))\n',
+        "p := filepath.Join(conf.Picture.Dir, strconv.FormatInt(r.ID, 10))\n",
+        "b, _ := os.ReadFile(filepath.Join(cfg.Root, user.Name))\n",
+    ])
+    def test_config_and_receiver_fields_not_flagged(self, code):
+        assert "GO-PATH-001" not in self._ids(code)
+
+    @pytest.mark.parametrize("code", [
+        "b, _ := os.ReadFile(filepath.Join(dir, r.URL.Path))\n",
+        'f, _ := os.Open(r.FormValue("file"))\n',
+        'p := filepath.Join(base, c.Param("name"))\n',
+        "b, _ := ioutil.ReadFile(req.Header.Get(\"X-File\"))\n",
+    ])
+    def test_request_derived_paths_still_flagged(self, code):
+        assert "GO-PATH-001" in self._ids(code)
+
+
+class TestSstiDefinition:
+    def _ids(self, code):
+        from vulnscanner.analyzers.ssti import SSTIAnalyzer
+        return {f.rule_id for f in SSTIAnalyzer().analyze("t.py", code)}
+
+    def test_definition_not_flagged(self):
+        assert "SSTI-001" not in self._ids("def render_template_string(source, **context):\n    pass\n")
+        assert "SSTI-001" not in self._ids("async def render_template_string(source):\n    pass\n")
+
+    def test_dynamic_call_still_flagged(self):
+        assert "SSTI-001" in self._ids("return render_template_string(tpl)\n")
+
+
+class TestPythonDocstringSecrets:
+    def _ids(self, code):
+        return {f.rule_id for f in HardcodedSecretsAnalyzer().analyze("cfg.py", code)}
+
+    def test_secret_in_docstring_not_flagged(self):
+        code = 'def f():\n    """Example::\n\n        SECRET_KEY = \'development key\'\n    """\n    return 1\n'
+        assert "SEC-003" not in self._ids(code)
+
+    def test_real_assignment_still_flagged(self):
+        assert "SEC-003" in self._ids("SECRET_KEY = 'prod-7f3a9c1d2b'\n")
+
+    def test_secret_after_docstring_still_flagged(self):
+        code = 'def f():\n    """doc"""\n    SECRET_KEY = \'prod-7f3a9c1d2b\'\n'
+        assert "SEC-003" in self._ids(code)
+
+
+class TestStorageIsNotDomEvidence:
+    def test_storage_only_file_is_low(self):
+        code = "const h = JSON.parse(window.localStorage.getItem('k') || '{}');\nel.innerHTML = tpl;\n"
+        f = [x for x in XSSAnalyzer().analyze("a.js", code) if x.rule_id == "XSS-001"]
+        assert f and all(x.severity == Severity.LOW for x in f)
+
+    def test_postmessage_data_is_evidence(self):
+        code = "window.addEventListener('message', e => { el.innerHTML = e.data; });\n"
+        f = [x for x in XSSAnalyzer().analyze("a.js", code) if x.rule_id == "XSS-001"]
+        assert f and all(x.severity == Severity.HIGH for x in f)
+
+
+class TestPostMessageNamedHandler:
+    def _ids(self, code):
+        from vulnscanner.analyzers.client_side import ClientSideAnalyzer
+        return {f.rule_id for f in ClientSideAnalyzer().analyze("a.ts", code)}
+
+    def test_named_handler_with_origin_check_ok(self):
+        code = (
+            "function onMsg(event) {\n    if (event.origin !== trusted) return;\n    use(event.data);\n}\n"
+            "window.addEventListener('message', onMsg);\n"
+        )
+        assert "CLIENT-MSG-001" not in self._ids(code)
+
+    def test_named_handler_without_check_flagged(self):
+        code = "function onMsg(event) {\n    use(event.data);\n}\nwindow.addEventListener('message', onMsg);\n"
+        assert "CLIENT-MSG-001" in self._ids(code)
+
+    def test_inline_handler_without_check_flagged(self):
+        assert "CLIENT-MSG-001" in self._ids("window.addEventListener('message', e => use(e.data));\n")
+
+
+class TestRedosOptionalGroup:
+    def _issue(self, src):
+        from vulnscanner.analyzers.ast_js import _is_redos_pattern
+        return _is_redos_pattern(src)
+
+    @pytest.mark.parametrize("src", [r"^(\d+(?:\.\d+)?)px$", r"^\d+\.\d+\.\d+(-.*)?"])
+    def test_optional_group_not_flagged(self, src):
+        assert self._issue(src) is None
+
+    @pytest.mark.parametrize("src", [r"(a+)+$", r"([a-z]+\s*)*x", r"(\w+){2,}"])
+    def test_unbounded_nested_quantifier_still_flagged(self, src):
+        assert self._issue(src)
+
+
+class TestGoExecArguments:
+    def _scan(self, call):
+        from vulnscanner.analyzers.ast_go import GoASTAnalyzer
+        code = (
+            "package main\n\nimport (\n\t\"net/http\"\n\t\"os/exec\"\n)\n\n"
+            "func h(w http.ResponseWriter, r *http.Request) {\n"
+            "\tv := r.FormValue(\"v\")\n\t" + call + "\n}\n"
+        )
+        return [f for f in GoASTAnalyzer().analyze("h.go", code) if f.rule_id == "GOAST-CMD-001"]
+
+    def test_fixed_program_tainted_args_is_high(self):
+        f = self._scan('cmd := exec.Command("git", v, "--stateless-rpc")\n\t_ = cmd')
+        assert f and {x.severity for x in f} == {Severity.HIGH}
+
+    def test_tainted_program_is_critical(self):
+        f = self._scan("cmd := exec.Command(v)\n\t_ = cmd")
+        assert f and {x.severity for x in f} == {Severity.CRITICAL}
+
+    @pytest.mark.parametrize("prog", ["sh", "bash", "/bin/sh", "cmd.exe", "python3"])
+    def test_shell_like_program_stays_critical(self, prog):
+        f = self._scan(f'cmd := exec.Command("{prog}", "-c", v)\n\t_ = cmd')
+        assert f and {x.severity for x in f} == {Severity.CRITICAL}
+
+
+class TestPasswordPathLabels:
+    def _ids(self, code, path="internal/email/email.go"):
+        return {f.rule_id for f in HardcodedSecretsAnalyzer().analyze(path, code)}
+
+    @pytest.mark.parametrize("code", [
+        '\ttmplAuthResetPassword  = "auth/reset_passwd"\n',
+        '\ttmplUserSettingsPassword = "user/settings/password"\n',
+        'const RESET_PASSWORD_VIEW = "auth/reset-password";\n',
+    ])
+    def test_template_path_constants_not_flagged(self, code):
+        assert "SEC-001" not in self._ids(code)
+
+    @pytest.mark.parametrize("code", [
+        '\tdbPassword = "Sup3rS3cret!"\n',
+        '\tadminPassword = "hunter2xyz"\n',
+        '\tpassword = "Winter/2024"\n',
+    ])
+    def test_real_passwords_still_flagged(self, code):
+        assert "SEC-001" in self._ids(code)

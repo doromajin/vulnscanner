@@ -143,6 +143,21 @@ def _walk(node):
         yield from _walk(child)
 
 
+_SHELL_LIKE_PROGRAMS = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "cmd", "powershell", "pwsh",
+    "python", "python2", "python3", "perl", "ruby", "node", "php", "env", "xargs", "sudo", "su", "eval",
+})
+
+
+def _literal_program_name(node) -> str | None:
+    """Base name of a string-literal program argument (``"/usr/bin/git"`` -> ``git``), else None."""
+    if node is None or node.type not in ("interpreted_string_literal", "raw_string_literal"):
+        return None
+    text = node.text.decode("utf-8", errors="replace").strip("`\"")
+    base = text.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return base[:-4] if base.endswith(".exe") else base or None
+
+
 def _selector_chain(node) -> list[str]:
     """Return name segments of a selector/call/identifier chain, root first.
 
@@ -626,10 +641,21 @@ def _check_sinks(
             # Command(cmd, args...) → all args checked
             start = 1 if method == "CommandContext" else 0
             if any(taint_check(a) for a in arg_nodes[start:]):
-                _emit(findings, seen, file_path, line, lines, repo_url,
-                      VulnType.COMMAND_INJECTION, Severity.CRITICAL,
-                      "GOAST-CMD-001",
-                      f"User-controlled data flows into exec.{method}() — OS command injection risk")
+                prog = arg_nodes[start] if len(arg_nodes) > start else None
+                prog_name = _literal_program_name(prog)
+                if prog_name and prog_name not in _SHELL_LIKE_PROGRAMS:
+                    # No shell is involved: only the arguments of a fixed program are
+                    # attacker-influenced (option / argument injection), not the command.
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.COMMAND_INJECTION, Severity.HIGH,
+                          "GOAST-CMD-001",
+                          f"User-controlled data flows into the arguments of exec.{method}({prog_name!r}, ...) "
+                          "— argument injection risk (no shell involved)")
+                else:
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.COMMAND_INJECTION, Severity.CRITICAL,
+                          "GOAST-CMD-001",
+                          f"User-controlled data flows into exec.{method}() — OS command injection risk")
 
         # ── Path traversal: os.Open, os.ReadFile, etc. ────────────────────
         elif pkg in ("os", "ioutil") and method in _OS_SINKS:

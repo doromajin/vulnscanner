@@ -67,7 +67,7 @@ _SIMPLE_GUARD = re.compile(
 _DOM_SOURCE_RE = re.compile(
     r'\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)'
     r'|window\.name|URLSearchParams|postMessage'
-    r'|\b(?:local|session)Storage\.getItem|\bevent\.data\b'
+    r'|\baddEventListener\s*\(\s*[\x22\x27]message|\bonmessage\b|\bevent\.data\b'
 )
 
 # PHP emitting a JS handler: `... b.innerHTML='<span>' . $var . '` — the RHS is a

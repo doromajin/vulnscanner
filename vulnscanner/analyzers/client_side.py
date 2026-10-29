@@ -86,6 +86,15 @@ _ORIGIN_CHECK_RE = re.compile(
 )
 
 
+def _named_handler_body(lines: list[str], name: str) -> str:
+    """Source of `function name(...)` / `name = (...) =>` / `name(...) {` (30 lines), or empty."""
+    decl = re.compile(r"\b(?:function\s+" + re.escape(name) + r"\b|(?:const|let|var)\s+" + re.escape(name) + r"\s*=|^\s*(?:async\s+)?" + re.escape(name) + r"\s*\([^)]*\)\s*\{)")
+    for j, text in enumerate(lines):
+        if decl.search(text):
+            return "\n".join(lines[j: min(j + 30, len(lines))])
+    return ""
+
+
 class ClientSideAnalyzer(BaseAnalyzer):
     """Detect browser-specific security patterns in HTML/JS/TS files."""
 
@@ -258,6 +267,9 @@ class ClientSideAnalyzer(BaseAnalyzer):
 
             # Inspect the handler body (up to 30 lines) for an origin check
             handler = "\n".join(lines[i: min(i + 30, len(lines))])
+            named = re.search(r"['\"]message['\"]\s*,\s*(?:this\.)?([A-Za-z_$][\w$]*)\s*[,)]", line)
+            if named:
+                handler += "\n" + _named_handler_body(lines, named.group(1))
             if not _ORIGIN_CHECK_RE.search(handler):
                 findings.append(Finding(
                     vuln_type=VulnType.XSS,

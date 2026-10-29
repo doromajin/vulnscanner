@@ -65,7 +65,8 @@ _RULES = [
         "GO-PATH-001",
         re.compile(
             r'(?:os\.Open|ioutil\.ReadFile|os\.ReadFile|filepath\.Join)\s*\('
-            r'[^)]*(?:r\.|req\.|request\.|c\.Param|c\.Query|r\.FormValue)',
+            r'[^)]*(?:\b(?:r|req|request)\.(?:URL|Form|PostForm|FormValue|PostFormValue|Header|Host|RequestURI|Referer|UserAgent|Cookie|PathValue|Body)\b'
+            r'|\bc\.(?:Param|Query|PostForm|FormValue|DefaultQuery)\b)',
             re.IGNORECASE,
         ),
         "Go file access with request parameter — path traversal risk",
@@ -84,7 +85,7 @@ _RULES = [
 ]
 
 _GUARD = re.compile(
-    r'exec\.Command|http\.Get|http\.Post|os\.Open|ioutil\.ReadFile|os\.ReadFile'
+    r'exec\.Command|http\.Get|http\.Post|os\.Open|ioutil\.ReadFile|os\.ReadFile|filepath\.Join'
     r'|\.Query\s*\(|\.Exec\s*\(|\.QueryRow\s*\(|template\.|http\.Redirect',
     re.IGNORECASE,
 )

@@ -689,7 +689,7 @@ _REDOS_NESTED = _re.compile(
     r'(?:[+*]|\{[0-9]+,[0-9]*\})'  # inner quantifier
     r'(?:[^()\\]|\\.)*'
     r'\)'             # close group
-    r'(?:[+*?]|\{[0-9]+,[0-9]*\})'  # outer quantifier
+    r'(?:[+*]|\{[0-9]+,\})'  # outer quantifier (unbounded: `?` repeats once, not exponential)
 )
 
 # Pattern 2: alternation inside a group with outer quantifier AND overlapping alternatives

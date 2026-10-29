@@ -70,6 +70,8 @@ _GUARD = re.compile(
 )
 
 
+_PY_DEF_RE = re.compile(r"\s*(?:async\s+)?def\s")
+
 # Twig's sandbox is the documented mitigation for rendering less-trusted templates
 # (e.g. user-editable invoice layouts).  Registering SandboxExtension alone does not
 # turn it on: it needs ->enableSandbox() or the "sandbox everything" flag (2nd arg true).
@@ -91,6 +93,10 @@ class SSTIAnalyzer(BaseAnalyzer):
         if not applicable:
             return []
         findings = self._scan_lines(file_path, content, repo_url, applicable, guard=_GUARD)
+        findings = [
+            f for f in findings
+            if not (f.rule_id == "SSTI-001" and _PY_DEF_RE.match(f.line_content))
+        ]
         if findings and _TWIG_SANDBOX_ON.search(content):
             findings = [f for f in findings if f.rule_id != "SSTI-003"]
         return findings
