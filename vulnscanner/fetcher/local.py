@@ -41,6 +41,24 @@ _SKIP_FILENAME_SUFFIXES = (".min.js", ".min.css", ".bundle.js", ".chunk.js")
 _MAX_FILE_BYTES = 500_000
 
 
+def is_vendored_filename(filename: str) -> bool:
+    """True for minified/bundled files and well-known third-party library names.
+
+    Shared by the local and GitHub fetchers so both skip the same files.
+    """
+    name_lower = filename.lower()
+    if name_lower.endswith(_SKIP_FILENAME_SUFFIXES):
+        return True
+
+    # jquery.js, jquery-3.6.0.js, bootstrap.bundle.js are skipped, but names that
+    # merely share a letter prefix (reactor.py) are not: a non-letter must follow.
+    stem_lower = Path(filename).stem.lower()
+    return any(
+        stem_lower == lib or (stem_lower.startswith(lib) and not stem_lower[len(lib)].isalpha())
+        for lib in _SKIP_PATH_SEGMENTS
+    )
+
+
 class LocalFetcher:
     def __init__(
         self,
@@ -105,19 +123,5 @@ class LocalFetcher:
         if {p.lower() for p in rel_parts} & _SKIP_DIRS:
             return True
 
-        # Skip minified/bundled files by filename suffix
-        name_lower = path.name.lower()
-        if any(name_lower.endswith(s) for s in _SKIP_FILENAME_SUFFIXES):
-            return True
-
-        # Skip well-known third-party library filenames (jquery.js, jquery-3.6.0.js,
-        # bootstrap.bundle.js) but not names that merely share a letter prefix
-        # (reactor.py, underscored_helpers.py). A non-letter must follow the name.
-        stem_lower = path.stem.lower()
-        if any(
-            stem_lower == lib or (stem_lower.startswith(lib) and not stem_lower[len(lib)].isalpha())
-            for lib in _SKIP_PATH_SEGMENTS
-        ):
-            return True
-
-        return False
+        # Skip minified/bundled files and well-known third-party library filenames
+        return is_vendored_filename(path.name)

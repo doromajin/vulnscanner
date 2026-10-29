@@ -155,7 +155,9 @@ class VulnScanner:
             with ThreadPoolExecutor(max_workers=self._workers) as pool:
                 futures: dict = {}
                 # Submit analysis jobs while fetching - overlaps network I/O with CPU work
-                for file_path, content in fetcher.iter_files(repo):
+                for file_path, content in fetcher.iter_files(
+                    repo, is_excluded=lambda p: _is_excluded(p, excludes)
+                ):
                     if _is_excluded(file_path, excludes):
                         continue
                     progress.update(task, description=f"[cyan]{file_path}")
@@ -173,6 +175,10 @@ class VulnScanner:
                         result.errors.append(f"{fp}: {exc}")
                         continue
                     _merge_into(result, partial)
+
+        # Directories/files that could not be fetched: surface them so an
+        # incomplete scan (rate limit, API error) is not mistaken for a clean one.
+        result.errors.extend(f"Skipped (scan incomplete): {s}" for s in fetcher.skipped)
 
         result.elapsed_seconds = time.perf_counter() - start
         result.findings = _deduplicate_global(result.findings)
