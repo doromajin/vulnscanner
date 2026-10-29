@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -212,7 +213,41 @@ def _collect_files_classic(juliet_root: Path) -> dict[str, list[Path]]:
     return result
 
 
-def run(juliet_root: Path, verbose: bool = False, max_workers: int = 4) -> None:
+# ── slow-unit tracing (--trace-slow) ────────────────────────────────────────────────────────
+_RUNNING: dict[str, float] = {}
+_DURATIONS: list[tuple[float, str]] = []
+
+
+def _timed(key: str, fn):
+    t0 = time.time()
+    _RUNNING[key] = t0
+    try:
+        return fn()
+    finally:
+        _RUNNING.pop(key, None)
+        _DURATIONS.append((time.time() - t0, key))
+
+
+def _start_watchdog(threshold: float):
+    """Report every unit that has been running longer than *threshold* seconds (once)."""
+    import threading
+    stop = threading.Event()
+    reported: set[str] = set()
+
+    def loop():
+        while not stop.wait(10):
+            now = time.time()
+            for k, t0 in list(_RUNNING.items()):
+                if now - t0 > threshold and k not in reported:
+                    reported.add(k)
+                    print(f"SLOW-RUNNING {k} {int(now - t0)}s", flush=True)
+
+    threading.Thread(target=loop, daemon=True).start()
+    return stop
+
+
+def run(juliet_root: Path, verbose: bool = False, max_workers: int = 4,
+        shard: tuple[int, int] | None = None) -> None:
     # Detect format: if immediate children have "src/testcases" → SARD 2022
     sample = next((d for d in juliet_root.iterdir() if d.is_dir()), None)
     if sample and (sample / "src" / "testcases").exists():
@@ -244,14 +279,24 @@ def run(juliet_root: Path, verbose: bool = False, max_workers: int = 4) -> None:
             else:
                 solos.append(p)
 
+        if shard:
+            # Split the units (single files and cross-file groups) round-robin so that
+            # N processes can each score 1/N of the CWE; sum the per-shard TP/FN afterwards.
+            idx, n_shards = shard
+            units = [("solo", p) for p in solos] + [("group", k) for k in groups]
+            mine = units[idx::n_shards]
+            solos = [p for kind, p in mine if kind == "solo"]
+            groups = {k: groups[k] for kind, k in mine if kind == "group"}
+            files = list(solos) + [p for g in groups.values() for p in g]
+
         tp = fn = 0
         misses: list[Path] = []
 
         def _solo_job(p: Path) -> tuple[list[Path], list[str]]:
-            return [p], _scan_file(p)
+            return [p], _timed(p.name, lambda: _scan_file(p))
 
         def _group_job(grp: list[Path]) -> tuple[list[Path], list[str]]:
-            return grp, _scan_group(grp)
+            return grp, _timed(f"{grp[0].name} (group of {len(grp)})", lambda: _scan_group(grp))
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures: dict = {}
@@ -304,7 +349,35 @@ if __name__ == "__main__":
                     help="Show missed files (up to 5 per CWE)")
     ap.add_argument("--workers", type=int, default=4,
                     help="Parallel scan threads (default: 4)")
+    ap.add_argument("--cwe", action="append", default=[], metavar="CWEnnn",
+                    help="Only score these CWEs (repeatable); lets several processes split the run")
+    ap.add_argument("--shard", metavar="i/N", default=None,
+                    help="Score only shard i of N (0-based); run N processes and sum TP/FN")
+    ap.add_argument("--trace-slow", type=float, default=None, metavar="SECONDS",
+                    help="Print every scoring unit that runs longer than SECONDS, while it runs")
+    ap.add_argument("--low-priority", action="store_true",
+                    help="Lower the process priority (Windows) so the PC stays responsive")
     args = ap.parse_args()
+
+    shard = None
+    if args.shard:
+        i_str, n_str = args.shard.split("/")
+        shard = (int(i_str), int(n_str))
+        if not (0 <= shard[0] < shard[1]):
+            print("ERROR: --shard must be i/N with 0 <= i < N")
+            sys.exit(1)
+    if args.low_priority and sys.platform == "win32":
+        import ctypes
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)
+
+    if args.cwe:
+        wanted = {c.upper() for c in args.cwe}
+        unknown = wanted - set(CWE_RULES)
+        if unknown:
+            print(f"ERROR: unknown CWE(s): {sorted(unknown)}; known: {sorted(CWE_RULES)}")
+            sys.exit(1)
+        for k in [k for k in CWE_RULES if k not in wanted]:
+            del CWE_RULES[k]
 
     root = Path(args.juliet_root)
     if not root.exists():
@@ -315,4 +388,10 @@ if __name__ == "__main__":
     print(f"Juliet C/C++ root : {root.resolve()}")
     print(f"Packages found    : {pkg_count}")
     print(f"Scoring CWEs      : {', '.join(CWE_RULES)}")
-    run(root, verbose=args.verbose, max_workers=args.workers)
+    if args.trace_slow:
+        _start_watchdog(args.trace_slow)
+    run(root, verbose=args.verbose, max_workers=args.workers, shard=shard)
+    if args.trace_slow and _DURATIONS:
+        print("\nSlowest units:", flush=True)
+        for d, k in sorted(_DURATIONS, reverse=True)[:8]:
+            print(f"  {d:8.1f}s  {k}", flush=True)

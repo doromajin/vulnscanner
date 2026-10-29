@@ -405,6 +405,8 @@ class _FuncSummary:
     # Constant integer value passed at each parameter index (CWE-129_large/CWE-839_negative).
     # Enables detecting buffer[data] OOB/negative when 'data' is a constant from the caller.
     param_const_ints: dict[int, int] = field(default_factory=dict)
+    # (lowest, highest) constant any call site passes for each parameter; see _note_const()
+    param_const_range: dict[int, tuple[int, int]] = field(default_factory=dict)
     # True if the function returns an untrusted integer (rand or atoi).
     # Enables V42 (rand-source): data = badSource() where badSource returns RAND32().
     returns_untrusted_int: bool = False
@@ -1171,6 +1173,32 @@ def _compute_underpointed(body_node) -> set[str]:
     return up
 
 
+def _note_const(summ: "_FuncSummary", idx: int, val: int) -> bool:
+    """Record that some call site passes constant *val* as parameter *idx*.
+
+    Returns True if the summary changed.  The recorded (low, high) range only ever widens, so the
+    caller's fixpoint terminates.  Overwriting a single value instead flips forever as soon as one
+    function is called with two different constants (f(10) here, f(2) there).
+    """
+    rng = summ.param_const_range.get(idx)
+    if rng is None:
+        summ.param_const_range[idx] = (val, val)
+        summ.param_const_ints.setdefault(idx, val)
+        return True
+    widened = (min(rng[0], val), max(rng[1], val))
+    if widened == rng:
+        return False
+    summ.param_const_range[idx] = widened
+    return True
+
+
+# Safety net for the interprocedural alloc-count fixpoint.  Every update is meant to be monotone
+# (counts only shrink, sets only grow), so a call graph converges in a handful of passes; a hard
+# cap turns any non-converging oscillation into a bounded cost instead of a hang.
+_MAX_ALLOC_FIXPOINT_ITERS = 50
+LAST_ALLOC_FIXPOINT_ITERS = 0   # diagnostics: passes used by the most recent run
+
+
 def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -> None:
     """Propagate alloc_counts and underpointed info through function call sites.
 
@@ -1270,8 +1298,11 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
     # Pass 2: fixpoint propagation of alloc_counts/underpointed/ptr_alloc through call sites.
     # Iterates until stable so multi-level chains (V52/53/54: a→b→c) are handled correctly.
     _a2_changed = True
-    while _a2_changed:
+    _a2_iters = 0
+    while _a2_changed and _a2_iters < _MAX_ALLOC_FIXPOINT_ITERS:
         _a2_changed = False
+        _a2_iters += 1
+        globals()["LAST_ALLOC_FIXPOINT_ITERS"] = _a2_iters
         for fname, func_node in funcs.items():
             body = func_node.child_by_field_name("body")
             if body is None:
@@ -1377,15 +1408,13 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
                         # Propagate constant integer (CWE-129_large / CWE-839_negative)
                         _civ = func_const_ints.get(fname, {}).get(aname)
                         if _civ is not None:
-                            if summaries[callee].param_const_ints.get(idx) != _civ:
-                                summaries[callee].param_const_ints[idx] = _civ
+                            if _note_const(summaries[callee], idx, _civ):
                                 _a2_changed = True
                     else:
                         # Literal constant arg: badSink(10) or badSink(-5)
                         _civ2 = _eval_const(arg)
                         if _civ2 is not None:
-                            if summaries[callee].param_const_ints.get(idx) != _civ2:
-                                summaries[callee].param_const_ints[idx] = _civ2
+                            if _note_const(summaries[callee], idx, _civ2):
                                 _a2_changed = True
                     if (arg.type == "pointer_expression"
                             and arg.children
@@ -3321,14 +3350,24 @@ def _analyze_with_parser(parser_fn, content: str, file_path: str) -> list[Findin
             for _ci_idx, _ci_val in summaries[fname].param_const_ints.items():
                 if _ci_idx < len(param_names):
                     _extra_ci[param_names[_ci_idx]] = _ci_val
-            _detect_sinks(body, tainted, lines, file_path, findings, summaries,
-                          _collect_funcptr_map(func_node),
-                          extra_alloc_counts=_extra if _extra else None,
-                          extra_underpointed=_extra_up if _extra_up else None,
-                          global_untrusted_int=_merged_ui or None,
-                          untrusted_int_ptr_names=_extra_ui_ptrs or None,
-                          extra_ptr_alloc_counts=_extra_ptr if _extra_ptr else None,
-                          extra_const_ints=_extra_ci if _extra_ci else None)
+            # When call sites pass different constants, a bad index / size is reported if ANY
+            # of them is bad: analyse once per extreme value (low and high).
+            _ci_variants: list[dict[str, int]] = [_extra_ci]
+            for _ci_idx, (_ci_lo, _ci_hi) in summaries[fname].param_const_range.items():
+                if _ci_lo != _ci_hi and _ci_idx < len(param_names):
+                    for _ci_ext in (_ci_lo, _ci_hi):
+                        _ci_alt = dict(_extra_ci)
+                        _ci_alt[param_names[_ci_idx]] = _ci_ext
+                        _ci_variants.append(_ci_alt)
+            for _ci_variant in _ci_variants:
+                _detect_sinks(body, tainted, lines, file_path, findings, summaries,
+                              _collect_funcptr_map(func_node),
+                              extra_alloc_counts=_extra if _extra else None,
+                              extra_underpointed=_extra_up if _extra_up else None,
+                              global_untrusted_int=_merged_ui or None,
+                              untrusted_int_ptr_names=_extra_ui_ptrs or None,
+                              extra_ptr_alloc_counts=_extra_ptr if _extra_ptr else None,
+                              extra_const_ints=_ci_variant if _ci_variant else None)
 
     # Step 5: C++ class member cross-method taint (constructor→destructor, etc.)
     # For each class, collect "free variables" (tainted but not locally declared) from
