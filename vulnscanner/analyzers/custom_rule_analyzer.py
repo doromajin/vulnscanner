@@ -1,6 +1,7 @@
 """Pattern-based analyzer that applies user-defined YAML rules."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from vulnscanner.analyzers.base import BaseAnalyzer
@@ -48,6 +49,11 @@ class CustomRuleAnalyzer(BaseAnalyzer):
         )
         findings: list[Finding] = []
         seen: set[tuple] = set()
+        # rule.id -> True when the file shows no evidence for a gated rule
+        no_evidence = {
+            r.id for r in applicable
+            if r.evidence_regex and not re.search(r.evidence_regex, content)
+        }
 
         for lineno, (line, scan_line) in enumerate(zip(lines, scan_lines), 1):
             stripped = line.strip()
@@ -82,6 +88,11 @@ class CustomRuleAnalyzer(BaseAnalyzer):
                 )
                 if rule.cwe is not None:
                     finding.cwe_id = rule.cwe
+                if rule.id in no_evidence and rule.no_evidence_severity is not None:
+                    finding.severity = rule.no_evidence_severity
+                    finding.taint_status = "unknown"
+                    finding.confidence = 0.3
+                    finding.description += " [low_reach: no browser-controlled input source in this file]"
                 findings.append(finding)
 
         return findings

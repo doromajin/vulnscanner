@@ -24,6 +24,7 @@ Rule IDs (PHAST-*):
 """
 from __future__ import annotations
 
+import re
 import threading as _threading
 from dataclasses import dataclass as _dataclass, field as _field
 
@@ -161,14 +162,53 @@ def _walk(node):
         yield from _walk(child)
 
 
+# HTML-escaping helpers shipped by common frameworks, called as functions (Laravel e(),
+# CakePHP h(), WordPress esc_*) or as static / instance methods (Yii Html::encode,
+# Zend/Laminas ->escapeHtml, Twig Escaper->escape, HTMLPurifier->purify).
+_HTML_ESCAPE_FUNC_RE = re.compile(r'^(?:e|h|esc_\w+|escape\w*)$', re.IGNORECASE)
+_HTML_ESCAPE_METHOD_RE = re.compile(
+    r'^(?:html|e|h|escape\w*|esc\w*|encode|purify|sanitize\w*)$', re.IGNORECASE
+)
+_ESCAPER_CLASS_RE = re.compile(r'sanitiz|purif|escap|^html$|^h$', re.IGNORECASE)
+
+
 def _is_sanitizer_call(node) -> bool:
     """True if node is a sanitizer function call."""
-    if node.type != 'function_call_expression' or not node.children:
-        return False
-    fname_node = node.children[0]
-    if fname_node.type != 'name':
-        return False
-    return fname_node.text.decode('utf-8', errors='replace').lower() in _ALL_SANITIZERS
+    if node.type == 'function_call_expression' and node.children:
+        fname_node = node.children[0]
+        if fname_node.type != 'name':
+            return False
+        fname = fname_node.text.decode('utf-8', errors='replace')
+        return fname.lower() in _ALL_SANITIZERS or bool(_HTML_ESCAPE_FUNC_RE.match(fname))
+    if node.type == 'scoped_call_expression' and len(node.children) >= 3:
+        cls, meth = node.children[0], node.children[2]
+        if cls.type in ('name', 'qualified_name') and meth.type == 'name':
+            return bool(
+                _ESCAPER_CLASS_RE.search(cls.text.decode('utf-8', errors='replace'))
+                and _HTML_ESCAPE_METHOD_RE.match(meth.text.decode('utf-8', errors='replace'))
+            )
+    if node.type == 'member_call_expression':
+        return bool(re.match(r'^(?:escape\w*|esc\w*|purify|sanitize\w*)$', _method_name(node), re.IGNORECASE))
+    return False
+
+
+def _is_existence_check(node) -> bool:
+    """isset($x) / empty($x) test a value; they never write it to the output."""
+    if node.type in ('isset_expression', 'empty_intrinsic'):
+        return True
+    if node.type == 'function_call_expression' and node.children:
+        f = node.children[0]
+        return f.type == 'name' and f.text.lower() in (b'isset', b'empty')
+    return False
+
+
+def _walk_output_refs(node):
+    """Pre-order walk that does not descend into sanitizer calls or isset()/empty()."""
+    if _is_sanitizer_call(node) or _is_existence_check(node):
+        return
+    yield node
+    for child in node.children:
+        yield from _walk_output_refs(child)
 
 
 def _member_prop_name(node) -> str | None:
@@ -682,9 +722,7 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                 if child.type in ('echo', 'print', ';', ','):
                     continue
                 # Walk the argument to find tainted references not inside sanitizers
-                for sub in _walk(child):
-                    if _is_sanitizer_call(sub):
-                        break
+                for sub in _walk_output_refs(child):
                     if sub.type == 'variable_name':
                         vname = _var_name(sub)
                         if vname and vname in tainted:

@@ -62,6 +62,22 @@ _SIMPLE_GUARD = re.compile(
 
 # ── XSS-001: innerHTML smart analysis ─────────────────────────────────────────
 
+# Browser-controlled input sources.  Keep in sync with evidence_regex in
+# rules/builtin/javascript.yaml.
+_DOM_SOURCE_RE = re.compile(
+    r'\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)'
+    r'|window\.name|URLSearchParams|postMessage'
+    r'|\b(?:local|session)Storage\.getItem|\bevent\.data\b'
+)
+
+# PHP emitting a JS handler: `... b.innerHTML='<span>' . $var . '` — the RHS is a
+# PHP-escaped string literal.  Only the concatenated PHP variables can carry data.
+_PHP_ESCAPED_RHS_RE = re.compile(r"innerHTML\s*=\s*\\['\"]")
+_PHP_CONCAT_VAR_RE = re.compile(r"\.\s*\$(\w+)")
+_PHP_SANITIZED_ASSIGN = (
+    r"\$%s\s*=\s*(?:\w+::)?(?:html|htmlspecialchars|htmlentities|esc_\w+|escape\w*|encode|e|h)\s*\("
+)
+
 # Functions whose return value is safe to assign to innerHTML.
 _SAFE_FUNCS = frozenset({
     "escHtml", "escapeHtml", "htmlEscape", "sanitize", "sanitizeHtml", "escape",
@@ -231,6 +247,16 @@ class XSSAnalyzer(BaseAnalyzer):
 
         return findings
 
+    @staticmethod
+    def _php_escaped_literal_is_safe(line: str, content: str) -> bool:
+        """innerHTML inside a PHP-escaped JS string: safe unless an unsanitized $var is concatenated."""
+        if not _PHP_ESCAPED_RHS_RE.search(line):
+            return False
+        for var in _PHP_CONCAT_VAR_RE.findall(line):
+            if not re.search(_PHP_SANITIZED_ASSIGN % re.escape(var), content):
+                return False
+        return True
+
     def _check_innerhtml(
         self, file_path: str, lines: list[str], repo_url: str
     ) -> list[Finding]:
@@ -239,16 +265,27 @@ class XSSAnalyzer(BaseAnalyzer):
         if not file_path.endswith(_JS_HTML_EXTS + (".php",)):
             return []
         findings: list[Finding] = []
+        content = "\n".join(lines)
+        is_php = file_path.endswith(".php")
         i = 0
         while i < len(lines):
             line = lines[i]
             if not self._is_comment(line) and 'innerHTML' in line and re.search(r'innerHTML\s*=', line):
                 lineno = i + 1
                 block = self._collect_block(lines, i)
+                if is_php and self._php_escaped_literal_is_safe(line, content):
+                    i += 1
+                    continue
                 if _innerhtml_is_unsafe(block):
+                    # A DOM sink in a file with no browser-controlled input source
+                    # (URL, referrer, postMessage, storage …) is most likely fed by
+                    # the app's own server responses — keep it, but as low reach.
+                    reachable = is_php or bool(_DOM_SOURCE_RE.search(content))
                     findings.append(Finding(
                         vuln_type=VulnType.XSS,
-                        severity=Severity.HIGH,
+                        severity=Severity.HIGH if reachable else Severity.LOW,
+                        taint_status=None if reachable else "unknown",
+                        confidence=1.0 if reachable else 0.3,
                         file_path=file_path,
                         line_number=lineno,
                         line_content=line.strip(),

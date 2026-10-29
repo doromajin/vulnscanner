@@ -108,4 +108,39 @@ class CommandInjectionAnalyzer(BaseAnalyzer):
     supported_extensions = (".php", ".js", ".ts", ".java", ".rb", ".sh")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        return self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)
+        findings = self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)
+        return [f for f in findings if f.rule_id != "CMD-004" or _call_outside_string(f.line_content)]
+
+
+_CMD004_RE = _RULES[3][1]
+
+
+def _mask_quoted(line: str) -> str | None:
+    """Blank out single-line quoted string interiors; None if a quote is left open."""
+    out: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and i + 1 < len(line):
+                out.append("  ")
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+                out.append(ch)
+            else:
+                out.append(" ")
+        else:
+            if ch in ("'", '"'):
+                quote = ch
+            out.append(ch)
+        i += 1
+    return None if quote else "".join(out)
+
+
+def _call_outside_string(line: str) -> bool:
+    """CMD-004 must match real code, not an 'exec() is disabled' message or label."""
+    masked = _mask_quoted(line)
+    return True if masked is None else bool(_CMD004_RE.search(masked))

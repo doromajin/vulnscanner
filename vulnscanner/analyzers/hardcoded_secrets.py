@@ -230,6 +230,26 @@ _GUARD = re.compile(
 )
 
 
+# `const PASSWORD = 'password';` / `case PASSWORD = 'password';` — a constant or enum case
+# whose value is a lowercase label naming the field, not a credential.
+_CONST_DECL_RE = re.compile(r'\b(?:const|case)\b|^\s*(?:[A-Za-z_]+\s+)*[A-Z][A-Z0-9_]{2,}\s*=')
+_LABEL_VALUE_RE = re.compile(
+    r'(?:password|passwd|pwd)\s*=\s*["\']([a-z]+(?:[-_.][a-z0-9]+)*)["\']', re.IGNORECASE
+)
+_LABEL_WORD_RE = re.compile(r'password|passwd|pwd')
+
+
+def _is_password_label(line: str) -> bool:
+    """True for constant declarations whose value is a slug that names the field itself."""
+    if not _CONST_DECL_RE.search(line):
+        return False
+    m = _LABEL_VALUE_RE.search(line)
+    if not m:
+        return False
+    value = m.group(1)
+    return value == value.lower() and bool(_LABEL_WORD_RE.search(value))
+
+
 class HardcodedSecretsAnalyzer(BaseAnalyzer):
     supported_extensions = (
         ".py", ".js", ".ts", ".java", ".rb", ".php", ".go",
@@ -294,6 +314,8 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                 if not pattern_re.search(line):
                     continue
                 if _ALLOWLIST_RE.search(line):
+                    continue
+                if rule_id == "SEC-001" and _is_password_label(line):
                     continue
                 key = (rule_id, lineno)
                 if key in seen:

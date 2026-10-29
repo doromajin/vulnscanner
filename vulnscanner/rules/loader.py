@@ -46,6 +46,11 @@ class CustomRule:
     regex: Optional[str] = None    # raw regex (alternative to pattern)
     cwe: Optional[int] = None
     source_file: str = ""
+    # Optional file-level gate: when set and the regex finds nothing in the file's
+    # content, the finding is kept but lowered to `no_evidence_severity` and marked
+    # [low_reach] (e.g. DOM sinks in a file with no browser-controlled input source).
+    evidence_regex: Optional[str] = None
+    no_evidence_severity: Optional[Severity] = None
 
     # compiled regex — populated by loader, not stored in YAML
     _compiled: re.Pattern = field(default=None, init=False, repr=False)
@@ -138,6 +143,13 @@ def _parse_rule(raw: dict, source_file: str) -> CustomRule:
     cwe_raw = raw.get("cwe")
     cwe = int(cwe_raw) if cwe_raw is not None else None
 
+    evidence_regex = raw.get("evidence_regex")
+    no_ev_raw = raw.get("no_evidence_severity")
+    if evidence_regex:
+        re.compile(str(evidence_regex))  # fail at load time, not mid-scan
+    if no_ev_raw is not None and str(no_ev_raw).upper() not in _VALID_SEVERITIES:
+        raise ValueError(f"Rule {rule_id}: invalid no_evidence_severity '{no_ev_raw}'")
+
     rule = CustomRule(
         id=rule_id,
         message=message,
@@ -149,6 +161,8 @@ def _parse_rule(raw: dict, source_file: str) -> CustomRule:
         regex=str(regex) if regex else None,
         cwe=cwe,
         source_file=source_file,
+        evidence_regex=str(evidence_regex) if evidence_regex else None,
+        no_evidence_severity=Severity(str(no_ev_raw).upper()) if no_ev_raw is not None else None,
     )
     rule.compile()
     return rule

@@ -76,7 +76,8 @@ def is_test_path(path: str) -> bool:
 def is_fixture_path(path: str) -> bool:
     """Return True if *path* resides in a fixture, mock, or stub directory."""
     parts = path.replace("\\", "/").lower().split("/")
-    return any(p in _FIXTURE_SEGMENTS for p in parts)
+    # Doctrine / Symfony convention: src/DataFixtures/, tests/TestFixtures/ …
+    return any(p in _FIXTURE_SEGMENTS or p.endswith(("fixture", "fixtures")) for p in parts)
 
 
 # ── Vendor / third-party path detection ───────────────────────────────────────
