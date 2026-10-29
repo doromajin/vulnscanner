@@ -1,6 +1,7 @@
 import re
 
 from vulnscanner.analyzers.base import BaseAnalyzer
+from vulnscanner.analyzers.php_input import has_request_input
 from vulnscanner.models import Finding, Severity, VulnType
 
 _OR = VulnType.OPEN_REDIRECT
@@ -102,4 +103,14 @@ class OpenRedirectAnalyzer(BaseAnalyzer):
         ]
         if not applicable:
             return []
-        return self._scan_lines(file_path, content, repo_url, applicable, guard=_GUARD)
+        findings = self._scan_lines(file_path, content, repo_url, applicable, guard=_GUARD)
+        if file_path.endswith(".php") and findings and not has_request_input(content):
+            for f in findings:
+                if f.rule_id == "REDIR-002":
+                    # Redirect helper / installer that never reads request data: the target
+                    # is built from constants and server config, so only worth a low-priority look.
+                    f.severity = Severity.LOW
+                    f.taint_status = "unknown"
+                    f.confidence = 0.3
+                    f.description += " [low_reach: no request-derived input in this file]"
+        return findings

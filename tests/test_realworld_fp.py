@@ -195,3 +195,53 @@ class TestTwigSandbox:
 
     def test_no_sandbox_still_flagged(self):
         assert self._scan("$content = $twig->render($template, $options);\n")
+
+
+# ── 7. CMD-004 reach: exec() in a PHP file with no request-derived input ──────
+
+class TestCmd004Reach:
+    def _sev(self, code):
+        f = [x for x in CommandInjectionAnalyzer().analyze("app/Thing.php", code) if x.rule_id == "CMD-004"]
+        assert f
+        return {x.severity for x in f}
+
+    def test_no_request_input_is_medium(self):
+        code = "function size($dir) {\n    $c = \"ls -lLR {$dir}\";\n    exec($c, $out);\n}\n"
+        assert self._sev(code) == {Severity.MEDIUM}
+
+    @pytest.mark.parametrize("src", [
+        "$c = $_GET['c'];",
+        "$c = $request->input('c');",
+        "$c = $this->request->get('c');",
+        "$c = Request::get('c');",
+        "$c = $_SERVER['argv'][1];",
+    ])
+    def test_request_input_stays_critical(self, src):
+        assert self._sev(f"{src}\nexec($c, $out);\n") == {Severity.CRITICAL}
+
+
+# ── 8. REDIR-002 reach + shared request-input evidence ────────────────────────
+
+class TestRedirectReach:
+    def _sev(self, code):
+        from vulnscanner.analyzers.open_redirect import OpenRedirectAnalyzer
+        f = [x for x in OpenRedirectAnalyzer().analyze("lib/Redirect.php", code) if x.rule_id == "REDIR-002"]
+        assert f
+        return {x.severity for x in f}
+
+    def test_helper_without_request_input_is_low(self):
+        code = "function go($url) {\n    header(\"Location: \" . $url, true, 302);\n}\n"
+        assert self._sev(code) == {Severity.LOW}
+
+    def test_server_derived_script_name_is_not_request_input(self):
+        code = "$base = dirname($_SERVER['SCRIPT_NAME']);\nheader('Location:' . $base . '/install.php');\n"
+        assert self._sev(code) == {Severity.LOW}
+
+    @pytest.mark.parametrize("src", [
+        "$t = $request->get('next');",
+        "$t = $_SERVER['HTTP_REFERER'];",
+        "$t = $_SERVER['REQUEST_URI'];",
+        "$t = $_COOKIE['back'];",
+    ])
+    def test_request_input_keeps_medium(self, src):
+        assert self._sev(f"{src}\nheader('Location: ' . $t);\n") == {Severity.MEDIUM}

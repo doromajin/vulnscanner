@@ -1,6 +1,7 @@
 import re
 
 from vulnscanner.analyzers.base import BaseAnalyzer
+from vulnscanner.analyzers.php_input import has_request_input
 from vulnscanner.models import Finding, Severity, VulnType
 
 _CI = VulnType.COMMAND_INJECTION
@@ -109,10 +110,21 @@ class CommandInjectionAnalyzer(BaseAnalyzer):
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         findings = self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)
-        return [f for f in findings if f.rule_id != "CMD-004" or _call_outside_string(f.line_content)]
+        findings = [f for f in findings if f.rule_id != "CMD-004" or _call_outside_string(f.line_content)]
+        if file_path.endswith(".php") and findings and not has_request_input(content):
+            for f in findings:
+                if f.rule_id == "CMD-004":
+                    # exec() in a file that never touches request data: still worth a look
+                    # (unquoted interpolation), but not an exploitable-by-default CRITICAL.
+                    f.severity = Severity.MEDIUM
+                    f.taint_status = "unknown"
+                    f.confidence = 0.3
+                    f.description += " [low_reach: no request-derived input in this file]"
+        return findings
 
 
 _CMD004_RE = _RULES[3][1]
+
 
 
 def _mask_quoted(line: str) -> str | None:
