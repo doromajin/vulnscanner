@@ -21,6 +21,10 @@ class BaseAnalyzer(ABC):
     # Subclasses declare which file extensions they handle
     supported_extensions: tuple[str, ...] = ()
 
+    # Test / fixture / vendor files have every finding suppressed except MALWARE, so only
+    # analyzers that can emit MALWARE are worth running on them.
+    runs_on_suppressed_paths: bool = False
+
     def supports(self, file_path: str) -> bool:
         return file_path.endswith(self.supported_extensions)
 

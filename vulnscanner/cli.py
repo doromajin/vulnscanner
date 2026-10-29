@@ -47,6 +47,9 @@ def main() -> None:
               help="Glob pattern to skip (can be repeated)")
 @click.option("--workers", "-w", default=0, type=int, metavar="N",
               help="Parallel worker threads (0 = auto-detect)")
+@click.option("--fast", is_flag=True, default=False,
+              help="Skip analysis of test/fixture/vendor files (their findings are suppressed "
+                   "anyway; the suppressed-finding count for those paths is not reported)")
 @click.option("--since", default=None, metavar="REF",
               help="Incremental scan: only analyse files changed since this git ref (e.g. HEAD~1, main)")
 @click.option("--stdout-json", "stdout_json", is_flag=True, default=False,
@@ -73,6 +76,7 @@ def scan(
     fail_on: str | None,
     exclude: tuple[str, ...],
     workers: int,
+    fast: bool,
     since: str | None,
     stdout_json: bool,
     rules: tuple[str, ...],
@@ -129,7 +133,7 @@ def scan(
         console.print(f"[dim]Custom rules: {len(custom_rules)} rule(s) loaded[/dim]")
 
     scanner = VulnScanner(github_token=token, exclude=exclude, workers=workers,
-                          custom_rules=custom_rules)
+                          custom_rules=custom_rules, fast=fast)
 
     try:
         result = scanner.scan(target, changed_files=changed_files)

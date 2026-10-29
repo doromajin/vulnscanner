@@ -20,6 +20,7 @@ class CustomRuleAnalyzer(BaseAnalyzer):
     """
 
     supported_extensions = ()  # handled dynamically per rule set
+    runs_on_suppressed_paths = True  # a user rule may declare vuln_type MALWARE
 
     def __init__(self, rules: list[CustomRule]) -> None:
         self._rules = rules
