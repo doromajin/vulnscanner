@@ -1506,7 +1506,10 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
                                             and _txt(_inner2) == _pn2):
                                         if _lhs2 not in local_counts or local_counts[_lhs2] > _pcnt2:
                                             local_counts[_lhs2] = _pcnt2
-            local_up = func_underpointed.get(fname, set())
+            # A parameter that callers pass in underpointed is just as underpointed when this
+            # function hands it on (52a -> 52b -> 52c): include the propagated parameters.
+            local_up = set(func_underpointed.get(fname, set())) | {
+                _pnames[_ui] for _ui in summaries[fname].param_underpointed if _ui < len(_pnames)}
             # Fixpoint: also update returns_alloc_count from augmented local_counts
             body2 = func_node.child_by_field_name("body")
             if body2:
@@ -1650,6 +1653,67 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                 _decl_elem_sz[_dname] = _desz
     for _pn, _pesz in _param_elem_sizes(body_node).items():
         _decl_elem_sz.setdefault(_pn, _pesz)
+    # CWE-467: `p = (T *)malloc(sizeof(p))` allocates the size of the POINTER, not of the object.
+    # The correct forms are sizeof(*p) / sizeof(T).  Only fires when the sizeof operand is the very
+    # variable that receives the allocation, which is almost never intentional.
+    _ptr_vars: set[str] = set()
+    for _pdn in _walk(body_node):
+        if _pdn.type == "declaration":
+            for _pdd in _pdn.named_children:
+                _pdec = _pdd.child_by_field_name("declarator") if _pdd.type == "init_declarator" else _pdd
+                if _pdec is not None and _pdec.type == "pointer_declarator":
+                    _pname = _decl_leaf_id(_pdec)
+                    if _pname:
+                        _ptr_vars.add(_pname)
+    for _pn, _pesz in _param_elem_sizes(body_node).items():
+        _ptr_vars.add(_pn)
+    if _ptr_vars:
+        for _an in _walk(body_node):
+            _alhs = _aval = None
+            if _an.type == "assignment_expression":
+                _alhsn = _an.child_by_field_name("left")
+                _alhs = _txt(_alhsn) if _alhsn is not None and _alhsn.type == "identifier" else None
+                _aval = _an.child_by_field_name("right")
+            elif _an.type == "init_declarator":
+                _alhs = _decl_leaf_id(_an.child_by_field_name("declarator"))
+                _aval = _an.child_by_field_name("value")
+            if not _alhs or _alhs not in _ptr_vars or _aval is None:
+                continue
+            for _ in range(4):
+                if _aval is not None and _aval.type in ("cast_expression", "parenthesized_expression"):
+                    _aval = next((c for c in _aval.named_children
+                                  if c.type not in ("type_descriptor", "comment")), None)
+            if _aval is None or _aval.type != "call_expression":
+                continue
+            if _call_fname(_aval) not in {"malloc", "alloca", "ALLOCA", "_alloca"}:
+                continue
+            _cargs = _call_args(_aval)
+            for _szn in (_walk(_cargs[0]) if _cargs else ()):
+                if _szn.type != "sizeof_expression":
+                    continue
+                _szv = next((c for c in _szn.named_children if c.type != "comment"), None)
+                for _ in range(3):
+                    if _szv is not None and _szv.type == "parenthesized_expression":
+                        _szv = next((c for c in _szv.named_children if c.type != "comment"), None)
+                if _szv is None or _szv.type != "identifier" or _txt(_szv) != _alhs:
+                    continue
+                _sln = _an.start_point[0] + 1
+                _skey = (file_path, _sln, "CAST-BUF-001")
+                if _skey not in seen:
+                    seen.add(_skey)
+                    findings.append(Finding(
+                        vuln_type=VulnType.TRUST_BOUNDARY_VIOLATION,
+                        severity=Severity.MEDIUM,
+                        file_path=file_path,
+                        line_number=_sln,
+                        line_content=(lines[_an.start_point[0]].strip()
+                                      if _an.start_point[0] < len(lines) else ""),
+                        description=(
+                            f"'{_alhs}' is allocated with sizeof({_alhs}), the size of the pointer, "
+                            f"not of the object it points to — use sizeof(*{_alhs}) (CWE-467)"
+                        ),
+                        rule_id="CAST-BUF-001",
+                    ))
     # Pure byte sizes (see _compute_alloc_bytes): local allocations plus what callers passed in.
     _true_bytes = _compute_alloc_bytes(
         body_node, seed=extra_alloc_bytes,
@@ -1666,7 +1730,15 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
         for _ev, _ec in extra_alloc_counts.items():
             _alloc_counts[_ev] = _ec
             # Also seed _alloc_sizes so identifier propagation fires for `x = seeded_var`.
-            _alloc_sizes[_ev] = _ec
+            # _alloc_sizes holds BYTES; the interprocedural summary only carries an element count,
+            # which equals the byte size for char buffers but not for wchar_t / int ones.  Use the
+            # propagated byte size when the caller's allocation was statically known.
+            _alloc_sizes[_ev] = (extra_alloc_bytes or {}).get(_ev, _ec)
+    # Byte sizes the callers passed in are valid on their own: `malloc(10)` yields no element
+    # count (so nothing above is seeded for it) but it is a 10-byte buffer all the same.
+    if extra_alloc_bytes:
+        for _eb, _ebv in extra_alloc_bytes.items():
+            _alloc_sizes[_eb] = _ebv
 
     # Seed pointer-to-buffer alloc counts: propagate deref `x = *ptr` where ptr is in extra_ptr_alloc.
     # Enables V63: char** dataPtr param where *dataPtr has alloc_count N → char* data = *dataPtr.
@@ -1704,6 +1776,11 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
 
     def _set_alloc(var: str, bytes_: int, count: int | None = None) -> None:
         """Update alloc maps taking minimum seen — handles if/else with different sizes."""
+        # Some call sites below pass an element count (a callee's returns_alloc_count) where bytes
+        # belong; when the pure byte size of this variable is known (_compute_alloc_bytes), use it.
+        _tb = _true_bytes.get(var)
+        if _tb is not None:
+            bytes_ = _tb
         ex_b = _alloc_sizes.get(var)
         if ex_b is None or bytes_ < ex_b:
             _alloc_sizes[var] = bytes_
@@ -1905,6 +1982,12 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     _src_cnt = _alloc_counts.get(_txt(_rhs))
                     if _src_sz:
                         _set_alloc(_txt(_fe_base_w), _src_sz, _src_cnt)
+
+    # Pure byte sizes override whatever the loop above recorded (it may hold an element count where
+    # bytes belong) and fill in variables it could not size at all, e.g. `data = badSource(data)`
+    # where the callee returns `malloc(10)` (a byte size without an element count).
+    for _tbn, _tbv in _true_bytes.items():
+        _alloc_sizes[_tbn] = _tbv
 
     # Pointer underwrite tracking: data = buffer - N → "underpointed"
     # Any write/read through such a pointer accesses memory before the allocation.

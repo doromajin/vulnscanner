@@ -231,3 +231,127 @@ class TestBytesReturnedFromCallee:
             "void f(void)\n{\n    int * data = source(3);\n" + self.LOOP + "}\n"
         )
         assert "CAST-BUF-001" not in _ids(code)
+
+
+class TestSizeofPointerAllocation:
+    """CWE-467: allocating with the size of the pointer instead of the pointee."""
+
+    def _fn(self, stmt, decl="double * data;"):
+        return f"#include <stdlib.h>\nvoid f(void)\n{{\n    {decl}\n    {stmt}\n}}\n"
+
+    @pytest.mark.parametrize("decl,stmt", [
+        ("double * data;", "data = (double *)malloc(sizeof(data));"),
+        ("twoIntsStruct * data;", "data = (twoIntsStruct *)malloc(sizeof(data));"),
+        ("int64_t * data;", "data = (int64_t *)malloc(sizeof(data));"),
+        ("char * data;", "data = (char *)alloca(sizeof(data));"),
+        ("double * data = NULL;", "data = (double *)malloc(sizeof((data)));"),
+    ])
+    def test_sizeof_of_the_receiving_pointer_is_reported(self, decl, stmt):
+        assert "CAST-BUF-001" in _ids(self._fn(stmt, decl))
+
+    def test_initializer_form_is_reported(self):
+        assert "CAST-BUF-001" in _ids(
+            "#include <stdlib.h>\nvoid f(void)\n{\n    double * data = (double *)malloc(sizeof(data));\n}\n")
+
+    @pytest.mark.parametrize("stmt", [
+        "data = (double *)malloc(sizeof(*data));",
+        "data = (double *)malloc(sizeof(double));",
+        "data = (double *)malloc(10 * sizeof(*data));",
+    ])
+    def test_correct_sizeofs_are_clean(self, stmt):
+        assert "CAST-BUF-001" not in _ids(self._fn(stmt))
+
+    def test_array_sizeof_is_clean(self):
+        code = "#include <stdlib.h>\nvoid f(void)\n{\n    char buf[8];\n    char * data;\n    data = (char *)malloc(sizeof(buf));\n}\n"
+        assert "CAST-BUF-001" not in _ids(code)
+
+    def test_sizeof_of_a_different_pointer_is_clean(self):
+        code = self._fn("data = (double *)malloc(sizeof(other));", "double * data; double * other;")
+        assert "CAST-BUF-001" not in _ids(code)
+
+
+class TestParameterBytesAreBytes:
+    """The callee must see the caller's BYTE size, not an element count mistaken for bytes."""
+
+    def test_wide_buffer_copied_within_its_size_is_clean(self):
+        code = (
+            "#include <wchar.h>\n#include <string.h>\n"
+            "static void sink(wchar_t * data)\n{\n    wchar_t dest[100];\n"
+            "    memcpy(dest, data, 99*sizeof(wchar_t));\n}\n"
+            "void f(void)\n{\n    wchar_t buf[100];\n    sink(buf);\n}\n"
+        )
+        assert "CAST-BUF-001" not in _ids(code)
+
+    def test_wide_buffer_copied_into_a_smaller_one_is_reported(self):
+        code = (
+            "#include <wchar.h>\n#include <string.h>\n"
+            "static void sink(wchar_t * data)\n{\n    wchar_t dest[50];\n"
+            "    memcpy(dest, data, 99*sizeof(wchar_t));\n}\n"
+            "void f(void)\n{\n    wchar_t buf[100];\n    sink(buf);\n}\n"
+        )
+        assert "CAST-BUF-001" in _ids(code)
+
+
+class TestCallerBytesReachTheCopySink:
+    """memcpy in a callee is judged against the BYTES the caller allocated (malloc(10) has no count)."""
+
+    SINK = ("#include <string.h>\nstatic void sink(int * data)\n{\n    int source[10] = {0};\n"
+            "    memcpy(data, source, 10*sizeof(int));\n}\n")
+
+    def test_undersized_caller_buffer_is_reported_at_the_sink(self):
+        code = self.SINK + "void f(void)\n{\n    int * data = (int *)malloc(10);\n    sink(data);\n}\n"
+        f = [x for x in _analyze(code) if x.rule_id == "CAST-BUF-001"]
+        assert f and f[0].line_number == 5
+
+    def test_correctly_sized_caller_buffer_is_clean(self):
+        code = self.SINK + "void f(void)\n{\n    int * data = (int *)malloc(10*sizeof(int));\n    sink(data);\n}\n"
+        assert "CAST-BUF-001" not in _ids(code)
+
+    def test_good_and_bad_callers_report_only_the_bad_sink(self):
+        code = (
+            "#include <string.h>\n"
+            "static void badSink(int * data) { int s[10] = {0}; memcpy(data, s, 10*sizeof(int)); }\n"
+            "static void goodSink(int * data) { int s[10] = {0}; memcpy(data, s, 10*sizeof(int)); }\n"
+            "void bad(void) { int * d = (int *)malloc(10); badSink(d); }\n"
+            "void good(void) { int * d = (int *)malloc(10*sizeof(int)); goodSink(d); }\n"
+        )
+        lines = sorted({x.line_number for x in _analyze(code) if x.rule_id == "CAST-BUF-001"})
+        assert lines == [2]            # badSink only; goodSink (line 3) is correctly sized
+
+
+class TestUnderpointedThroughPassThrough:
+    """data = buf - 8 passed down two functions (52a -> 52b -> 52c) still underwrites in the last one."""
+
+    def _code(self, assign):
+        return (
+            "#include <wchar.h>\n"
+            "static void c_sink(wchar_t * data)\n{\n    wchar_t source[100];\n    wcsncpy(data, source, 100-1);\n}\n"
+            "static void b_sink(wchar_t * data)\n{\n    c_sink(data);\n}\n"
+            f"void a(void)\n{{\n    wchar_t * data;\n    wchar_t dataBuffer[100];\n    {assign}\n    b_sink(data);\n}}\n"
+        )
+
+    def test_two_hops_reports_the_underwrite_at_the_sink(self):
+        f = [x for x in _analyze(self._code("data = dataBuffer - 8;")) if x.rule_id == "CAST-BUF-001"]
+        assert f and 5 in {x.line_number for x in f}
+
+    def test_properly_derived_pointer_is_clean(self):
+        assert "CAST-BUF-001" not in _ids(self._code("data = dataBuffer;"))
+
+
+class TestReturnedBufferReachesCopySink:
+    """data = source(data) where source returns malloc(10) (bytes, no element count) is judged by memmove."""
+
+    def _code(self, alloc):
+        return (
+            "#include <string.h>\n"
+            f"static int * source(int * data)\n{{\n    data = (int *){alloc};\n    return data;\n}}\n"
+            "void f(void)\n{\n    int * data = NULL;\n    int src[10] = {0};\n    data = source(data);\n"
+            "    memmove(data, src, 10*sizeof(int));\n}\n"
+        )
+
+    def test_undersized_returned_buffer_is_reported_at_memmove(self):
+        f = [x for x in _analyze(self._code("malloc(10)")) if x.rule_id == "CAST-BUF-001"]
+        assert f and 12 in {x.line_number for x in f}      # the memmove line
+
+    def test_correctly_sized_returned_buffer_is_clean(self):
+        assert "CAST-BUF-001" not in _ids(self._code("malloc(10*sizeof(int))"))
