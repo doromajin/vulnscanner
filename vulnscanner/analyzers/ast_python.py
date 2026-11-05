@@ -826,6 +826,73 @@ def _func_is_web_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     return any(a.arg == "request" for a in node.args.args)
 
 
+def _name_assignments(scope: ast.AST) -> dict[str, list[ast.expr]]:
+    """Every ``name = expr`` in *scope* (all of them, not only the last)."""
+    found: dict[str, list[ast.expr]] = {}
+    for sub in ast.walk(scope):
+        if isinstance(sub, ast.Assign):
+            for tgt in sub.targets:
+                if isinstance(tgt, ast.Name):
+                    found.setdefault(tgt.id, []).append(sub.value)
+        elif isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name) and sub.value:
+            found.setdefault(sub.target.id, []).append(sub.value)
+    return found
+
+
+def _derives_from_cli_args(
+    node: ast.expr,
+    scope_assigns: dict[str, list[ast.expr]],
+    _seen: frozenset[str] = frozenset(),
+) -> bool:
+    """True when *node* is built from the result of an argparse ``parse_args()`` call.
+
+    ``parse_args()`` results are CLEAN for most sinks (the operator owns the command
+    line), but a CLI that is launched by another program or a service takes its
+    arguments from that caller.  Code-execution sinks use this to avoid treating
+    such a value as safe.  Every assignment to a name counts, so a later
+    ``except: name = None`` does not hide an earlier argument-derived value.
+    """
+    if isinstance(node, ast.Call):
+        if _attr_name(node.func) in _CLI_PARSE_METHODS:
+            return True
+        parts = list(node.args) + [kw.value for kw in node.keywords]
+        if isinstance(node.func, ast.Attribute):
+            parts.append(node.func.value)
+        return any(_derives_from_cli_args(p, scope_assigns, _seen) for p in parts)
+    if isinstance(node, ast.Name):
+        if node.id in _seen:
+            return False
+        seen = _seen | {node.id}
+        return any(_derives_from_cli_args(v, scope_assigns, seen)
+                   for v in scope_assigns.get(node.id, ()))
+    if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+        return _derives_from_cli_args(node.value, scope_assigns, _seen)
+    if isinstance(node, ast.IfExp):
+        return (_derives_from_cli_args(node.body, scope_assigns, _seen)
+                or _derives_from_cli_args(node.orelse, scope_assigns, _seen))
+    if isinstance(node, ast.BinOp):
+        return (_derives_from_cli_args(node.left, scope_assigns, _seen)
+                or _derives_from_cli_args(node.right, scope_assigns, _seen))
+    if isinstance(node, ast.JoinedStr):
+        return any(_derives_from_cli_args(v.value, scope_assigns, _seen)
+                   for v in node.values if isinstance(v, ast.FormattedValue))
+    return False
+
+
+def _cli_arg_code_taint(taint: TaintInfo, arg: ast.expr,
+                        scope: ast.AST | None) -> TaintInfo:
+    """Raise a CLEAN taint to UNKNOWN when a CLI argument reaches eval()/exec()."""
+    if (taint.status == TaintStatus.CLEAN and scope is not None
+            and _derives_from_cli_args(arg, _name_assignments(scope))):
+        return TaintInfo(
+            TaintStatus.UNKNOWN,
+            "command-line argument reaches a code-execution sink -"
+            " unsafe if this CLI is launched by a service or another program",
+            source="argparse",
+        )
+    return taint
+
+
 def _func_is_cli_entry(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     """Return True if *node* is a CLI entry point (Click/Typer decorated or argparse-using).
 
@@ -1404,6 +1471,7 @@ class _VulnVisitor(ast.NodeVisitor):
         elif attr == "eval" and not isinstance(node.func, ast.Attribute):
             if node.args and not _is_const(node.args[0]):
                 taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+                taint = _cli_arg_code_taint(taint, node.args[0], self._current_func_node)
                 if taint.status == TaintStatus.CLEAN:
                     return
                 sev = Severity.CRITICAL if taint.status == TaintStatus.TAINTED else Severity.HIGH
@@ -1417,6 +1485,7 @@ class _VulnVisitor(ast.NodeVisitor):
         elif attr == "exec" and not isinstance(node.func, ast.Attribute):
             if node.args and not _is_const(node.args[0]):
                 taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+                taint = _cli_arg_code_taint(taint, node.args[0], self._current_func_node)
                 if taint.status == TaintStatus.CLEAN:
                     return
                 sev = Severity.CRITICAL if taint.status == TaintStatus.TAINTED else Severity.HIGH

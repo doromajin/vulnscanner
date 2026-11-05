@@ -472,3 +472,51 @@ class TestInnerHtmlSanitizerAndI18n:
     def test_non_i18n_concat_still_flagged(self, code):
         assert self._xss(code)
         assert self._custom(code)
+
+
+# ── 6. command-line arguments reaching eval()/exec() ──────────────────────────
+
+class TestCliArgsReachCodeExecution:
+    """parse_args() values stay CLEAN for most sinks, but a CLI that another program
+    launches takes its arguments from that caller, so eval()/exec() must not treat
+    them as safe (found on ytdlp2STRM: a service shelling out to its own cli.py)."""
+
+    def _ids(self, code):
+        from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
+        return {f.rule_id for f in PythonASTAnalyzer().analyze("tool.py", code)}
+
+    PARSER = (
+        "import argparse\n"
+        "def main():\n"
+        "    p = argparse.ArgumentParser()\n"
+        "    p.add_argument('-m')\n"
+        "    args = p.parse_args()\n"
+    )
+
+    @pytest.mark.parametrize("body", [
+        "    eval(args.m)\n",
+        "    method = args.m\n    eval('{}.{}'.format('plugins', method))\n",
+        "    method = args.m if args.m != None else 'error'\n    eval(method)\n",
+        "    exec(args.m)\n",
+        "    eval(f'plugins.{args.m}.run')\n",
+        # a later reassignment (try/except fallback) must not hide the CLI-derived value
+        "    method = args.m\n    try:\n        method = method.split('.')[1]\n"
+        "    except Exception:\n        method = None\n    eval('{}.{}'.format('plugins', method))(*[])\n",
+    ])
+    def test_cli_arg_into_eval_or_exec_flagged(self, body):
+        ids = self._ids(self.PARSER + body)
+        assert ids & {"AST-CMD-003", "AST-CMD-004"}
+
+    @pytest.mark.parametrize("body", [
+        "    eval('1 + 1')\n",
+        "    name = 'plugins'\n    eval(name)\n",
+        "    n = len(args.m)\n    x = 'static'\n    eval(x)\n",
+    ])
+    def test_constant_eval_not_flagged(self, body):
+        assert not (self._ids(self.PARSER + body) & {"AST-CMD-003", "AST-CMD-004"})
+
+    def test_cli_arg_into_path_sink_not_escalated(self):
+        from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
+        code = self.PARSER + "    open(args.m).read()\n"
+        found = [f for f in PythonASTAnalyzer().analyze("tool.py", code) if "PATH" in f.rule_id]
+        assert all(f.severity == Severity.INFO for f in found)
