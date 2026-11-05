@@ -1,0 +1,81 @@
+{
+  "_comment": "Ground truth from human-confirmed, vendor-reported findings (see disclosures/). Pinned by commit so lines do not drift. 'detected' records what the scanner reported on the measurement date; it is a measurement, not a label. No exploit strings belong in this file.",
+  "measured_on": "2026-11-05",
+  "scanner_commit": "bff5167",
+  "cases": [
+    {
+      "id": "gerapy-missing-auth",
+      "repo": "Gerapy/Gerapy",
+      "commit": "7c4eda875563f5d0342a3650959e0502bc279d77",
+      "file": "gerapy/server/core/views.py",
+      "line": 329,
+      "cwe": 306,
+      "verdict": "TP",
+      "source": "disclosures/gerapy_zipslip_disclosure.md",
+      "detected": true,
+      "detected_by": "AUTH-001 (HIGH)"
+    },
+    {
+      "id": "gerapy-zipfile-extractall",
+      "repo": "Gerapy/Gerapy",
+      "commit": "7c4eda875563f5d0342a3650959e0502bc279d77",
+      "file": "gerapy/server/core/views.py",
+      "line": 343,
+      "cwe": 22,
+      "verdict": "DISPUTED",
+      "verdict_note": "Disclosure claims traversal via zipfile.extractall. The stdlib ZipFile extraction code strips '..' and absolute-path components (checked in CPython 3.14 source; 3.7-3.11 not checked). Needs verification before it is used as a label.",
+      "source": "disclosures/gerapy_zipslip_disclosure.md",
+      "detected": false,
+      "note": "No rule for archive extraction exists in the scanner; if added, it must model tarfile separately from zipfile."
+    },
+    {
+      "id": "attendize-upload-event-image",
+      "repo": "Attendize/Attendize",
+      "commit": "9289acbab1583898fd85aeee66c7b613d8971deb",
+      "file": "app/Http/Controllers/EventController.php",
+      "line": 168,
+      "cwe": 434,
+      "verdict": "TP",
+      "source": "disclosures/attendize_fileupload_disclosure.md",
+      "detected": false,
+      "missing": "no PHP file-upload rule (client-supplied extension used in the stored file name, file moved to a public directory before validation)"
+    },
+    {
+      "id": "attendize-upload-organiser-logo",
+      "repo": "Attendize/Attendize",
+      "commit": "9289acbab1583898fd85aeee66c7b613d8971deb",
+      "file": "app/Models/Organiser.php",
+      "line": 149,
+      "cwe": 434,
+      "verdict": "TP",
+      "source": "disclosures/attendize_fileupload_disclosure.md",
+      "detected": false,
+      "missing": "same as attendize-upload-event-image"
+    },
+    {
+      "id": "wallabag-client-ssrf",
+      "repo": "wallabag/wallabag",
+      "commit": "9f2e8aa111dcb92767c53944451748d447ac6188",
+      "file": "src/HttpClient/WallabagClient.php",
+      "line": 29,
+      "cwe": 918,
+      "verdict": "TP",
+      "source": "disclosures/wallabag_ssrf_disclosure.md",
+      "detected": false,
+      "missing": "Symfony HttpClient request($method, $url) is not a modelled SSRF sink; the URL arrives from another class, so cross-file taint is needed too"
+    },
+    {
+      "id": "ytdlp2strm-eval-dispatch",
+      "repo": "fe80Grau/ytdlp2STRM",
+      "commit": "d3084be5f4e03c729159f7c07e1b9fd8711719df",
+      "file": "cli.py",
+      "line": 65,
+      "cwe": 95,
+      "verdict": "TP",
+      "source": "disclosures/ytdlp2strm-eval-injection/GITHUB_SECURITY_ADVISORY.md",
+      "detected": true,
+      "detected_by": "AST-CMD-003 (HIGH, taint unknown) after the argparse-to-eval change; missed before it",
+      "note": "Fixed upstream in the next commit; scan the pre-fix commit."
+    }
+  ]
+}

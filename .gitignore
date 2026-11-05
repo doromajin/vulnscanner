@@ -57,3 +57,6 @@ _*.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# ground-truth labels for real-world findings (not scan output)
+!recall/real_world/*.json
