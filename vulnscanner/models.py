@@ -43,6 +43,7 @@ class VulnType(str, Enum):
     REDOS = "Regular Expression Denial of Service (ReDoS)"
     INTENT_INJECTION = "Android Intent Injection"
     EXPOSED_ENDPOINT = "Exposed API Endpoint"
+    FILE_UPLOAD = "Unrestricted File Upload"
 
 
 @dataclass

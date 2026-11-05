@@ -37,6 +37,7 @@ _PREFIX: dict[str, int] = {
     "DEBUG":    489,   # CWE-489:  Active Debug Code
     "JWT":      347,   # CWE-347:  Improper Verification of Cryptographic Signature
     "CORS":     346,   # CWE-346:  Origin Validation Error
+    "UPLOAD":   434,   # CWE-434:  Unrestricted Upload of File with Dangerous Type
 }
 
 

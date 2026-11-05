@@ -37,8 +37,8 @@
       "cwe": 434,
       "verdict": "TP",
       "source": "disclosures/attendize_fileupload_disclosure.md",
-      "detected": false,
-      "missing": "no PHP file-upload rule (client-supplied extension used in the stored file name, file moved to a public directory before validation)"
+      "detected": true,
+      "detected_by": "PHAST-UPLOAD-001 (HIGH)"
     },
     {
       "id": "attendize-upload-organiser-logo",
@@ -49,8 +49,8 @@
       "cwe": 434,
       "verdict": "TP",
       "source": "disclosures/attendize_fileupload_disclosure.md",
-      "detected": false,
-      "missing": "same as attendize-upload-event-image"
+      "detected": true,
+      "detected_by": "PHAST-UPLOAD-001 (HIGH)"
     },
     {
       "id": "wallabag-client-ssrf",

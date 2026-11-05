@@ -296,6 +296,32 @@ _DB: dict[VulnType, dict] = {
         ),
     },
 
+    VulnType.FILE_UPLOAD: {
+        "cwe": 434,
+        "text": (
+            "Never build the stored file name or extension from the client-supplied "
+            "name. Generate the name on the server and take the extension from the "
+            "detected content type (e.g. guessExtension()/extension()) or check it "
+            "against an allow-list. Store uploads outside the web root, or in a "
+            "directory where script execution is disabled."
+        ),
+        "markdown": (
+            "## Fix: Unrestricted File Upload (CWE-434)\n\n"
+            "A file whose extension comes from the client can be saved as an executable "
+            "type inside a served directory.\n\n"
+            "```php\n"
+            "// ❌ Vulnerable\n"
+            "$name = md5(time()) . '.' . $file->getClientOriginalExtension();\n"
+            "$file->move(public_path('uploads'), $name);\n\n"
+            "// ✅ Safe: server-chosen name, extension from the detected content type\n"
+            "$name = bin2hex(random_bytes(16)) . '.' . $file->guessExtension();\n"
+            "$file->move(storage_path('app/uploads'), $name);\n"
+            "```\n\n"
+            "**References:** "
+            "[OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)"
+        ),
+    },
+
     VulnType.PROTOTYPE_POLLUTION: {
         "cwe": 1321,
         "text": (

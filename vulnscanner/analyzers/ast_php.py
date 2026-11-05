@@ -21,6 +21,7 @@ Rule IDs (PHAST-*):
   PHAST-EVAL-002  Code injection (assert() with user input — PHP < 8.0 evaluates strings)
   PHAST-CMD-002   Command injection (backtick shell execution `$cmd`)
   PHAST-SSTI-001  SSTI (Twig createTemplate, Smarty fetch with tainted template)
+  PHAST-UPLOAD-001 Unrestricted file upload (stored name/extension taken from the client)
 """
 from __future__ import annotations
 
@@ -770,6 +771,156 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
 
 # ── Analyzer class ────────────────────────────────────────────────────────────
 
+# ── Unrestricted file upload (PHAST-UPLOAD-001, CWE-434) ──────────────────────
+#
+# An uploaded file is saved under a name whose extension the client chose.  Content
+# checks (Laravel ``image`` / ``mimes``) look at the bytes, not at that extension, so
+# they do not stop a script-type extension from being stored.  Names built from
+# guessExtension()/extension()/hashName() or a fixed suffix never match, and an
+# allow-list check on the extension anywhere in the same function suppresses it.
+
+_UPLOAD_CLIENT_NAME_RE = re.compile(
+    r"getClientOriginalExtension\s*\(|getClientOriginalName\s*\(|getClientFilename\s*\("
+    r"|\$_FILES\b[^;]*?\[\s*['\"]name['\"]\s*\]"
+)
+_UPLOAD_PUBLIC_RE = re.compile(
+    r"public_path|DOCUMENT_ROOT|webroot|web_root|wwwroot|htdocs|\bpublic\b", re.IGNORECASE
+)
+_UPLOAD_EXT_RULE_RE = re.compile(r"['\"|]extensions:|->extensions\s*\(")
+# method / function -> (index of the stored-name argument, index of the directory argument)
+_UPLOAD_METHOD_SINKS = {'move': (1, 0), 'storeAs': (1, 0), 'storePubliclyAs': (1, 0),
+                        'putFileAs': (2, 0)}
+_UPLOAD_FUNC_SINKS = {'move_uploaded_file': (1, 1)}
+_UPLOAD_SCOPE_TYPES = ('method_declaration', 'function_definition', 'anonymous_function',
+                       'anonymous_function_creation_expression')
+_PHP_VAR_RE = re.compile(r"\$\w+")
+# Calls that test the client name/extension against an allow-list (suffix match included).
+_UPLOAD_CHECK_FUNCS = frozenset({
+    'in_array', 'array_search', 'preg_match', 'preg_match_all',
+    'substr_compare', 'str_ends_with', 'endsWith', 'ends_with',
+})
+# A client *name* that only passes through these loses its extension (slug turns the dot
+# into a dash, hashes are hex, pathinfo(.., PATHINFO_FILENAME) drops it).  The extension
+# itself (getClientOriginalExtension) is never neutralised by them.
+_UPLOAD_BAL = r"(?:[^()]|\((?:[^()]|\([^()]*\))*\))*"
+_UPLOAD_NAME_WRAP_RE = re.compile(
+    r"(?:\bpathinfo|Str::slug|\bslug|\bmd5|\bsha1|\bcrc32|\bhash|\bbin2hex)\s*\(" + _UPLOAD_BAL + r"\)"
+)
+
+
+def _drop_extensionless_names(text: str) -> str:
+    def repl(m):
+        inner = m.group(0)
+        if 'OriginalExtension' in inner:
+            return inner
+        if inner.lstrip().startswith('pathinfo') and 'PATHINFO_FILENAME' not in inner:
+            return inner
+        return ' '
+    return _UPLOAD_NAME_WRAP_RE.sub(repl, text)
+
+
+def _node_text(node) -> str:
+    return node.text.decode('utf-8', errors='replace')
+
+
+def _upload_scope(node):
+    cur = node.parent
+    while cur is not None and cur.type not in _UPLOAD_SCOPE_TYPES:
+        cur = cur.parent
+    return cur
+
+
+def _upload_scope_assignments(scope) -> dict[str, list[str]]:
+    """{'$var': [rhs text, ...]} for every plain assignment inside *scope*."""
+    found: dict[str, list[str]] = {}
+    for n in _walk(scope):
+        if n.type in ('assignment_expression', 'augmented_assignment_expression'):
+            left = n.child_by_field_name('left')
+            right = n.child_by_field_name('right')
+            if left is not None and right is not None and left.type == 'variable_name':
+                found.setdefault(_node_text(left), []).append(_node_text(right))
+    return found
+
+
+def _expand_upload_expr(text: str, assigns: dict[str, list[str]], depth: int = 4,
+                        seen: frozenset = frozenset()) -> str:
+    """*text* plus the right-hand sides of every variable it mentions (transitively)."""
+    out = [text]
+    if depth <= 0:
+        return text
+    for var in set(_PHP_VAR_RE.findall(text)):
+        if var in seen:
+            continue
+        for rhs in assigns.get(var, ()):
+            out.append(_expand_upload_expr(rhs, assigns, depth - 1, seen | {var}))
+    return ' '.join(out)
+
+
+def _upload_name_is_checked(scope, assigns: dict[str, list[str]]) -> bool:
+    """True when the function checks the client extension against an allow-list."""
+    if _UPLOAD_EXT_RULE_RE.search(_node_text(scope)):
+        return True
+    for n in _walk(scope):
+        if n.type == 'function_call_expression':
+            fname, args = _call_name(n), _call_args(n)
+        elif n.type == 'member_call_expression':
+            fname, args = _method_name(n), _member_args(n)
+        elif n.type == 'scoped_call_expression':
+            fname = next((_node_text(c) for c in reversed(n.children) if c.type == 'name'), '')
+            args = _call_args(n)
+        else:
+            continue
+        if fname not in _UPLOAD_CHECK_FUNCS:
+            continue
+        subject = args[1] if fname.startswith('preg_') and len(args) > 1 else (args[0] if args else None)
+        if subject is not None and _UPLOAD_CLIENT_NAME_RE.search(
+                _expand_upload_expr(_node_text(subject), assigns)):
+            return True
+    return False
+
+
+def _check_uploads(root, file_path: str, lines: list[str], repo_url: str) -> list:
+    findings: list[Finding] = []
+    seen: set = set()
+    cache: dict[int, tuple[dict, bool]] = {}
+    for node in _walk(root):
+        if node.type == 'member_call_expression':
+            sink = _method_name(node)
+            idx = _UPLOAD_METHOD_SINKS.get(sink)
+            args = _member_args(node) if idx else []
+        elif node.type == 'scoped_call_expression':
+            sink = next((_node_text(c) for c in reversed(node.children) if c.type == 'name'), '')
+            idx = _UPLOAD_METHOD_SINKS.get(sink)
+            args = _call_args(node) if idx else []
+        elif node.type == 'function_call_expression':
+            sink = _call_name(node)
+            idx = _UPLOAD_FUNC_SINKS.get(sink)
+            args = _call_args(node) if idx else []
+        else:
+            continue
+        if not idx or len(args) <= idx[0]:
+            continue
+        scope = _upload_scope(node) or root
+        key = id(scope)
+        if key not in cache:
+            assigns = _upload_scope_assignments(scope)
+            cache[key] = (assigns, _upload_name_is_checked(scope, assigns))
+        assigns, checked = cache[key]
+        name_text = _expand_upload_expr(_node_text(args[idx[0]]), assigns)
+        if checked or not _UPLOAD_CLIENT_NAME_RE.search(_drop_extensionless_names(name_text)):
+            continue
+        dir_text = _expand_upload_expr(_node_text(args[idx[1]]), assigns) if len(args) > idx[1] else ''
+        publicly = bool(_UPLOAD_PUBLIC_RE.search(dir_text)) or sink == 'storePubliclyAs' \
+            or any(_node_text(a).strip('\'"') == 'public' for a in args[2:])
+        _emit(findings, seen, file_path, node.start_point[0] + 1, lines, repo_url,
+              VulnType.FILE_UPLOAD, Severity.HIGH if publicly else Severity.MEDIUM,
+              'PHAST-UPLOAD-001',
+              f"Uploaded file saved via {sink}() under a name whose extension comes from the "
+              f"client{' into a web-served directory' if publicly else ''} - a script-type "
+              "extension would be stored; use a server-chosen name and an extension allow-list")
+    return findings
+
+
 class PhpASTAnalyzer(BaseAnalyzer):
     """PHP AST multi-vuln taint analyzer (tree-sitter-php).
 
@@ -794,6 +945,8 @@ class PhpASTAnalyzer(BaseAnalyzer):
         seed = cf_ctx.tainted_func_names if cf_ctx else None
         tainted, tainted_funcs, tainted_props = _build_taint(tree.root_node, seed)
 
-        return _check_sinks(
+        findings = _check_sinks(
             tree.root_node, tainted, tainted_funcs, tainted_props, file_path, lines, repo_url
         )
+        findings.extend(_check_uploads(tree.root_node, file_path, lines, repo_url))
+        return findings
