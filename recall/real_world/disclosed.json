@@ -22,11 +22,11 @@
       "file": "gerapy/server/core/views.py",
       "line": 343,
       "cwe": 22,
-      "verdict": "DISPUTED",
-      "verdict_note": "Disclosure claims traversal via zipfile.extractall. The stdlib ZipFile extraction code strips '..' and absolute-path components (checked in CPython 3.14 source; 3.7-3.11 not checked). Needs verification before it is used as a label.",
+      "verdict": "NOT_VULNERABLE",
+      "verdict_note": "Disclosure claims path traversal via zipfile.extractall. ZipFile._extract_member removes '..', '.', empty and drive/absolute components before joining the path (read in CPython v3.7.17, v3.11.9 and 3.14). The scanner correctly reports nothing here; do not count it as a miss.",
       "source": "disclosures/gerapy_zipslip_disclosure.md",
       "detected": false,
-      "note": "No rule for archive extraction exists in the scanner; if added, it must model tarfile separately from zipfile."
+      "note": "If an archive-extraction rule is ever added, it must model tarfile (no such stripping) separately from zipfile."
     },
     {
       "id": "attendize-upload-event-image",
