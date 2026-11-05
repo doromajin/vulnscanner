@@ -412,3 +412,63 @@ class TestPasswordPathLabels:
     ])
     def test_real_passwords_still_flagged(self, code):
         assert "SEC-001" in self._ids(code)
+
+
+# ── 5. innerHTML fed by a sanitizer call / an i18n message catalogue ──────────
+
+class TestInnerHtmlSanitizerAndI18n:
+    def _custom(self, code):
+        return [x for x in CustomRuleAnalyzer(load_rules([_BUILTIN])).analyze("assets/a.js", code)
+                if x.rule_id == "JS-XSS-001"]
+
+    def _xss(self, code):
+        return [x for x in XSSAnalyzer().analyze("assets/a.js", code) if x.rule_id == "XSS-001"]
+
+    # JS-XSS-001 (regex rule): a lone sanitizer call is not flagged
+    @pytest.mark.parametrize("rhs", [
+        "ESCAPER.sanitize(newWidget);",
+        "DOMPurify.sanitize(html);",
+        "this.sanitizeHtml(a.b(c));",
+    ])
+    def test_sanitizer_call_not_flagged(self, rhs):
+        assert not self._custom(f"temp.innerHTML = {rhs}\n")
+
+    # ...but a sanitizer call mixed with raw data still is
+    @pytest.mark.parametrize("rhs", [
+        "DOMPurify.sanitize(a) + userInput;",
+        "sanitize(a) + f(b);",
+        "html;",
+        "render(html);",
+    ])
+    def test_sanitizer_mixed_with_raw_data_still_flagged(self, rhs):
+        assert self._custom(f"temp.innerHTML = {rhs}\n")
+
+    # XSS-001: concatenated values that all come from the message catalogue
+    def test_i18n_message_not_flagged(self):
+        code = (
+            "const msg = this.translate('modal.dirty');\n"
+            "temp.innerHTML = '<p class=\"x\">' + msg + '</p>';\n"
+        )
+        assert not self._xss(code)
+        assert not self._custom(code)
+
+    def test_i18n_via_translation_get_not_flagged(self):
+        code = (
+            "const label = translation.get('close');\n"
+            "el.innerHTML = '<a>' + label + '</a>';\n"
+        )
+        assert not self._xss(code)
+
+    @pytest.mark.parametrize("code", [
+        # variable of unknown origin
+        "temp.innerHTML = '<p>' + msg + '</p>';\n",
+        # one i18n value, one raw value
+        "const a = this.translate('k');\nel.innerHTML = '<p>' + a + b + '</p>';\n",
+        # a call inside the concatenation is not a bare catalogue variable
+        "const a = this.translate('k');\nel.innerHTML = '<p>' + a + getName() + '</p>';\n",
+        # assigned from request data, not the catalogue
+        "const a = req.query.name;\nel.innerHTML = '<p>' + a + '</p>';\n",
+    ])
+    def test_non_i18n_concat_still_flagged(self, code):
+        assert self._xss(code)
+        assert self._custom(code)

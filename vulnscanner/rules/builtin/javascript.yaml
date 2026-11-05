@@ -8,7 +8,10 @@
   languages: [javascript, typescript]
   # Skip when the whole right-hand side is one complete string literal with no
   # concatenation or ${} interpolation (e.g. el.innerHTML = '<b>static</b>';).
-  regex: '\.innerHTML\s*=(?!\s*(?:''[^''\\]*''|"[^"\\]*"|`[^`$\\]*`)\s*[;,]?\s*(?://.*)?$)'
+  # Also skip when the whole right-hand side is a single sanitizer call
+  # (el.innerHTML = DOMPurify.sanitize(x); / this.sanitize(x)) — one level of
+  # nested parentheses is allowed in its argument list.
+  regex: '\.innerHTML\s*=(?!\s*(?:''[^''\\]*''|"[^"\\]*"|`[^`$\\]*`)\s*[;,]?\s*(?://.*)?$)(?!\s*(?:[\w$]+\.)*sanitize\w*\s*\((?:[^()]|\([^()]*\))*\)\s*[;,]?\s*(?://.*)?$)'
   evidence_regex: '\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)|window\.name|URLSearchParams|postMessage|\baddEventListener\s*\(\s*[\x22\x27]message|\bonmessage\b|\bevent\.data\b'
   no_evidence_severity: LOW
 

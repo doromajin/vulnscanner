@@ -5,10 +5,22 @@ import re
 from pathlib import Path
 
 from vulnscanner.analyzers.base import BaseAnalyzer
+from vulnscanner.analyzers.xss import _concat_vars_are_i18n
 from vulnscanner.models import Finding
 from vulnscanner.rules.loader import CustomRule
 
 _INLINE_IGNORE = "vulnscanner: ignore"
+
+
+def _innerhtml_is_i18n_concat(line: str, lines: list[str], idx: int) -> bool:
+    """Same verdict as XSS-001: innerHTML built only from message-catalogue values."""
+    m = re.search(r"\.innerHTML\s*=\s*([^\n]*)", line)
+    return bool(m) and _concat_vars_are_i18n(m.group(1), lines, idx)
+
+
+# Built-in rules whose regex alone cannot see that the matched value is safe.
+# Each veto gets (line, all lines, 0-based line index); True drops the match.
+_RULE_VETOES = {"JS-XSS-001": _innerhtml_is_i18n_concat}
 
 
 class CustomRuleAnalyzer(BaseAnalyzer):
@@ -74,6 +86,9 @@ class CustomRuleAnalyzer(BaseAnalyzer):
                 if key in seen:
                     continue
                 seen.add(key)
+                veto = _RULE_VETOES.get(rule.id)
+                if veto is not None and veto(line, lines, lineno - 1):
+                    continue
 
                 snippet = self._extract_snippet(lines, lineno)
                 finding = Finding(

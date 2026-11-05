@@ -170,6 +170,31 @@ def _is_safe_interpolation(expr: str) -> bool:
     return False
 
 
+# Lookup of a developer-authored message catalogue (this.translate('k'),
+# translation.get('k'), i18n.t('k'), gettext('k'), __('k')).  The returned text
+# is fixed at build time, so it carries no attacker data.
+_I18N_ASSIGN = (
+    r"(?:const|let|var)\s+%s\s*=\s*"
+    r"(?:(?:this|[\w$]+)\.)?(?:translate|translation\.get|i18n\.t|t|gettext|ngettext|__|_)\s*\("
+)
+_STR_LITERAL_RE = re.compile(r"""'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*\"""")
+_BARE_IDENT_RE = re.compile(r"^[A-Za-z_$][\w$]*$")
+
+
+def _concat_vars_are_i18n(rhs: str, lines: list[str], idx: int) -> bool:
+    """
+    True when ``rhs`` is string literals joined by ``+`` with at least one bare
+    variable, and every such variable was assigned from an i18n lookup shortly
+    before line ``idx``.
+    """
+    rest = _STR_LITERAL_RE.sub("", rhs).rstrip().rstrip(";")
+    tokens = [t.strip() for t in rest.split("+") if t.strip()]
+    if not tokens or not all(_BARE_IDENT_RE.match(t) for t in tokens):
+        return False
+    window = "\n".join(lines[max(0, idx - 40):idx])
+    return all(re.search(_I18N_ASSIGN % re.escape(t), window) for t in tokens)
+
+
 def _innerhtml_is_unsafe(block: str) -> bool:
     """
     Analyse a (possibly multiline) ``innerHTML = ...`` assignment block.
@@ -314,6 +339,10 @@ class XSSAnalyzer(BaseAnalyzer):
                 lineno = i + 1
                 block = self._collect_block(lines, i)
                 if is_php and self._php_escaped_literal_is_safe(line, content):
+                    i += 1
+                    continue
+                rhs_m = re.search(r'innerHTML\s*=\s*([^\n]*)', line)
+                if rhs_m and _concat_vars_are_i18n(rhs_m.group(1), lines, i):
                     i += 1
                     continue
                 if _innerhtml_is_unsafe(block):
