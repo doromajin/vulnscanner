@@ -1,7 +1,5 @@
 {
-  "_comment": "Ground truth from human-confirmed, vendor-reported findings (see disclosures/). Pinned by commit so lines do not drift. 'detected' records what the scanner reported on the measurement date; it is a measurement, not a label. No exploit strings belong in this file.",
-  "measured_on": "2026-11-05",
-  "scanner_commit": "bff5167",
+  "_comment": "Ground truth from human-confirmed, vendor-reported findings (see disclosures/), pinned by commit so lines do not drift. check_real_world.py scans each pinned commit and compares: expect_detected is what the scanner is expected to do today (false = known gap). Entries without expect_detected are not checked. No exploit strings belong in this file.",
   "cases": [
     {
       "id": "gerapy-missing-auth",
@@ -12,8 +10,12 @@
       "cwe": 306,
       "verdict": "TP",
       "source": "disclosures/gerapy_zipslip_disclosure.md",
-      "detected": true,
-      "detected_by": "AUTH-001 (HIGH)"
+      "detected_by": "AUTH-001 (HIGH)",
+      "dir": "Gerapy",
+      "expect_detected": true,
+      "expect_rules": [
+        "AUTH-001"
+      ]
     },
     {
       "id": "gerapy-zipfile-extractall",
@@ -25,7 +27,6 @@
       "verdict": "NOT_VULNERABLE",
       "verdict_note": "Disclosure claims path traversal via zipfile.extractall. ZipFile._extract_member removes '..', '.', empty and drive/absolute components before joining the path (read in CPython v3.7.17, v3.11.9 and 3.14). The scanner correctly reports nothing here; do not count it as a miss.",
       "source": "disclosures/gerapy_zipslip_disclosure.md",
-      "detected": false,
       "note": "If an archive-extraction rule is ever added, it must model tarfile (no such stripping) separately from zipfile."
     },
     {
@@ -37,8 +38,12 @@
       "cwe": 434,
       "verdict": "TP",
       "source": "disclosures/attendize_fileupload_disclosure.md",
-      "detected": true,
-      "detected_by": "PHAST-UPLOAD-001 (HIGH)"
+      "detected_by": "PHAST-UPLOAD-001 (HIGH)",
+      "dir": "Attendize",
+      "expect_detected": true,
+      "expect_rules": [
+        "PHAST-UPLOAD-001"
+      ]
     },
     {
       "id": "attendize-upload-organiser-logo",
@@ -49,8 +54,12 @@
       "cwe": 434,
       "verdict": "TP",
       "source": "disclosures/attendize_fileupload_disclosure.md",
-      "detected": true,
-      "detected_by": "PHAST-UPLOAD-001 (HIGH)"
+      "detected_by": "PHAST-UPLOAD-001 (HIGH)",
+      "dir": "Attendize",
+      "expect_detected": true,
+      "expect_rules": [
+        "PHAST-UPLOAD-001"
+      ]
     },
     {
       "id": "wallabag-client-ssrf",
@@ -61,8 +70,15 @@
       "cwe": 918,
       "verdict": "TP",
       "source": "disclosures/wallabag_ssrf_disclosure.md",
-      "detected": false,
-      "missing": "Symfony HttpClient request($method, $url) is not a modelled SSRF sink; the URL arrives from another class, so cross-file taint is needed too"
+      "missing": "Symfony HttpClient request($method, $url) is not a modelled SSRF sink; the URL arrives from another class, so cross-file taint is needed too",
+      "dir": "wallabag",
+      "expect_detected": false,
+      "expect_rules": [
+        "PHAST-SSRF-001",
+        "AST-SSRF-001",
+        "AST-SSRF-002",
+        "SSRF-001"
+      ]
     },
     {
       "id": "ytdlp2strm-eval-dispatch",
@@ -73,9 +89,13 @@
       "cwe": 95,
       "verdict": "TP",
       "source": "disclosures/ytdlp2strm-eval-injection/GITHUB_SECURITY_ADVISORY.md",
-      "detected": true,
       "detected_by": "AST-CMD-003 (HIGH, taint unknown) after the argparse-to-eval change; missed before it",
-      "note": "Fixed upstream in the next commit; scan the pre-fix commit."
+      "note": "Fixed upstream in the next commit; scan the pre-fix commit.",
+      "dir": "ytdlp2STRM",
+      "expect_detected": true,
+      "expect_rules": [
+        "AST-CMD-003"
+      ]
     }
   ]
 }

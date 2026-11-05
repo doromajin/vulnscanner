@@ -1,0 +1,541 @@
+{
+  "_comment": "Ground truth for check_real_world.py: every non-INFO finding on a pinned OSS commit with a verdict. TP = real weakness; FP = not a problem; HARDENING = low risk by design; DEP_ADVISORY = known-vulnerable dependency, reachability not assessed; UNTRIAGED = not looked at yet (never treat as TP or FP). A finding without a label fails the check until it is triaged.",
+  "labelled_on": "2026-11-05",
+  "repos": {
+    "bludit": {
+      "url": "https://github.com/bludit/bludit",
+      "commit": "4b1288d30150bb6e2cc410637e0b0e1d8fe1d14a",
+      "findings": [
+        {
+          "rule": "PHAST-XSS-001",
+          "file": "bl-kernel/admin/views/new-category.php",
+          "content": "echo Bootstrap::formInputText(array(",
+          "verdict": "TP",
+          "note": "Admin form echoes a $_POST value back unescaped (confirmed 2026-10-29)."
+        },
+        {
+          "rule": "PHAST-XSS-001",
+          "file": "bl-kernel/admin/views/new-category.php",
+          "content": "echo Bootstrap::formTextarea(array(",
+          "verdict": "TP",
+          "note": "Admin form echoes a $_POST value back unescaped (confirmed 2026-10-29)."
+        },
+        {
+          "rule": "PHAST-XSS-001",
+          "file": "bl-kernel/admin/views/new-user.php",
+          "content": "echo Bootstrap::formInputText(array(",
+          "verdict": "TP",
+          "note": "Admin form echoes a $_POST value back unescaped (confirmed 2026-10-29)."
+        },
+        {
+          "rule": "PHAST-XSS-001",
+          "file": "bl-kernel/admin/views/new-user.php",
+          "content": "echo Bootstrap::formInputText(array(",
+          "verdict": "TP",
+          "note": "Admin form echoes a $_POST value back unescaped (confirmed 2026-10-29)."
+        },
+        {
+          "rule": "PHAST-LOG-001",
+          "file": "bl-kernel/helpers/log.class.php",
+          "content": "error_log($type.' ['.BLUDIT_VERSION.'] ['.$_SERVER['REQUEST_URI'].'] '.$text, $messageType);",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "REDIR-002",
+          "file": "bl-kernel/helpers/redirect.class.php",
+          "content": "header(\"Location: \".$url, TRUE, $httpCode);",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "WCRYPTO-004",
+          "file": "bl-kernel/users.class.php",
+          "content": "return sha1($password.$salt);",
+          "verdict": "TP",
+          "note": "Password hashed with salted SHA-1. Real weakness; CRITICAL is too high for it."
+        },
+        {
+          "rule": "CORS-007",
+          "file": "bl-plugins/api/plugin.php",
+          "content": "header('Access-Control-Allow-Origin: *');",
+          "verdict": "HARDENING",
+          "note": "Wildcard origin on a token-authenticated JSON API without credentials; a hardening point, not a hole."
+        },
+        {
+          "rule": "REDIR-002",
+          "file": "index.php",
+          "content": "header('Location:'.$base.'/install.php');",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "REDIR-002",
+          "file": "install.php",
+          "content": "header(\"Location:\" . $url, TRUE, 302);",
+          "verdict": "FP",
+          "note": "redirect() is only called with the constant HTML_PATH_ROOT (install.php lines 588 and 598)."
+        }
+      ]
+    },
+    "Lychee": {
+      "url": "https://github.com/LycheeOrg/Lychee",
+      "commit": "4df83b4b7dd5a42a7f258219cde1249ef41ae6c2",
+      "findings": [
+        {
+          "rule": "CMD-004",
+          "file": "app/Assets/CommandExecutor.php",
+          "content": "exec($command, $output, $code);",
+          "verdict": "FP",
+          "note": "Thin wrapper kept so tests can stub exec(); its callers pass fixed commands (composer install, git pull with config('urls.git.pull'))."
+        },
+        {
+          "rule": "CMD-004",
+          "file": "app/Metadata/DiskUsage.php",
+          "content": "exec($command, $output);",
+          "verdict": "HARDENING",
+          "note": "Unquoted $dir inside a shell string, but it is always base_path() or a configured storage path, never request data."
+        },
+        {
+          "rule": "DEP-001",
+          "file": "package.json",
+          "content": "axios==1.18.0",
+          "verdict": "DEP_ADVISORY",
+          "note": "Matches the advisory database; reachability not assessed."
+        }
+      ]
+    },
+    "kimai": {
+      "url": "https://github.com/kimai/kimai",
+      "commit": "aaff60bcb7c76a82b2d338bbe1513dbbddc36e7e",
+      "findings": [
+        {
+          "rule": "JS-REDIR-001",
+          "file": "assets/js/plugins/KimaiAjaxModalForm.js",
+          "content": "window.location = url;",
+          "verdict": "HARDENING",
+          "note": "Fallback navigation to the URL of the link that opened the modal; no attacker-controlled source found."
+        },
+        {
+          "rule": "JS-REDIR-001",
+          "file": "assets/js/plugins/KimaiAjaxModalForm.js",
+          "content": "window.location = url;",
+          "verdict": "HARDENING",
+          "note": "Fallback navigation to the URL of the link that opened the modal; no attacker-controlled source found."
+        },
+        {
+          "rule": "XSS-001",
+          "file": "assets/js/plugins/KimaiAjaxModalForm.js",
+          "content": "newFormHtml.innerHTML = html;",
+          "verdict": "HARDENING",
+          "note": "Inserts HTML fragments fetched from the application's own server (Twig-escaped); not a front-end hole by itself."
+        },
+        {
+          "rule": "XSS-001",
+          "file": "assets/js/plugins/KimaiAjaxModalForm.js",
+          "content": "responseHtml.innerHTML = html;",
+          "verdict": "HARDENING",
+          "note": "Inserts HTML fragments fetched from the application's own server (Twig-escaped); not a front-end hole by itself."
+        },
+        {
+          "rule": "JS-XSS-001",
+          "file": "assets/js/plugins/KimaiAlert.js",
+          "content": "template.innerHTML = html.trim();",
+          "verdict": "HARDENING",
+          "note": "Alert text is concatenated unescaped, but every caller passes translation keys, constants or server error text from flows that carry no free text; no attacker-controlled path found. Defensive escaping would be cheap."
+        },
+        {
+          "rule": "JS-XSS-001",
+          "file": "assets/js/plugins/KimaiAlert.js",
+          "content": "template.innerHTML = html.trim();",
+          "verdict": "HARDENING",
+          "note": "Alert text is concatenated unescaped, but every caller passes translation keys, constants or server error text from flows that carry no free text; no attacker-controlled path found. Defensive escaping would be cheap."
+        },
+        {
+          "rule": "JS-XSS-001",
+          "file": "assets/js/plugins/KimaiAlert.js",
+          "content": "template.innerHTML = html.trim();",
+          "verdict": "HARDENING",
+          "note": "Alert text is concatenated unescaped, but every caller passes translation keys, constants or server error text from flows that carry no free text; no attacker-controlled path found. Defensive escaping would be cheap."
+        },
+        {
+          "rule": "JS-REDIR-001",
+          "file": "assets/js/plugins/KimaiAlternativeLinks.js",
+          "content": "window.location = href;",
+          "verdict": "FP",
+          "note": "Navigates to the href of the link the user just clicked."
+        },
+        {
+          "rule": "XSS-001",
+          "file": "assets/js/plugins/KimaiDatatable.js",
+          "content": "temp.innerHTML = text;",
+          "verdict": "HARDENING",
+          "note": "Inserts HTML fragments fetched from the application's own server (Twig-escaped); not a front-end hole by itself."
+        },
+        {
+          "rule": "JS-REDIR-001",
+          "file": "assets/js/plugins/KimaiFetch.js",
+          "content": "window.location = response.headers.get('x-modal-redirect');",
+          "verdict": "FP",
+          "note": "Target comes from a response header set by the application's own server."
+        },
+        {
+          "rule": "XSS-001",
+          "file": "assets/js/plugins/KimaiRemoteModal.js",
+          "content": "modalBody.innerHTML = html;",
+          "verdict": "HARDENING",
+          "note": "Inserts HTML fragments fetched from the application's own server (Twig-escaped); not a front-end hole by itself."
+        },
+        {
+          "rule": "XSS-001",
+          "file": "assets/js/widgets/KimaiContextMenu.js",
+          "content": "dropdownElement.innerHTML = html;",
+          "verdict": "HARDENING",
+          "note": "Inserts HTML fragments fetched from the application's own server (Twig-escaped); not a front-end hole by itself."
+        },
+        {
+          "rule": "XSS-001",
+          "file": "assets/js/widgets/KimaiPaginatedBoxWidget.js",
+          "content": "temp.innerHTML = text;",
+          "verdict": "HARDENING",
+          "note": "Inserts HTML fragments fetched from the application's own server (Twig-escaped); not a front-end hole by itself."
+        },
+        {
+          "rule": "XSS-001",
+          "file": "assets/js/widgets/KimaiReloadPageWidget.js",
+          "content": "temp.innerHTML = text;",
+          "verdict": "HARDENING",
+          "note": "Inserts HTML fragments fetched from the application's own server (Twig-escaped); not a front-end hole by itself."
+        },
+        {
+          "rule": "DEP-001",
+          "file": "package.json",
+          "content": "dompurify==3.4.11",
+          "verdict": "DEP_ADVISORY",
+          "note": "Matches the advisory database; reachability not assessed."
+        }
+      ]
+    },
+    "healthchecks": {
+      "url": "https://github.com/healthchecks/healthchecks",
+      "commit": "69dbd2a0801dfbcfcd554af8cbbdaaab0b39e2a3",
+      "findings": [
+        {
+          "rule": "AST-SSRF-002",
+          "file": "docker/fetchstatus.py",
+          "content": "with urlopen(Request(url, headers=headers)) as response:",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "PY-ASSERT-001",
+          "file": "hc/accounts/backends.py",
+          "content": "assert remote_user_email",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "PY-ASSERT-001",
+          "file": "hc/accounts/decorators.py",
+          "content": "assert request.user.is_authenticated",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-CRYPTO-003",
+          "file": "hc/accounts/models.py",
+          "content": "dt = dt.replace(hour=9, minute=0) + td(minutes=random.randrange(0, 120))",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "PY-ASSERT-001",
+          "file": "hc/accounts/views.py",
+          "content": "assert isinstance(request.user, User)",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "PY-ASSERT-001",
+          "file": "hc/accounts/views.py",
+          "content": "assert isinstance(form.user, User)",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/accounts/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-CRYPTO-001",
+          "file": "hc/api/models.py",
+          "content": "return hashlib.sha1(code_half.encode()).hexdigest()",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-CRYPTO-001",
+          "file": "hc/api/models.py",
+          "content": "hashed = hashlib.sha1(salted_encoded).hexdigest()",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-CRYPTO-001",
+          "file": "hc/api/models.py",
+          "content": "hashed = hashlib.sha1(salted_encoded).hexdigest()",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-CRYPTO-001",
+          "file": "hc/api/models.py",
+          "content": "hashed = hashlib.sha1(salted_encoded).hexdigest()",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-CRYPTO-001",
+          "file": "hc/api/models.py",
+          "content": "hashed = hashlib.sha1(salted_encoded).hexdigest()",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-CRYPTO-001",
+          "file": "hc/api/models.py",
+          "content": "hashed = hashlib.sha1(salted_encoded).hexdigest()",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AUTH-001",
+          "file": "hc/api/views.py",
+          "content": "def notification_status(request: HttpRequest, code: UUID) -> HttpResponse:",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/api/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-PATH-002",
+          "file": "hc/front/management/commands/pygmentize.py",
+          "content": "with open(f\"templates/front/snippets/{name}.txt\") as f:",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-PATH-002",
+          "file": "hc/front/management/commands/pygmentize.py",
+          "content": "with open(f\"templates/front/snippets/{name}.html\", \"w\") as out:",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-PATH-004",
+          "file": "hc/front/management/commands/render_docs.py",
+          "content": "for src_path in path.glob(\"*.md\"):",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "PY-ASSERT-001",
+          "file": "hc/front/views.py",
+          "content": "assert request.user.is_authenticated",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "PY-ASSERT-001",
+          "file": "hc/front/views.py",
+          "content": "assert request.user.is_authenticated",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/front/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AUTH-001",
+          "file": "hc/front/views.py",
+          "content": "def cron_preview(request: HttpRequest) -> HttpResponse:",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/integrations/email/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "XSS-004",
+          "file": "hc/integrations/pd/templates/add_pd_simple.html",
+          "content": "<a href=\"{{ install_url|safe }}\" class=\"btn btn-lg btn-default\">",
+          "verdict": "HARDENING",
+          "note": "Carried over from the 2026-10-29 triage: |safe on trusted/designed content (docs, own markup). Not re-verified."
+        },
+        {
+          "rule": "AST-REDIR-002",
+          "file": "hc/integrations/po/views.py",
+          "content": "return redirect(subscription_url)",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AST-CMD-001",
+          "file": "hc/integrations/shell/transport.py",
+          "content": "code = os.system(cmd)",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "XSS-004",
+          "file": "hc/integrations/signal/templates/signal_message.html",
+          "content": "{% line %}• <b>{{ c.name_then_code|safe }}</b> (last ping: {{ c.last_ping|naturaltime|default:\"never\" }}){% endline %}",
+          "verdict": "HARDENING",
+          "note": "Carried over from the 2026-10-29 triage: |safe on trusted/designed content (docs, own markup). Not re-verified."
+        },
+        {
+          "rule": "CSRF-001",
+          "file": "hc/integrations/telegram/views.py",
+          "content": "@csrf_exempt",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "AUTH-001",
+          "file": "hc/integrations/telegram/views.py",
+          "content": "def telegram_bot(request: HttpRequest) -> HttpResponse:",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "XSS-001",
+          "file": "static/js/badges.js",
+          "content": "document.getElementById(\"preview\").innerHTML = data;",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "XSS-001",
+          "file": "static/js/log.js",
+          "content": "tbody.innerHTML = data;",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "XSS-001",
+          "file": "static/js/log.js",
+          "content": "tbody.innerHTML = data;",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "XSS-001",
+          "file": "static/js/signup.js",
+          "content": "resultLine.innerHTML = text;",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "CSRF-002",
+          "file": "templates/accounts/unsubscribe_submit.html",
+          "content": "<form id=\"form\" method=\"post\">",
+          "verdict": "UNTRIAGED"
+        },
+        {
+          "rule": "XSS-004",
+          "file": "templates/emails/signal-rate-limited-body-html.html",
+          "content": "{{ message|safe|linebreaksbr }}",
+          "verdict": "HARDENING",
+          "note": "Carried over from the 2026-10-29 triage: |safe on trusted/designed content (docs, own markup). Not re-verified."
+        },
+        {
+          "rule": "XSS-004",
+          "file": "templates/front/docs_search.html",
+          "content": "<a href=\"{% url 'hc-serve-doc' slug %}\">{{ title|safe }}</a>",
+          "verdict": "HARDENING",
+          "note": "Carried over from the 2026-10-29 triage: |safe on trusted/designed content (docs, own markup). Not re-verified."
+        },
+        {
+          "rule": "XSS-004",
+          "file": "templates/front/docs_search.html",
+          "content": "<p>{{ snippet|safe }}</p>",
+          "verdict": "HARDENING",
+          "note": "Carried over from the 2026-10-29 triage: |safe on trusted/designed content (docs, own markup). Not re-verified."
+        },
+        {
+          "rule": "XSS-004",
+          "file": "templates/front/docs_single.html",
+          "content": "<div class=\"docs-content docs-{{ section }}\">{{ content|safe }}</div>",
+          "verdict": "HARDENING",
+          "note": "Carried over from the 2026-10-29 triage: |safe on trusted/designed content (docs, own markup). Not re-verified."
+        }
+      ]
+    }
+  }
+}
