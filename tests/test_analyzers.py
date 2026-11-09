@@ -7260,6 +7260,43 @@ int f(int fail) {
         assert len(self._uaf(code)) == 1
 
 
+class TestCsrf002FormTokens:
+    """CSRF-002 (POST form without a token) honours other token styles and header-based defences."""
+
+    def _hits(self, html):
+        from vulnscanner.analyzers.csrf import CSRFAnalyzer
+        return [f.rule_id for f in CSRFAnalyzer().analyze("templates/f.html", html) if f.rule_id == "CSRF-002"]
+
+    def test_bare_post_form_is_flagged(self):
+        assert self._hits('<form method="post" action="/x">\n<input name="a">\n</form>') == ["CSRF-002"]
+
+    def test_django_tag_and_other_token_styles_are_accepted(self):
+        for token in ("{% csrf_token %}", "{{ form.csrf_token }}", "{{ form.hidden_tag() }}",
+                      '<input type="hidden" name="csrftoken" value="{{ csrftoken() }}">',
+                      '<input type="hidden" name="_xsrf" value="{{ xsrf_token }}">',
+                      '<input type="hidden" name="authenticity_token" value="x">'):
+            assert self._hits('<form method="post">\n' + token + '\n</form>') == [], token
+
+    def test_token_far_below_the_form_tag_is_still_found(self):
+        body = "\n".join(f'<input name="f{i}">' for i in range(30))
+        assert self._hits('<form method="post">\n' + body + '\n{% csrf_token %}\n</form>') == []
+
+    def test_token_after_the_form_closes_does_not_count(self):
+        html = '<form method="post">\n<input name="a">\n</form>\n<p>{% csrf_token %}</p>'
+        assert self._hits(html) == ["CSRF-002"]
+
+    def test_project_with_fetch_metadata_defence_is_not_flagged_per_form(self):
+        from vulnscanner.analyzers.ast_python import set_cross_file_context
+        guard = "# CSRF protection\nif headers.get('sec-fetch-site') == 'cross-site': reject()\n"
+        try:
+            set_cross_file_context({"app/csrf.py": guard})
+            assert self._hits('<form method="post">\n</form>') == []
+            set_cross_file_context({"app/other.py": "x = 1\n"})
+            assert self._hits('<form method="post">\n</form>') == ["CSRF-002"]
+        finally:
+            set_cross_file_context({})
+
+
 class TestPathTraversalArgvOnly:
     """CAST-PATH-001 fed only by main()'s argv is demoted to LOW; other sources keep HIGH."""
 

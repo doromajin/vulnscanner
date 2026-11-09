@@ -1,5 +1,7 @@
 import re
+import threading
 
+from vulnscanner.analyzers.ast_python import get_cross_file_contents
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
@@ -12,6 +14,37 @@ _DJANGO_EXEMPT_RE = re.compile(r'@\s*csrf_exempt', re.IGNORECASE)
 # Django form missing {% csrf_token %} — POST form without token tag
 _DJANGO_FORM_RE  = re.compile(r'<form[^>]*method\s*=\s*["\']post["\'][^>]*>', re.IGNORECASE)
 _DJANGO_TOKEN_RE = re.compile(r'\{%[-\s]*csrf_token[-\s]*%\}', re.IGNORECASE)
+
+# Any other per-form token: Flask-WTF {{ form.csrf_token }} / hidden_tag(), Jinja csrftoken(),
+# Rails authenticity_token, an <input name="_xsrf"> ... anywhere inside the same <form>.
+_FORM_END_RE = re.compile(r'</form\s*>', re.IGNORECASE)
+_FORM_TOKEN_RE = re.compile(r'csrf|xsrf|authenticity_token|hidden_tag\s*\(', re.IGNORECASE)
+
+# Header-based CSRF defence (Fetch-Metadata / Origin check, Go's http.CrossOriginProtection):
+# needs no token in the form, so a project that implements it is not exposed form by form.
+_HEADER_DEFENCE_EXTS = (".py", ".js", ".ts", ".go", ".rb", ".php", ".java", ".cs")
+_header_defence_local = threading.local()
+
+
+def _project_has_header_csrf_defence() -> bool:
+    """True when some source file of the project checks Sec-Fetch-Site as a CSRF/cross-origin guard."""
+    contents = get_cross_file_contents()
+    if not contents:
+        return False
+    cached = getattr(_header_defence_local, "entry", None)
+    if cached is not None and cached[0] is contents:
+        return cached[1]
+    found = False
+    for path, text in contents.items():
+        if not path.endswith(_HEADER_DEFENCE_EXTS):
+            continue
+        low = text.lower()
+        if "sec-fetch-site" in low and ("csrf" in low or "cross-origin" in low or "crossorigin" in low):
+            found = True
+            break
+    _header_defence_local.entry = (contents, found)
+    return found
+
 
 # ── Flask / Werkzeug ─────────────────────────────────────────────────────────────
 # WTForms CSRF disabled: app.config['WTF_CSRF_ENABLED'] = False
@@ -124,9 +157,12 @@ class CSRFAnalyzer(BaseAnalyzer):
 
             # Django HTML template: POST form without {% csrf_token %}
             if file_path.endswith((".html", ".htm")) and _DJANGO_FORM_RE.search(line):
-                # Check the next 10 lines for a csrf_token tag
-                window = "\n".join(lines[lineno - 1: lineno + 10])
-                if not _DJANGO_TOKEN_RE.search(window):
+                # The form's own markup (to its closing tag; at most 200 lines) must carry a token
+                tail = "\n".join(lines[lineno - 1: lineno + 199])
+                end = _FORM_END_RE.search(tail)
+                window = tail[: end.end()] if end else "\n".join(lines[lineno - 1: lineno + 10])
+                if not (_DJANGO_TOKEN_RE.search(window) or _FORM_TOKEN_RE.search(window)
+                        or _project_has_header_csrf_defence()):
                     findings.append(self._make(
                         "CSRF-002", Severity.HIGH,
                         "HTML POST form missing {% csrf_token %} — CSRF protection absent",
