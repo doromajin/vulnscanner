@@ -36,7 +36,9 @@ _RULES = [
         "PATH-005",
         re.compile(
             r'^(?!\s*(?:import\b|export\b[^\n]*\bfrom\b)|[^\n]*\bfrom\s+[\'"]\.\.?/'
-            r'|[^\n]*\b(?:require|import)\s*\(\s*[\'"]\.\.?/)'
+            r'|[^\n]*\b(?:require|import)\s*\(\s*[\'"]\.\.?/'
+            # script-directory anchor + constant literal (no variable part): a fixed relative path
+            r'|[^\n]*(?:__DIR__|\bdirname\s*\(\s*__FILE__\s*\)|\b__dirname)\s*[.,+]\s*[\'"][^\'"$]*[\'"]\s*(?:[);]|$))'
             r'[^\n]*(?:\.\./|\.\.\\\\)',
             re.IGNORECASE,
         ),

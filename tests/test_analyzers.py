@@ -7607,3 +7607,15 @@ class TestPath005ModuleImports:
     def test_literal_traversal_still_flagged(self):
         src = 'const p = base + "/../../etc/passwd";\nfs.readFile("../secret", cb);\n'
         assert self._ids("a.js", src).count("PATH-005") == 2
+
+    def test_script_dir_anchored_constant_path_not_flagged(self):
+        php = "<?php\n$j = file_get_contents(__DIR__ . '/../../composer.json');\n$k = require dirname(__FILE__) . '/../boot.php';\n"
+        js = "const p = path.join(__dirname, '../config.json');\n"
+        assert "PATH-005" not in self._ids("a.php", php)
+        assert "PATH-005" not in self._ids("a.js", js)
+
+    def test_script_dir_anchor_with_variable_part_still_flagged(self):
+        php = "<?php\n$j = file_get_contents(__DIR__ . '/../' . $name);\n"
+        js = "const p = path.join(__dirname, '../', name);\n"
+        assert "PATH-005" in self._ids("a.php", php)
+        assert "PATH-005" in self._ids("a.js", js)
