@@ -7319,6 +7319,61 @@ int main(int argc, char **argv) { FILE *f = fopen(argv[1], "rb"); if (f) fclose(
         assert [f.severity.value for f in self._path(code)] == ["LOW"]  # still seeded on a second call
 
 
+class TestContainerValueFlow:
+    """Underpointed pointers and integer values survive a round trip through a std container."""
+
+    def _buf_lines(self, code):
+        from vulnscanner.analyzers.ast_c import CPPASTAnalyzer
+        return [f.line_number for f in CPPASTAnalyzer().analyze("t.cpp", code)
+                if f.rule_id == "CAST-BUF-001"]
+
+    _UNDER = """
+#include <vector>
+#include <string.h>
+using namespace std;
+void sink(vector<char *> v);
+void bad() {
+    char *data; vector<char *> v; char buf[100];
+    memset(buf, 'A', 99); buf[99] = 0;
+    data = buf - 8;
+    v.insert(v.end(), 1, data); v.insert(v.end(), 1, data);
+    sink(v);
+}
+void sink(vector<char *> v) { char *d = v[1]; char src[100]; memset(src, 'C', 99); src[99] = 0; memcpy(d, src, 100 * sizeof(char)); }
+"""
+    _CONST = """
+#include <vector>
+using namespace std;
+void sink(vector<int> v);
+void bad() { int data = __N__; vector<int> v; v.push_back(data); v.push_back(data); sink(v); }
+void sink(vector<int> v) { int d = v[1]; int buffer[10] = {0}; buffer[d] = 1; }
+"""
+
+    def test_underpointed_pointer_through_vector_is_flagged(self):
+        assert len(self._buf_lines(self._UNDER)) == 1
+
+    def test_pointer_to_buffer_start_through_vector_is_clean(self):
+        assert self._buf_lines(self._UNDER.replace("buf - 8", "buf")) == []
+
+    def test_constant_index_through_vector_negative_and_too_large_flagged(self):
+        assert len(self._buf_lines(self._CONST.replace("__N__", "-5"))) == 1
+        assert len(self._buf_lines(self._CONST.replace("__N__", "100"))) == 1
+
+    def test_constant_index_in_range_through_vector_is_clean(self):
+        assert self._buf_lines(self._CONST.replace("__N__", "3")) == []
+
+    def test_untrusted_integer_through_vector_reaches_array_index(self):
+        code = """
+#include <vector>
+#include <stdlib.h>
+using namespace std;
+void sink(vector<int> v);
+void bad() { int data = rand(); vector<int> v; v.push_back(data); sink(v); }
+void sink(vector<int> v) { int d = v[0]; int buffer[10] = {0}; if (d >= 0) { buffer[d] = 1; } }
+"""
+        assert len(self._buf_lines(code)) == 1
+
+
 class TestContainerAllocPropagation:
     """A pointer stored in std::vector / list / map keeps its allocation size for the code that reads it back."""
 

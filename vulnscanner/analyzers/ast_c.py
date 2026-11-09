@@ -1081,24 +1081,18 @@ def _container_get(node, cont: frozenset[str]) -> str | None:
     return None
 
 
-def _propagate_containers(body_node, tables: list[dict[str, int]]) -> None:
-    """Move allocation sizes through containers inside *body_node*, in every dict of *tables*."""
+def _container_moves(body_node):
+    """Yield (source variable, destination variable) for every value moved through a container
+    inside *body_node*, in source order: `c.push_back(x)` is (x, c), `y = c[i]` is (c, y)."""
     cont = _container_names(body_node)
     if not cont:
         return
-
-    def _carry(src: str, dst: str) -> None:
-        for t in tables:
-            v = t.get(src)
-            if v is not None and (dst not in t or v < t[dst]):
-                t[dst] = v
-
     for sn in _walk(body_node):
         st = sn.type
         if st == "call_expression":
             put = _container_put(sn, cont)
             if put:
-                _carry(put[1], put[0])
+                yield put[1], put[0]
         elif st == "assignment_expression":
             lhs, rhs = sn.child_by_field_name("left"), _strip_casts(sn.child_by_field_name("right"))
             if lhs is None or rhs is None:
@@ -1107,16 +1101,33 @@ def _propagate_containers(body_node, tables: list[dict[str, int]]) -> None:
                 base = lhs.child_by_field_name("argument")
                 if (base is not None and base.type == "identifier" and _txt(base) in cont
                         and rhs.type == "identifier"):
-                    _carry(_txt(rhs), _txt(base))
+                    yield _txt(rhs), _txt(base)
             elif lhs.type == "identifier":
                 src = _container_get(rhs, cont)
                 if src:
-                    _carry(src, _txt(lhs))
+                    yield src, _txt(lhs)
         elif st == "init_declarator":
             var = _decl_leaf_id(sn.child_by_field_name("declarator"))
             src = _container_get(_strip_casts(sn.child_by_field_name("value")), cont)
             if var and src:
-                _carry(src, var)
+                yield src, var
+
+
+def _propagate_containers(body_node, tables: list[dict[str, int]]) -> None:
+    """Move numeric facts (sizes, constant values) through containers; the smallest value wins."""
+    for src, dst in _container_moves(body_node):
+        for t in tables:
+            v = t.get(src)
+            if v is not None and (dst not in t or v < t[dst]):
+                t[dst] = v
+
+
+def _propagate_container_sets(body_node, sets: list[set[str]]) -> None:
+    """Move boolean facts (underpointed, untrusted integer) through containers."""
+    for src, dst in _container_moves(body_node):
+        for st in sets:
+            if src in st:
+                st.add(dst)
 
 
 def _compute_alloc_bytes(body_node, seed: dict[str, int] | None = None,
@@ -1514,6 +1525,7 @@ def _compute_underpointed(body_node) -> set[str]:
             val = sn.child_by_field_name("value")
             if iv and val:
                 _check(iv, val)
+    _propagate_container_sets(body_node, [up])
     return up
 
 
@@ -1581,6 +1593,7 @@ def _update_alloc_summaries(funcs: dict, summaries: dict[str, "_FuncSummary"]) -
                             _fciv2 = _eval_const(_fciexpr)
                             if _fciv2 is not None:
                                 _fci[_fcivar] = _fciv2
+        _propagate_containers(body, [_fci])
         func_const_ints[fname] = _fci
         func_underpointed[fname] = _compute_underpointed(body)
         # Infer returns_alloc_count: scan for `return var` where var has known count
@@ -2391,6 +2404,11 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                         _inner_sc = next((c for c in _arg_sc.named_children), None)
                         if _inner_sc and _inner_sc.type == "identifier":
                             _untrusted_int.add(_txt(_inner_sc))
+
+    # Values read back from a std container (`x = v[i]`, `v.back()`, `m[k]`) inherit what was put in:
+    # a pointer before its buffer, an untrusted integer, a constant integer.
+    _propagate_container_sets(body_node, [_underpointed, _untrusted_int])
+    _propagate_containers(body_node, [_const_ints])
 
     # (size_arg_index, bytes_per_element)
     # Element size is 1 for byte-based functions, 2 for wchar_t-based functions.
@@ -3788,6 +3806,7 @@ def _analyze_with_parser(parser_fn, content: str, file_path: str) -> list[Findin
                                     (c for c in _ui_sc_arg.named_children), None)
                                 if _ui_sc_in and _ui_sc_in.type == "identifier":
                                     _func_ui.add(_txt(_ui_sc_in))
+            _propagate_container_sets(_ui_fbody, [_func_ui])
             # Check if this function returns an untrusted int (V42 rand-source pattern)
             if _func_ui and not summaries[_ui_fname].returns_untrusted_int:
                 for _ui_sn in _walk(_ui_fbody):
