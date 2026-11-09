@@ -7163,6 +7163,79 @@ int f(int fail) {
         assert len(self._uaf(code)) == 1
 
 
+class TestContainerAllocPropagation:
+    """A pointer stored in std::vector / list / map keeps its allocation size for the code that reads it back."""
+
+    _TMPL = """
+#include <vector>
+#include <list>
+#include <map>
+#include <string.h>
+#include <stdlib.h>
+using namespace std;
+void sinkV(vector<int *> v);
+void sinkL(list<int *> l);
+void sinkM(map<int, int *> m);
+void run() {
+    int *data = (int *)malloc(__N__ * sizeof(int));
+    vector<int *> v; v.insert(v.end(), 1, data); v.insert(v.end(), 1, data);
+    sinkV(v);
+    list<int *> l; l.push_back(data); l.push_front(data);
+    sinkL(l);
+    map<int, int *> m; m[0] = data; m.insert(make_pair(1, data));
+    sinkM(m);
+}
+void sinkV(vector<int *> v) { int *d = v[1]; int src[100] = {0}; memmove(d, src, 100 * sizeof(int)); }
+void sinkL(list<int *> l) { int *d = l.back(); int src[100] = {0}; memcpy(d, src, 100 * sizeof(int)); }
+void sinkM(map<int, int *> m) { int *d = m[1]; int src[100] = {0}; memcpy(d, src, 100 * sizeof(int)); }
+"""
+
+    def _buf_lines(self, code):
+        from vulnscanner.analyzers.ast_c import CPPASTAnalyzer
+        return sorted(f.line_number for f in CPPASTAnalyzer().analyze("t.cpp", code)
+                      if f.rule_id == "CAST-BUF-001")
+
+    def test_undersized_allocation_through_vector_list_map_is_flagged(self):
+        lines = self._buf_lines(self._TMPL.replace("__N__", "50"))
+        assert len(lines) == 3
+
+    def test_large_enough_allocation_through_containers_is_clean(self):
+        assert self._buf_lines(self._TMPL.replace("__N__", "100")) == []
+
+    def test_plain_array_subscript_is_not_a_container(self):
+        code = """
+#include <string.h>
+#include <stdlib.h>
+void f() {
+    char *p = (char *)malloc(10);
+    char table[10];
+    char *q = &table[0];
+    char c = table[3];
+    char big[100];
+    memset(big, c, 100);
+    free(p);
+}
+"""
+        assert self._buf_lines(code) == []
+
+    def test_container_of_values_does_not_carry_an_allocation(self):
+        code = """
+#include <vector>
+#include <string.h>
+#include <stdlib.h>
+using namespace std;
+void f() {
+    char *data = (char *)malloc(10);
+    vector<int> v; v.push_back(7);
+    int n = v[0];
+    char *big = (char *)malloc(100);
+    memcpy(big, "x", 1);
+    free(data);
+}
+"""
+        assert self._buf_lines(code) == []
+
+
 class TestConstantSizeOverflow:
     """CWE805/CWE121/CWE122: memcpy/memmove/strncpy with statically-known overflow."""
 

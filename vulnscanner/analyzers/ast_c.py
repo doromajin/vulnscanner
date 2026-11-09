@@ -910,6 +910,124 @@ def _known_sizeof_type(type_text: str) -> int | None:
     return None
 
 
+# ── C++ containers carrying allocated pointers (Juliet flow variants 72-74) ───────────────────
+# `v.push_back(p)` / `v.insert(pos, n, p)` / `m[k] = p` store a pointer whose allocation size is
+# known; `x = v[i]` / `v.at(i)` / `v.back()` / `v.front()` read one back.  The container is
+# treated as holding the smallest allocation put into it (worst case), so the existing
+# call-site propagation of `param_alloc_*` carries it into the callee that unpacks it.
+_CONTAINER_TYPE_RE = re.compile(
+    r"^(?:const\s+)?(?:std::)?(?:vector|list|deque|map|unordered_map|multimap|array)\s*<")
+_CONTAINER_PUT_METHODS = frozenset({"push_back", "push_front", "insert", "emplace_back", "emplace_front"})
+_CONTAINER_GET_METHODS = frozenset({"at", "back", "front"})
+
+
+def _strip_casts(n):
+    for _ in range(4):
+        if n is not None and n.type in ("cast_expression", "parenthesized_expression"):
+            n = next((c for c in n.named_children if c.type not in ("type_descriptor", "comment")), None)
+        else:
+            break
+    return n
+
+
+def _container_names(body_node) -> frozenset[str]:
+    """Locals and parameters of the function owning *body_node* declared as a std container."""
+    nodes = list(_walk(body_node))
+    fn = body_node.parent
+    fdecl = fn.child_by_field_name("declarator") if fn is not None else None
+    if fdecl is not None:
+        nodes.extend(n for n in _walk(fdecl) if n.type == "parameter_declaration")
+    names: set[str] = set()
+    for sn in nodes:
+        if sn.type not in ("declaration", "parameter_declaration"):
+            continue
+        ty = sn.child_by_field_name("type")
+        if ty is None or not _CONTAINER_TYPE_RE.match(_txt(ty).strip()):
+            continue
+        if sn.type == "parameter_declaration":
+            leaf = _decl_leaf_id(sn.child_by_field_name("declarator"))
+            if leaf:
+                names.add(leaf)
+            continue
+        for dc in sn.named_children:
+            if dc is ty:
+                continue
+            decl = dc.child_by_field_name("declarator") if dc.type == "init_declarator" else dc
+            leaf = _decl_leaf_id(decl)
+            if leaf:
+                names.add(leaf)
+    return frozenset(names)
+
+
+def _container_put(call_node, cont: frozenset[str]) -> tuple[str, str] | None:
+    """`c.push_back(x)` / `c.insert(pos[, n], x)` / `c.insert(make_pair(k, x))` → (c, x)."""
+    if _call_fname(call_node) not in _CONTAINER_PUT_METHODS:
+        return None
+    recv = _call_receiver(call_node)
+    args = _call_args(call_node)
+    if recv is None or recv.type != "identifier" or _txt(recv) not in cont or not args:
+        return None
+    last = _strip_casts(args[-1])
+    if last is not None and last.type == "call_expression" and _call_fname(last) == "make_pair":
+        inner = _call_args(last)
+        last = _strip_casts(inner[-1]) if inner else None
+    if last is not None and last.type == "identifier":
+        return _txt(recv), _txt(last)
+    return None
+
+
+def _container_get(node, cont: frozenset[str]) -> str | None:
+    """`c[i]` / `c.at(i)` / `c.back()` / `c.front()` → container name."""
+    if node is None:
+        return None
+    base = None
+    if node.type == "subscript_expression":
+        base = node.child_by_field_name("argument")
+    elif node.type == "call_expression" and _call_fname(node) in _CONTAINER_GET_METHODS:
+        base = _call_receiver(node)
+    if base is not None and base.type == "identifier" and _txt(base) in cont:
+        return _txt(base)
+    return None
+
+
+def _propagate_containers(body_node, tables: list[dict[str, int]]) -> None:
+    """Move allocation sizes through containers inside *body_node*, in every dict of *tables*."""
+    cont = _container_names(body_node)
+    if not cont:
+        return
+
+    def _carry(src: str, dst: str) -> None:
+        for t in tables:
+            v = t.get(src)
+            if v is not None and (dst not in t or v < t[dst]):
+                t[dst] = v
+
+    for sn in _walk(body_node):
+        st = sn.type
+        if st == "call_expression":
+            put = _container_put(sn, cont)
+            if put:
+                _carry(put[1], put[0])
+        elif st == "assignment_expression":
+            lhs, rhs = sn.child_by_field_name("left"), _strip_casts(sn.child_by_field_name("right"))
+            if lhs is None or rhs is None:
+                continue
+            if lhs.type == "subscript_expression":  # c[k] = x
+                base = lhs.child_by_field_name("argument")
+                if (base is not None and base.type == "identifier" and _txt(base) in cont
+                        and rhs.type == "identifier"):
+                    _carry(_txt(rhs), _txt(base))
+            elif lhs.type == "identifier":
+                src = _container_get(rhs, cont)
+                if src:
+                    _carry(src, _txt(lhs))
+        elif st == "init_declarator":
+            var = _decl_leaf_id(sn.child_by_field_name("declarator"))
+            src = _container_get(_strip_casts(sn.child_by_field_name("value")), cont)
+            if var and src:
+                _carry(src, var)
+
+
 def _compute_alloc_bytes(body_node, seed: dict[str, int] | None = None,
                          returns: dict[str, int] | None = None) -> dict[str, int]:
     """var → allocated BYTES for malloc/alloca(const), calloc(n, m) and fixed-size arrays.
@@ -981,6 +1099,7 @@ def _compute_alloc_bytes(body_node, seed: dict[str, int] | None = None,
                 nbytes = _value_bytes(sn.child_by_field_name("right"))
                 if nbytes:
                     _set(_txt(lhs), nbytes)
+    _propagate_containers(body_node, [out])
     return out
 
 
@@ -1261,6 +1380,7 @@ def _compute_alloc_counts(body_node) -> dict[str, int]:
                     src67 = alloc_counts.get(_txt(rhs))
                     if src67:
                         _set(_txt(_fe_base67), src67)
+    _propagate_containers(body_node, [alloc_counts])
     return alloc_counts
 
 
@@ -1739,6 +1859,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     if extra_alloc_bytes:
         for _eb, _ebv in extra_alloc_bytes.items():
             _alloc_sizes[_eb] = _ebv
+    # `x = param_vector[2]` and friends: hand the sizes callers put into a container to its reader.
+    _propagate_containers(body_node, [_alloc_counts, _alloc_sizes, _true_bytes])
 
     # Seed pointer-to-buffer alloc counts: propagate deref `x = *ptr` where ptr is in extra_ptr_alloc.
     # Enables V63: char** dataPtr param where *dataPtr has alloc_count N → char* data = *dataPtr.
