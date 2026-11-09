@@ -74,6 +74,27 @@ def _php_vuln_reason(version_str: str) -> str | None:
 
 _OSV_API = "https://api.osv.dev/v1/querybatch"
 _OSV_TIMEOUT = 15  # seconds
+_OSV_VULN_API = "https://api.osv.dev/v1/vulns/"
+_OSV_DETAIL_LIMIT = 20  # advisories fetched per package
+_osv_detail_cache: dict[str, dict] = {}
+
+
+def _osv_vuln_detail(req_lib, stub: dict) -> dict:
+    """Return the full OSV record for a querybatch stub; the stub itself if unavailable."""
+    vid = stub.get("id", "")
+    if not vid or "database_specific" in stub or "severity" in stub:
+        return stub
+    if vid not in _osv_detail_cache:
+        try:
+            resp = req_lib.get(_OSV_VULN_API + vid, timeout=_OSV_TIMEOUT)
+            resp.raise_for_status()
+            _osv_detail_cache[vid] = resp.json()
+        except Exception:
+            return stub  # not cached: a later package may retry
+    return _osv_detail_cache[vid]
+
+
+_SEVERITY_ORDER = [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO]
 
 # (name, version, ecosystem, lineno)
 _Package = tuple[str, str, str, int]
@@ -189,6 +210,8 @@ class DependencyAnalyzer(BaseAnalyzer):
             vulns = result.get("vulns", [])
             if not vulns:
                 continue
+            # querybatch returns only {id, modified}: fetch records for severity and aliases
+            vulns = [_osv_vuln_detail(req_lib, v) for v in vulns[:_OSV_DETAIL_LIMIT]] + vulns[_OSV_DETAIL_LIMIT:]
 
             cve_ids = [
                 a
@@ -196,12 +219,18 @@ class DependencyAnalyzer(BaseAnalyzer):
                 for a in v.get("aliases", [])
                 if a.startswith("CVE-")
             ]
-            sev = _osv_severity(vulns[0])
+            # OSV returns advisories in arbitrary order: report the highest severity
+            sev = min((_osv_severity(v) for v in vulns), key=_SEVERITY_ORDER.index)
 
             count = len(vulns)
-            desc = f"{name} {ver} has {count} known vulnerability" + ("s" if count > 1 else "")
+            desc = f"{name} {ver} has {count} known " + ("vulnerabilities" if count > 1 else "vulnerability")
             if cve_ids:
                 desc += f" ({', '.join(cve_ids[:3])})"
+            if count > 1:
+                desc += (
+                    f"; severity is the highest of {count} advisories. "
+                    "Exploitability depends on how the library is used (some advisories need non-default options)"
+                )
 
             findings.append(Finding(
                 vuln_type=VulnType.VULNERABLE_DEPENDENCY,

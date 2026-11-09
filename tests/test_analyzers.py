@@ -1605,6 +1605,62 @@ class TestDependencyParsers:
         lock = _json.dumps({"platform": {"php": "8.2.35"}})
         assert da.analyze("composer.lock", lock, "") == []
 
+    def test_osv_severity_is_highest_regardless_of_order(self):
+        from unittest.mock import MagicMock, patch
+        vulns = [
+            {"id": "A", "aliases": ["CVE-1"], "database_specific": {"severity": "MODERATE"}},
+            {"id": "B", "aliases": ["CVE-2"], "database_specific": {"severity": "CRITICAL"}},
+            {"id": "C", "aliases": [], "database_specific": {"severity": "LOW"}},
+        ]
+        for order in (vulns, list(reversed(vulns))):
+            resp = MagicMock()
+            resp.json.return_value = {"results": [{"vulns": order}]}
+            with patch("requests.post", return_value=resp):
+                findings = DependencyAnalyzer().analyze("package.json", '{"dependencies": {"lib": "1.2.3"}}', "")
+            assert len(findings) == 1
+            assert findings[0].severity.value == "CRITICAL"
+            assert "highest of 3 advisories" in findings[0].description
+
+    def test_osv_batch_stubs_are_resolved_to_full_records(self):
+        from unittest.mock import MagicMock, patch
+        from vulnscanner.analyzers import dependencies as dep
+        dep._osv_detail_cache.clear()
+        details = {
+            "X-1": {"id": "X-1", "aliases": ["CVE-9"], "database_specific": {"severity": "LOW"}},
+            "X-2": {"id": "X-2", "aliases": [], "database_specific": {"severity": "HIGH"}},
+        }
+        post = MagicMock()
+        post.json.return_value = {"results": [{"vulns": [{"id": "X-1"}, {"id": "X-2"}]}]}
+        def fake_get(url, timeout=None):
+            r = MagicMock()
+            r.json.return_value = details[url.rsplit("/", 1)[1]]
+            return r
+        with patch("requests.post", return_value=post), patch("requests.get", side_effect=fake_get):
+            findings = DependencyAnalyzer().analyze("package.json", '{"dependencies": {"lib": "1.2.3"}}', "")
+        dep._osv_detail_cache.clear()
+        assert findings[0].severity.value == "HIGH"
+        assert "CVE-9" in findings[0].description
+        assert "2 known vulnerabilities" in findings[0].description
+
+    def test_osv_detail_fetch_failure_falls_back_to_stub(self):
+        from unittest.mock import MagicMock, patch
+        from vulnscanner.analyzers import dependencies as dep
+        dep._osv_detail_cache.clear()
+        post = MagicMock()
+        post.json.return_value = {"results": [{"vulns": [{"id": "X-1"}]}]}
+        with patch("requests.post", return_value=post), patch("requests.get", side_effect=OSError("down")):
+            findings = DependencyAnalyzer().analyze("package.json", '{"dependencies": {"lib": "1.2.3"}}', "")
+        assert findings[0].severity.value == "MEDIUM"
+
+    def test_osv_single_advisory_has_no_severity_note(self):
+        from unittest.mock import MagicMock, patch
+        resp = MagicMock()
+        resp.json.return_value = {"results": [{"vulns": [{"id": "A", "database_specific": {"severity": "HIGH"}}]}]}
+        with patch("requests.post", return_value=resp):
+            findings = DependencyAnalyzer().analyze("package.json", '{"dependencies": {"lib": "1.2.3"}}', "")
+        assert findings[0].severity.value == "HIGH"
+        assert "highest of" not in findings[0].description
+
     def test_php_supports(self):
         da = DependencyAnalyzer()
         assert da.supports(".php-version")
