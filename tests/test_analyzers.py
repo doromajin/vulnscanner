@@ -7163,6 +7163,65 @@ int f(int fail) {
         assert len(self._uaf(code)) == 1
 
 
+class TestPathTraversalArgvOnly:
+    """CAST-PATH-001 fed only by main()'s argv is demoted to LOW; other sources keep HIGH."""
+
+    def _path(self, code):
+        from vulnscanner.analyzers.ast_c import CASTAnalyzer
+        return [f for f in CASTAnalyzer().analyze("t.c", code) if f.rule_id == "CAST-PATH-001"]
+
+    def test_argv_only_path_is_low_with_note(self):
+        code = """
+#include <stdio.h>
+static void load(const char *name) { FILE *f = fopen(name, "rb"); if (f) fclose(f); }
+int main(int argc, char **argv) { load(argv[1]); return 0; }
+"""
+        hits = self._path(code)
+        assert len(hits) == 1
+        assert hits[0].severity.value == "LOW"
+        assert "command-line arguments" in hits[0].description
+
+    def test_network_source_stays_high_even_in_a_program_with_main(self):
+        code = """
+#include <stdio.h>
+#include <sys/socket.h>
+int main(int argc, char **argv) {
+    char name[128];
+    recv(0, name, sizeof(name), 0);
+    FILE *f = fopen(name, "rb");
+    if (f) fclose(f);
+    return 0;
+}
+"""
+        hits = self._path(code)
+        assert len(hits) == 1 and hits[0].severity.value == "HIGH"
+
+    def test_argv_and_network_on_same_sink_stays_high(self):
+        code = """
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+int main(int argc, char **argv) {
+    char name[128];
+    recv(0, name, sizeof(name), 0);
+    strcat(name, argv[1]);
+    FILE *f = fopen(name, "rb");
+    if (f) fclose(f);
+    return 0;
+}
+"""
+        hits = self._path(code)
+        assert len(hits) == 1 and hits[0].severity.value == "HIGH"
+
+    def test_argv_taint_is_restored_after_the_demotion_pass(self):
+        code = """
+#include <stdio.h>
+int main(int argc, char **argv) { FILE *f = fopen(argv[1], "rb"); if (f) fclose(f); return 0; }
+"""
+        assert [f.severity.value for f in self._path(code)] == ["LOW"]
+        assert [f.severity.value for f in self._path(code)] == ["LOW"]  # still seeded on a second call
+
+
 class TestContainerAllocPropagation:
     """A pointer stored in std::vector / list / map keeps its allocation size for the code that reads it back."""
 

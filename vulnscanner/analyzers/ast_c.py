@@ -636,8 +636,13 @@ def _is_tainted(node, tainted: set[str],
 
 # ── Per-function analysis ─────────────────────────────────────────────────────
 
+_argv_seed_local = threading.local()  # .off = True: main()'s argv is not a taint source
+
+
 def _seed_main_argv(func_node: object, tainted: set[str]) -> None:
     """If this is main(), seed argv as tainted."""
+    if getattr(_argv_seed_local, "off", False):
+        return
     decl = func_node.child_by_field_name("declarator")
     if decl is None:
         return
@@ -3885,6 +3890,37 @@ def _analyze_with_parser(parser_fn, content: str, file_path: str) -> list[Findin
 
 # ── Analyzer classes ──────────────────────────────────────────────────────────
 
+_MAIN_WITH_ARGV_RE = re.compile(r"\bmain\s*\(\s*[^)]*,")
+_ARGV_ONLY_NOTE = (
+    " — reachable only from command-line arguments: a local CLI opens what its own caller names, "
+    "so there is no privilege boundary unless it runs setuid or is invoked by a service with "
+    "untrusted arguments"
+)
+
+
+def _analyze_file(get_parser, content: str, file_path: str) -> list[Finding]:
+    """Analyze one C/C++ file; path-traversal findings fed only by argv are demoted to LOW.
+
+    A second pass with main()'s argv not tainted shows which CAST-PATH-001 findings depend on
+    argv alone (network, stdin and environment sources still fire in that pass).
+    """
+    findings = _analyze_with_parser(get_parser, content, file_path)
+    path_hits = [f for f in findings if f.rule_id == "CAST-PATH-001"]
+    if not path_hits or not _MAIN_WITH_ARGV_RE.search(content):
+        return findings
+    _argv_seed_local.off = True
+    try:
+        without_argv = _analyze_with_parser(get_parser, content, file_path)
+    finally:
+        _argv_seed_local.off = False
+    still = {f.line_number for f in without_argv if f.rule_id == "CAST-PATH-001"}
+    for f in path_hits:
+        if f.line_number not in still:
+            f.severity = Severity.LOW
+            f.description += _ARGV_ONLY_NOTE
+    return findings
+
+
 class CASTAnalyzer(BaseAnalyzer):
     """C AST taint analyzer (.c / .h)."""
 
@@ -3893,7 +3929,7 @@ class CASTAnalyzer(BaseAnalyzer):
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         if not _TS_C_AVAILABLE:
             return []
-        return _analyze_with_parser(_get_c_parser, content, file_path)
+        return _analyze_file(_get_c_parser, content, file_path)
 
 
 class CPPASTAnalyzer(BaseAnalyzer):
@@ -3904,4 +3940,4 @@ class CPPASTAnalyzer(BaseAnalyzer):
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         if not _TS_C_AVAILABLE:
             return []
-        return _analyze_with_parser(_get_cpp_parser, content, file_path)
+        return _analyze_file(_get_cpp_parser, content, file_path)
