@@ -32,6 +32,8 @@ _TEST_SEGMENTS = frozenset({
     "it",           # Java integration tests (src/it/)
     "integration",  # common integration-test directory
     "testing",      # e.g. pyspider/testing/
+    "unittest", "unittests",   # C/C++ unit-test directories (libhv/unittest/)
+    "fuzz", "fuzzing", "fuzzers",  # libFuzzer / OSS-Fuzz harnesses (quickjs/fuzz/)
 })
 
 # Single directory-name segments that indicate fixture / mock data.
@@ -56,7 +58,7 @@ _TEST_FILENAME_RE = re.compile(
     r"|\.test\.[jt]sx?$"                     # JS/TS        *.test.js/ts
     r"|\.spec\.[jt]sx?$"                     # JS/TS        *.spec.js/ts
     r"|_spec\.rb$"                           # Ruby         foo_spec.rb
-    r"|_test\.(?:go|rb)$"                    # Go / minitest foo_test.go, foo_test.rb
+    r"|_test\.(?:go|rb|c|cc|cpp|cxx)$"       # Go / minitest / C/C++ foo_test.go, foo_test.cc
     r"|(?-i:[a-z0-9_]Tests?\.(?:java|kt|groovy|cs)$)"  # JUnit / xUnit UserTests.cs
     r")",
     re.IGNORECASE,

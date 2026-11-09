@@ -3082,11 +3082,41 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                             rule_id="CAST-BUF-001",
                         ))
 
-    # C-7: Scoped UAF — free(p)/delete p followed by use in same function
-    _freed: dict[str, int] = {}
+    # C-7: Scoped UAF — free(p)/delete p followed by use in same function.
+    # A free only reaches the code that can run after it: when it sits in a block that ends in
+    # return/goto/break/continue/exit (error-path cleanup), code past that block is not reached
+    # from it. Assigning the pointer or taking its address (a callee may reallocate it) ends the
+    # freed state; `&p` is not a dereference.
+    _frees: dict[str, list[tuple[int, int]]] = {}  # var -> [(free line, last line it reaches)]
+    _uaf_kills: dict[str, list[int]] = {}           # var -> lines that re-point / re-seat it
     _FREE_FUNCS_UAF = frozenset({"free", "cfree", "_free", "kfree",
                                  "HeapFree", "LocalFree", "GlobalFree",
                                  "operator delete", "operator delete[]"})
+    _UAF_TERMINATORS = frozenset({"return_statement", "goto_statement",
+                                  "break_statement", "continue_statement"})
+    _UAF_NORETURN = frozenset({"exit", "_exit", "_Exit", "quick_exit", "abort",
+                               "pthread_exit", "longjmp", "siglongjmp"})
+    _UAF_UNBOUNDED = 1 << 30
+
+    def _uaf_reach_end(free_node) -> int:
+        child, parent = free_node, free_node.parent
+        while parent is not None and parent.type != "compound_statement":
+            if parent.type in ("case_statement", "labeled_statement", "function_definition"):
+                return _UAF_UNBOUNDED  # switch/label bodies: flow into the next label is not modelled
+            child, parent = parent, parent.parent
+        if parent is None:
+            return _UAF_UNBOUNDED
+        for sib in parent.named_children:
+            if sib.start_byte < child.end_byte:
+                continue
+            if sib.type in _UAF_TERMINATORS:
+                return parent.end_point[0] + 1
+            if sib.type == "expression_statement":
+                inner = next((c for c in sib.named_children if c.type == "call_expression"), None)
+                if inner is not None and _call_fname(inner) in _UAF_NORETURN:
+                    return parent.end_point[0] + 1
+        return _UAF_UNBOUNDED
+
     for _uaf_node in _walk(body_node):
         _uaf_t = _uaf_node.type
         if _uaf_t == "call_expression":
@@ -3094,28 +3124,49 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
             _uaf_args = _call_args(_uaf_node)
             if _uaf_fn in _FREE_FUNCS_UAF and _uaf_args:
                 _uaf_var = _txt(_uaf_args[0]).strip("() \t")
-                if _uaf_var and _uaf_var not in _freed:
-                    _freed[_uaf_var] = _uaf_node.start_point[0] + 1
+                if _uaf_var:
+                    _frees.setdefault(_uaf_var, []).append(
+                        (_uaf_node.start_point[0] + 1, _uaf_reach_end(_uaf_node)))
         elif _uaf_t in ("delete_expression", "delete_expression_statement"):
             _del_inner = next(
                 (c for c in _uaf_node.named_children if c.type != "comment"), None
             )
             if _del_inner and _del_inner.type == "identifier":
                 _del_var = _txt(_del_inner)
-                if _del_var and _del_var not in _freed:
-                    _freed[_del_var] = _uaf_node.start_point[0] + 1
+                if _del_var:
+                    _frees.setdefault(_del_var, []).append(
+                        (_uaf_node.start_point[0] + 1, _uaf_reach_end(_uaf_node)))
+        elif _uaf_t == "assignment_expression":
+            _kl = _uaf_node.child_by_field_name("left")
+            if _kl is not None and _kl.type == "identifier":
+                _uaf_kills.setdefault(_txt(_kl), []).append(_uaf_node.start_point[0] + 1)
+        elif _uaf_t == "pointer_expression" and _txt(_uaf_node).lstrip().startswith("&"):
+            _ka = _uaf_node.child_by_field_name("argument")
+            if _ka is not None and _ka.type == "identifier":
+                _uaf_kills.setdefault(_txt(_ka), []).append(_uaf_node.start_point[0] + 1)
 
-    if _freed:
+    def _uaf_freed_before(var: str, use_ln: int) -> int | None:
+        """Line of a free of *var* that still reaches *use_ln* unbroken, else None."""
+        for free_ln, reach_end in _frees.get(var, ()):
+            if free_ln < use_ln <= reach_end and not any(
+                free_ln <= k < use_ln for k in _uaf_kills.get(var, ())
+            ):
+                return free_ln
+        return None
+
+    if _frees:
         for _uaf_node in _walk(body_node):
             _uaf_t = _uaf_node.type
             if _uaf_t in ("pointer_expression", "subscript_expression", "field_expression"):
+                if _uaf_t == "pointer_expression" and _txt(_uaf_node).lstrip().startswith("&"):
+                    continue
                 _cand = _uaf_node.child_by_field_name("argument") or (
                     _uaf_node.named_children[0] if _uaf_node.named_children else None
                 )
                 if _cand and _cand.type == "identifier":
                     _cvar = _txt(_cand)
-                    _free_ln = _freed.get(_cvar)
-                    if _free_ln and _uaf_node.start_point[0] + 1 > _free_ln:
+                    _free_ln = _uaf_freed_before(_cvar, _uaf_node.start_point[0] + 1)
+                    if _free_ln:
                         _uaf_ln = _uaf_node.start_point[0] + 1
                         _key = (file_path, _uaf_ln, "CAST-UAF-001")
                         if _key not in seen:

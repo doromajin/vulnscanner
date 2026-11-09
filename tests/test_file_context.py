@@ -32,6 +32,18 @@ class TestIsTestPath:
     def test_java_test_suffix(self):
         assert is_test_path("app/Service/UserServiceTest.java")
 
+    def test_c_cpp_unittest_and_fuzz_directories(self):
+        assert is_test_path("unittest/webbench.c")
+        assert is_test_path("lib/unittests/a.cpp")
+        assert is_test_path("fuzz/fuzz_json.c")
+        assert is_test_path("src/fuzzers/x.cc")
+        assert is_test_path("src/http_test.cc")
+
+    def test_c_cpp_non_test_names_not_matched(self):
+        assert not is_test_path("src/fuzzy_match.c")
+        assert not is_test_path("src/contest.c")
+        assert not is_test_path("src/latest_test_data.c")
+
     def test_php_test_suffix(self):
         assert is_test_path("app/Service/UserServiceTest.php")
 

@@ -7036,6 +7036,132 @@ int main() {
         assert "CAST-UAF-001" in rule_ids, \
             "delete p followed by p->field must fire CAST-UAF-001 in C++"
 
+    def _uaf(self, code):
+        return [f for f in self._az_c().analyze("test.c", code) if f.rule_id == "CAST-UAF-001"]
+
+    def test_free_in_returning_error_branch_does_not_reach_later_code(self):
+        code = r"""
+#include <stdlib.h>
+struct S { int n; };
+struct S *make(int fail) {
+    struct S *ps = malloc(sizeof(*ps));
+    if (!ps)
+        return NULL;
+    if (fail) {
+        free(ps);
+        return NULL;
+    }
+    ps->n = 1;
+    return ps;
+}
+"""
+        assert self._uaf(code) == []
+
+    def test_free_in_continue_and_goto_branches_do_not_reach_later_code(self):
+        code = r"""
+#include <stdlib.h>
+void f(int n, char *s) {
+    for (int i = 0; i < n; i++) {
+        char *b = malloc(8);
+        if (!s) {
+            free(b);
+            continue;
+        }
+        b[0] = s[i];
+        free(b);
+    }
+    char *c = malloc(8);
+    if (!s) {
+        free(c);
+        goto out;
+    }
+    c[0] = 1;
+    free(c);
+out:
+    return;
+}
+"""
+        assert self._uaf(code) == []
+
+    def test_use_inside_terminating_free_block_still_fires(self):
+        code = r"""
+#include <stdlib.h>
+int f(int fail) {
+    int *p = malloc(4);
+    if (fail) {
+        free(p);
+        return *p;
+    }
+    return 0;
+}
+"""
+        assert len(self._uaf(code)) == 1
+
+    def test_braceless_conditional_free_still_reaches_later_use(self):
+        code = r"""
+#include <stdlib.h>
+int f(int c) {
+    int *p = malloc(4);
+    if (c) free(p);
+    return *p;
+}
+"""
+        assert len(self._uaf(code)) == 1
+
+    def test_braceless_else_free_in_block_that_returns_does_not_reach_past_it(self):
+        code = r"""
+#include <stdlib.h>
+char *rd(int ctx, int n) {
+    char *buf = malloc(n);
+    if (n > 4) {
+        if (ctx)
+            n++;
+        else
+            free(buf);
+    fail:
+        n = 0;
+        return NULL;
+    }
+    buf[0] = 0;
+    return buf;
+}
+"""
+        assert self._uaf(code) == []
+
+    def test_reassignment_or_address_taken_ends_freed_state(self):
+        code = r"""
+#include <stdlib.h>
+void grow(char **pp);
+int f() {
+    char *a = malloc(4);
+    free(a);
+    a = malloc(8);
+    a[0] = 1;
+    char *b = malloc(4);
+    free(b);
+    grow(&b);
+    b[0] = 1;
+    return 0;
+}
+"""
+        assert self._uaf(code) == []
+
+    def test_second_free_after_early_return_free_is_still_tracked(self):
+        code = r"""
+#include <stdlib.h>
+int f(int fail) {
+    char *p = malloc(4);
+    if (fail) {
+        free(p);
+        return 1;
+    }
+    free(p);
+    p[0] = 1;
+    return 0;
+}
+"""
+        assert len(self._uaf(code)) == 1
+
 
 class TestConstantSizeOverflow:
     """CWE805/CWE121/CWE122: memcpy/memmove/strncpy with statically-known overflow."""
