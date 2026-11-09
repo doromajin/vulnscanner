@@ -551,6 +551,11 @@ def set_cross_file_context(
     _cross_file_local.cf_summary = summary
 
 
+def get_cross_file_contents() -> dict[str, str]:
+    """Return the {relative_path: content} map registered for this thread (empty if none)."""
+    return getattr(_cross_file_local, "all_contents", None) or {}
+
+
 def _resolve_module_to_file(
     module_name: str,
     current_file: str,

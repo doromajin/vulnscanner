@@ -21,6 +21,7 @@ import json
 import os
 import re
 
+from vulnscanner.analyzers.ast_python import get_cross_file_contents
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
@@ -116,7 +117,10 @@ class DependencyAnalyzer(BaseAnalyzer):
         packages = self._parse(filename, content)
         if not packages:
             return []
-        return self._check_osv(packages, file_path, repo_url)
+        floor_names: frozenset[str] = frozenset()
+        if filename == "package.json":
+            packages, floor_names = _resolve_npm_ranges(file_path, content, packages)
+        return self._check_osv(packages, file_path, repo_url, floor_names)
 
     def _check_php_runtime(
         self,
@@ -183,7 +187,9 @@ class DependencyAnalyzer(BaseAnalyzer):
         packages: list[_Package],
         file_path: str,
         repo_url: str,
+        floor_names: frozenset[str] = frozenset(),
     ) -> list[Finding]:
+        """*floor_names*: packages queried at a range's lowest version (installed version unknown)."""
         try:
             import requests as req_lib
         except ImportError:
@@ -226,7 +232,16 @@ class DependencyAnalyzer(BaseAnalyzer):
             desc = f"{name} {ver} has {count} known " + ("vulnerabilities" if count > 1 else "vulnerability")
             if cve_ids:
                 desc += f" ({', '.join(cve_ids[:3])})"
-            if count > 1:
+            if name in floor_names:
+                # the range resolves to the newest matching release at install time, which is
+                # usually past the floor: without a lock file this is only a possible exposure
+                if _SEVERITY_ORDER.index(sev) < _SEVERITY_ORDER.index(Severity.LOW):
+                    sev = Severity.LOW
+                desc += (
+                    "; queried at the lowest version of the declared range because no lock file "
+                    "was found, so the installed version may be newer and unaffected (severity capped at LOW)"
+                )
+            elif count > 1:
                 desc += (
                     f"; severity is the highest of {count} advisories. "
                     "Exploitability depends on how the library is used (some advisories need non-default options)"
@@ -280,6 +295,117 @@ def _parse_package_json(content: str) -> list[_Package]:
             if ver and re.match(r"^\d", ver):
                 packages.append((name, ver, "npm", 1))
     return packages
+
+
+_EXACT_VER_RE = re.compile(r"=?v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?")
+_RANGE_SPEC_RE = re.compile(r"[\s0-9A-Za-z.*^~<>=|-]+")
+_NPM_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+
+
+def _npm_range_specs(content: str) -> dict[str, str]:
+    """Return {name: declared spec} for package.json deps given as a version range, not an exact pin."""
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return {}
+    specs: dict[str, str] = {}
+    for section in ("dependencies", "devDependencies"):
+        for name, spec in data.get(section, {}).items():
+            spec = str(spec).strip()
+            if (
+                not _EXACT_VER_RE.fullmatch(spec)
+                and _RANGE_SPEC_RE.fullmatch(spec)
+                and re.search(r"\d", spec)
+            ):
+                specs[name] = spec
+    return specs
+
+
+def _lock_version_npm(text: str, name: str, spec: str) -> str | None:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    entry = (data.get("packages") or {}).get(f"node_modules/{name}")  # lockfileVersion 2/3
+    if not isinstance(entry, dict):
+        entry = (data.get("dependencies") or {}).get(name)  # lockfileVersion 1
+    ver = entry.get("version") if isinstance(entry, dict) else None
+    return ver if isinstance(ver, str) and re.match(r"\d", ver) else None
+
+
+def _lock_version_yarn(text: str, name: str, spec: str) -> str | None:
+    wanted = {f"{name}@{spec}", f"{name}@npm:{spec}"}  # classic / berry header forms
+    matched = False
+    for line in text.splitlines():
+        if line and not line[0].isspace() and not line.startswith("#") and line.rstrip().endswith(":"):
+            entries = {e.strip().strip('"') for e in line.rstrip()[:-1].split(",")}
+            matched = bool(wanted & entries)
+        elif matched:
+            m = re.match(r'\s+version:?\s+"?(\d[^"\s]*)"?', line)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _lock_version_pnpm(text: str, name: str, spec: str) -> str | None:
+    esc = re.escape(name)
+    m = re.search(
+        r"^\s+['\"]?" + esc + r"['\"]?:\s*\n\s+specifier:[^\n]*\n\s+version:\s*['\"]?(\d[^\s'\"(]*)",
+        text, re.M,
+    )
+    if m:
+        return m.group(1)
+    # older lockfile layouts: usable only when this package is locked at a single version
+    versions = set(re.findall(r"^  /?['\"]?" + esc + r"[@/](\d[^:'\"()\s]*)", text, re.M))
+    return next(iter(versions)) if len(versions) == 1 else None
+
+
+_LOCK_RESOLVERS = {
+    "package-lock.json": _lock_version_npm,
+    "npm-shrinkwrap.json": _lock_version_npm,
+    "yarn.lock": _lock_version_yarn,
+    "pnpm-lock.yaml": _lock_version_pnpm,
+}
+
+
+def _resolve_npm_ranges(
+    file_path: str, content: str, packages: list[_Package],
+) -> tuple[list[_Package], frozenset[str]]:
+    """Replace range-spec deps by the version a sibling lock file resolved them to.
+
+    Deps with no resolvable lock entry keep their range floor and are returned in the
+    second element so the caller can mark the finding as lower confidence.
+    """
+    specs = _npm_range_specs(content)
+    if not specs:
+        return packages, frozenset()
+    all_contents = get_cross_file_contents()
+    base = os.path.dirname(file_path.replace("\\", "/"))
+
+    def _lock_text(lock: str) -> str | None:
+        key = f"{base}/{lock}" if base else lock
+        text = all_contents.get(key)
+        return text if text is not None else all_contents.get(key.replace("/", "\\"))
+
+    resolved: list[_Package] = []
+    floor: set[str] = set()
+    for name, ver, eco, lineno in packages:
+        spec = specs.get(name)
+        locked = None
+        if spec is not None:
+            for lock in _NPM_LOCKFILES:
+                text = _lock_text(lock)
+                if text is not None:
+                    locked = _LOCK_RESOLVERS[lock](text, name, spec)
+                    if locked:
+                        break
+        if locked:
+            resolved.append((name, locked, eco, lineno))
+        else:
+            resolved.append((name, ver, eco, lineno))
+            if spec is not None:
+                floor.add(name)
+    return resolved, frozenset(floor)
 
 
 def _parse_gemfile_lock(content: str) -> list[_Package]:

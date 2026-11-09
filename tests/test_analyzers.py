@@ -1652,6 +1652,70 @@ class TestDependencyParsers:
             findings = DependencyAnalyzer().analyze("package.json", '{"dependencies": {"lib": "1.2.3"}}', "")
         assert findings[0].severity.value == "MEDIUM"
 
+    # ── npm range specs resolved through lock files ───────────────────────────
+
+    def test_npm_range_specs_ignore_exact_pins_and_non_versions(self):
+        from vulnscanner.analyzers.dependencies import _npm_range_specs
+        data = json.dumps({"dependencies": {
+            "a": "^1.2.3", "b": "~2.0.0", "c": ">=1.0.0 <2.0.0", "d": "1.x || 2.x", "e": "3.4",
+            "exact": "4.18.2", "pinned": "=1.0.0", "tag": "latest", "git": "github:o/r#v1.2.3", "ws": "workspace:*",
+        }})
+        assert set(_npm_range_specs(data)) == {"a", "b", "c", "d", "e"}
+
+    def test_lock_version_resolvers(self):
+        from vulnscanner.analyzers.dependencies import (
+            _lock_version_npm, _lock_version_pnpm, _lock_version_yarn,
+        )
+        npm_v3 = json.dumps({"packages": {"": {}, "node_modules/lib": {"version": "1.4.2"},
+                                          "node_modules/x/node_modules/lib": {"version": "0.1.0"}}})
+        npm_v1 = json.dumps({"dependencies": {"lib": {"version": "1.4.2"}}})
+        assert _lock_version_npm(npm_v3, "lib", "^1.0.0") == "1.4.2"
+        assert _lock_version_npm(npm_v1, "lib", "^1.0.0") == "1.4.2"
+        assert _lock_version_npm(npm_v1, "other", "^1.0.0") is None
+        yarn_classic = '"lib@^1.0.0", "lib@^1.2.0":\n  version "1.4.2"\n  resolved "x"\n\nother@^2.0.0:\n  version "2.0.0"\n'
+        yarn_berry = '"@s/lib@npm:^1.0.0":\n  version: 1.4.2\n  resolution: "x"\n'
+        assert _lock_version_yarn(yarn_classic, "lib", "^1.0.0") == "1.4.2"
+        assert _lock_version_yarn(yarn_classic, "other", "^2.0.0") == "2.0.0"
+        assert _lock_version_yarn(yarn_classic, "lib", "^9.0.0") is None
+        assert _lock_version_yarn(yarn_berry, "@s/lib", "^1.0.0") == "1.4.2"
+        pnpm = ("importers:\n\n  .:\n    dependencies:\n      lib:\n        specifier: ^1.0.0\n"
+                "        version: 1.4.2(peer@1.0.0)\n\npackages:\n\n  lib@1.4.2:\n    resolution: {}\n")
+        pnpm_old = "packages:\n\n  /lib@1.4.2:\n    resolution: {}\n"
+        pnpm_ambiguous = "packages:\n\n  /lib@1.4.2:\n    x: 1\n\n  /lib@2.0.0:\n    x: 1\n"
+        assert _lock_version_pnpm(pnpm, "lib", "^1.0.0") == "1.4.2"
+        assert _lock_version_pnpm(pnpm_old, "lib", "^1.0.0") == "1.4.2"
+        assert _lock_version_pnpm(pnpm_ambiguous, "lib", "^1.0.0") is None
+
+    def test_resolve_npm_ranges_uses_sibling_lock_only(self):
+        from vulnscanner.analyzers.ast_python import set_cross_file_context
+        from vulnscanner.analyzers.dependencies import _resolve_npm_ranges
+        pkg = json.dumps({"dependencies": {"lib": "^1.0.0", "pin": "2.0.0"}})
+        pkgs = [("lib", "1.0.0", "npm", 1), ("pin", "2.0.0", "npm", 1)]
+        lock = json.dumps({"packages": {"node_modules/lib": {"version": "1.4.2"}}})
+        try:
+            set_cross_file_context({"app/package-lock.json": lock, "other/package-lock.json": lock})
+            resolved, floor = _resolve_npm_ranges("app/package.json", pkg, pkgs)
+            assert resolved == [("lib", "1.4.2", "npm", 1), ("pin", "2.0.0", "npm", 1)]
+            assert floor == frozenset()
+            resolved, floor = _resolve_npm_ranges("nolock/package.json", pkg, pkgs)  # lock is in another dir
+            assert resolved == pkgs and floor == frozenset({"lib"})
+        finally:
+            set_cross_file_context({})
+
+    def test_range_without_lock_is_capped_at_low_with_note(self):
+        from unittest.mock import MagicMock, patch
+        resp = MagicMock()
+        resp.json.return_value = {"results": [{"vulns": [{"id": "A", "database_specific": {"severity": "CRITICAL"}}]},
+                                              {"vulns": [{"id": "B", "database_specific": {"severity": "HIGH"}}]}]}
+        pkg = json.dumps({"dependencies": {"ranged": "^1.0.0", "exact": "2.0.0"}})
+        with patch("requests.post", return_value=resp):
+            findings = DependencyAnalyzer().analyze("package.json", pkg, "")
+        by_line = {f.line_content: f for f in findings}
+        assert by_line["ranged==1.0.0"].severity.value == "LOW"
+        assert "no lock file" in by_line["ranged==1.0.0"].description
+        assert by_line["exact==2.0.0"].severity.value == "HIGH"
+        assert "no lock file" not in by_line["exact==2.0.0"].description
+
     def test_osv_single_advisory_has_no_severity_note(self):
         from unittest.mock import MagicMock, patch
         resp = MagicMock()
