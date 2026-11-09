@@ -915,6 +915,92 @@ def _known_sizeof_type(type_text: str) -> int | None:
     return None
 
 
+# ── Unsafe string calls whose output length is fixed at compile time ──────────────────────────
+_STR_MACRO_RE = re.compile(r'^\s*#\s*define\s+(\w+)\s+((?:"(?:[^"\\]|\\.)*"\s*)+)$')
+_STR_LITERAL_PART_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_PRINTF_SPEC_RE = re.compile(r"%(?P<flags>[-+ #0]*)(?P<width>\d+)?(?:\.(?P<prec>\d+))?(?P<len>hh|h)?(?P<conv>[diuxXoc%])")
+_PRINTF_INT_MAX = {"d": 11, "i": 11, "u": 10, "x": 8, "X": 8, "o": 11, "c": 1, "%": 1}
+
+
+def _string_macros(lines: list[str]) -> dict[str, str]:
+    """`#define NAME "text"` lines of the file → {NAME: decoded text length placeholder text}."""
+    out: dict[str, str] = {}
+    for ln in lines:
+        m = _STR_MACRO_RE.match(ln)
+        if m:
+            out[m.group(1)] = "".join(_STR_LITERAL_PART_RE.findall(m.group(2)))
+    return out
+
+
+def _const_string(node, macros: dict[str, str]) -> str | None:
+    """Raw (still escaped) text of a string literal / adjacent literals / same-file string macro."""
+    if node is None:
+        return None
+    if node.type == "string_literal":
+        return "".join(_STR_LITERAL_PART_RE.findall(_txt(node)))
+    if node.type == "concatenated_string":
+        parts = [_const_string(c, macros) for c in node.named_children if c.type != "comment"]
+        return None if any(p is None for p in parts) else "".join(parts)
+    if node.type == "identifier":
+        return macros.get(_txt(node))
+    return None
+
+
+def _decoded_len(raw: str) -> int:
+    return len(re.sub(r"\\(?:x[0-9a-fA-F]{1,2}|[0-7]{1,3}|.)", "X", raw))
+
+
+def _printf_max_len(fmt_raw: str) -> int | None:
+    """Longest output of an integer-only printf format (without the NUL); None if not computable."""
+    total, pos = 0, 0
+    for m in _PRINTF_SPEC_RE.finditer(fmt_raw):
+        total += _decoded_len(fmt_raw[pos:m.start()])
+        base = _PRINTF_INT_MAX[m.group("conv")]
+        total += max(base, int(m.group("width") or 0), int(m.group("prec") or 0))
+        pos = m.end()
+    tail = fmt_raw[pos:]
+    if "%" in tail:
+        return None  # %s, %f, %ld ... : length depends on the argument
+    return total + _decoded_len(tail)
+
+
+_macro_cache_local = threading.local()
+
+
+def _macros_of(lines: list[str]) -> dict[str, str]:
+    """_string_macros(), computed once per file (the `lines` list is shared by all its functions)."""
+    cached = getattr(_macro_cache_local, "entry", None)
+    if cached is None or cached[0] is not lines:
+        cached = (lines, _string_macros(lines))
+        _macro_cache_local.entry = cached
+    return cached[1]
+
+
+def _bounded_unsafe_call(fname: str, args: list, dest_bytes: dict[str, int],
+                         macros: dict[str, str]) -> bool:
+    """True when strcpy/strcat/sprintf cannot overflow because the written text is a constant.
+
+    Only silences the call when the destination size is unknown (a bare constant string says
+    nothing about its buffer) or provably large enough; a known-too-small destination still fires.
+    """
+    if fname in ("strcpy", "strcat") and len(args) == 2:
+        raw = _const_string(args[1], macros)
+        if raw is None:
+            return False
+        size = dest_bytes.get(_txt(args[0])) if args[0].type == "identifier" else None
+        if size is None:
+            return True
+        return fname == "strcpy" and size >= _decoded_len(raw) + 1
+    if fname == "sprintf" and len(args) >= 2:
+        raw = _const_string(args[1], macros)
+        need = _printf_max_len(raw) if raw is not None else None
+        if need is None:
+            return False
+        size = dest_bytes.get(_txt(args[0])) if args[0].type == "identifier" else None
+        return size is not None and size >= need + 1
+    return False
+
+
 # ── C++ containers carrying allocated pointers (Juliet flow variants 72-74) ───────────────────
 # `v.push_back(p)` / `v.insert(pos, n, p)` / `m[k] = p` store a pointer whose allocation size is
 # known; `x = v[i]` / `v.at(i)` / `v.back()` / `v.front()` read one back.  The container is
@@ -2339,7 +2425,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                      if node.start_point[0] < len(lines) else "")
 
         # Always-unsafe functions (no taint check needed)
-        if fname in _ALWAYS_UNSAFE:
+        if fname in _ALWAYS_UNSAFE and not _bounded_unsafe_call(
+                fname, args, _true_bytes, _macros_of(lines)):
             rule_id, sev, vtype, desc = _ALWAYS_UNSAFE[fname]
             key = (file_path, line_no, rule_id)
             if key not in seen:
@@ -2660,6 +2747,10 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
             _for_body = _fs.child_by_field_name("body")
             if _for_body is None:
                 continue
+            # The loop variable (`i` in `i < N`): a write only repeats N times through the loop
+            # when its index depends on it (`t[0] = clock()` inside the loop is one element).
+            _lv_node = _cond.child_by_field_name("left")
+            _loop_var = _txt(_lv_node) if _lv_node is not None and _lv_node.type == "identifier" else None
             for _bn in _walk(_for_body):
                 if _bn.type != "assignment_expression":
                     continue
@@ -2669,6 +2760,12 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                 _barg = _blhs.child_by_field_name("argument")
                 if _barg is None or _barg.type != "identifier":
                     continue
+                if _loop_var is not None:
+                    _bidx = (_blhs.child_by_field_name("index")
+                             or _blhs.child_by_field_name("indices"))
+                    if _bidx is None or not any(
+                            _w.type == "identifier" and _txt(_w) == _loop_var for _w in _walk(_bidx)):
+                        continue
                 _bvar = _txt(_barg)
                 _bcount = _alloc_counts.get(_bvar)
                 _over_count = _bcount is not None and _loop_bound > _bcount
@@ -2705,6 +2802,20 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     # CWE-121/122: constant-index out-of-bounds — data[99]=x where alloc_count=50
     # Catches direct subscript accesses with a compile-time constant index >= alloc_count.
     if _alloc_counts:
+        # A pointer that is stepped (`q++`, `q += n`) no longer sits at its allocation's base, so
+        # a constant index relative to it says nothing about the allocation (`q[-1]` is legal).
+        _stepped_ptrs: set[str] = set()
+        for _stn in _walk(body_node):
+            if _stn.type == "update_expression":
+                _stid = next((c for c in _stn.named_children if c.type == "identifier"), None)
+                if _stid is not None:
+                    _stepped_ptrs.add(_txt(_stid))
+            elif _stn.type == "assignment_expression":
+                _stl = _stn.child_by_field_name("left")
+                _sto = _stn.child_by_field_name("operator")
+                if (_stl is not None and _stl.type == "identifier"
+                        and _sto is not None and _txt(_sto) in ("+=", "-=")):
+                    _stepped_ptrs.add(_txt(_stl))
         for _sn in _walk(body_node):
             if _sn.type != "assignment_expression":
                 continue
@@ -2724,7 +2835,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     if _sidx_v is None and _sidx.type == "identifier":
                         _sidx_v = _const_ints.get(_txt(_sidx))
                     _scnt = _alloc_counts.get(_svar)
-                    if _sidx_v is not None and _scnt is not None and (_sidx_v >= _scnt or _sidx_v < 0):
+                    if (_sidx_v is not None and _scnt is not None and _svar not in _stepped_ptrs
+                            and (_sidx_v >= _scnt or _sidx_v < 0)):
                         _sln = _sn.start_point[0] + 1
                         _stxt = (lines[_sn.start_point[0]].strip()
                                  if _sn.start_point[0] < len(lines) else "")

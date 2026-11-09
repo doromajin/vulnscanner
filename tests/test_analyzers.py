@@ -5932,17 +5932,114 @@ void run() {
         assert "CAST-CMD-001" in ids, "struct field taint s.data = getenv → system(s.data)"
 
     def test_strcpy_always_unsafe(self):
-        """strcpy() must always fire CAST-BUF-001 (no bounds check)."""
+        """strcpy() of a non-constant source must always fire CAST-BUF-001 (no bounds check)."""
+        code = """
+#include <string.h>
+void f(const char *src) {
+    char dst[10];
+    strcpy(dst, src);
+}
+"""
+        findings = self._c().analyze("strcpy_unbounded.c", code)
+        ids = [f.rule_id for f in findings]
+        assert "CAST-BUF-001" in ids, "strcpy() of a variable source must fire BUF-001 (always unsafe)"
+
+    def _buf(self, code):
+        return [f for f in self._c().analyze("t.c", code) if f.rule_id == "CAST-BUF-001"]
+
+    def test_strcpy_of_constant_that_fits_or_with_unknown_dest_is_silent(self):
+        code = """
+#include <string.h>
+#define DEVICE_NAME "Sound Blaster"
+struct info { char name[32]; };
+void f(char *out, struct info *p) {
+    char dst[10];
+    strcpy(dst, "hello");
+    strcpy(out, "file://");
+    strcpy(p->name, DEVICE_NAME);
+}
+"""
+        assert self._buf(code) == []
+
+    def test_strcpy_of_constant_into_too_small_known_dest_still_fires(self):
         code = """
 #include <string.h>
 void f() {
-    char dst[10];
+    char dst[4];
     strcpy(dst, "hello");
 }
 """
-        findings = self._c().analyze("strcpy_safe_looking.c", code)
-        ids = [f.rule_id for f in findings]
-        assert "CAST-BUF-001" in ids, "strcpy() must always fire BUF-001 (always unsafe)"
+        assert len(self._buf(code)) == 1
+
+    def test_strcpy_of_macro_defined_elsewhere_still_fires(self):
+        code = """
+#include <string.h>
+void f() { char dst[10]; strcpy(dst, SOME_HEADER_MACRO); }
+"""
+        assert len(self._buf(code)) == 1
+
+    def test_sprintf_with_bounded_integer_format_into_large_enough_array_is_silent(self):
+        code = """
+#include <stdio.h>
+void f(const unsigned char *ch) {
+    char ok[64];
+    char tiny[8];
+    sprintf(ok, "%d.%d.%d.%d", ch[3], ch[2], ch[1], ch[0]);
+    sprintf(tiny, "%d.%d.%d.%d", ch[3], ch[2], ch[1], ch[0]);
+}
+"""
+        assert [f.line_number for f in self._buf(code)] == [7]
+
+    def test_sprintf_with_string_conversion_still_fires(self):
+        code = """
+#include <stdio.h>
+void f(const char *s) { char b[64]; sprintf(b, "%s", s); }
+"""
+        assert len(self._buf(code)) == 1
+
+    def test_loop_write_with_fixed_index_is_not_a_loop_overflow(self):
+        code = """
+#include <time.h>
+void f() {
+    clock_t t[5];
+    int i;
+    for (i = 0; i < 100; i++) {
+        t[0] = clock();
+        t[4] = clock();
+    }
+}
+"""
+        assert self._buf(code) == []
+
+    def test_loop_write_indexed_by_loop_variable_still_fires(self):
+        code = """
+void f() {
+    char buf[10];
+    int i;
+    for (i = 0; i < 100; i++) { buf[i] = 'A'; }
+}
+"""
+        assert len(self._buf(code)) == 1
+
+    def test_negative_index_on_stepped_pointer_is_not_flagged(self):
+        code = """
+void f() {
+    char fmt[32];
+    char *q = fmt;
+    *q++ = '%';
+    q[-1] = 'I';
+}
+"""
+        assert self._buf(code) == []
+
+    def test_negative_index_on_array_still_fires(self):
+        code = """
+void f() {
+    char fmt[32];
+    fmt[-1] = 'I';
+}
+"""
+        assert len(self._buf(code)) == 1
 
     def test_wcscpy_always_unsafe(self):
         """wcscpy() must always fire CAST-BUF-001."""
