@@ -443,6 +443,17 @@ class TestInnerHtmlSanitizerAndI18n:
     def test_sanitizer_mixed_with_raw_data_still_flagged(self, rhs):
         assert self._custom(f"temp.innerHTML = {rhs}\n")
 
+    # Static text: a constant only ever assigned a plain literal, or a template without ${}
+    def test_static_constant_and_plain_template_not_flagged(self):
+        assert not self._custom("const MENU = '<ul></ul>';\nel.innerHTML = MENU;\n")
+        assert not self._custom("const MENU = `<ul></ul>`;\nel.innerHTML = MENU;\n")
+        assert not self._custom("el.innerHTML = `\n  <ul><li>fixed</li></ul>\n`;\n")
+
+    def test_constant_with_dynamic_part_or_reassigned_or_interpolated_still_flagged(self):
+        assert self._custom("const MENU = '<ul>' + name;\nel.innerHTML = MENU;\n")
+        assert self._custom("let m = '<ul></ul>';\nm = location.hash;\nel.innerHTML = m;\n")
+        assert self._custom("el.innerHTML = `<ul>${name}</ul>`;\n")
+
     # XSS-001: concatenated values that all come from the message catalogue
     def test_i18n_message_not_flagged(self):
         code = (

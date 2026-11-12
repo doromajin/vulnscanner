@@ -338,3 +338,28 @@ class TestFastMode:
         slow = VulnScanner().scan(str(repo))
         fast = VulnScanner(fast=True).scan(str(repo))
         assert {f.rule_id for f in fast.findings} == {f.rule_id for f in slow.findings}
+
+
+# ── is_minified_line ──────────────────────────────────────────────────────────
+
+class TestIsMinifiedLine:
+    def test_long_js_and_css_lines_are_minified(self):
+        from vulnscanner.analyzers.file_context import is_minified_line
+        long = "var a=" + "x," * 3000 + "1;"
+        assert is_minified_line("static/js/chunk-582dc9b0.1b37a15f.js", long)
+        assert is_minified_line("assets/app.css", long)
+
+    def test_short_lines_and_other_languages_are_not(self):
+        from vulnscanner.analyzers.file_context import is_minified_line
+        assert not is_minified_line("src/app.js", "const a = 1;")
+        assert not is_minified_line("src/app.py", "x" * 5000)   # only JS/CSS are judged by line length
+
+    def test_scanner_drops_findings_on_minified_lines_but_keeps_handwritten_ones(self, tmp_path):
+        from vulnscanner.scanner import VulnScanner
+        repo = tmp_path / "r"
+        (repo / "static").mkdir(parents=True)
+        bundle = "var q=" + "z," * 2500 + "0;el.innerHTML=location.hash;\n" + "el2.innerHTML = location.hash;\n"
+        (repo / "static" / "app-bundle.js").write_text(bundle, encoding="utf-8")
+        res = VulnScanner().scan(str(repo))
+        lines = sorted(f.line_number for f in res.findings if f.rule_id == "XSS-001")
+        assert lines == [2]

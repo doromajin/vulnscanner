@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import re
+import threading
 from pathlib import Path
 
 from vulnscanner.analyzers.base import BaseAnalyzer
-from vulnscanner.analyzers.xss import _concat_vars_are_i18n
+from vulnscanner.analyzers.xss import (
+    _BARE_IDENT_RE,
+    XSSAnalyzer,
+    _concat_vars_are_i18n,
+    _is_static_string_constant,
+)
 from vulnscanner.models import Finding
 from vulnscanner.rules.loader import CustomRule
 
@@ -18,9 +24,42 @@ def _innerhtml_is_i18n_concat(line: str, lines: list[str], idx: int) -> bool:
     return bool(m) and _concat_vars_are_i18n(m.group(1), lines, idx)
 
 
+_joined_local = threading.local()
+_XSS_ANALYZER = XSSAnalyzer()
+
+
+def _joined(lines: list[str]) -> str:
+    """"\\n".join(lines), built once per file: the same string object keeps downstream caches valid."""
+    cached = getattr(_joined_local, "entry", None)
+    if cached is None or cached[0] is not lines:
+        cached = (lines, "\n".join(lines))
+        _joined_local.entry = cached
+    return cached[1]
+
+
+def _innerhtml_is_static_text(line: str, lines: list[str], idx: int) -> bool:
+    """`x.innerHTML = <rhs>` where rhs cannot carry data: a constant that is only ever a plain
+    string literal, or a template literal without `${}`.  Unlike XSS-001 this stays strict about
+    function-call results and interpolations (JS-XSS-001 is the broader rule)."""
+    m = re.search(r"\.innerHTML\s*=(?!=)\s*([^\n]*)", line)
+    if not m:
+        return False
+    rhs = m.group(1).strip().rstrip(";").strip()
+    if _BARE_IDENT_RE.match(rhs):
+        return _is_static_string_constant(rhs, _joined(lines))
+    if rhs.startswith("`"):
+        block = _XSS_ANALYZER._collect_block(lines, idx)
+        return "${" not in block
+    return False
+
+
 # Built-in rules whose regex alone cannot see that the matched value is safe.
 # Each veto gets (line, all lines, 0-based line index); True drops the match.
-_RULE_VETOES = {"JS-XSS-001": _innerhtml_is_i18n_concat}
+_RULE_VETOES = {
+    "JS-XSS-001": lambda line, lines, idx: (
+        _innerhtml_is_i18n_concat(line, lines, idx) or _innerhtml_is_static_text(line, lines, idx)
+    ),
+}
 
 
 class CustomRuleAnalyzer(BaseAnalyzer):

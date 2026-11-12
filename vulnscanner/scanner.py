@@ -41,6 +41,7 @@ from vulnscanner.analyzers.file_context import (
     INCLUDE_TEST_FILES,
     INCLUDE_VENDOR_FILES,
     classify_file_context,
+    is_minified_line,
 )
 from vulnscanner.fetcher.github import GitHubFetcher
 from vulnscanner.fetcher.local import LocalFetcher
@@ -312,6 +313,21 @@ class VulnScanner:
         if clean_taint:
             partial.suppression_breakdown["clean_taint_source"] = len(clean_taint)
         raw = [f for f in raw if f.suppression_reason != "clean_taint_source"]
+
+        # 2b. Findings on minified lines are vendored / bundled build output, not reviewed source.
+        #     Decided per line so hand-written code in the same bundle stays reportable; MALWARE
+        #     findings are never dropped.
+        if not INCLUDE_VENDOR_FILES:
+            minified = [
+                f for f in raw
+                if f.vuln_type != VulnType.MALWARE and 0 < f.line_number <= len(lines)
+                and is_minified_line(file_path, lines[f.line_number - 1])
+            ]
+            if minified:
+                partial.suppression_breakdown["vendor_path"] = (
+                    partial.suppression_breakdown.get("vendor_path", 0) + len(minified))
+                dropped = {id(f) for f in minified}
+                raw = [f for f in raw if id(f) not in dropped]
 
         # 3. File-context suppression (test / fixture / vendor paths)
         #    MALWARE findings are always surfaced regardless of file context —

@@ -1,4 +1,5 @@
 import re
+import threading
 
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
@@ -195,7 +196,46 @@ def _concat_vars_are_i18n(rhs: str, lines: list[str], idx: int) -> bool:
     return all(re.search(_I18N_ASSIGN % re.escape(t), window) for t in tokens)
 
 
-def _innerhtml_is_unsafe(block: str) -> bool:
+_STATIC_STRING_RHS = (
+    r"(?:'(?:[^'\\\n]|\\.)*'"      # 'single quoted'
+    r'|"(?:[^"\\\n]|\\.)*"'        # "double quoted"
+    r"|`[^`$]*`)"                  # `template literal without ${}`
+)
+
+
+_ASSIGN_NAME_RE = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*=(?!=)")
+# `const NAME = <literal>` that ends the statement: a `;`, or no operator continuing the expression
+# (`'<b>' + name`, `'x'.repeat(n)`)
+_STATIC_DEF_RE = re.compile(
+    r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*" + _STATIC_STRING_RHS
+    + r"(?:\s*;|(?!\s*[-+.?\[(|&,*/%]))"
+)
+_static_const_local = threading.local()
+
+
+def _static_string_constants(content: str) -> frozenset[str]:
+    """Names assigned exactly once in *content*, to a literal without interpolation.
+
+    Computed once per file (single linear pass) and cached for the next call on the same string:
+    a bundle can hold thousands of innerHTML assignments, each of which asks this question.
+    """
+    cached = getattr(_static_const_local, "entry", None)
+    if cached is not None and cached[0] is content:
+        return cached[1]
+    counts: dict[str, int] = {}
+    for m in _ASSIGN_NAME_RE.finditer(content):
+        counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    names = frozenset(m.group(1) for m in _STATIC_DEF_RE.finditer(content) if counts.get(m.group(1)) == 1)
+    _static_const_local.entry = (content, names)
+    return names
+
+
+def _is_static_string_constant(name: str, content: str) -> bool:
+    """True when *name* is assigned exactly once in *content*, to a literal with no interpolation."""
+    return name in _static_string_constants(content)
+
+
+def _innerhtml_is_unsafe(block: str, content: str | None = None) -> bool:
     """
     Analyse a (possibly multiline) ``innerHTML = ...`` assignment block.
 
@@ -239,6 +279,9 @@ def _innerhtml_is_unsafe(block: str) -> bool:
         # policy as the template-literal branch: function call = not a bare ref).
         # e.g. innerHTML = DOMPurify.sanitize(x)  or  innerHTML = escapeHtml(x)
         if re.search(r'\w\s*\(', rhs):
+            return False
+        # A constant that is only ever a plain string literal carries no user data
+        if content and _BARE_IDENT_RE.match(rhs) and _is_static_string_constant(rhs, content):
             return False
         # Bare variable or property access — flag
         return True
@@ -345,7 +388,7 @@ class XSSAnalyzer(BaseAnalyzer):
                 if rhs_m and _concat_vars_are_i18n(rhs_m.group(1), lines, i):
                     i += 1
                     continue
-                if _innerhtml_is_unsafe(block):
+                if _innerhtml_is_unsafe(block, content):
                     # A DOM sink in a file with no browser-controlled input source
                     # (URL, referrer, postMessage, storage …) is most likely fed by
                     # the app's own server responses — keep it, but as low reach.

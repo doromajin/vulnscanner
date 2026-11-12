@@ -8186,3 +8186,23 @@ class TestPath005ModuleImports:
         js = "const p = path.join(__dirname, '../', name);\n"
         assert "PATH-005" in self._ids("a.php", php)
         assert "PATH-005" in self._ids("a.js", js)
+
+
+class TestInnerHtmlStaticConstant:
+    """XSS-001: innerHTML = NAME is safe when NAME is only ever a plain string literal in the file."""
+
+    def _hits(self, js):
+        from vulnscanner.analyzers.xss import XSSAnalyzer
+        return [f.line_number for f in XSSAnalyzer().analyze("a.js", js) if f.rule_id == "XSS-001"]
+
+    def test_static_constants_are_safe(self):
+        assert self._hits("const ICON = '<svg></svg>';\nel.innerHTML = ICON;\n") == []
+        assert self._hits("const ICON = `<svg></svg>`;\nel.innerHTML = ICON;\n") == []
+        assert self._hits("const ICON = '<svg></svg>'\nel.innerHTML = ICON\n") == []
+
+    def test_dynamic_or_reassigned_values_are_still_flagged(self):
+        assert self._hits("const ICON = '<b>' + name;\nel.innerHTML = ICON;\n") == [2]
+        assert self._hits("const ICON = '<b>'\n  + name;\nel.innerHTML = ICON;\n") == [3]
+        assert self._hits("let h = '<b></b>';\nh = location.hash;\nel.innerHTML = h;\n") == [3]
+        assert self._hits("function f(h){ el.innerHTML = h; }\n") == [1]
+        assert self._hits("const T = `<b>${x}</b>`;\nel.innerHTML = T;\n") == [2]

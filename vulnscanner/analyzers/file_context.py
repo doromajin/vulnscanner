@@ -115,6 +115,18 @@ _VENDOR_FILENAME_RE = re.compile(
 _MINIFIED_RE = re.compile(r"\.min\.(?:js|css)$", re.IGNORECASE)
 
 
+# A line of JS/CSS that is thousands of characters long is minified build output (a webpack
+# chunk, a vendored library concatenated into an app bundle), not reviewed source.  Judged per
+# line: a hand-written call such as `eval(data.x)` elsewhere in the same bundle stays reportable.
+_MINIFIED_EXTS = (".js", ".mjs", ".cjs", ".css")
+_MINIFIED_LINE_LEN = 3000
+
+
+def is_minified_line(path: str, line: str) -> bool:
+    """Return True if *line* of the JS/CSS file *path* is minified code."""
+    return len(line) > _MINIFIED_LINE_LEN and path.lower().endswith(_MINIFIED_EXTS)
+
+
 def is_vendor_file(path: str) -> bool:
     """Return True if *path* is a third-party vendor or library file."""
     norm = path.replace("\\", "/")
