@@ -1107,6 +1107,17 @@ _URL_ATTR_START_RE = re.compile(
     r"""(?<![\w-])(?:href|src|action|formaction|poster|data|cite)\s*=\s*["']?\s*$""", re.IGNORECASE)
 
 
+def _is_non_logger_class(recv: ast.expr) -> bool:
+    """A PascalCase class name (`Response`, `JsonResponse`) that does not look like a logger.
+
+    Loggers are lower-case (`logger`, `self.log`), ALL-CAPS (`LOGGER`) or, for static helpers,
+    named after logging (`Logger.error`, `Log.warn`): those stay log sinks.
+    """
+    name = recv.id if isinstance(recv, ast.Name) else recv.attr if isinstance(recv, ast.Attribute) else ""
+    return (name[:1].isupper() and any(c.islower() for c in name)
+            and "log" not in name.lower())
+
+
 def _contains_name(node: ast.AST, name: str) -> bool:
     return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
 
@@ -2331,6 +2342,9 @@ class _VulnVisitor(ast.NodeVisitor):
         # user (HTML-escaped on render); it is not a log sink.
         if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "messages"):
+            return
+        # `Response.error(...)`, `JsonResponse.warning(...)`: a class that builds an HTTP response.
+        if isinstance(node.func, ast.Attribute) and _is_non_logger_class(node.func.value):
             return
         taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
         if taint.status != TaintStatus.TAINTED:
