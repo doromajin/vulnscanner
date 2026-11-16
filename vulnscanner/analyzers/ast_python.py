@@ -2742,9 +2742,12 @@ def _collect_scope_assignments(
     that an original tainted assignment to X is not overwritten by the empty-string
     default; e.g. ``param = request.form.get(...); if not param: param = ""``.
     """
+    # Every pass below reads the same unchanged tree: walk it once.
+    nodes = list(ast.walk(func))
+
     # First pass: identify null-guard assignment node ids to skip.
     null_guard_ids: set[int] = set()
-    for node in ast.walk(func):
+    for node in nodes:
         if not (
             isinstance(node, ast.If)
             and isinstance(node.test, ast.UnaryOp)
@@ -2768,7 +2771,7 @@ def _collect_scope_assignments(
     # Includes int/float (for if/else) and strings (for match-case).
     # Also evaluates one-level constant-string subscripts: "ABC"[0] → 'A'.
     simple_consts: dict[str, ast.expr] = {}
-    for node in ast.walk(func):
+    for node in nodes:
         if (isinstance(node, ast.Assign)
                 and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)):
@@ -2791,7 +2794,7 @@ def _collect_scope_assignments(
     # Identify assignments in dead branches of constant if/else, so they do not
     # overwrite live-branch assignments via the BFS last-write-wins rule.
     dead_assign_ids: set[int] = set()
-    for node in ast.walk(func):
+    for node in nodes:
         if isinstance(node, ast.If):
             branch = _eval_const_branch(node.test, simple_consts)
             if branch is True and node.orelse:
@@ -2810,7 +2813,7 @@ def _collect_scope_assignments(
     # When the subject evaluates to a compile-time constant, only the matching
     # case branch is live; all others are dead.
     if hasattr(ast, "Match"):
-        for node in ast.walk(func):
+        for node in nodes:
             if not isinstance(node, ast.Match):
                 continue
             subject_val: object = None
@@ -2860,7 +2863,7 @@ def _collect_scope_assignments(
     # Names in _TAINTED_NAME_SOURCES (e.g. 'request') are intentionally excluded.
     result: dict[str, ast.expr] = {}
     _CLEAN_NODE = ast.Constant(value=0)
-    for node in ast.walk(func):
+    for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = (alias.asname or alias.name.split('.')[0])
@@ -2872,7 +2875,7 @@ def _collect_scope_assignments(
                 if name not in _TAINTED_NAME_SOURCES and name not in result:
                     result[name] = _CLEAN_NODE
 
-    for node in ast.walk(func):
+    for node in nodes:
         if isinstance(node, ast.Assign):
             if id(node) in null_guard_ids or id(node) in dead_assign_ids:
                 continue
@@ -2907,7 +2910,7 @@ def _collect_scope_assignments(
     # Fold constant-integer chains in-place (e.g. loop counters: iteration += 1,
     # repeated N times) so the resulting value stays a Constant(int) instead of
     # a depth-N BinOp that would exceed _taint_of's recursion limit.
-    for node in ast.walk(func):
+    for node in nodes:
         if (isinstance(node, ast.AugAssign)
                 and isinstance(node.target, ast.Name)):
             var = node.target.id
@@ -2937,7 +2940,7 @@ def _collect_scope_assignments(
     # a BinOp aggregate for unknown-index subscript fallback.
     # Also models lst.pop(0) so index-shifted accesses resolve correctly.
     _list_contents: dict[str, list[ast.expr]] = {}
-    for node in ast.walk(func):
+    for node in nodes:
         if not (isinstance(node, ast.Expr)
                 and isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute)
@@ -2970,7 +2973,7 @@ def _collect_scope_assignments(
     # Pattern: `for var in expr` — var is an element of expr, so it carries the same taint.
     # Real-world: `for name in request.form.keys()` → name is user-controlled (TAINTED).
     # Also covers generator/list/set/dict comprehension targets (same semantics, own scope).
-    for node in ast.walk(func):
+    for node in nodes:
         if isinstance(node, (ast.For, ast.comprehension)):
             iter_expr = node.iter
             target = node.target
@@ -2983,7 +2986,7 @@ def _collect_scope_assignments(
 
     # Fifth pass: configparser conf.set(section, key, value) — track key-level taint
     # so conf.get(section, key) can resolve to TAINTED or CLEAN instead of UNKNOWN.
-    for node in ast.walk(func):
+    for node in nodes:
         if (isinstance(node, ast.Expr)
                 and isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute)
@@ -3001,13 +3004,13 @@ def _collect_scope_assignments(
 
     # Sixth pass: walrus operator (x := expr) — NamedExpr. Python 3.8+.
     # Pattern: `if (uid := request.GET.get('id')): cursor.execute(uid)`
-    for node in ast.walk(func):
+    for node in nodes:
         if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
             result[node.target.id] = node.value
 
     # Seventh pass: with statement targets — `with expr as var`.
     # Pattern: `with get_db() as db: db.execute(user_input)`
-    for node in ast.walk(func):
+    for node in nodes:
         if isinstance(node, ast.With):
             for _wi in node.items:
                 if _wi.optional_vars is None:
@@ -4210,17 +4213,66 @@ def _module_level_clean_names(tree: ast.Module) -> frozenset[str]:
     return frozenset(clean)
 
 
+class _FuncFacts:
+    """Memo of facts that depend only on a function's AST, not on fixed-point state.
+
+    The Phase E/F fixed points revisit every function up to ten times; re-walking each body
+    for its call sites, return values and CLI-entry check on every pass dominated the cost
+    of build_cross_file_summary.
+    """
+
+    def __init__(self) -> None:
+        self._sites: dict[int, list] = {}
+        self._returns: dict[int, list] = {}
+        self._cli: dict[int, bool] = {}
+
+    def call_sites(self, func_def) -> list[tuple[str, list]]:
+        """(callee, args) of every call that has arguments, in ast.walk order."""
+        sites = self._sites.get(id(func_def))
+        if sites is None:
+            sites = []
+            for node in ast.walk(func_def):
+                if not isinstance(node, ast.Call):
+                    continue
+                callee = _full_name(node.func) or _attr_name(node.func)
+                # Qualified names like 'scanner.scan' won't match func_bodies keyed by plain
+                # name 'scan'; fall back to the attr name.
+                if not callee or "." in callee:
+                    callee = _attr_name(node.func)
+                if callee and node.args:
+                    sites.append((callee, node.args))
+            self._sites[id(func_def)] = sites
+        return sites
+
+    def return_values(self, func_def) -> list:
+        """Value expressions of every `return <expr>`, in ast.walk order."""
+        values = self._returns.get(id(func_def))
+        if values is None:
+            values = [n.value for n in ast.walk(func_def)
+                      if isinstance(n, ast.Return) and n.value is not None]
+            self._returns[id(func_def)] = values
+        return values
+
+    def is_cli_entry(self, func_def) -> bool:
+        cli = self._cli.get(id(func_def))
+        if cli is None:
+            cli = self._cli[id(func_def)] = _func_is_cli_entry(func_def)
+        return cli
+
+
 def _compute_clean_return_funcs(
     func_bodies: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]],
     module_clean_by_fp: dict[str, frozenset[str]],
     func_to_fp: dict[int, str],
     seed: frozenset[str] = frozenset(),
+    facts: "_FuncFacts | None" = None,
 ) -> frozenset[str]:
     """Phase F-2: identify user-defined functions that return CLEAN when called with CLEAN args.
 
     Fixed-point iteration so that function A calling CLEAN-return function B and
     returning its result is also recognized as CLEAN-return.
     """
+    facts = facts or _FuncFacts()
     result: set[str] = set(seed)
     for _ in range(5):
         prev_size = len(result)
@@ -4236,17 +4288,11 @@ def _compute_clean_return_funcs(
                 clean_vars = _collect_clean_vars_in_body(
                     func_def.body, clean_seed, module_clean, current_crf
                 )
-                has_return = False
-                all_clean = True
-                for node in ast.walk(func_def):
-                    if isinstance(node, ast.Return) and node.value is not None:
-                        has_return = True
-                        if not _is_clean_expr_quick(
-                            node.value, clean_vars, module_clean, 0, current_crf
-                        ):
-                            all_clean = False
-                            break
-                if has_return and all_clean:
+                returns = facts.return_values(func_def)
+                if returns and all(
+                    _is_clean_expr_quick(v, clean_vars, module_clean, 0, current_crf)
+                    for v in returns
+                ):
                     result.add(name)
                     break  # one definition is sufficient
         if len(result) == prev_size:
@@ -4264,6 +4310,7 @@ def _build_confirmed_clean_params(
     so helper functions called from CLI entries suppress path-traversal FPs.
     """
     confirmed: dict[str, set[int]] = {}
+    facts = _FuncFacts()
 
     # Pre-compute module-level CLEAN names per file.  These are passed as
     # module_clean to _is_clean_expr_quick so that module globals like
@@ -4291,7 +4338,7 @@ def _build_confirmed_clean_params(
                 module_clean = module_clean_by_fp.get(func_to_fp.get(id(func_def), ""), frozenset())
 
                 # Seed: CLI entry params are CLEAN; confirmed clean from previous iters
-                is_cli = _func_is_cli_entry(func_def)
+                is_cli = facts.is_cli_entry(func_def)
                 clean_seed: set[str] = set()
                 if is_cli:
                     clean_seed.update(params)
@@ -4307,17 +4354,8 @@ def _build_confirmed_clean_params(
 
                 clean_vars = _collect_clean_vars_in_body(func_def.body, clean_seed, module_clean)
 
-                for node in ast.walk(func_def):
-                    if not isinstance(node, ast.Call):
-                        continue
-                    callee = _full_name(node.func) or _attr_name(node.func)
-                    # Mirror Phase E: qualified names like 'scanner.scan' won't match
-                    # func_bodies keyed by plain name 'scan'; fall back to attr name.
-                    if not callee or "." in callee:
-                        callee = _attr_name(node.func)
-                    if not callee:
-                        continue
-                    for i, arg in enumerate(node.args):
+                for callee, args in facts.call_sites(func_def):
+                    for i, arg in enumerate(args):
                         if _is_clean_expr_quick(arg, clean_vars, module_clean):
                             if i not in confirmed.get(callee, set()):
                                 confirmed.setdefault(callee, set()).add(i)
@@ -4327,7 +4365,7 @@ def _build_confirmed_clean_params(
     # This handles patterns like run_dir = get_run_dir(datetime.now()) where
     # the callee is not a known stdlib function but always returns a CLEAN path.
     clean_return_funcs = _compute_clean_return_funcs(
-        func_bodies, module_clean_by_fp, func_to_fp
+        func_bodies, module_clean_by_fp, func_to_fp, facts=facts
     )
     if clean_return_funcs:
         changed = True
@@ -4341,7 +4379,7 @@ def _build_confirmed_clean_params(
                     module_clean = module_clean_by_fp.get(
                         func_to_fp.get(id(func_def), ""), frozenset()
                     )
-                    is_cli = _func_is_cli_entry(func_def)
+                    is_cli = facts.is_cli_entry(func_def)
                     clean_seed_f2: set[str] = set()
                     if is_cli:
                         clean_seed_f2.update(params)
@@ -4353,15 +4391,8 @@ def _build_confirmed_clean_params(
                     clean_vars = _collect_clean_vars_in_body(
                         func_def.body, clean_seed_f2, module_clean, clean_return_funcs
                     )
-                    for node in ast.walk(func_def):
-                        if not isinstance(node, ast.Call):
-                            continue
-                        callee = _full_name(node.func) or _attr_name(node.func)
-                        if not callee or "." in callee:
-                            callee = _attr_name(node.func)
-                        if not callee:
-                            continue
-                        for i, arg in enumerate(node.args):
+                    for callee, args in facts.call_sites(func_def):
+                        for i, arg in enumerate(args):
                             if _is_clean_expr_quick(
                                 arg, clean_vars, module_clean, 0, clean_return_funcs
                             ):
@@ -4388,6 +4419,7 @@ def _build_confirmed_tainted_params(
     when they are analyzed independently of their callers.
     """
     confirmed: dict[str, set[int]] = {}
+    facts = _FuncFacts()
 
     # Collect all function defs keyed by name for body lookup
     func_bodies: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
@@ -4426,16 +4458,8 @@ def _build_confirmed_tainted_params(
                 )
 
                 # Find calls that receive tainted args
-                for node in ast.walk(func_def):
-                    if not isinstance(node, ast.Call):
-                        continue
-                    callee = _full_name(node.func) or _attr_name(node.func)
-                    if not callee or "." in callee:
-                        # Skip qualified calls like obj.method — focus on plain func names
-                        callee = _attr_name(node.func)
-                    if not callee:
-                        continue
-                    for i, arg in enumerate(node.args):
+                for callee, args in facts.call_sites(func_def):
+                    for i, arg in enumerate(args):
                         if _is_tainted_expr_quick(arg, tainted_vars, global_taint_sources):
                             prev = confirmed.get(callee, set())
                             if i not in prev:
