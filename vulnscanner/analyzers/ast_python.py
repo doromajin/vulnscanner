@@ -1102,6 +1102,11 @@ _SECURITY_CONTEXT_RE = re.compile(
 )
 
 
+# Text that ends right where the value of a URL-bearing attribute begins: `<a href="`, `src='`.
+_URL_ATTR_START_RE = re.compile(
+    r"""(?<![\w-])(?:href|src|action|formaction|poster|data|cite)\s*=\s*["']?\s*$""", re.IGNORECASE)
+
+
 def _contains_name(node: ast.AST, name: str) -> bool:
     return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
 
@@ -1686,12 +1691,42 @@ class _VulnVisitor(ast.NodeVisitor):
                       f"[needs_review] {name}() called with a non-literal value —"
                       " verify no user input reaches this")
 
+    def _fstring_is_neutral(self, node: ast.JoinedStr, _depth: int = 0) -> bool:
+        """An f-string whose substitutions cannot inject markup.
+
+        Substitutions may be numeric, escaped inline (`{escape(x)}`) or names assigned from an
+        escape call (`escaped = escape(x); f"<b>{escaped}</b>"`).  HTML-escaping does not stop
+        a `javascript:` URL, though, so a substitution that starts the value of a URL attribute
+        (`href="{x}"`, `src="{x}"`) must be numeric or URL-encoded to count.
+        """
+        before = ""
+        for part in node.values:
+            if isinstance(part, ast.Constant):
+                before += str(part.value)
+                continue
+            if not isinstance(part, ast.FormattedValue):
+                return False
+            val = part.value
+            at_url_start = _URL_ATTR_START_RE.search(before) is not None
+            if isinstance(val, ast.Call) and _full_name(val.func) in _SAFE_FSTRING_WRAPPERS:
+                # numeric wrappers and url quoting are fine anywhere; escape() is not at a URL start
+                if at_url_start and _full_name(val.func).rsplit(".", 1)[-1] in {"escape", "conditional_escape"}:
+                    return False
+            elif _rooted_at_settings(val):
+                pass
+            elif at_url_start or not self._xss_value_is_neutral(val, _depth + 1):
+                return False
+            before += "\0"          # a substitution is neither a quote nor an attribute name
+        return True
+
     def _xss_value_is_neutral(self, node: ast.expr, _depth: int = 0) -> bool:
         """True if marking *node* safe cannot inject markup: literals, numeric / escaped f-strings,
         concatenations of those, HTML-escaped or URL-encoded values, and module-level constants
         built from them."""
         if _depth > 6:
             return False
+        if isinstance(node, ast.JoinedStr):
+            return self._fstring_is_neutral(node, _depth)
         if _mark_safe_arg_is_safe(node):
             return True
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
