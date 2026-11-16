@@ -226,6 +226,16 @@ _STRING_TEMPLATE_METHODS = frozenset({
 # int/float/bool produce non-string values that cannot carry injection payloads.
 _UNIVERSAL_SANITIZER_FUNCS = frozenset({"int", "float", "bool"})
 
+# SQL identifier-quoting helpers (last dotted component).  A correctly quoted identifier
+# cannot break out of its quoting, so the result is safe to interpolate into SQL text
+# whatever the argument is: Django `connection.ops.quote_name`, psycopg2 `quote_ident`,
+# psycopg `sql.Identifier`, SQLAlchemy `identifier_preparer.quote_identifier`, Datasette
+# `escape_sqlite`.  Values still need bound parameters; this covers table/column names only.
+_SQL_IDENT_QUOTE_FUNCS = frozenset({
+    "escape_sqlite", "quote_ident", "quote_identifier", "quote_name",
+    "escape_identifier", "Identifier",
+})
+
 # Decode/transform functions that are NOT sanitizers — they propagate taint from
 # their first argument.  URL-decoding (unquote*) makes encoded input *more* raw,
 # not safer.  JSON parsing preserves any injection payload in the underlying string.
@@ -3300,6 +3310,12 @@ def _taint_of(
         if full in _UNIVERSAL_SANITIZER_FUNCS:
             return TaintInfo(TaintStatus.CLEAN, f"sanitized by {full}()", sanitizers=[full])
 
+        # SQL identifier quoting: the quoted name is safe inside SQL text.
+        if node.args and (full.rsplit(".", 1)[-1] or attr) in _SQL_IDENT_QUOTE_FUNCS:
+            _qname = full or f".{attr}"
+            return TaintInfo(TaintStatus.CLEAN, f"identifier quoted by {_qname}()",
+                             sanitizers=[_qname])
+
         # Decode/transform functions that propagate taint unchanged (not sanitizers).
         if full in _TAINT_PASSTHROUGH_FUNCS:
             if node.args:
@@ -3667,6 +3683,17 @@ def _taint_of(
             _taint_of(node.body, assignments, class_attrs, _depth + 1),
             _taint_of(node.orelse, assignments, class_attrs, _depth + 1),
         )
+
+    # ── Comprehensions / generator expressions ───────────────────────────────────
+    # The result carries the taint of its element expression.  Loop variables are bound
+    # to the iterable so `[c for c in cols]` is as tainted as `cols`.
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        bound = dict(assignments) if assignments is not None else {}
+        for gen in node.generators:
+            for tgt in ast.walk(gen.target):
+                if isinstance(tgt, ast.Name):
+                    bound[tgt.id] = gen.iter
+        return _taint_of(node.elt, bound, class_attrs, _depth + 1)
 
     return TaintInfo(TaintStatus.UNKNOWN,
                      f"unanalyzed expr ({type(node).__name__})", source="<expr>")
