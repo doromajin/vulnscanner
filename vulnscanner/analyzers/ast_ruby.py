@@ -63,27 +63,36 @@ def _get_ruby_cf_ctx() -> "RubyCrossFileContext | None":
     return getattr(_ruby_cf_local, "ctx", None)
 
 
+def collect_ruby_file(path: str, content: str) -> frozenset[str] | None:
+    """Per-file part of the pre-pass: method names in one .rb file that return or receive taint."""
+    if not _TS_RUBY_AVAILABLE or not path.endswith(".rb"):
+        return None
+    found: set[str] = set()
+    try:
+        tree = _ruby_parser.parse(content.encode("utf-8", errors="replace"))
+        tainted, file_methods, tainted_ivars = _build_taint(tree.root_node)
+        found.update(file_methods)
+        # Also collect methods whose params appear in tainted (callee-param seeding)
+        param_map = _build_method_param_map(tree.root_node)
+        for mname, params in param_map.items():
+            if any(p in tainted for p in params):
+                found.add(mname)
+    except Exception:
+        pass  # keep whatever was found before the failure
+    return frozenset(found)
+
+
+def merge_ruby_cross_file_parts(parts) -> RubyCrossFileContext:
+    global_tainted: set[str] = set()
+    for part in parts:
+        global_tainted.update(part)
+    return RubyCrossFileContext(tainted_method_names=frozenset(global_tainted))
+
+
 def build_ruby_cross_file_context(all_contents: dict[str, str]) -> RubyCrossFileContext:
     """Pre-pass: collect all method names that return OR receive tainted data."""
-    if not _TS_RUBY_AVAILABLE:
-        return RubyCrossFileContext()
-
-    global_tainted: set[str] = set()
-    for path, content in all_contents.items():
-        if not path.endswith(".rb"):
-            continue
-        try:
-            tree = _ruby_parser.parse(content.encode("utf-8", errors="replace"))
-            tainted, file_methods, tainted_ivars = _build_taint(tree.root_node)
-            global_tainted.update(file_methods)
-            # Also collect methods whose params appear in tainted (callee-param seeding)
-            param_map = _build_method_param_map(tree.root_node)
-            for mname, params in param_map.items():
-                if any(p in tainted for p in params):
-                    global_tainted.add(mname)
-        except Exception:
-            pass
-    return RubyCrossFileContext(tainted_method_names=frozenset(global_tainted))
+    parts = (collect_ruby_file(path, content) for path, content in all_contents.items())
+    return merge_ruby_cross_file_parts(p for p in parts if p is not None)
 
 _RUBY_EXTS = (".rb",)
 

@@ -15,6 +15,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 _progress_console = _RichConsole(stderr=True)
 
+from vulnscanner import pool_worker
 from vulnscanner.analyzers import ALL_ANALYZERS, BaseAnalyzer
 from vulnscanner.analyzers.ast_python import (
     build_cross_file_summary,
@@ -29,15 +30,22 @@ from vulnscanner.analyzers.ast_go import (
     set_go_cross_file_context,
 )
 from vulnscanner.analyzers.ast_js import (
+    JS_TS_EXTS,
     build_js_cross_file_context,
+    collect_js_file,
+    merge_js_cross_file_parts,
     set_js_cross_file_context,
 )
 from vulnscanner.analyzers.ast_ruby import (
     build_ruby_cross_file_context,
+    collect_ruby_file,
+    merge_ruby_cross_file_parts,
     set_ruby_cross_file_context,
 )
 from vulnscanner.analyzers.ast_php import (
     build_php_cross_file_context,
+    collect_php_file,
+    merge_php_cross_file_parts,
     set_php_cross_file_context,
 )
 from vulnscanner.analyzers.file_context import (
@@ -62,33 +70,51 @@ DEFAULT_WORKERS = min((os.cpu_count() or 1) * 2, 16)
 # Analysis is pure-Python CPU work, so threads serialise on the GIL.  Local scans run in worker
 # processes when there is enough work to pay for starting them (each worker re-imports the
 # analyzers: ~1s, and process creation is slow on Windows/macOS spawn).  The work is estimated
-# from the content size (~15s of CPU per MB, measured on Python/PHP/JS repos), and a worker is
-# only added for every _SECONDS_PER_WORKER of it.  VULNSCANNER_PARALLEL=thread|process|auto
-# overrides the choice; an explicit -w N overrides the worker count.
-_SECONDS_PER_BYTE = 1.5e-5
+# from the content size with a per-language cost, and a worker is only added for every
+# _SECONDS_PER_WORKER of it.  VULNSCANNER_PARALLEL=thread|process|auto overrides the choice;
+# an explicit -w N overrides the worker count.
 _SECONDS_PER_WORKER = 4.0
 
-# Per-process state set by _init_worker: (scanner, directory, all_contents, cross-file contexts).
-_worker_state: tuple | None = None
+# Analysis CPU seconds per MB of source, measured single-threaded on real repositories (Python
+# varied 16-41 across projects; the middle is used).  Languages not measured use the tree-sitter
+# figure; everything else (json, html, yaml, ...) is nearly free.
+_SECONDS_PER_MB = {
+    ".py": 25.0, ".java": 15.0, ".c": 13.0, ".cc": 12.0, ".cpp": 12.0, ".cxx": 12.0,
+    ".h": 5.0, ".hpp": 8.0, ".php": 2.5, ".js": 4.5, ".jsx": 4.5, ".mjs": 4.5, ".cjs": 4.5,
+    ".ts": 4.5, ".tsx": 4.5, ".go": 10.0, ".rb": 10.0, ".cs": 10.0, ".rs": 10.0,
+}
+_DEFAULT_SECONDS_PER_MB = 0.4
 
 
-def _init_worker(analyzers, fast: bool, directory: str, all_contents: dict, contexts: tuple) -> None:
-    """Process-pool initializer: receives the shared read-only inputs once per worker."""
-    global _worker_state
-    _worker_state = (VulnScanner(analyzers=analyzers, fast=fast), directory, all_contents, contexts)
+def _estimated_seconds(files) -> float:
+    """Rough single-thread analysis time of *files* (path, content) pairs."""
+    total = 0.0
+    for fp, content in files:
+        ext = os.path.splitext(fp)[1].lower()
+        total += len(content) * _SECONDS_PER_MB.get(ext, _DEFAULT_SECONDS_PER_MB) / 1e6
+    return total
 
 
-def _analyze_chunk_in_worker(file_paths: list[str]) -> list[tuple[str, _FileResult | None, str | None]]:
-    """Analyse a batch of files; one (path, result, error) triple per file."""
-    scanner, directory, all_contents, contexts = _worker_state  # type: ignore[misc]
-    out = []
-    for fp in file_paths:
-        try:
-            out.append((fp, scanner._analyze_file_pure(
-                fp, all_contents[fp], directory, all_contents, *contexts), None))
-        except Exception as exc:
-            out.append((fp, None, str(exc)))
-    return out
+# Cross-file pre-passes that look at each file on its own (no whole-program fixed point), so they
+# can be spread over the worker pool: kind -> (per-file collector, file extensions).
+_PRESCAN_COLLECTORS = {
+    "php": (collect_php_file, (".php",)),
+    "ruby": (collect_ruby_file, (".rb",)),
+    "js": (collect_js_file, tuple(JS_TS_EXTS)),
+}
+
+
+def _prescan_on_pool(pool, all_contents: dict, workers: int) -> dict[str, list]:
+    """Per-file cross-file pre-passes (PHP/Ruby/JS) on the worker pool: kind -> collected parts."""
+    # Starting the workers is what the first submit() does (slow with spawn), so make that
+    # happen now even when no PHP/Ruby/JS file needs scanning.
+    pool.submit(abs, 0)
+    futures = {}
+    for kind, (_, exts) in _PRESCAN_COLLECTORS.items():
+        subset = [(fp, c) for fp, c in all_contents.items() if fp.endswith(exts)]
+        futures[kind] = [pool.submit(pool_worker._prescan_chunk_in_worker, kind, chunk)
+                         for chunk in _balanced_chunks(subset, workers)]
+    return {kind: [p for f in fs for p in f.result()] for kind, fs in futures.items()}
 
 
 # Tasks handed to each worker.  Submitting one file at a time made the parent the bottleneck
@@ -277,35 +303,46 @@ class VulnScanner:
         # Only Python files are needed; others are included harmlessly and ignored.
         all_contents = {fp: content for fp, content in files}
 
-        # Phase C pre-scan: build global taint summary BEFORE parallel per-file analysis.
-        # This seeds _interprocedural_taint_sources with globally-known taint sources so
-        # Phase B (module-global scanning) correctly resolves function-call chains like
-        # ``config.ALLOWED_HOST = get_host()`` where get_host is in a transitive import.
-        cf_summary = build_cross_file_summary(all_contents)
-        java_cf_ctx = build_java_cross_file_context(all_contents)
-        go_cf_ctx = build_go_cross_file_context(all_contents)
-        js_cf_ctx = build_js_cross_file_context(all_contents)
-        ruby_cf_ctx = build_ruby_cross_file_context(all_contents)
-        php_cf_ctx = build_php_cross_file_context(all_contents)
+        # Start the worker processes first: they take seconds to come up, which overlaps with
+        # the whole-program pre-passes below, and the per-file pre-passes run on them too.
+        workers = self._process_workers(files)
+        pool = None
+        if workers:
+            # spawn on every OS: fork()ing while the progress-bar thread runs can deadlock,
+            # and it keeps Linux, macOS and Windows behaving the same.
+            blob = pickle.dumps((self._analyzers, self._fast, directory, all_contents),
+                                protocol=pickle.HIGHEST_PROTOCOL)
+            pool = ProcessPoolExecutor(
+                max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                initializer=pool_worker._init_worker, initargs=(blob,),
+            )
+        try:
+            contexts, pool_ok = self._build_contexts(all_contents, pool, workers)
+            if not pool_ok and pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+                pool = None
 
-        start = time.perf_counter()
-        with Progress(
-            SpinnerColumn("line"),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            redirect_stderr=False,
-            console=_progress_console,
-        ) as progress:
-            task = progress.add_task(f"Scanning {directory}...", total=len(files))
+            start = time.perf_counter()
+            with Progress(
+                SpinnerColumn("line"),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                redirect_stderr=False,
+                console=_progress_console,
+            ) as progress:
+                task = progress.add_task(f"Scanning {directory}...", total=len(files))
 
-            contexts = (cf_summary, java_cf_ctx, go_cf_ctx, js_cf_ctx, ruby_cf_ctx, php_cf_ctx)
-            for fp, partial, exc in self._analyze_all(files, directory, all_contents, contexts):
-                progress.update(task, description=f"[cyan]{fp}", advance=1)
-                if exc is not None:
-                    result.errors.append(f"{fp}: {exc}")
-                    continue
-                _merge_into(result, partial)
+                for fp, partial, exc in self._analyze_all(
+                        files, directory, all_contents, contexts, pool, workers):
+                    progress.update(task, description=f"[cyan]{fp}", advance=1)
+                    if exc is not None:
+                        result.errors.append(f"{fp}: {exc}")
+                        continue
+                    _merge_into(result, partial)
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
 
         result.elapsed_seconds = time.perf_counter() - start
 
@@ -324,8 +361,7 @@ class VulnScanner:
         if self._workers_explicit:
             workers = self._workers
         else:
-            seconds = sum(len(c) for _, c in files) * _SECONDS_PER_BYTE
-            workers = min(cpus, int(seconds / _SECONDS_PER_WORKER))
+            workers = min(cpus, int(_estimated_seconds(files) / _SECONDS_PER_WORKER))
             if mode == "process":
                 workers = max(workers, 2)
             if workers < 2:
@@ -336,25 +372,54 @@ class VulnScanner:
             return 0
         return min(workers, 61)  # ProcessPoolExecutor's limit on Windows
 
-    def _analyze_all(self, files, directory: str, all_contents: dict, contexts: tuple):
-        """Yield (file_path, result, error) as files finish; processes when worthwhile, else threads."""
-        done: set[str] = set()
-        workers = self._process_workers(files)
-        if workers:
+    def _build_contexts(self, all_contents: dict, pool, workers: int) -> tuple[tuple, bool]:
+        """Cross-file pre-passes: returns (contexts for _analyze_file_pure, whether *pool* is still usable)."""
+        job = helper = None
+        if pool is not None:
+            # Submitting is what starts the workers, so do it off this thread while the
+            # whole-program contexts below (which cannot be split per file) are built here.
+            helper = ThreadPoolExecutor(max_workers=1)
+            job = helper.submit(_prescan_on_pool, pool, all_contents, workers)
+
+        # Phase C pre-scan: build global taint summary BEFORE parallel per-file analysis.
+        # This seeds _interprocedural_taint_sources with globally-known taint sources so
+        # Phase B (module-global scanning) correctly resolves function-call chains like
+        # ``config.ALLOWED_HOST = get_host()`` where get_host is in a transitive import.
+        cf_summary = build_cross_file_summary(all_contents)
+        java_cf_ctx = build_java_cross_file_context(all_contents)
+        go_cf_ctx = build_go_cross_file_context(all_contents)
+
+        parts = None
+        if job is not None:
             try:
-                # spawn on every OS: fork()ing while the progress-bar thread runs can deadlock,
-                # and it keeps Linux, macOS and Windows behaving the same.
-                with ProcessPoolExecutor(
-                    max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
-                    initializer=_init_worker,
-                    initargs=(self._analyzers, self._fast, directory, all_contents, contexts),
-                ) as pool:
-                    futures = [pool.submit(_analyze_chunk_in_worker, chunk)
-                               for chunk in _balanced_chunks(files, workers)]
-                    for future in as_completed(futures):
-                        for fp, partial, error in future.result():  # BrokenProcessPool propagates
-                            done.add(fp)
-                            yield fp, partial, error
+                parts = job.result()
+            except Exception:
+                parts = None  # a worker died or a result could not be returned: do it here
+            finally:
+                helper.shutdown()
+        if parts is not None:
+            js_cf_ctx = merge_js_cross_file_parts(parts["js"], all_contents)
+            ruby_cf_ctx = merge_ruby_cross_file_parts(parts["ruby"])
+            php_cf_ctx = merge_php_cross_file_parts(parts["php"])
+        else:
+            js_cf_ctx = build_js_cross_file_context(all_contents)
+            ruby_cf_ctx = build_ruby_cross_file_context(all_contents)
+            php_cf_ctx = build_php_cross_file_context(all_contents)
+        contexts = (cf_summary, java_cf_ctx, go_cf_ctx, js_cf_ctx, ruby_cf_ctx, php_cf_ctx)
+        return contexts, parts is not None
+
+    def _analyze_all(self, files, directory: str, all_contents: dict, contexts: tuple,
+                     pool=None, workers: int = 0):
+        """Yield (file_path, result, error) as files finish: on *pool* if given, else on threads."""
+        done: set[str] = set()
+        if pool is not None:
+            try:
+                futures = [pool.submit(pool_worker._analyze_chunk_in_worker, chunk, contexts)
+                           for chunk in _balanced_chunks(files, workers)]
+                for future in as_completed(futures):
+                    for fp, partial, error in future.result():  # BrokenProcessPool propagates
+                        done.add(fp)
+                        yield fp, partial, error
                 return
             except BrokenProcessPool:
                 pass  # a worker died (e.g. out of memory): redo the unfinished files on threads

@@ -1,12 +1,20 @@
 """Process-pool scanning must give the same results as the threaded path."""
+import dataclasses
+import multiprocessing
 import os
-from concurrent.futures import Future
+from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
 import pytest
 
+import pickle
+
+from vulnscanner import pool_worker as PW
 from vulnscanner import scanner as S
 from vulnscanner.analyzers import ALL_ANALYZERS
+from vulnscanner.analyzers.ast_js import build_js_cross_file_context
+from vulnscanner.analyzers.ast_php import build_php_cross_file_context
+from vulnscanner.analyzers.ast_ruby import build_ruby_cross_file_context
 from vulnscanner.analyzers.base import BaseAnalyzer
 
 _VULN = 'import os\ndef view(request):\n    os.system("ls " + request.args.get("d"))\n'
@@ -16,6 +24,15 @@ def _make_repo(root, n=12):
     for i in range(n):
         (root / f"mod{i}.py").write_text(_VULN + f"# file {i}\n" * i, encoding="utf-8")
     (root / "notes.txt").write_text("nothing here\n", encoding="utf-8")
+    # cross-file PHP / JS / Ruby, so the per-file pre-passes have something to find
+    (root / "lib.php").write_text("<?php function getq() { return $_GET['q']; }\n", encoding="utf-8")
+    (root / "page.php").write_text("<?php echo getq();\n", encoding="utf-8")
+    (root / "util.js").write_text(
+        "function getq(req) { return req.query.q; }\nmodule.exports = { getq };\n", encoding="utf-8")
+    (root / "use.js").write_text(
+        "const { getq } = require('./util');\nfunction h(req, res) { res.send(getq(req)); }\n",
+        encoding="utf-8")
+    (root / "m.rb").write_text("def read_q\n  params[:q]\nend\n", encoding="utf-8")
 
 
 def _keys(result):
@@ -116,46 +133,82 @@ def test_process_scan_matches_thread_scan(tmp_path):
     assert pooled.errors == threaded.errors == []
 
 
+# ── per-file pre-passes on the pool ───────────────────────────────────────────
+
+_PRESCAN_SAMPLE = {
+    "a.php": "<?php function getq() { return $_GET['q']; }\nfunction safe() { return 1; }\n",
+    "b.php": "<?php function other() { $x = $_POST['a']; return $x; }\n",
+    "c.rb": "def read_q\n  params[:q]\nend\ndef use(x)\n  y = params[:z]\n  system(y)\nend\n",
+    "d.js": "function getq(req) { return req.query.q; }\nmodule.exports = { getq };\n",
+    "e.ts": "export function getq(req: any) { return req.query.q; }\n",
+    "f.py": "x = 1\n",
+}
+
+
+def test_pool_prescan_matches_serial_builders():
+    pool = ProcessPoolExecutor(
+        max_workers=2, mp_context=multiprocessing.get_context("spawn"), initializer=PW._init_worker,
+        initargs=(pickle.dumps((list(ALL_ANALYZERS), False, ".", _PRESCAN_SAMPLE)),))
+    try:
+        parts = S._prescan_on_pool(pool, _PRESCAN_SAMPLE, workers=2)
+    finally:
+        pool.shutdown(wait=True)
+
+    got = (S.merge_php_cross_file_parts(parts["php"]),
+           S.merge_ruby_cross_file_parts(parts["ruby"]),
+           S.merge_js_cross_file_parts(parts["js"], _PRESCAN_SAMPLE))
+    want = (build_php_cross_file_context(_PRESCAN_SAMPLE),
+            build_ruby_cross_file_context(_PRESCAN_SAMPLE),
+            build_js_cross_file_context(_PRESCAN_SAMPLE))
+    assert [dataclasses.asdict(g) for g in got] == [dataclasses.asdict(w) for w in want]
+    assert want[0].tainted_func_names and want[1].tainted_method_names and want[2].tainted_exports
+
+
 # ── failure handling ──────────────────────────────────────────────────────────
 
-class _BrokenAfterFirstChunk:
-    """Stands in for ProcessPoolExecutor: first batch runs, then a worker 'dies'."""
+class _InlinePool:
+    """Stands in for ProcessPoolExecutor: runs tasks in this process and can 'kill a worker'."""
 
-    def __init__(self, *a, **k):
+    break_on = None  # "prescan" | "analysis-after-first"
+
+    def __init__(self, *a, initializer=None, initargs=(), **k):
+        self.initializer, self.initargs = initializer, initargs
+        self.analysis_calls = 0
+        self.ready = False
+
+    def shutdown(self, *a, **k):
         pass
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def submit(self, fn, chunk):
+    def submit(self, fn, *args):
+        if not self.ready:
+            self.initializer(*self.initargs)
+            self.ready = True
         f = Future()
-        if not getattr(_BrokenAfterFirstChunk, "used", False):
-            _BrokenAfterFirstChunk.used = True
-            S._init_worker(*_BrokenAfterFirstChunk.initargs)
-            f.set_result(fn(chunk))
-        else:
+        if fn is PW._prescan_chunk_in_worker and self.break_on == "prescan":
             f.set_exception(BrokenProcessPool("worker died"))
+            return f
+        if fn is PW._analyze_chunk_in_worker:
+            self.analysis_calls += 1
+            if self.break_on == "analysis-after-first" and self.analysis_calls > 1:
+                f.set_exception(BrokenProcessPool("worker died"))
+                return f
+        f.set_result(fn(*args))
         return f
 
 
-def test_broken_pool_finishes_remaining_files_on_threads(tmp_path, monkeypatch):
+@pytest.mark.parametrize("break_on", ["analysis-after-first", "prescan"])
+def test_broken_pool_still_scans_every_file_once(tmp_path, monkeypatch, break_on):
     _make_repo(tmp_path)
     expected = _scan(tmp_path, "thread")
 
-    class Pool(_BrokenAfterFirstChunk):
-        def __init__(self, *a, initargs=(), **k):
-            _BrokenAfterFirstChunk.initargs = initargs
-
-    _BrokenAfterFirstChunk.used = False
-    monkeypatch.setattr(S, "ProcessPoolExecutor", Pool)
+    monkeypatch.setattr(PW, "_worker_state", None)  # restored afterwards
+    monkeypatch.setattr(_InlinePool, "break_on", break_on)
+    monkeypatch.setattr(S, "ProcessPoolExecutor", _InlinePool)
     monkeypatch.setenv("VULNSCANNER_PARALLEL", "process")
-    # one task per chunk so that the second chunk is the one that "breaks"
+    # one file per task so that the second analysis task is the one that "breaks"
     monkeypatch.setattr(S, "_TASKS_PER_WORKER", 1000)
     result = S.VulnScanner(workers=2).scan(str(tmp_path))
 
-    assert _BrokenAfterFirstChunk.used
     assert result.scanned_files == expected.scanned_files  # nothing skipped, nothing doubled
     assert _keys(result) == _keys(expected)
+    assert result.errors == expected.errors

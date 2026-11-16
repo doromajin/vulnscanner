@@ -64,6 +64,7 @@ from vulnscanner.models import Finding, Severity, VulnType
 _JS_AST_EXTS = (".js", ".jsx", ".mjs", ".cjs")
 _TS_AST_EXTS = (".ts", ".tsx")
 _ALL_JS_TS_EXTS = _JS_AST_EXTS + _TS_AST_EXTS
+JS_TS_EXTS = _ALL_JS_TS_EXTS  # public: the scanner selects pre-pass files with it
 
 # ── Cross-file taint context ──────────────────────────────────────────────────
 
@@ -1282,39 +1283,50 @@ def _resolve_js_imports(root, file_path: str, cf_ctx: JSCrossFileContext) -> set
     return result
 
 
+def collect_js_file(path: str, content: str) -> tuple[str, frozenset[str]] | None:
+    """Per-file part of the pre-pass: (normalised path, tainted exported names) or None."""
+    if not (_TS_JS_AVAILABLE or _TS_TS_AVAILABLE):
+        return None
+    is_js = any(path.endswith(e) for e in _JS_AST_EXTS)
+    is_ts = any(path.endswith(e) for e in _TS_AST_EXTS)
+    if not (is_js or is_ts):
+        return None
+    try:
+        if is_ts:
+            if not _TS_TS_AVAILABLE:
+                return None
+            parser = _tsx_parser if path.endswith(".tsx") else _ts_parser
+        else:
+            if not _TS_JS_AVAILABLE:
+                return None
+            parser = _js_parser
+        tree = parser.parse(content.encode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    state = _build_taint_state(tree.root_node)
+    if not state.tainted_funcs:
+        return None
+    exported = _find_js_exports(tree.root_node, state.tainted_funcs)
+    if not exported:
+        return None
+    return path.replace("\\", "/"), frozenset(exported)
+
+
+def merge_js_cross_file_parts(parts, paths) -> JSCrossFileContext:
+    """*parts*: collect_js_file() results; *paths*: every scanned file path."""
+    all_paths: frozenset[str] = frozenset(
+        p.replace("\\", "/") for p in paths
+        if any(p.endswith(e) for e in _ALL_JS_TS_EXTS)
+    )
+    return JSCrossFileContext(tainted_exports=dict(parts), all_paths=all_paths)
+
+
 def build_js_cross_file_context(all_contents: dict[str, str]) -> JSCrossFileContext:
     """Pre-pass: build export-taint map for all JS/TS files so cross-file callers can seed imports."""
     if not (_TS_JS_AVAILABLE or _TS_TS_AVAILABLE):
         return JSCrossFileContext()
-    all_paths: frozenset[str] = frozenset(
-        p.replace("\\", "/") for p in all_contents
-        if any(p.endswith(e) for e in _ALL_JS_TS_EXTS)
-    )
-    tainted_exports: dict[str, frozenset[str]] = {}
-    for path, content in all_contents.items():
-        is_js = any(path.endswith(e) for e in _JS_AST_EXTS)
-        is_ts = any(path.endswith(e) for e in _TS_AST_EXTS)
-        if not (is_js or is_ts):
-            continue
-        try:
-            if is_ts:
-                if not _TS_TS_AVAILABLE:
-                    continue
-                parser = _tsx_parser if path.endswith(".tsx") else _ts_parser
-            else:
-                if not _TS_JS_AVAILABLE:
-                    continue
-                parser = _js_parser
-            tree = parser.parse(content.encode("utf-8", errors="replace"))
-        except Exception:
-            continue
-        state = _build_taint_state(tree.root_node)
-        if not state.tainted_funcs:
-            continue
-        exported = _find_js_exports(tree.root_node, state.tainted_funcs)
-        if exported:
-            tainted_exports[path.replace("\\", "/")] = frozenset(exported)
-    return JSCrossFileContext(tainted_exports=tainted_exports, all_paths=all_paths)
+    parts = (collect_js_file(path, content) for path, content in all_contents.items())
+    return merge_js_cross_file_parts((p for p in parts if p is not None), all_contents)
 
 
 # ── Analyzer ──────────────────────────────────────────────────────────────────

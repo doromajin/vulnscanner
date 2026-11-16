@@ -61,22 +61,29 @@ def _get_php_cf_ctx() -> "PhpCrossFileContext | None":
     return getattr(_php_cf_local, "ctx", None)
 
 
+def collect_php_file(path: str, content: str) -> frozenset[str] | None:
+    """Per-file part of the pre-pass: tainted function names defined in one .php file."""
+    if not _TS_AVAILABLE or not path.endswith(".php"):
+        return None
+    try:
+        tree = _php_parser.parse(content.encode("utf-8", errors="replace"))
+        _, file_funcs, _ = _build_taint(tree.root_node)
+        return frozenset(file_funcs)
+    except Exception:
+        return None
+
+
+def merge_php_cross_file_parts(parts) -> PhpCrossFileContext:
+    global_tainted: set[str] = set()
+    for part in parts:
+        global_tainted.update(part)
+    return PhpCrossFileContext(tainted_func_names=frozenset(global_tainted))
+
+
 def build_php_cross_file_context(all_contents: dict[str, str]) -> PhpCrossFileContext:
     """Pre-pass: collect all PHP function names that return tainted data."""
-    if not _TS_AVAILABLE:
-        return PhpCrossFileContext()
-
-    global_tainted: set[str] = set()
-    for path, content in all_contents.items():
-        if not path.endswith(".php"):
-            continue
-        try:
-            tree = _php_parser.parse(content.encode("utf-8", errors="replace"))
-            _, file_funcs, _ = _build_taint(tree.root_node)
-            global_tainted.update(file_funcs)
-        except Exception:
-            pass
-    return PhpCrossFileContext(tainted_func_names=frozenset(global_tainted))
+    parts = (collect_php_file(path, content) for path, content in all_contents.items())
+    return merge_php_cross_file_parts(p for p in parts if p is not None)
 
 # ── Source definitions ────────────────────────────────────────────────────────
 
