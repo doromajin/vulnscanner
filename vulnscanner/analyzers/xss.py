@@ -235,6 +235,12 @@ def _is_static_string_constant(name: str, content: str) -> bool:
     return name in _static_string_constants(content)
 
 
+def _is_static_interpolation(expr: str, content: str | None) -> bool:
+    """``${NAME}`` where NAME is assigned exactly once, to a plain string literal."""
+    expr = expr.strip()
+    return bool(content) and bool(_BARE_IDENT_RE.match(expr)) and _is_static_string_constant(expr, content)
+
+
 def _innerhtml_is_unsafe(block: str, content: str | None = None) -> bool:
     """
     Analyse a (possibly multiline) ``innerHTML = ...`` assignment block.
@@ -265,7 +271,7 @@ def _innerhtml_is_unsafe(block: str, content: str | None = None) -> bool:
         if '${' not in rhs:
             return False
         return any(
-            not _is_safe_interpolation(e)
+            not (_is_safe_interpolation(e) or _is_static_interpolation(e, content))
             for e in _INTERP_RE.findall(rhs)
         )
 

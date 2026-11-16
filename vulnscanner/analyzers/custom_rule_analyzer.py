@@ -8,8 +8,10 @@ from pathlib import Path
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.analyzers.xss import (
     _BARE_IDENT_RE,
+    _INTERP_RE,
     XSSAnalyzer,
     _concat_vars_are_i18n,
+    _is_static_interpolation,
     _is_static_string_constant,
 )
 from vulnscanner.models import Finding
@@ -39,8 +41,9 @@ def _joined(lines: list[str]) -> str:
 
 def _innerhtml_is_static_text(line: str, lines: list[str], idx: int) -> bool:
     """`x.innerHTML = <rhs>` where rhs cannot carry data: a constant that is only ever a plain
-    string literal, or a template literal without `${}`.  Unlike XSS-001 this stays strict about
-    function-call results and interpolations (JS-XSS-001 is the broader rule)."""
+    string literal, or a template literal whose `${}` are all such constants (or absent).  Unlike
+    XSS-001 this stays strict about function-call results and other interpolations (JS-XSS-001 is
+    the broader rule)."""
     m = re.search(r"\.innerHTML\s*=(?!=)\s*([^\n]*)", line)
     if not m:
         return False
@@ -49,7 +52,11 @@ def _innerhtml_is_static_text(line: str, lines: list[str], idx: int) -> bool:
         return _is_static_string_constant(rhs, _joined(lines))
     if rhs.startswith("`"):
         block = _XSS_ANALYZER._collect_block(lines, idx)
-        return "${" not in block
+        interpolations = _INTERP_RE.findall(block)
+        if len(interpolations) != block.count("${"):
+            return False  # nested braces: do not guess
+        joined = _joined(lines)
+        return all(_is_static_interpolation(e, joined) for e in interpolations)
     return False
 
 
