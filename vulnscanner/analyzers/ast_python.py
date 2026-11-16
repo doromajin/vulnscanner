@@ -1063,6 +1063,37 @@ _INTERNAL_URL_BUILDERS = frozenset({
     "url_for", "flask.url_for",
 })
 
+# `request.url_for("name")` (Starlette/FastAPI), `app.url_path_for("name")`: route-name reversal.
+_URL_BUILDER_METHODS = frozenset({"url_for", "url_path_for"})
+
+# Methods of a mapping/sequence that happens to be called `urls`: `data.urls.get("next")` reads a
+# value that may come from the request, it does not build one of the application's own URLs.
+_URLS_CONTAINER_ACCESSORS = frozenset({
+    "get", "getlist", "pop", "popitem", "setdefault", "copy", "items", "values", "keys", "index",
+    "join", "format", "replace", "strip", "split", "lower", "upper",
+})
+
+
+def _is_internal_url_builder_call(node: ast.expr) -> bool:
+    """A call that builds one of the application's own URLs.
+
+    `reverse()`/`url_for()` and friends, route reversal on a request/app object, and the
+    `<app>.urls.<name>(...)` helper namespace many projects expose (`ds.urls.instance()`).
+    The result starts with the application's own path prefix, so on its own it cannot send
+    the user to another host.  Callers decide what to do about request-derived arguments.
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    if _full_name(node.func) in _INTERNAL_URL_BUILDERS:
+        return True
+    if not isinstance(node.func, ast.Attribute):
+        return False
+    if node.func.attr in _URL_BUILDER_METHODS:
+        return True
+    recv = node.func.value
+    recv_name = recv.attr if isinstance(recv, ast.Attribute) else getattr(recv, "id", None)
+    return recv_name == "urls" and node.func.attr not in _URLS_CONTAINER_ACCESSORS
+
 # random.* is only a problem when the value protects something.
 _SECURITY_CONTEXT_RE = re.compile(
     r"token|secret|passw|pwd|salt|nonce|otp|session|csrf|auth|api_?key|\bkey\b|_key\b|sign|verif|reset"
@@ -1696,8 +1727,10 @@ class _VulnVisitor(ast.NodeVisitor):
         if not events or not isinstance(events[0][1], ast.Assign):
             return False
         first = events[0][1].value
-        if not (isinstance(first, ast.Call)
-                and _full_name(first.func) in _INTERNAL_URL_BUILDERS):
+        # `builder(...) + "/suffix"` still starts with the builder's prefix.
+        while isinstance(first, ast.BinOp) and isinstance(first.op, ast.Add):
+            first = first.left
+        if not _is_internal_url_builder_call(first):
             return False
         return all(isinstance(e, ast.AugAssign) and isinstance(e.op, ast.Add) for _, e in events[1:])
 
@@ -1837,6 +1870,13 @@ class _VulnVisitor(ast.NodeVisitor):
         # Flask url_for() generates server-side URLs from endpoint names — always safe.
         if (isinstance(url_arg, ast.Call)
                 and _full_name(url_arg.func) in {"url_for", "flask.url_for"}):
+            return
+
+        # Other URL builders (request.url_for, app.url_path_for, ds.urls.path(...)): the result
+        # keeps the application's own prefix, unless an argument is itself request-controlled.
+        if _is_internal_url_builder_call(url_arg) and not any(
+                _taint_of(a, self._assignments, self._class_attrs).status == TaintStatus.TAINTED
+                for a in [*url_arg.args, *(k.value for k in url_arg.keywords)]):
             return
 
         taint = _taint_of(url_arg, self._assignments, self._class_attrs)
@@ -3678,6 +3718,12 @@ def _taint_of(
         return _taint_worst([
             _taint_of(n, assignments, class_attrs, _depth + 1)
             for n in all_nodes
+        ])
+
+    # ── Boolean operators: `a or b` / `a and b` evaluate to one of their operands ─
+    if isinstance(node, ast.BoolOp):
+        return _taint_worst([
+            _taint_of(v, assignments, class_attrs, _depth + 1) for v in node.values
         ])
 
     # ── Conditional expression ───────────────────────────────────────────────────
