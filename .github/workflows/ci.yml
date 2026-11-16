@@ -25,7 +25,9 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        # requirements.txt carries the tree-sitter / javalang parsers the AST tests need;
+        # pyproject's dependency list does not include them.
+        run: pip install -r requirements.txt -e ".[dev]"
 
       - name: Run tests
         run: pytest tests/ -q --tb=short

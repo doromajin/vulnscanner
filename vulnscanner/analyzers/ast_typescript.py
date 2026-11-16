@@ -43,6 +43,9 @@ try:
     _TSAST_AVAIL = _TS_TS_AVAILABLE
 except (ImportError, Exception):
     _TSAST_AVAIL = False
+    # tree-sitter missing: keep the module importable. _TSTaintState below subclasses
+    # this, and analyze() returns early while _TSAST_AVAIL is False.
+    _JSTaintState = object  # type: ignore[assignment,misc]
 
 _TS_EXTS = (".ts", ".tsx")
 
