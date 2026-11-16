@@ -652,6 +652,9 @@ def _build_remote_func_defs(
                 if (isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
                         and item.name != "__init__"
                         and not item.name.startswith("__")):
+                    # Remember where the method lives: findings reported while its body is
+                    # analysed on behalf of a caller must carry this file and these lines.
+                    item._source_path = module_file  # type: ignore[attr-defined]
                     class_methods.setdefault(item.name, []).append(item)
         # Phase A: add module-level functions at depth > 1 so callee bodies can be
         # resolved when Phase 4 evaluates a directly-imported function's body.
@@ -2552,6 +2555,8 @@ class _VulnVisitor(ast.NodeVisitor):
                 elif attr in _rcm and _rcm[attr]:
                     callee_def = _rcm[attr][0]  # use first definition
                     skip_self = True
+                    # A method of another file: analyse it as that file, not as this one.
+                    src_path_override = getattr(callee_def, "_source_path", None)
 
             if callee_def is None:
                 continue
