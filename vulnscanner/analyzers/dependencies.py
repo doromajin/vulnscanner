@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from vulnscanner.analyzers.ast_python import get_cross_file_contents
 from vulnscanner.analyzers.base import BaseAnalyzer
@@ -77,6 +78,7 @@ _OSV_API = "https://api.osv.dev/v1/querybatch"
 _OSV_TIMEOUT = 15  # seconds
 _OSV_VULN_API = "https://api.osv.dev/v1/vulns/"
 _OSV_DETAIL_LIMIT = 20  # advisories fetched per package
+_OSV_FETCH_WORKERS = 8  # concurrent advisory lookups; modest to stay polite to api.osv.dev
 _osv_detail_cache: dict[str, dict] = {}
 
 
@@ -93,6 +95,23 @@ def _osv_vuln_detail(req_lib, stub: dict) -> dict:
         except Exception:
             return stub  # not cached: a later package may retry
     return _osv_detail_cache[vid]
+
+
+def _prefetch_osv_details(req_lib, stubs: list[dict]) -> None:
+    """Fetch the records `_osv_vuln_detail` will need concurrently, filling the cache.
+
+    Each lookup is an independent GET (~0.3s); doing them one by one made a lockfile
+    with ~80 advisories take ~30s.  Failures are left uncached so the caller retries.
+    """
+    todo = {
+        s["id"]: s for s in stubs
+        if s.get("id") and "database_specific" not in s and "severity" not in s
+        and s["id"] not in _osv_detail_cache
+    }
+    if len(todo) < 2:
+        return
+    with ThreadPoolExecutor(max_workers=min(_OSV_FETCH_WORKERS, len(todo))) as pool:
+        list(pool.map(lambda s: _osv_vuln_detail(req_lib, s), todo.values()))
 
 
 _SEVERITY_ORDER = [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO]
@@ -210,6 +229,10 @@ class DependencyAnalyzer(BaseAnalyzer):
             results = resp.json().get("results", [])
         except Exception:
             return []  # don't crash the scan when OSV is unreachable
+
+        _prefetch_osv_details(req_lib, [
+            v for result in results for v in result.get("vulns", [])[:_OSV_DETAIL_LIMIT]
+        ])
 
         findings: list[Finding] = []
         for (name, ver, _eco, lineno), result in zip(packages, results):

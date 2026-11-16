@@ -1652,6 +1652,66 @@ class TestDependencyParsers:
             findings = DependencyAnalyzer().analyze("package.json", '{"dependencies": {"lib": "1.2.3"}}', "")
         assert findings[0].severity.value == "MEDIUM"
 
+    def test_osv_detail_fetches_run_concurrently(self):
+        import threading, time
+        from unittest.mock import MagicMock, patch
+        from vulnscanner.analyzers import dependencies as dep
+        dep._osv_detail_cache.clear()
+        ids = [f"C-{i}" for i in range(12)]
+        post = MagicMock()
+        post.json.return_value = {"results": [{"vulns": [{"id": i} for i in ids]}]}
+        lock, state = threading.Lock(), {"now": 0, "peak": 0}
+        def slow_get(url, timeout=None):
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            time.sleep(0.05)
+            with lock:
+                state["now"] -= 1
+            r = MagicMock()
+            r.json.return_value = {"id": url.rsplit("/", 1)[1], "database_specific": {"severity": "LOW"}}
+            return r
+        with patch("requests.post", return_value=post), patch("requests.get", side_effect=slow_get):
+            findings = DependencyAnalyzer().analyze("package.json", '{"dependencies": {"lib": "1.2.3"}}', "")
+        dep._osv_detail_cache.clear()
+        assert state["peak"] > 1
+        assert state["peak"] <= dep._OSV_FETCH_WORKERS
+        assert "12 known vulnerabilities" in findings[0].description
+
+    def test_osv_detail_one_failure_does_not_block_others(self):
+        from unittest.mock import MagicMock, patch
+        from vulnscanner.analyzers import dependencies as dep
+        dep._osv_detail_cache.clear()
+        post = MagicMock()
+        post.json.return_value = {"results": [{"vulns": [{"id": "OK-1"}, {"id": "BAD"}, {"id": "OK-2"}]}]}
+        def flaky_get(url, timeout=None):
+            vid = url.rsplit("/", 1)[1]
+            if vid == "BAD":
+                raise OSError("down")
+            r = MagicMock()
+            r.json.return_value = {"id": vid, "database_specific": {"severity": "CRITICAL"}}
+            return r
+        with patch("requests.post", return_value=post), patch("requests.get", side_effect=flaky_get):
+            findings = DependencyAnalyzer().analyze("package.json", '{"dependencies": {"lib": "1.2.3"}}', "")
+        cached = set(dep._osv_detail_cache)
+        dep._osv_detail_cache.clear()
+        assert cached == {"OK-1", "OK-2"}
+        assert findings[0].severity.value == "CRITICAL"
+
+    def test_osv_detail_cached_ids_are_not_refetched(self):
+        from unittest.mock import MagicMock, patch
+        from vulnscanner.analyzers import dependencies as dep
+        dep._osv_detail_cache.clear()
+        dep._osv_detail_cache["H-1"] = {"id": "H-1", "database_specific": {"severity": "HIGH"}}
+        dep._osv_detail_cache["H-2"] = {"id": "H-2", "database_specific": {"severity": "LOW"}}
+        post = MagicMock()
+        post.json.return_value = {"results": [{"vulns": [{"id": "H-1"}, {"id": "H-2"}]}]}
+        with patch("requests.post", return_value=post), patch("requests.get") as get:
+            findings = DependencyAnalyzer().analyze("package.json", '{"dependencies": {"lib": "1.2.3"}}', "")
+        dep._osv_detail_cache.clear()
+        get.assert_not_called()
+        assert findings[0].severity.value == "HIGH"
+
     # ── npm range specs resolved through lock files ───────────────────────────
 
     def test_npm_range_specs_ignore_exact_pins_and_non_versions(self):
