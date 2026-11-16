@@ -581,17 +581,29 @@ def _deduplicate_global(findings: list) -> list:
     and once when the caller file is analysed with cross-file context (tainted arg
     confirmed → callee finding re-attributed to callee file path).
 
-    Both produce identical (file_path, line_number, rule_id) tuples; keep only one.
-    Order is preserved (first occurrence wins).
+    Both produce identical (file_path, line_number, rule_id) tuples; keep only one: the most
+    significant (severity, then confirmed taint, then confidence).  Which copy arrives first
+    depends on which worker finishes first, so keeping "the first" made the severity of the
+    same finding vary from run to run (a --fail-on gate could flip on identical code).  The
+    result is sorted so that identical input gives identical output.
     """
-    seen: set[tuple] = set()
-    result: list = []
+    best: dict[tuple, object] = {}
     for f in findings:
         key = (f.file_path, f.line_number, f.rule_id)
-        if key not in seen:
-            seen.add(key)
-            result.append(f)
-    return result
+        cur = best.get(key)
+        if cur is None or _significance(f) > _significance(cur):
+            best[key] = f
+    return [best[k] for k in sorted(best)]
+
+
+_SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+_TAINT_RANK = {"tainted": 2, "unknown": 1, "clean": 0}
+
+
+def _significance(f) -> tuple:
+    """Ordering used to pick among duplicate findings; the description makes ties deterministic."""
+    return (_SEVERITY_RANK.get(getattr(f.severity, "value", f.severity), 0),
+            _TAINT_RANK.get(f.taint_status or "", 1), f.confidence, f.description)
 
 
 def _deduplicate(findings: list) -> list:
