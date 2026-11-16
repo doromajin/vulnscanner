@@ -340,8 +340,37 @@ def _expand_defines(content: str) -> str:
     return content
 
 
+_CLANG_LINEMARKER_RE = re.compile(r'^# (\d+) "([^"]*)"')
+
+
+def _realign_clang_output(text: str, source_line_count: int) -> str | None:
+    """Put `clang -E` output back on the source's line numbers; None if that is not possible.
+
+    Findings take their line number from the parsed text, so it must line up with the
+    original file.  `-P` collapses blank lines (shifting everything below the first
+    directive) and plain `-E` adds a linemarker header, so drop the markers and pad each
+    gap that a `# N "<stdin>"` marker stands for.
+    """
+    out: list[str] = []
+    for ln in text.split("\n"):
+        m = _CLANG_LINEMARKER_RE.match(ln)
+        if m:
+            if m.group(2) == "<stdin>":
+                out.extend([""] * (int(m.group(1)) - 1 - len(out)))
+            continue
+        out.append(ln)
+    while out and not out[-1].strip():
+        out.pop()
+    if len(out) > source_line_count:
+        return None  # output ran ahead of the source: line numbers would be wrong
+    return "\n".join(out)
+
+
 def _try_clang_preprocess(content: str, lang: str = "c") -> str | None:
-    """Run `clang -E -P` to expand macros. Returns None if clang is unavailable."""
+    """Run `clang -E` to expand macros, keeping source line numbers.
+
+    Returns None if clang is unavailable or its output cannot be mapped back to the source.
+    """
     global _CLANG_AVAIL
     if _CLANG_AVAIL is False:
         return None
@@ -349,7 +378,7 @@ def _try_clang_preprocess(content: str, lang: str = "c") -> str | None:
     stripped = re.sub(r'^[ \t]*#[ \t]*include\b.*$', '', content, flags=re.MULTILINE)
     try:
         r = subprocess.run(
-            ["clang", "-E", "-P", "-w", "-ferror-limit=0",
+            ["clang", "-E", "-w", "-ferror-limit=0",
              "-Wno-everything", "-x", lang, "-"],
             input=stripped.encode("utf-8", errors="replace"),
             capture_output=True, timeout=15,
@@ -357,7 +386,10 @@ def _try_clang_preprocess(content: str, lang: str = "c") -> str | None:
         if _CLANG_AVAIL is None:
             _CLANG_AVAIL = True
         if r.stdout:
-            return r.stdout.decode("utf-8", errors="replace")
+            return _realign_clang_output(
+                r.stdout.decode("utf-8", errors="replace").replace("\r\n", "\n"),
+                len(stripped.split("\n")),
+            )
     except FileNotFoundError:
         _CLANG_AVAIL = False
     except Exception:
