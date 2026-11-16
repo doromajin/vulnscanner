@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import fnmatch
+import multiprocessing
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import pickle
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 
 from rich.console import Console as _RichConsole
@@ -55,6 +58,61 @@ _SUPPRESS_RE = re.compile(
 )
 
 DEFAULT_WORKERS = min((os.cpu_count() or 1) * 2, 16)
+
+# Analysis is pure-Python CPU work, so threads serialise on the GIL.  Local scans run in worker
+# processes when there is enough work to pay for starting them (each worker re-imports the
+# analyzers: ~1s, and process creation is slow on Windows/macOS spawn).  The work is estimated
+# from the content size (~15s of CPU per MB, measured on Python/PHP/JS repos), and a worker is
+# only added for every _SECONDS_PER_WORKER of it.  VULNSCANNER_PARALLEL=thread|process|auto
+# overrides the choice; an explicit -w N overrides the worker count.
+_SECONDS_PER_BYTE = 1.5e-5
+_SECONDS_PER_WORKER = 4.0
+
+# Per-process state set by _init_worker: (scanner, directory, all_contents, cross-file contexts).
+_worker_state: tuple | None = None
+
+
+def _init_worker(analyzers, fast: bool, directory: str, all_contents: dict, contexts: tuple) -> None:
+    """Process-pool initializer: receives the shared read-only inputs once per worker."""
+    global _worker_state
+    _worker_state = (VulnScanner(analyzers=analyzers, fast=fast), directory, all_contents, contexts)
+
+
+def _analyze_chunk_in_worker(file_paths: list[str]) -> list[tuple[str, _FileResult | None, str | None]]:
+    """Analyse a batch of files; one (path, result, error) triple per file."""
+    scanner, directory, all_contents, contexts = _worker_state  # type: ignore[misc]
+    out = []
+    for fp in file_paths:
+        try:
+            out.append((fp, scanner._analyze_file_pure(
+                fp, all_contents[fp], directory, all_contents, *contexts), None))
+        except Exception as exc:
+            out.append((fp, None, str(exc)))
+    return out
+
+
+# Tasks handed to each worker.  Submitting one file at a time made the parent the bottleneck
+# (~10ms per submit(), 9s for ~900 files); a handful of byte-balanced batches per worker keeps
+# the IPC cheap while still evening out uneven file sizes.
+_TASKS_PER_WORKER = 6
+
+
+def _balanced_chunks(files, workers: int) -> list[list[str]]:
+    """Group file paths into batches of similar total size, largest files first."""
+    ordered = sorted(files, key=lambda f: len(f[1]), reverse=True)
+    target = max(1, sum(len(c) for _, c in ordered) // (workers * _TASKS_PER_WORKER))
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    size = 0
+    for fp, content in ordered:
+        current.append(fp)
+        size += len(content)
+        if size >= target:
+            chunks.append(current)
+            current, size = [], 0
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 @dataclass
@@ -112,6 +170,7 @@ class VulnScanner:
         self._github_token = github_token
         self._cli_excludes = tuple(exclude)
         self._workers = workers if workers > 0 else DEFAULT_WORKERS
+        self._workers_explicit = workers > 0
 
         base_analyzers = analyzers or ALL_ANALYZERS
         if custom_rules:
@@ -240,20 +299,13 @@ class VulnScanner:
         ) as progress:
             task = progress.add_task(f"Scanning {directory}...", total=len(files))
 
-            with ThreadPoolExecutor(max_workers=self._workers) as pool:
-                futures = {
-                    pool.submit(self._analyze_file_pure, fp, content, directory, all_contents, cf_summary, java_cf_ctx, go_cf_ctx, js_cf_ctx, ruby_cf_ctx, php_cf_ctx): fp
-                    for fp, content in files
-                }
-                for future in as_completed(futures):
-                    fp = futures[future]
-                    progress.update(task, description=f"[cyan]{fp}", advance=1)
-                    try:
-                        partial = future.result()
-                    except Exception as exc:
-                        result.errors.append(f"{fp}: {exc}")
-                        continue
-                    _merge_into(result, partial)
+            contexts = (cf_summary, java_cf_ctx, go_cf_ctx, js_cf_ctx, ruby_cf_ctx, php_cf_ctx)
+            for fp, partial, exc in self._analyze_all(files, directory, all_contents, contexts):
+                progress.update(task, description=f"[cyan]{fp}", advance=1)
+                if exc is not None:
+                    result.errors.append(f"{fp}: {exc}")
+                    continue
+                _merge_into(result, partial)
 
         result.elapsed_seconds = time.perf_counter() - start
 
@@ -262,6 +314,62 @@ class VulnScanner:
         # exact duplicates of (file_path, line_number, vuln_type, rule_id).
         result.findings = _deduplicate_global(result.findings)
         return result
+
+    def _process_workers(self, files) -> int:
+        """Number of worker processes to use, or 0 to analyse on threads."""
+        mode = os.environ.get("VULNSCANNER_PARALLEL", "auto").lower()
+        cpus = os.cpu_count() or 1
+        if mode == "thread" or cpus < 2 or self._workers < 2:
+            return 0
+        if self._workers_explicit:
+            workers = self._workers
+        else:
+            seconds = sum(len(c) for _, c in files) * _SECONDS_PER_BYTE
+            workers = min(cpus, int(seconds / _SECONDS_PER_WORKER))
+            if mode == "process":
+                workers = max(workers, 2)
+            if workers < 2:
+                return 0
+        try:
+            pickle.dumps(self._analyzers)  # workers receive their own copy of the analyzers
+        except Exception:
+            return 0
+        return min(workers, 61)  # ProcessPoolExecutor's limit on Windows
+
+    def _analyze_all(self, files, directory: str, all_contents: dict, contexts: tuple):
+        """Yield (file_path, result, error) as files finish; processes when worthwhile, else threads."""
+        done: set[str] = set()
+        workers = self._process_workers(files)
+        if workers:
+            try:
+                # spawn on every OS: fork()ing while the progress-bar thread runs can deadlock,
+                # and it keeps Linux, macOS and Windows behaving the same.
+                with ProcessPoolExecutor(
+                    max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_init_worker,
+                    initargs=(self._analyzers, self._fast, directory, all_contents, contexts),
+                ) as pool:
+                    futures = [pool.submit(_analyze_chunk_in_worker, chunk)
+                               for chunk in _balanced_chunks(files, workers)]
+                    for future in as_completed(futures):
+                        for fp, partial, error in future.result():  # BrokenProcessPool propagates
+                            done.add(fp)
+                            yield fp, partial, error
+                return
+            except BrokenProcessPool:
+                pass  # a worker died (e.g. out of memory): redo the unfinished files on threads
+        pending = [(fp, content) for fp, content in files if fp not in done]
+        with ThreadPoolExecutor(max_workers=self._workers) as pool:
+            futures = {
+                pool.submit(self._analyze_file_pure, fp, content, directory, all_contents, *contexts): fp
+                for fp, content in pending
+            }
+            for future in as_completed(futures):
+                fp = futures[future]
+                try:
+                    yield fp, future.result(), None
+                except Exception as exc:
+                    yield fp, None, exc
 
     def _analyze_file_pure(
         self, file_path: str, content: str, source: str,
