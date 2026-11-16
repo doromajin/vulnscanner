@@ -4213,6 +4213,14 @@ def _module_level_clean_names(tree: ast.Module) -> frozenset[str]:
     return frozenset(clean)
 
 
+def _functions_by_file(parsed_trees: dict) -> dict[str, list]:
+    """{file: [FunctionDef/AsyncFunctionDef in ast.walk order]} for already parsed trees."""
+    return {
+        fp: [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for fp, tree in parsed_trees.items()
+    }
+
+
 class _FuncFacts:
     """Memo of facts that depend only on a function's AST, not on fixed-point state.
 
@@ -4302,6 +4310,7 @@ def _compute_clean_return_funcs(
 
 def _build_confirmed_clean_params(
     parsed_trees: dict[str, ast.Module],
+    funcs_by_fp: dict[str, list] | None = None,
 ) -> dict[str, frozenset[int]]:
     """Phase F: build {func_name: {param_idx}} for params confirmed CLEAN from CLI callers.
 
@@ -4320,12 +4329,13 @@ def _build_confirmed_clean_params(
     func_to_fp: dict[int, str] = {}
 
     func_bodies: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    if funcs_by_fp is None:
+        funcs_by_fp = _functions_by_file(parsed_trees)
     for fp, tree in parsed_trees.items():
         module_clean_by_fp[fp] = _module_level_clean_names(tree)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                func_bodies.setdefault(node.name, []).append(node)
-                func_to_fp[id(node)] = fp
+        for node in funcs_by_fp[fp]:
+            func_bodies.setdefault(node.name, []).append(node)
+            func_to_fp[id(node)] = fp
 
     changed = True
     for _ in range(10):
@@ -4406,6 +4416,7 @@ def _build_confirmed_clean_params(
 def _build_confirmed_tainted_params(
     parsed_trees: dict[str, ast.Module],
     global_taint_sources: frozenset[str],
+    funcs_by_fp: dict[str, list] | None = None,
 ) -> dict[str, frozenset[int]]:
     """Phase E: build {func_name: {param_idx}} for params confirmed tainted at call sites.
 
@@ -4423,10 +4434,11 @@ def _build_confirmed_tainted_params(
 
     # Collect all function defs keyed by name for body lookup
     func_bodies: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
-    for tree in parsed_trees.values():
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                func_bodies.setdefault(node.name, []).append(node)
+    if funcs_by_fp is None:
+        funcs_by_fp = _functions_by_file(parsed_trees)
+    for fns in funcs_by_fp.values():
+        for node in fns:
+            func_bodies.setdefault(node.name, []).append(node)
 
     changed = True
     max_iters = 10
@@ -4492,6 +4504,7 @@ def build_cross_file_summary(all_contents: dict[str, str]) -> CrossFileTaintSumm
     # ── Step 1: collect all function nodes from all Python files ───────────────
     all_func_nodes: list[ast.stmt] = []
     parsed_trees: dict[str, ast.Module] = {}
+    funcs_by_fp: dict[str, list] = {}
 
     for fp, content in all_contents.items():
         if not fp.endswith(".py"):
@@ -4499,10 +4512,11 @@ def build_cross_file_summary(all_contents: dict[str, str]) -> CrossFileTaintSumm
         try:
             tree = ast.parse(content)
             parsed_trees[fp] = tree
-            all_func_nodes.extend(
+            funcs_by_fp[fp] = [
                 n for n in ast.walk(tree)
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-            )
+            ]
+            all_func_nodes.extend(funcs_by_fp[fp])
         except SyntaxError:
             pass
 
@@ -4559,13 +4573,13 @@ def build_cross_file_summary(all_contents: dict[str, str]) -> CrossFileTaintSumm
     # Build {func_name: {param_idx}} for parameters that are confirmed to receive
     # tainted input from callers.  Used in visit_FunctionDef to inject TAINTED
     # sentinels, raising finding confidence from 0.3 (UNKNOWN/low_reach) to 0.9.
-    conf_params = _build_confirmed_tainted_params(parsed_trees, global_sources)
+    conf_params = _build_confirmed_tainted_params(parsed_trees, global_sources, funcs_by_fp)
 
     # ── Step 5 (Phase F): confirmed-CLEAN parameter map ───────────────────────
     # Build {func_name: {param_idx}} for parameters confirmed to receive only
     # CLI-originated (operator-controlled) input.  These params are injected as
     # CLEAN sentinels to suppress false positives for internal path operations.
-    conf_clean_params = _build_confirmed_clean_params(parsed_trees)
+    conf_clean_params = _build_confirmed_clean_params(parsed_trees, funcs_by_fp)
 
     return CrossFileTaintSummary(
         global_taint_sources=global_sources,
