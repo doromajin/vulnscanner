@@ -1586,12 +1586,19 @@ class _VulnVisitor(ast.NodeVisitor):
             taint = _taint_of(module_arg, self._assignments, self._class_attrs)
             if taint.status == TaintStatus.CLEAN:
                 return
-            sev = Severity.CRITICAL if taint.status == TaintStatus.TAINTED else Severity.HIGH
-            label = "tainted" if taint.status == TaintStatus.TAINTED else "dynamic"
-            self._add(node, VulnType.COMMAND_INJECTION, sev, "AST-CMD-005",
-                      f"{full}() with {label} module name — allows loading arbitrary code:"
-                      f" {taint.reason}",
-                      taint)
+            if taint.status == TaintStatus.TAINTED:
+                self._add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "AST-CMD-005",
+                          f"{full}() with tainted module name — allows loading arbitrary code:"
+                          f" {taint.reason}",
+                          taint)
+            else:
+                # A module name read from configuration (ORM routers, plugin lists, CLI options) is
+                # the normal way to load plugins; it is only a flaw when the name can come from a
+                # request, which the taint analysis has not shown.
+                self._add(node, VulnType.COMMAND_INJECTION, Severity.MEDIUM, "AST-CMD-005",
+                          f"[needs_review] {full}() with a dynamic module name — verify the name "
+                          f"cannot be controlled by user input: {taint.reason}",
+                          taint)
 
     # ── path traversal ─────────────────────────────────────────────────────────
 

@@ -15,6 +15,14 @@ class AnalyzerRule:
     severity: str
 
 
+# Languages whose comments can be `/* ... */`; a block that starts at the beginning of a line is
+# treated as comment text (only those, so a `/*` inside a string or regex cannot hide code).
+_C_COMMENT_EXTS = (
+    ".php", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".java", ".c", ".h", ".cpp", ".cc",
+    ".hpp", ".cs", ".go", ".rs", ".kt", ".swift", ".scala", ".css",
+)
+
+
 class BaseAnalyzer(ABC):
     """Base class for all vulnerability analyzers."""
 
@@ -73,7 +81,20 @@ class BaseAnalyzer(ABC):
             else lines
         )
         findings: list[Finding] = []
+        c_style = file_path.endswith(_C_COMMENT_EXTS)
+        in_block = False
         for lineno, (line, scan_line) in enumerate(zip(lines, scan_lines), 1):
+            if in_block:
+                # Inside a `/* ... */` block that opened at the start of a line: prose, not code.
+                # The closing line is handled normally (code may follow the `*/`).
+                if "*/" in line:
+                    in_block = False
+                else:
+                    continue
+            elif c_style:
+                s = line.lstrip()
+                if s.startswith("/*") and "*/" not in s[2:]:
+                    in_block = True
             if self._is_comment(line):
                 continue
             stripped = line.strip()

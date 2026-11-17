@@ -29,10 +29,11 @@ _RULES = [
     (
         "CMD-004",
         re.compile(
-            # Exclude ->eval()/::eval() and string-prefixed 'eval(
-            r"(?<![\w.>:'\"])eval\s*\(\s*(?![\'\"]\s*[\'\"]\s*\))"
-            # Exclude ->exec()/::exec() and string-prefixed 'exec(
-            r"|(?<![\w.>:'\"])exec\s*\(\s*(?![\'\"#])",
+            # Exclude ->eval()/::eval(), string-prefixed 'eval( and an empty `eval()`: a call with
+            # no argument executes nothing, so it is prose ("eval() must be enabled"), not code.
+            r"(?<![\w.>:'\"])eval\s*\(\s*(?![\'\"]\s*[\'\"]\s*\)|\))"
+            # Exclude ->exec()/::exec(), string-prefixed 'exec( and an empty `exec()`
+            r"|(?<![\w.>:'\"])exec\s*\(\s*(?![\'\"#)])",
             re.IGNORECASE,
         ),
         "eval()/exec() with non-literal argument",
