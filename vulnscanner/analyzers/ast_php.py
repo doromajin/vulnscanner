@@ -48,6 +48,8 @@ from vulnscanner.models import Finding, Severity, VulnType
 class PhpCrossFileContext:
     """PHP function names (from any .php file) that return tainted data."""
     tainted_func_names: frozenset[str] = _field(default_factory=frozenset)
+    # Eloquent models declared with `$guarded = []` (every attribute mass-assignable).
+    unguarded_models: frozenset[str] = _field(default_factory=frozenset)
 
 
 _php_cf_local = _threading.local()
@@ -61,23 +63,46 @@ def _get_php_cf_ctx() -> "PhpCrossFileContext | None":
     return getattr(_php_cf_local, "ctx", None)
 
 
-def collect_php_file(path: str, content: str) -> frozenset[str] | None:
-    """Per-file part of the pre-pass: tainted function names defined in one .php file."""
+_UNGUARDED_RE = re.compile(r"\$guarded\s*=\s*\[\s*\]\s*;")
+_CLASS_NAME_RE = re.compile(r"\bclass\s+(\w+)")
+
+
+def _unguarded_models_of(path: str, content: str) -> frozenset[str]:
+    """Eloquent model declared `$guarded = []` in application code (not vendor / tests / fixtures).
+    A temporary `Model::unguard()` in an importer or seeder is deliberately not counted."""
+    from vulnscanner.analyzers.file_context import is_fixture_path, is_test_path, is_vendor_file
+    if is_vendor_file(path) or is_test_path(path) or is_fixture_path(path):
+        return frozenset()
+    if _UNGUARDED_RE.search(content):
+        m = _CLASS_NAME_RE.search(content)
+        if m:
+            return frozenset({m.group(1)})
+    return frozenset()
+
+
+def collect_php_file(path: str, content: str) -> "tuple[frozenset[str], frozenset[str]] | None":
+    """Per-file part of the pre-pass: (tainted function names, unguarded Eloquent models)."""
     if not _TS_AVAILABLE or not path.endswith(".php"):
         return None
     try:
         tree = _php_parser.parse(content.encode("utf-8", errors="replace"))
         _, file_funcs, _ = _build_taint(tree.root_node)
-        return frozenset(file_funcs)
+        return frozenset(file_funcs), _unguarded_models_of(path, content)
     except Exception:
         return None
 
 
 def merge_php_cross_file_parts(parts) -> PhpCrossFileContext:
     global_tainted: set[str] = set()
+    unguarded: set[str] = set()
     for part in parts:
-        global_tainted.update(part)
-    return PhpCrossFileContext(tainted_func_names=frozenset(global_tainted))
+        if isinstance(part, tuple):
+            global_tainted.update(part[0])
+            unguarded.update(part[1])
+        else:                       # a bare set of function names (older callers)
+            global_tainted.update(part)
+    return PhpCrossFileContext(tainted_func_names=frozenset(global_tainted),
+                               unguarded_models=frozenset(unguarded))
 
 
 def build_php_cross_file_context(all_contents: dict[str, str]) -> PhpCrossFileContext:
@@ -89,6 +114,38 @@ def build_php_cross_file_context(all_contents: dict[str, str]) -> PhpCrossFileCo
 
 _SOURCES: frozenset[str] = frozenset({
     '_GET', '_POST', '_REQUEST', '_COOKIE', '_FILES', '_SERVER',
+})
+
+# Laravel / Symfony-style request objects: a `Request $request` parameter (seeded as tainted by
+# _seed_request_params), `request()` and the `Request::` facade carry client data. Methods that
+# answer a yes/no question, cast the value, or return something other than client data do not.
+_REQUEST_SAFE_METHODS: frozenset[str] = frozenset({
+    'user', 'session', 'ip', 'ips', 'has', 'hasAny', 'filled', 'missing', 'isMethod', 'method',
+    'boolean', 'integer', 'float', 'ajax', 'pjax', 'wantsJson', 'expectsJson', 'routeIs', 'hasFile',
+    'hasHeader', 'hasCookie', 'is', 'secure', 'isJson', 'hasValidSignature', 'validate', 'validateWithBag',
+    # UploadedFile attributes the server computes (the client-chosen name is getClientOriginalName)
+    'getRealPath', 'getPathname', 'path', 'hashName', 'getSize', 'getMimeType', 'guessExtension',
+    'extension', 'getError', 'isValid',
+})
+# Path helpers that return a filesystem path built from their argument.
+_PATH_HELPERS: frozenset[str] = frozenset({
+    'storage_path', 'public_path', 'base_path', 'app_path', 'resource_path', 'config_path',
+    'database_path', 'lang_path',
+})
+# Query-builder / DB-facade methods that take a raw SQL fragment as their first argument.
+_SQL_RAW_METHODS: frozenset[str] = frozenset({
+    'whereRaw', 'orWhereRaw', 'havingRaw', 'orHavingRaw', 'orderByRaw', 'selectRaw', 'groupByRaw',
+    'fromRaw', 'joinRaw',
+})
+_DB_FACADE_SQL_METHODS: frozenset[str] = frozenset({
+    'select', 'selectOne', 'statement', 'unprepared', 'raw', 'insert', 'update', 'delete',
+    'scalar', 'affectingStatement', 'cursor',
+})
+_MASS_ASSIGN_METHODS: frozenset[str] = frozenset({
+    'create', 'update', 'fill', 'forceFill', 'firstOrCreate', 'updateOrCreate', 'forceCreate',
+})
+_HTTP_FACADE_METHODS: frozenset[str] = frozenset({
+    'get', 'post', 'put', 'patch', 'delete', 'head', 'send',
 })
 
 # ── Sanitizer definitions ─────────────────────────────────────────────────────
@@ -347,10 +404,30 @@ def _is_tainted_node(node, tainted: dict, tainted_funcs: set,
         if fname in tainted_funcs:
             return True
 
+    # Request object API: $request->input('k'), request('k'), Request::get('k')
+    if t == 'member_call_expression':
+        if _is_sanitizer_call(node) or _method_name(node) in _REQUEST_SAFE_METHODS:
+            return False
+        obj = node.children[0] if node.children else None
+        return obj is not None and _is_tainted_node(obj, tainted, tainted_funcs, tainted_props)
+    if t == 'function_call_expression':
+        fname = _call_name(node)
+        if fname == 'request':
+            return True
+        if fname in _PATH_HELPERS:
+            return any(_is_tainted_node(a, tainted, tainted_funcs, tainted_props) for a in _call_args(node))
+    if t == 'scoped_call_expression' and len(node.children) >= 3:
+        cls, meth = node.children[0], node.children[2]
+        return (cls.text.decode('utf-8', errors='replace').lstrip('\\').split('\\')[-1] == 'Request'
+                and meth.text.decode('utf-8', errors='replace') not in _REQUEST_SAFE_METHODS)
+
     # Cast expression: (int)$x is clean; (string)$x propagates
     if t == 'cast_expression':
         for child in node.children:
             if child.type in ('integer_cast', 'float_cast', 'boolean_cast'):
+                return False
+            if child.type == 'cast_type' and child.text.decode('utf-8', errors='replace').lower() in (
+                    'int', 'integer', 'float', 'double', 'real', 'bool', 'boolean'):
                 return False
         for child in node.children:
             if _is_tainted_node(child, tainted, tainted_funcs, tainted_props):
@@ -522,6 +599,23 @@ def _collect_php_call_site_taint(
     return changed
 
 
+def _seed_request_params(root, tainted: dict) -> None:
+    """`Request $request` / `FormRequest $r` parameters hold the client's request."""
+    for n in _walk(root):
+        if n.type != 'simple_parameter':
+            continue
+        type_node = n.child_by_field_name('type')
+        if type_node is None:
+            continue
+        type_name = type_node.text.decode('utf-8', errors='replace').lstrip('?\\').split('\\')[-1]
+        if not type_name.endswith('Request'):
+            continue
+        name_node = n.child_by_field_name('name')
+        var = _var_name(name_node) if name_node is not None else None
+        if var:
+            tainted.setdefault(var, (n.start_point[0] + 1, 'request object parameter'))
+
+
 def _build_taint(
     root,
     seed_funcs: "frozenset[str] | None" = None,
@@ -532,6 +626,7 @@ def _build_taint(
     Includes interprocedural caller→callee param seeding.
     """
     tainted: dict[str, tuple[int, str]] = {}
+    _seed_request_params(root, tainted)
     tainted_funcs: set[str] = set(seed_funcs or ())
     tainted_props: set[str] = set()
     func_param_map = _build_php_func_param_map(root)
@@ -576,13 +671,94 @@ def _emit(
     ))
 
 
+def _scoped_parts(node) -> tuple[str, str]:
+    """(class, method) of `Cls::method(...)`, class without namespace."""
+    cls = node.children[0].text.decode('utf-8', errors='replace').lstrip('\\').split('\\')[-1]
+    return cls, node.children[2].text.decode('utf-8', errors='replace')
+
+
+def _is_call_to(node, name: str) -> bool:
+    """`name(...)` as a plain function call, e.g. the receiver in `redirect()->to(...)`."""
+    return node is not None and node.type == 'function_call_expression' and _call_name(node) == name
+
+
+_INTERNAL_URL_BUILDERS: frozenset[str] = frozenset({'route', 'action', 'to_route'})
+
+
+def _is_internal_redirect_target(node) -> bool:
+    """`route('x') . $suffix`, `"/path/{$id}"`: the host part is fixed by the application."""
+    while node is not None and node.type == 'parenthesized_expression' and node.named_children:
+        node = node.named_children[0]
+    if node is None:
+        return False
+    if node.type == 'binary_expression' and node.children:
+        return _is_internal_redirect_target(node.children[0])
+    if node.type == 'function_call_expression':
+        return _call_name(node) in _INTERNAL_URL_BUILDERS
+    if node.type in ('encapsed_string', 'string'):
+        text = node.text.decode('utf-8', errors='replace')
+        if re.match(r'''["']https?://[^/$"'{]+[/?]''', text):
+            return True     # literal scheme://host/ prefix: only the path/query is variable
+        return len(text) > 2 and text[1] == '/' and text[2:3] not in ('/', '\\')
+    return False
+
+
+def _has_origin_check(node) -> bool:
+    """The enclosing function compares the target's host (parse_url(...)['host']) before redirecting."""
+    fn = node.parent
+    while fn is not None and fn.type not in ('method_declaration', 'function_definition',
+                                              'anonymous_function', 'arrow_function'):
+        fn = fn.parent
+    if fn is None:
+        return False
+    text = fn.text.decode('utf-8', errors='replace')
+    return 'parse_url(' in text and ("'host'" in text or '"host"' in text or 'PHP_URL_HOST' in text)
+
+
+def _redirect_is_safe(node, target) -> bool:
+    return _is_internal_redirect_target(target) or _has_origin_check(node)
+
+
+def _emit_mass_assignment(findings, seen, file_path, line, lines, repo_url, call, cls) -> None:
+    """Mass assignment needs a model that accepts every attribute (`$guarded = []`): Eloquent drops
+    attributes outside `$fillable`, so a whole-request create()/fill() on a guarded model is fine."""
+    ctx = _get_php_cf_ctx()
+    unguarded = ctx.unguarded_models if ctx else frozenset()
+    if not unguarded:
+        return
+    if cls is not None and cls in unguarded:
+        sev, note = Severity.MEDIUM, f"{cls} declares $guarded = []"
+    else:
+        sev = Severity.LOW
+        note = "model type not resolved; unguarded models here: " + ", ".join(sorted(unguarded)[:4])
+    _emit(findings, seen, file_path, line, lines, repo_url,
+          VulnType.TRUST_BOUNDARY_VIOLATION, sev, 'PHAST-MASS-001',
+          f"[needs_review] whole request body passed to {call} — mass assignment ({note}); "
+          "use validated()/only()")
+
+
+def _is_whole_request(node, taint) -> bool:
+    """`$request->all()` / `->input()` without a key or whitelist: every field the client sent."""
+    return (node is not None and node.type == 'member_call_expression'
+            and _method_name(node) in ('all', 'input', 'post', 'query', 'json', 'toArray')
+            and not _member_args(node) and taint(node.children[0]))
+
+
 # ── Sink checker ─────────────────────────────────────────────────────────────
 
 def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, repo_url) -> list:
     findings: list[Finding] = []
     seen: set = set()
 
+    def raw_taint(n):
+        return _is_tainted_node(n, tainted, tainted_funcs, tainted_props)
+
     def taint(n):
+        # The request object itself (`foo($request)`) is not client data; its accessors are.
+        if n is not None and n.type == 'variable_name':
+            entry = tainted.get(_var_name(n) or '')
+            if entry is not None and entry[1] == 'request object parameter':
+                return False
         return _is_tainted_node(n, tainted, tainted_funcs, tainted_props)
 
     for node in _walk(root):
@@ -688,6 +864,18 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                       VulnType.XXE, Severity.HIGH, 'PHAST-XXE-001',
                       f"User-controlled XML input to {fname}() — XXE if external entities not disabled")
 
+            # Laravel: redirect($request->input('next')) — open redirect
+            elif fname == 'redirect' and args and taint(args[0]) and not _redirect_is_safe(node, args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.OPEN_REDIRECT, Severity.MEDIUM, 'PHAST-REDIR-001',
+                      "User-controlled value flows into redirect() — open redirect risk")
+
+            # Laravel: response($html) with client data — reflected XSS when served as text/html
+            elif fname == 'response' and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.XSS, Severity.MEDIUM, 'PHAST-XSS-001',
+                      "User-controlled data flows into response() body — reflected XSS if served as HTML")
+
             # XSS: print_r($var, false) — only if output goes to browser
             # Covered by echo_statement below; skip here to avoid FPs
 
@@ -706,13 +894,16 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                           f"User-controlled data flows into ->{mname}() — SQL injection risk")
 
             # SSTI: $twig->createTemplate($userInput) — Twig evaluates template string
-            elif mname == 'createTemplate' and args and taint(args[0]):
+            elif (mname == 'createTemplate' and args and taint(args[0])
+                  and re.search(r'twig|environment|(?<![a-z])env(?![a-z])',
+                                node.children[0].text.decode('utf-8', errors='replace'), re.I)):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.SSTI, Severity.CRITICAL, 'PHAST-SSTI-001',
                       "User-controlled data flows into ->createTemplate() — Twig SSTI risk")
 
             # Smarty method: $smarty->fetch($tainted), $smarty->display($tainted)
-            elif mname in ('fetch', 'display') and args and taint(args[0]):
+            elif mname in ('fetch', 'display') and args and taint(args[0]) \
+                    and re.search(r'smarty|tpl|templ', node.children[0].text.decode('utf-8', errors='replace'), re.I):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.SSTI, Severity.HIGH, 'PHAST-SSTI-001',
                       f"User-controlled data flows into ->{mname}() — Smarty template injection risk")
@@ -722,6 +913,61 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.XXE, Severity.HIGH, 'PHAST-XXE-001',
                       f"User-controlled XML in ->{mname}() — XXE risk if external entities not disabled")
+
+            # Laravel query builder: ->whereRaw("... " . $request->input('q'))
+            elif mname in _SQL_RAW_METHODS and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.SQL_INJECTION, Severity.HIGH, 'PHAST-SQL-001',
+                      f"User-controlled data flows into ->{mname}() — SQL injection risk; bind it with ? placeholders")
+
+            # Laravel mass assignment: $model->update($request->all())
+            elif mname in _MASS_ASSIGN_METHODS and args and _is_whole_request(args[0], raw_taint):
+                _emit_mass_assignment(findings, seen, file_path, line, lines, repo_url,
+                                      f"->{mname}()", None)
+
+            # Laravel: response()->download($request->input('f')) — arbitrary file read
+            elif mname in ('download', 'file') and _is_call_to(node.children[0], 'response')                     and args and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.PATH_TRAVERSAL, Severity.HIGH, 'PHAST-PATH-001',
+                      f"User-controlled path flows into response()->{mname}() — path traversal risk")
+
+            # Laravel: redirect()->to($url) / ->away($url)
+            elif mname in ('to', 'away') and _is_call_to(node.children[0], 'redirect')                     and args and taint(args[0]) and not _redirect_is_safe(node, args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.OPEN_REDIRECT, Severity.MEDIUM, 'PHAST-REDIR-001',
+                      f"User-controlled value flows into redirect()->{mname}() — open redirect risk")
+
+        # ── Static / facade calls: DB::select($sql), Http::get($url) ─────────
+        elif node.type == 'scoped_call_expression' and len(node.children) >= 3:
+            cls, mname = _scoped_parts(node)
+            args = _member_args(node)
+            line = node.start_point[0] + 1
+            if not args:
+                continue
+            if cls == 'DB' and mname in _DB_FACADE_SQL_METHODS and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.SQL_INJECTION, Severity.HIGH, 'PHAST-SQL-001',
+                      f"User-controlled data flows into DB::{mname}() — SQL injection risk; bind it with ? placeholders")
+            elif mname in _SQL_RAW_METHODS and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.SQL_INJECTION, Severity.HIGH, 'PHAST-SQL-001',
+                      f"User-controlled data flows into {cls}::{mname}() — SQL injection risk; bind it with ? placeholders")
+            elif mname in _MASS_ASSIGN_METHODS and _is_whole_request(args[0], raw_taint):
+                _emit_mass_assignment(findings, seen, file_path, line, lines, repo_url,
+                                      f"{cls}::{mname}()", cls)
+            elif cls == 'Http' and mname in _HTTP_FACADE_METHODS and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.SSRF, Severity.HIGH, 'PHAST-SSRF-001',
+                      f"User-controlled URL flows into Http::{mname}() — SSRF risk")
+            elif cls == 'Redirect' and mname in ('to', 'away') and taint(args[0]) \
+                    and not _redirect_is_safe(node, args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.OPEN_REDIRECT, Severity.MEDIUM, 'PHAST-REDIR-001',
+                      f"User-controlled value flows into Redirect::{mname}() — open redirect risk")
+            elif cls == 'Response' and mname in ('download', 'file') and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.PATH_TRAVERSAL, Severity.HIGH, 'PHAST-PATH-001',
+                      f"User-controlled path flows into Response::{mname}() — path traversal risk")
 
         # ── Echo / print sinks ────────────────────────────────────────────────
         elif node.type in ('echo_statement', 'print_intrinsic'):
