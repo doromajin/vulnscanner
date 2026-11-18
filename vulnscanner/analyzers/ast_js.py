@@ -669,6 +669,30 @@ _MERGE_ROOTS = frozenset({"_", "lodash", "$", "jQuery", "deepmerge"})
 _MERGE_METHODS = frozenset({
     "merge", "extend", "mergeWith", "defaults", "defaultsDeep", "assign", "mixin",
 })
+
+
+_JQUERY_RECEIVER_RE = _re.compile(r"(?:^|\.)\$\w*(?:\.|$|\()|^(?:\$|jQuery)\(")
+
+
+def _is_jquery_receiver(obj_node) -> bool:
+    """`$el.find(sel)`, `this.$body.find(sel)`, `$(x).filter(...)`: a jQuery selection, whose
+    find/filter/... take selectors, not MongoDB queries."""
+    return bool(_JQUERY_RECEIVER_RE.search(obj_node.text.decode(errors="replace")))
+
+
+def _is_jquery_non_recursive_merge(obj_root: str, prop: str, arg_list: list) -> bool:
+    """`$.merge(a, b)` concatenates arrays and a shallow `$.extend(target, src)` only copies own
+    properties onto `target`: neither reaches Object.prototype. Only the recursive form
+    `$.extend(true, ...)` is a prototype-pollution sink (old jQuery)."""
+    if obj_root not in ("$", "jQuery"):
+        return False
+    if prop == "merge":
+        return True
+    if prop == "extend":
+        return not (arg_list and arg_list[0].text.decode(errors="replace") == "true")
+    return False
+
+
 # DOM XSS: assignment sinks where LHS property causes script execution
 _DOM_ASSIGN_SINKS = frozenset({"innerHTML", "outerHTML", "srcdoc"})
 # DOM redirect: assignment to location.href / location causes navigation
@@ -1022,7 +1046,8 @@ def _check_sinks(
                           "User-controlled URL in res.redirect() — open redirect risk")
 
             # NoSQL injection: collection.find(tainted), db.users.findOne(tainted)
-            elif prop in _NOSQL_METHOD_SINKS and tainted_args(args_node):
+            elif (prop in _NOSQL_METHOD_SINKS and tainted_args(args_node)
+                  and not _is_jquery_receiver(obj_node)):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.NOSQL_INJECTION, Severity.HIGH,
                       "JSAST-NOSQL-001",
@@ -1066,7 +1091,8 @@ def _check_sinks(
             elif ((obj_root in _MERGE_ROOTS and prop in _MERGE_METHODS)
                   or (obj_root == "Object" and prop == "assign")):
                 arg_list = list(args_node.named_children)
-                if len(arg_list) >= 2 and any(state.is_tainted_node(a) for a in arg_list[1:]):
+                if (len(arg_list) >= 2 and any(state.is_tainted_node(a) for a in arg_list[1:])
+                        and not _is_jquery_non_recursive_merge(obj_root, prop, arg_list)):
                     _emit(findings, seen, file_path, line, lines, repo_url,
                           VulnType.PROTOTYPE_POLLUTION, Severity.HIGH,
                           "JSAST-PROTO-001",
