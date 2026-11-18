@@ -108,7 +108,7 @@ class TestAuthOnWebhooks:
         assert self._sev(code) == {Severity.HIGH}
 
     def test_plain_post_view_stays_high(self):
-        code = "@require_POST\ndef change(request):\n    return HttpResponse()\n"
+        code = "@require_POST\ndef change(request):\n    Item.objects.all().delete()\n    return HttpResponse()\n"
         assert self._sev(code) == {Severity.HIGH}
 
 

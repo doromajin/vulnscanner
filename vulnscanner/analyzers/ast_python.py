@@ -1783,7 +1783,10 @@ class _VulnVisitor(ast.NodeVisitor):
         # `builder(...) + "/suffix"` still starts with the builder's prefix.
         while isinstance(first, ast.BinOp) and isinstance(first.op, ast.Add):
             first = first.left
-        if not _is_internal_url_builder_call(first):
+        # `settings.SOME_URL + "?" + query`: the scheme and host come from configuration.
+        is_settings_attr = (isinstance(first, ast.Attribute) and isinstance(first.value, ast.Name)
+                            and first.value.id == "settings")
+        if not (_is_internal_url_builder_call(first) or is_settings_attr):
             return False
         return all(isinstance(e, ast.AugAssign) and isinstance(e.op, ast.Add) for _, e in events[1:])
 

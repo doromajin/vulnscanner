@@ -97,6 +97,12 @@ _PY_CLASS_MIXIN_RE = re.compile(
 
 # Function definition — group 1 = indent, group 2 = name
 _PY_FUNC_RE = re.compile(r'^(\s*)(?:async\s+)?def\s+(\w+)\s*\(')
+# Anything that reads or writes stored data, sends something or touches the filesystem / shell.
+_PY_DATA_ACCESS_RE = re.compile(
+    r"\.objects\b|get_object_or_404|get_list_or_404|\.save\(|\.delete\(|\.update\(|\.create\("
+    r"|\bcursor\b|\bsession\b|\.execute\(|send_mail|send_mass_mail|requests\.|httpx\.|urlopen|subprocess"
+    r"|os\.system|\bopen\(|\.write\(|\.commit\(|\bdb\.|\.add\(|\.remove\(|\.send\("
+)
 
 # Class definition — group 1 = indent
 _PY_CLASS_RE = re.compile(r'^(\s*)class\s+\w+')
@@ -210,6 +216,16 @@ class MissingAuthAnalyzer(BaseAnalyzer):
 
         return findings
 
+    @staticmethod
+    def _py_func_body(lines: list[str], func_idx: int, func_indent: int) -> str:
+        """Source of the function starting at *func_idx* (up to the next line at or below its indent)."""
+        out = [lines[func_idx]]
+        for ln in lines[func_idx + 1: func_idx + 400]:
+            if ln.strip() and len(ln) - len(ln.lstrip()) <= func_indent:
+                break
+            out.append(ln)
+        return "\n".join(out)
+
     def _check_py_func(
         self,
         dec_block: list[str],
@@ -279,9 +295,13 @@ class MissingAuthAnalyzer(BaseAnalyzer):
         # signature-authenticated endpoint: authentication is not session based, so a missing
         # login decorator is expected.
         severity, note = Severity.HIGH, ""
-        if "csrf_exempt" in dec_text and not _SESSION_USE_RE.search("\n".join(lines[func_idx: func_idx + 120])):
+        body = self._py_func_body(lines, func_idx, func_indent)
+        if "csrf_exempt" in dec_text and not _SESSION_USE_RE.search(body):
             severity = Severity.LOW
             note = " [low_reach: csrf_exempt endpoint that never uses the session — webhook / token-authenticated]"
+        elif not _SESSION_USE_RE.search(body) and not _PY_DATA_ACCESS_RE.search(body):
+            severity = Severity.LOW
+            note = " [low_reach: handler touches no session, user or stored data — stateless computation]"
 
         return Finding(
             vuln_type=_MA,
