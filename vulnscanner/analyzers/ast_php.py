@@ -144,6 +144,13 @@ _DB_FACADE_SQL_METHODS: frozenset[str] = frozenset({
 _MASS_ASSIGN_METHODS: frozenset[str] = frozenset({
     'create', 'update', 'fill', 'forceFill', 'firstOrCreate', 'updateOrCreate', 'forceCreate',
 })
+# Illuminate\Filesystem\Filesystem / File:: operate on any path (unlike Storage disks, which are rooted).
+_FILESYSTEM_METHODS: frozenset[str] = frozenset({
+    'get', 'put', 'size', 'lastModified', 'exists', 'delete', 'isFile', 'isDirectory', 'move', 'copy',
+    'files', 'allFiles', 'directories', 'hash', 'mimeType', 'append', 'prepend', 'sharedGet', 'getRequire',
+    'requireOnce', 'lines', 'type', 'extension', 'basename', 'cleanDirectory', 'deleteDirectory',
+})
+_FILESYSTEM_RECEIVER_RE = re.compile(r'filesystem|^\$files$|^\$fs$', re.IGNORECASE)
 _HTTP_FACADE_METHODS: frozenset[str] = frozenset({
     'get', 'post', 'put', 'patch', 'delete', 'head', 'send',
 })
@@ -937,6 +944,14 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                       VulnType.OPEN_REDIRECT, Severity.MEDIUM, 'PHAST-REDIR-001',
                       f"User-controlled value flows into redirect()->{mname}() — open redirect risk")
 
+            # Laravel Filesystem: $this->filesystem->size($request->get('fileName')) — arbitrary path
+            elif (mname in _FILESYSTEM_METHODS and args and taint(args[0])
+                  and _FILESYSTEM_RECEIVER_RE.search(node.children[0].text.decode('utf-8', errors='replace').split('->')[-1])):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.PATH_TRAVERSAL, Severity.HIGH, 'PHAST-PATH-001',
+                      f"User-controlled path flows into Filesystem->{mname}() — path traversal / phar:// "
+                      "object injection risk")
+
         # ── Static / facade calls: DB::select($sql), Http::get($url) ─────────
         elif node.type == 'scoped_call_expression' and len(node.children) >= 3:
             cls, mname = _scoped_parts(node)
@@ -964,6 +979,11 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.OPEN_REDIRECT, Severity.MEDIUM, 'PHAST-REDIR-001',
                       f"User-controlled value flows into Redirect::{mname}() — open redirect risk")
+            elif cls == 'File' and mname in _FILESYSTEM_METHODS and taint(args[0]):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.PATH_TRAVERSAL, Severity.HIGH, 'PHAST-PATH-001',
+                      f"User-controlled path flows into File::{mname}() — path traversal / phar:// "
+                      "object injection risk")
             elif cls == 'Response' and mname in ('download', 'file') and taint(args[0]):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.PATH_TRAVERSAL, Severity.HIGH, 'PHAST-PATH-001',

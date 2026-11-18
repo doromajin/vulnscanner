@@ -168,3 +168,18 @@ def test_passing_the_request_object_to_own_method_is_not_template_injection():
 def test_twig_create_template_with_request_data_still_reported():
     body = "function f(Request $request) { return $twig->createTemplate($request->input('tpl')); }"
     assert "PHAST-SSTI-001" in _rules(body)
+
+
+def test_filesystem_path_from_request_is_path_traversal():
+    body = ("function f(Request $request) { $name = $request->get('fileName');"
+            " return $this->filesystem->size($name); }")
+    assert "PHAST-PATH-001" in _rules(body)
+
+
+def test_file_facade_path_from_request():
+    assert "PHAST-PATH-001" in _rules("function f(Request $request) { return File::get($request->input('p')); }")
+
+
+def test_storage_disk_and_unrelated_get_are_not_flagged():
+    body = "function f(Request $request) { return Storage::disk('x')->get($request->input('p')) . $cache->get($request->input('k')); }"
+    assert "PHAST-PATH-001" not in _rules(body)
