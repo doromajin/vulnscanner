@@ -34,6 +34,7 @@ from vulnscanner.analyzers.cors_analyzer import CORSAnalyzer
 from vulnscanner.analyzers.ldap_injection import LDAPInjectionAnalyzer
 from vulnscanner.analyzers.weak_crypto import WeakCryptoAnalyzer
 from vulnscanner.analyzers.xss import XSSAnalyzer
+from vulnscanner.analyzers.blade_xss import BladeXSSAnalyzer
 
 ALL_ANALYZERS: list[BaseAnalyzer] = [
     # Python: AST-based (high precision, covers SQL/CMD/PATH/XSS/DESER/SSRF/REDIR/SSTI)
@@ -41,6 +42,8 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     # Multi-language: regex-based
     SQLInjectionAnalyzer(),
     XSSAnalyzer(),
+    # Laravel Blade: unescaped {!! !!} output
+    BladeXSSAnalyzer(),
     # PHP: AST-based multi-hop XSS taint (2-hop, null-coalescing, function propagation)
     PhpASTAnalyzer(),
     CommandInjectionAnalyzer(),
