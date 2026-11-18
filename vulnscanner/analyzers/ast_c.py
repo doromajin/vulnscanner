@@ -1884,6 +1884,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
     # ── Pre-scan: build constant allocation-size map for CWE805 detection ───
     # Maps variable name → allocated byte count when statically determinable.
     _alloc_sizes: dict[str, int] = {}
+    _unsized_elem_vars: set[str] = set()   # arrays whose element type has no known byte size
     _alloc_counts: dict[str, int] = {}  # variable → element count (stack arrays only)
     _const_ints: dict[str, int] = {}   # variable → constant integer value (for OOB detection)
     _strlen_vars: dict[str, str] = {}  # variable → identifier whose strlen it stores
@@ -2065,10 +2066,13 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                         _type_node = _tc
                         break
             _elem_sz = _sizeof_type_text(_txt(_type_node)) if _type_node else 4
+            _elem_known = _type_node is not None and _known_sizeof_type(_txt(_type_node)) is not None
             for _dc in _sn.named_children:
                 if _dc.type == "array_declarator":
                     # int buf[50] → 50 * sizeof(int)
                     _var = _decl_leaf_id(_dc)
+                    if _var and not _elem_known:
+                        _unsized_elem_vars.add(_var)     # union/struct/typedef element: byte size unknown
                     _arr_n = None
                     for _ac in _dc.named_children:
                         if _ac.type not in ("comment",) and _ac != _dc.named_children[0]:
@@ -2529,7 +2533,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
             _dst_var = (_txt(_dst_arg) if _dst_arg.type == "identifier"
                         else _first_identifier(_dst_arg))
             _dst_alloc = _alloc_sizes.get(_dst_var) if _dst_var else None
-            if _copy_sz and _dst_alloc and _copy_sz > _dst_alloc:
+            if (_copy_sz and _dst_alloc and _copy_sz > _dst_alloc
+                    and not (_dst_var in _unsized_elem_vars and _true_bytes.get(_dst_var) is None)):
                 _key = (file_path, line_no, "CAST-BUF-001")
                 if _key not in seen:
                     seen.add(_key)
@@ -4055,30 +4060,34 @@ def _analyze_with_parser(parser_fn, content: str, file_path: str) -> list[Findin
 
 _MAIN_WITH_ARGV_RE = re.compile(r"\bmain\s*\(\s*[^)]*,")
 _ARGV_ONLY_NOTE = (
-    " — reachable only from command-line arguments: a local CLI opens what its own caller names, "
-    "so there is no privilege boundary unless it runs setuid or is invoked by a service with "
+    " — reachable only from command-line arguments: a local CLI acts on what its own caller "
+    "passes, so there is no privilege boundary unless it runs setuid or is invoked by a service with "
     "untrusted arguments"
 )
 
 
-def _analyze_file(get_parser, content: str, file_path: str) -> list[Finding]:
-    """Analyze one C/C++ file; path-traversal findings fed only by argv are demoted to LOW.
+_ARGV_DEMOTED_RULES = frozenset({"CAST-PATH-001", "CAST-BUF-001", "CAST-INT-001"})
 
-    A second pass with main()'s argv not tainted shows which CAST-PATH-001 findings depend on
-    argv alone (network, stdin and environment sources still fire in that pass).
+
+def _analyze_file(get_parser, content: str, file_path: str) -> list[Finding]:
+    """Analyze one C/C++ file; path/buffer/allocation findings fed only by argv are demoted to LOW.
+
+    A second pass with main()'s argv not tainted shows which findings depend on argv alone
+    (network, stdin and environment sources still fire in that pass): the caller of a command-line
+    program already controls its own arguments, so that is not a trust boundary.
     """
     findings = _analyze_with_parser(get_parser, content, file_path)
-    path_hits = [f for f in findings if f.rule_id == "CAST-PATH-001"]
-    if not path_hits or not _MAIN_WITH_ARGV_RE.search(content):
+    hits = [f for f in findings if f.rule_id in _ARGV_DEMOTED_RULES]
+    if not hits or not _MAIN_WITH_ARGV_RE.search(content):
         return findings
     _argv_seed_local.off = True
     try:
         without_argv = _analyze_with_parser(get_parser, content, file_path)
     finally:
         _argv_seed_local.off = False
-    still = {f.line_number for f in without_argv if f.rule_id == "CAST-PATH-001"}
-    for f in path_hits:
-        if f.line_number not in still:
+    still = {(f.rule_id, f.line_number) for f in without_argv if f.rule_id in _ARGV_DEMOTED_RULES}
+    for f in hits:
+        if (f.rule_id, f.line_number) not in still:
             f.severity = Severity.LOW
             f.description += _ARGV_ONLY_NOTE
     return findings
