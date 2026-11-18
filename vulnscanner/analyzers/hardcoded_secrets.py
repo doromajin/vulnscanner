@@ -239,6 +239,11 @@ _LABEL_VALUE_RE = re.compile(
 _LABEL_WORD_RE = re.compile(r'password|passwd|pwd')
 
 
+# `var msg = '{{ trans('x') }}'`: the "password" is a rendered template expression, not a literal.
+_TEMPLATE_VALUE_RE = re.compile(
+    r"""(?:password|passwd|pwd)\w*\s*=\s*["'](?:\{\{|\{%|<\?|<%|\$\{)""", re.IGNORECASE)
+
+
 def _is_password_label(line: str) -> bool:
     """True for constant declarations whose value is a slug that names the field itself."""
     m = _LABEL_VALUE_RE.search(line)
@@ -337,7 +342,7 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                     continue
                 if _ALLOWLIST_RE.search(line):
                     continue
-                if rule_id == "SEC-001" and _is_password_label(line):
+                if rule_id == "SEC-001" and (_is_password_label(line) or _TEMPLATE_VALUE_RE.search(line)):
                     continue
                 key = (rule_id, lineno)
                 if key in seen:

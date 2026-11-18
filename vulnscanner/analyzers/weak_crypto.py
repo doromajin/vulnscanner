@@ -125,6 +125,9 @@ _GUARD = re.compile(
 )
 
 
+_PWNED_API_RE = re.compile(r"pwnedpasswords\.com|haveibeenpwned", re.IGNORECASE)
+
+
 class WeakCryptoAnalyzer(BaseAnalyzer):
     supported_extensions = (
         ".py", ".php", ".java", ".js", ".ts",
@@ -141,4 +144,9 @@ class WeakCryptoAnalyzer(BaseAnalyzer):
         ]
         if not applicable:
             return []
-        return self._scan_lines(file_path, content, repo_url, applicable, guard=None)
+        findings = self._scan_lines(file_path, content, repo_url, applicable, guard=None)
+        if _PWNED_API_RE.search(content):
+            # The Have I Been Pwned range API is queried with the SHA-1 prefix of the password:
+            # the protocol fixes the algorithm and only 5 hex characters leave the server.
+            findings = [f for f in findings if f.rule_id != "WCRYPTO-004"]
+        return findings

@@ -104,6 +104,12 @@ _GUARD = re.compile(
 _XMLDECODER_GUARD = re.compile(r'\bXMLDecoder\b')
 
 
+
+def _is_migration_path(path: str) -> bool:
+    parts = path.replace("\\", "/").lower().split("/")
+    return "migrations" in parts[:-1] and path.endswith(".php")
+
+
 class DeserializationAnalyzer(BaseAnalyzer):
     # Python is primarily handled by PythonASTAnalyzer (higher precision).
     # .py rules here serve as a fallback for files that cannot be AST-parsed.
@@ -157,6 +163,9 @@ class DeserializationAnalyzer(BaseAnalyzer):
                     if _PHP_USER_UNSERIALIZE_RE.search(line):
                         continue
 
+                if rule_id == "DESER-004" and _is_migration_path(file_path):
+                    severity = Severity.LOW
+                    description += " [low_reach: one-off schema migration reading the application's own database]"
                 findings.append(Finding(
                     vuln_type=vuln_type,
                     severity=severity,

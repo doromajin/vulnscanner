@@ -272,6 +272,8 @@ class ClientSideAnalyzer(BaseAnalyzer):
         for i, line in enumerate(lines):
             if self._is_comment(line) or not _MSG_LISTENER_RE.search(line):
                 continue
+            if "serviceWorker" in line:
+                continue    # a ServiceWorkerContainer only receives messages from our own same-origin worker
 
             # Inspect the handler body (up to 30 lines) for an origin check
             handler = "\n".join(lines[i: min(i + 30, len(lines))])

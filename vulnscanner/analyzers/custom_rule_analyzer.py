@@ -39,6 +39,9 @@ def _joined(lines: list[str]) -> str:
     return cached[1]
 
 
+_DOM_MARKUP_COPY_RE = re.compile(r"[\w$.\[\]'\"]+\.(?:innerHTML|outerHTML)")
+
+
 def _innerhtml_is_static_text(line: str, lines: list[str], idx: int) -> bool:
     """`x.innerHTML = <rhs>` where rhs cannot carry data: a constant that is only ever a plain
     string literal, or a template literal whose `${}` are all such constants (or absent).  Unlike
@@ -48,6 +51,8 @@ def _innerhtml_is_static_text(line: str, lines: list[str], idx: int) -> bool:
     if not m:
         return False
     rhs = m.group(1).strip().rstrip(";").strip()
+    if _DOM_MARKUP_COPY_RE.fullmatch(rhs):
+        return True     # `a.innerHTML = b.innerHTML`: markup already parsed into the DOM once
     if _BARE_IDENT_RE.match(rhs):
         return _is_static_string_constant(rhs, _joined(lines))
     if rhs.startswith("`"):

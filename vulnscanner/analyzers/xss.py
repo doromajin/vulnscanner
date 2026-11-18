@@ -260,6 +260,11 @@ def _innerhtml_is_unsafe(block: str, content: str | None = None) -> bool:
     if not rhs:
         return False
 
+    # ── copy of another element's markup: `a.innerHTML = b.innerHTML` ────────
+    # The markup was already parsed into the DOM once; copying it adds no new untrusted data.
+    if re.fullmatch(r"[\w$.\[\]'\"]+\.(?:innerHTML|outerHTML)", rhs):
+        return False
+
     # ── quoted string literal ─────────────────────────────────────────────────
     # JS string literals ('' or "") cannot contain variable interpolation.
     # Only flag if there is a concatenation operator after a closing quote.

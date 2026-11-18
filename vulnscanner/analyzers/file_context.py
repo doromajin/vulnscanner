@@ -82,7 +82,10 @@ def is_fixture_path(path: str) -> bool:
     """Return True if *path* resides in a fixture, mock, or stub directory."""
     parts = path.replace("\\", "/").lower().split("/")
     # Doctrine / Symfony convention: src/DataFixtures/, tests/TestFixtures/ …
-    return any(p in _FIXTURE_SEGMENTS or p.endswith(("fixture", "fixtures")) for p in parts)
+    if any(p in _FIXTURE_SEGMENTS or p.endswith(("fixture", "fixtures")) for p in parts):
+        return True
+    # Laravel convention: database/factories/ builds fake model rows for tests and seeding.
+    return any(a == "database" and b == "factories" for a, b in zip(parts, parts[1:]))
 
 
 # ── Vendor / third-party path detection ───────────────────────────────────────
