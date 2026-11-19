@@ -1107,6 +1107,53 @@ _URLS_CONTAINER_ACCESSORS = frozenset({
 })
 
 
+_BUILTIN_REDIRECT_VALIDATORS = frozenset({
+    "url_has_allowed_host_and_scheme", "is_safe_url", "is_safe_redirect_url",
+})
+
+
+def _function_calls(fn: ast.AST) -> set[str]:
+    return {n for sub in ast.walk(fn) if isinstance(sub, ast.Call)
+            for n in [_attr_name(sub.func) or _full_name(sub.func)] if n}
+
+
+def _validated_redirect_funcs() -> frozenset[str]:
+    """Names of functions in this repository that return a URL after checking it with a redirect
+    validator (Django's url_has_allowed_host_and_scheme, or a project helper that wraps it).
+
+    Built once per scan from the cross-file contents; a function that only returns a bool
+    (the validators themselves) is not included."""
+    return _redirect_validator_sets()[1]
+
+
+def _redirect_validator_sets() -> tuple[frozenset[str], frozenset[str]]:
+    """(validators that return a bool, functions that return an already-validated URL)."""
+    contents = get_cross_file_contents()
+    cached = getattr(_cross_file_local, "validated_redirects", None)
+    if cached is not None and cached[0] is contents:
+        return cached[1], cached[2]
+    funcs: list[ast.AST] = []
+    needles = tuple(_BUILTIN_REDIRECT_VALIDATORS) + ("safe_for_redirect", "safe_redirect", "safe_url")
+    for path, src in contents.items():
+        if not path.endswith(".py") or not any(n in src for n in needles):
+            continue
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError):
+            continue
+        funcs.extend(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    validators = set(_BUILTIN_REDIRECT_VALIDATORS)
+    for fn in funcs:
+        if _function_calls(fn) & _BUILTIN_REDIRECT_VALIDATORS:
+            validators.add(fn.name)
+    result = frozenset(
+        fn.name for fn in funcs
+        if fn.name not in validators and _function_calls(fn) & validators
+    )
+    _cross_file_local.validated_redirects = (contents, frozenset(validators), result)
+    return frozenset(validators), result
+
+
 def _is_internal_url_builder_call(node: ast.expr) -> bool:
     """A call that builds one of the application's own URLs.
 
@@ -1967,6 +2014,65 @@ class _VulnVisitor(ast.NodeVisitor):
 
     # ── open redirect ──────────────────────────────────────────────────────────
 
+    def _inside_validating_if(self, name_node: ast.Name) -> bool:
+        """`if safe_for_redirect(url): ... redirect(url)`: the name is checked by a validator in an
+        enclosing `if` test."""
+        fn = self._current_func_node
+        if fn is None:
+            return False
+        validators = _redirect_validator_sets()[0]
+        for sub in ast.walk(fn):
+            if not isinstance(sub, ast.If) or isinstance(sub.test, ast.UnaryOp):
+                continue    # `if not safe(url):` guards the failure branch
+            body_start = sub.body[0].lineno
+            body_end = max(getattr(s, "end_lineno", s.lineno) or s.lineno for s in sub.body)
+            if not (body_start <= name_node.lineno <= body_end):
+                continue    # only the guarded body counts, not the else branch or the test
+            for call in ast.walk(sub.test):
+                if (isinstance(call, ast.Call)
+                        and (_attr_name(call.func) or _full_name(call.func)) in validators
+                        and any(isinstance(a, ast.Name) and a.id == name_node.id for a in call.args)):
+                    return True
+        return False
+
+    def _redirect_value_is_internal(self, node: ast.expr, _depth: int = 0) -> bool:
+        """The redirect target is one of the application's own URLs, or a value a validator in this
+        repository has already checked (`obj.get_absolute_url()`, `request.get_full_path()`,
+        `resolve_url(settings.X)`, `self.get_return_url(request)` that runs url_has_allowed_host_and_scheme)."""
+        if _depth > 3:
+            return False
+        if isinstance(node, ast.Name):
+            if self._inside_validating_if(node):
+                return True
+            value = self._assignments.get(node.id)
+            return value is not None and value is not node and self._redirect_value_is_internal(value, _depth + 1)
+        if isinstance(node, ast.IfExp):
+            return (self._redirect_value_is_internal(node.body, _depth + 1)
+                    and self._redirect_value_is_internal(node.orelse, _depth + 1))
+        if isinstance(node, ast.BoolOp):
+            return all(self._redirect_value_is_internal(v, _depth + 1) for v in node.values)
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, str)
+        if isinstance(node, ast.Attribute):
+            recv = node.value
+            return node.attr in ("path", "path_info") and isinstance(recv, ast.Name) and recv.id == "request"
+        if isinstance(node, ast.Call):
+            attr = _attr_name(node.func)
+            if attr in ("get_absolute_url", "get_full_path", "get_full_path_info"):
+                return True
+            if _is_internal_url_builder_call(node):
+                return not any(
+                    _taint_of(a, self._assignments, self._class_attrs).status == TaintStatus.TAINTED
+                    for a in [*node.args, *(k.value for k in node.keywords)]
+                )
+            fname = attr or _full_name(node.func)
+            if fname == "resolve_url" and node.args:
+                a0 = node.args[0]
+                return (isinstance(a0, ast.Attribute) and isinstance(a0.value, ast.Name)
+                        and a0.value.id == "settings") or _is_const(a0)
+            return bool(fname) and fname in _validated_redirect_funcs()
+        return False
+
     def _check_open_redirect(self, node: ast.Call) -> None:
         name = _attr_name(node.func) or _full_name(node.func)
         if name not in _REDIRECT_FUNCS:
@@ -1976,6 +2082,8 @@ class _VulnVisitor(ast.NodeVisitor):
 
         url_arg = node.args[0]
         if _is_const(url_arg):
+            return
+        if self._redirect_value_is_internal(url_arg):
             return
 
         # Flask url_for() generates server-side URLs from endpoint names — always safe.
