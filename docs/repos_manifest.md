@@ -33,6 +33,16 @@
 | webgoat | https://github.com/webgoat/webgoat | 651458671472 | Java。繰り返し使うベンチマーク（残す） |
 | ytdlp2STRM | https://github.com/fe80Grau/ytdlp2STRM | bcc67af191dd | Python |
 
+## 使い捨てで測定したもの（浅い clone、2026-11-19）
+
+| ディレクトリ | URL | コミット（12桁） | 結果の要点 |
+|---|---|---|---|
+| pterodactyl | https://github.com/pterodactyl/panel | 60a100158158 | 12 件 → 7 件。確定した脆弱性なし |
+| crater | https://github.com/crater-invoice-inc/crater | 05d5ce26fdd8 | 79 件 → 54 件。管理者指定 URL への接続（ExchangeRateProvider.php）を要確認として残した |
+| bagisto | https://github.com/bagisto/bagisto | ac4bd606e7a5 | 76 件 → 75 件（XSS-001 の 9 件は HIGH→LOW）。既定の管理者パスワード、クライアント指定拡張子の保存を妥当な指摘とした |
+
+取り直し: `git clone --depth 1 <URL>` のあと、`git fetch --depth 1 origin <ID>` と `git checkout <ID>`。
+
 ## 削除してはいけないもの
 
 | ディレクトリ | 理由 |
