@@ -403,7 +403,8 @@ class XSSAnalyzer(BaseAnalyzer):
                     # A DOM sink in a file with no browser-controlled input source
                     # (URL, referrer, postMessage, storage …) is most likely fed by
                     # the app's own server responses — keep it, but as low reach.
-                    reachable = is_php or bool(_DOM_SOURCE_RE.search(content))
+                    # A .blade.php <script> block is plain browser JS, not PHP emitting a handler.
+                    reachable = (is_php and not file_path.endswith(".blade.php")) or bool(_DOM_SOURCE_RE.search(content))
                     findings.append(Finding(
                         vuln_type=VulnType.XSS,
                         severity=Severity.HIGH if reachable else Severity.LOW,
