@@ -680,6 +680,27 @@ def _is_jquery_receiver(obj_node) -> bool:
     return bool(_JQUERY_RECEIVER_RE.search(obj_node.text.decode(errors="replace")))
 
 
+# Cheap pre-check: a file that never mentions a request / DOM source cannot have a direct
+# `exec(req.body.x)`-style flow, so the sink pass can be skipped for it.
+_SOURCE_HINT_RE = _re.compile(
+    r"\b(?:req|request|ctx|event)\.(?:\w+)|\blocation\.|\bdocument\.|\bwindow\.(?:name|location)"
+    r"|localStorage|sessionStorage|URLSearchParams|searchParams"
+)
+
+_REGEX_RECEIVER_RE = _re.compile(
+    r"^(?:/.*/[a-z]*|new\s+RegExp\(.*\)"
+    r"|(?:\w+\.)*(?:re|rx|reg|regex|regexp|RegExp|pattern|matcher)\d*"
+    r"|(?:\w+\.)*\w+(?:Re|RE|Regex|RegExp|Pattern|_re|_regex|_pattern))$",
+    _re.DOTALL,
+)
+
+
+def _is_regex_receiver(obj_node) -> bool:
+    """`/x/.exec(s)`, `new RegExp(p).exec(s)`, `regex.exec(s)`: RegExp.prototype.exec matches a
+    string, it does not run a command."""
+    return bool(_REGEX_RECEIVER_RE.match(obj_node.text.decode(errors="replace").strip()))
+
+
 def _is_jquery_non_recursive_merge(obj_root: str, prop: str, arg_list: list) -> bool:
     """`$.merge(a, b)` concatenates arrays and a shallow `$.extend(target, src)` only copies own
     properties onto `target`: neither reaches Object.prototype. Only the recursive form
@@ -1073,7 +1094,8 @@ def _check_sinks(
                       f"User-controlled URL flows into {obj_root}.{prop}() — SSRF risk")
 
             # child_process method on object: cp.exec(tainted)
-            elif prop in _CMD_GLOBAL_SINKS and tainted_args(args_node):
+            elif (prop in _CMD_GLOBAL_SINKS and tainted_args(args_node)
+                  and not (prop == "exec" and _is_regex_receiver(obj_node))):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                       "JSAST-CMD-001",
@@ -1381,7 +1403,8 @@ def _analyze_with_parser(
                 if not _collect_declarations(tree.root_node, state):
                     break
 
-    if not state.tainted and not state.tainted_funcs and not state.tainted_attrs:
+    if (not state.tainted and not state.tainted_funcs and not state.tainted_attrs
+            and not _SOURCE_HINT_RE.search(content)):
         return results
     results += _check_sinks(tree.root_node, state, file_path, lines, repo_url)
     return results

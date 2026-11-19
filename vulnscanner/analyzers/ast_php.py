@@ -916,7 +916,10 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                       f"User-controlled data flows into ->{mname}() — Smarty template injection risk")
 
             # XXE: $dom->loadXML($tainted) / $dom->load($tainted)
-            elif mname in ('loadXML', 'load', 'loadHTML') and args and taint(args[0]):
+            elif (mname in ('loadXML', 'load', 'loadHTML') and args and taint(args[0])
+                  and (mname == 'loadXML'
+                       or re.search(r'dom|xml|doc|reader|html',
+                                    node.children[0].text.decode('utf-8', errors='replace'), re.I))):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.XXE, Severity.HIGH, 'PHAST-XXE-001',
                       f"User-controlled XML in ->{mname}() — XXE risk if external entities not disabled")

@@ -361,5 +361,5 @@ class TestIsMinifiedLine:
         bundle = "var q=" + "z," * 2500 + "0;el.innerHTML=location.hash;\n" + "el2.innerHTML = location.hash;\n"
         (repo / "static" / "app-bundle.js").write_text(bundle, encoding="utf-8")
         res = VulnScanner().scan(str(repo))
-        lines = sorted(f.line_number for f in res.findings if f.rule_id == "XSS-001")
+        lines = sorted(f.line_number for f in res.findings if f.rule_id in ("XSS-001", "JSAST-DOMXSS-001"))
         assert lines == [2]
