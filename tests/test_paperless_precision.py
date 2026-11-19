@@ -54,3 +54,18 @@ def test_e2e_directory_counts_as_test_code():
     from vulnscanner.analyzers.file_context import is_test_path
     assert is_test_path("src-ui/e2e/backend.py")
     assert not is_test_path("src/app/views.py")
+
+
+def test_token_name_constants_are_not_secrets():
+    for line in ("REQUEST_TOKEN = 'request'", "MODULE_TOKEN = '{module}'", "CONSTRAINT_TOKEN_USER = '$user'",
+                 "TOKEN_PREFIX = 'nbt_'", "SECRET_KEY_CHARSET = 'abcdefghijklmnopqrstuvwxyz0123'"):
+        assert not any(r == "AST-SEC-001" for r, _ in _ids(line + "\n")), line
+    assert any(r == "AST-SEC-001" for r, _ in _ids("DB_PASSWORD = 'hunter2hunter2'\n"))
+
+
+def test_re_search_is_not_an_ldap_filter():
+    src = "import re\ndef f(request):\n    v = request.GET['q']\n    return re.search(PATTERN, v)\n"
+    assert not any(r == "AST-LDAP-001" for r, _ in _ids(src))
+    ldap = ("import ldap3\ndef f(request, conn):\n    u = request.GET['u']\n"
+            "    conn.search('dc=x', '(uid=' + u + ')')\n")
+    assert any(r == "AST-LDAP-001" for r, _ in _ids(ldap))

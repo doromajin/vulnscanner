@@ -157,6 +157,20 @@ _SECRET_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NON_SECRET_NAME_RE = re.compile(r"charset|alphabet|prefix|suffix|pattern|format|length|placeholder", re.IGNORECASE)
+
+
+def _is_secret_label_value(name: str, value: str) -> bool:
+    """`REQUEST_TOKEN = 'request'`, `MODULE_TOKEN = '{module}'`, `TOKEN_PREFIX = 'nbt_'`: constants that
+    name a token, not hold one."""
+    if _NON_SECRET_NAME_RE.search(name):
+        return True
+    if re.fullmatch(r"\{\w+\}|\$\w+|\w+_", value):          # template slot, `$user`, `nbt_`
+        return True
+    words = {w for w in re.split(r"[^a-z]+", name.lower()) if w}
+    return value.lower() in words                           # the value is one of the name's own words
+
+
 # Variable names that look like they accumulate HTML response content.
 # _check_xss_response only fires for AugAssign targets matching this pattern,
 # to avoid FPs on intermediate variables like string59781 that are never rendered.
@@ -2178,6 +2192,10 @@ class _VulnVisitor(ast.NodeVisitor):
             return
         if node.func.attr not in _LDAP3_SEARCH_METHODS:
             return
+        # `re.search(pattern, s)` / `qs.search(queryset, name, value)` share the method name; a file
+        # that never mentions LDAP cannot be building an LDAP filter.
+        if "ldap" not in self.content.lower():
+            return
         # Need at least 2 positional args: base + filter
         if len(node.args) < 2:
             return
@@ -2531,6 +2549,8 @@ class _VulnVisitor(ast.NodeVisitor):
             return
         # `TOKEN_STRATEGY = "pkg.adapter.DrfTokenStrategy"`: a dotted import path to a class.
         if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\.[A-Z]\w*", secret):
+            return
+        if _is_secret_label_value(name, secret):
             return
         self._add(
             node, VulnType.HARDCODED_SECRET, Severity.HIGH, "AST-SEC-001",
