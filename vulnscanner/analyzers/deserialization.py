@@ -105,6 +105,13 @@ _XMLDECODER_GUARD = re.compile(r'\bXMLDecoder\b')
 
 
 
+# Anything in the file that reads data from the HTTP request.
+_PHP_REQUEST_INPUT_RE = re.compile(
+    r"\$_(?:GET|POST|COOKIE|REQUEST|FILES|SERVER)\b|\$request\b|\brequest\s*\(|\bRequest::|\bInput::"
+    r"|php://input|getContent\s*\(|\$this->input\b"
+)
+
+
 def _is_migration_path(path: str) -> bool:
     parts = path.replace("\\", "/").lower().split("/")
     return "migrations" in parts[:-1] and path.endswith(".php")
@@ -166,6 +173,11 @@ class DeserializationAnalyzer(BaseAnalyzer):
                 if rule_id == "DESER-004" and _is_migration_path(file_path):
                     severity = Severity.LOW
                     description += " [low_reach: one-off schema migration reading the application's own database]"
+                elif (rule_id == "DESER-004" and file_path.endswith(".php")
+                        and severity in (Severity.CRITICAL, Severity.HIGH)
+                        and not _PHP_REQUEST_INPUT_RE.search(content)):
+                    severity = Severity.MEDIUM
+                    description += " [needs_review: no request input is read in this file — check where the data comes from]"
                 findings.append(Finding(
                     vuln_type=vuln_type,
                     severity=severity,

@@ -192,6 +192,8 @@ _SQL_FUNC_SINKS_ARG1: frozenset[str] = frozenset({
     'sqlite_query',
 })
 # SQL sinks — member_call_expression (PDO, mysqli object)
+_DB_RECEIVER_RE = re.compile(r'db|conn|pdo|sql|mysqli|database|adapter|dbal|statement|stmt|query', re.I)
+
 _SQL_METHOD_SINKS: frozenset[str] = frozenset({
     'query', 'exec', 'prepare', 'multi_query', 'real_query',
     'execute',
@@ -923,6 +925,11 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
             line = node.start_point[0] + 1
 
             if mname in _SQL_METHOD_SINKS:
+                # `$stmt->execute($params)` binds values and `$cache->execute($action)` is an
+                # application method: only a database-looking receiver makes execute() a SQL sink.
+                if mname == 'execute' and not _DB_RECEIVER_RE.search(
+                        node.children[0].text.decode('utf-8', errors='replace')):
+                    continue
                 if args and taint(args[0]):
                     _emit(findings, seen, file_path, line, lines, repo_url,
                           VulnType.SQL_INJECTION, Severity.HIGH, 'PHAST-SQL-001',
