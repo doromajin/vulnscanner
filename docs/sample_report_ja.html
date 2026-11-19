@@ -1,0 +1,38 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>セキュリティ診断レポート（サンプル）</title><style>
+:root{--bg:#fff;--fg:#1d2433;--muted:#5b6578;--line:#d9dee8;--accent:#1f4fa3;--soft:#f3f6fb}
+@media (prefers-color-scheme:dark){:root{--bg:#12161f;--fg:#e6e9f0;--muted:#9aa4b8;--line:#2c3446;--accent:#7aa2f7;--soft:#1a2030}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.8 "Yu Gothic","Hiragino Sans",Meiryo,sans-serif}
+main{max-width:860px;margin:0 auto;padding:32px 16px 64px}
+h1{font-size:1.7rem;border-bottom:3px solid var(--accent);padding-bottom:.4em}
+h2{font-size:1.25rem;margin-top:2.2em;border-left:5px solid var(--accent);padding-left:.6em}
+h3{font-size:1.08rem;margin-top:1.8em}
+table{border-collapse:collapse;width:100%;margin:1em 0;font-size:.92rem;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:.45em .7em;text-align:left;vertical-align:top}
+th{background:var(--soft)}
+code{background:var(--soft);padding:.1em .35em;border-radius:4px;font-size:.88em;word-break:break-all}
+blockquote{margin:1em 0;padding:.6em 1em;background:var(--soft);border-left:4px solid var(--muted);color:var(--muted)}
+@media print{body{font-size:11pt}main{padding:0}h2,h3{break-after:avoid}table,li{break-inside:avoid}}
+</style></head><body><main><h1>セキュリティ診断レポート（サンプル）</h1>
+<table><thead><tr><th>項目</th><th>内容</th></tr></thead><tbody><tr><td>対象</td><td>Vulnerable Laravel App（講演用に作られた、意図的に脆弱な公開デモアプリ）</td></tr><tr><td>版</td><td>コミット <code>12b6444</code></td></tr><tr><td>診断日</td><td>2026-11-19</td></tr><tr><td>診断方法</td><td>ソースコードの静的解析（VulnScanner）と、担当者によるコード確認</td></tr><tr><td>診断範囲</td><td>リポジトリ内の PHP / Blade / JavaScript / 依存パッケージ定義</td></tr><tr><td>対象外</td><td>稼働中のサーバーへの接続・攻撃、動的な検証、インフラ設定</td></tr></tbody></table>
+<blockquote><strong>このレポートについて</strong>: 営業用のサンプルです。対象は「意図的に脆弱」なデモアプリなので、件数は実運用のアプリの代表値ではありません。実案件では、同じ構成で、貴社のコードに対する結果をお渡しします。</blockquote>
+<h2>1. 要約</h2>
+<p>診断の結果、<strong>5 件</strong>の指摘がありました。</p>
+<table><thead><tr><th>重大度</th><th>件数</th><th>内容</th></tr></thead><tbody><tr><td>High</td><td>3</td><td>SQL インジェクション 1 件、パストラバーサル（ファイルパスの外部入力）2 件</td></tr><tr><td>Medium</td><td>1</td><td>アップロードされたファイルの保存方法</td></tr><tr><td>Low</td><td>1</td><td>古い依存パッケージ（axios 0.19）</td></tr></tbody></table>
+<p><strong>最優先の対応</strong>は、次の 2 点です。</p>
+<ol><li><strong>一覧 API の <code>sort</code> パラメータ</strong>が、そのまま SQL の並び順として実行されます。データベースの内容の読み出しや、改ざんにつながります。</li><li><strong>ファイル情報 API の <code>fileName</code> パラメータ</strong>が、検証なしでファイル操作に渡されます。サーバー上の任意のパスへのアクセスや、アップロード済みファイルの悪用（PHP オブジェクトの注入）につながります。</li></ol>
+<h2>2. 指摘一覧</h2>
+<table><thead><tr><th>ID</th><th>重大度</th><th>種別（CWE）</th><th>場所</th><th>概要</th></tr></thead><tbody><tr><td>F-01</td><td>High</td><td>SQL インジェクション（CWE-89）</td><td><code>app/Http/Controllers/Api/EventController.php:18</code></td><td>リクエストの <code>sort</code> が <code>orderByRaw()</code> に渡される</td></tr><tr><td>F-02</td><td>High</td><td>パストラバーサル（CWE-22）</td><td><code>app/Http/Controllers/Api/GetFileDetails.php:29-30</code></td><td>リクエストの <code>fileName</code> が <code>Filesystem-&gt;size()</code> / <code>-&gt;lastModified()</code> に渡される</td></tr><tr><td>F-03</td><td>Medium</td><td>制限のないファイルアップロード（CWE-434）</td><td><code>app/Http/Controllers/Api/FileUploader.php:16</code></td><td>クライアントが指定したファイル名で保存される</td></tr><tr><td>F-04</td><td>Low</td><td>既知の脆弱性のある依存（CWE-1104）</td><td><code>package.json</code></td><td><code>axios</code> 0.19 に既知の脆弱性が複数ある</td></tr></tbody></table>
+<p>F-02 は、同じ原因で 2 行に出ています（件数は 5 件、原因は 4 件です）。</p>
+<h2>3. 指摘の詳細</h2>
+<h3>F-01 SQL インジェクション（High）</h3>
+<ul><li><strong>場所</strong>: <code>EventController::index()</code>（18 行目）</li><li><strong>内容</strong>: リクエストの <code>sort</code> を、そのまま <code>orderByRaw()</code> に渡しています。<code>orderByRaw()</code> は、SQL の断片をそのまま実行する API です。</li><li><strong>影響</strong>: <code>routes/api.php</code> のルート定義に認証ミドルウェアがないため、未認証で呼べる可能性が高く（他の場所で制限されていないかは、動的な確認が必要です）、その場合、データベースの内容の読み取りや、変更につながります。</li><li><strong>推奨対策</strong>:<ul><li>並び替え可能な列を<strong>許可リスト</strong>で固定し、リストにない値は既定の列に置き換える。</li><li>列名と向きを <code>orderBy($column, $direction)</code> に渡す（列名は許可リストの値のみ）。</li><li>例: 許可する列を <code>['id', 'name', 'created_at']</code> に限定し、<code>in_array($sort, $allowed, true)</code> で確認する。</li></ul></li></ul>
+<h3>F-02 パストラバーサル／オブジェクト注入（High）</h3>
+<ul><li><strong>場所</strong>: <code>GetFileDetails::__invoke()</code>（29〜30 行目）</li><li><strong>内容</strong>: リクエストの <code>fileName</code> を、<code>Illuminate\Filesystem\Filesystem</code> の <code>size()</code> と <code>lastModified()</code> に渡しています。この API は、<code>Storage</code> のディスクと違って、ルートの制限がありません。入力のパスがそのまま使われます。</li><li><strong>影響</strong>:<ul><li>アップロードディレクトリの外にあるファイルの情報の取得。</li><li><code>phar://</code> 形式のパスを通じた、PHP のオブジェクトの復元（PHP 7 系の環境）。F-03 でアップロードされたファイルと組み合わさると、リモートコード実行につながる恐れがあります。</li></ul></li><li><strong>推奨対策</strong>:<ul><li><code>basename()</code> でディレクトリ成分を取り除き、アップロードディレクトリを基準にした <code>realpath()</code> が、そのディレクトリの配下にあることを確認する。</li><li><code>phar://</code> などのストリームラッパーを拒否する（<code>str_contains($name, '://')</code> を拒否）。</li><li>ファイルの参照は、ファイル名ではなく、データベースの ID で行う。</li><li>PHP を 8 系に上げる（<code>phar://</code> のメタデータが、自動では復元されなくなります）。</li></ul></li></ul>
+<h3>F-03 制限のないファイルアップロード（Medium）</h3>
+<ul><li><strong>場所</strong>: <code>FileUploader::__invoke()</code>（16 行目）</li><li><strong>内容</strong>: <code>putFileAs()</code> に、クライアントが指定したファイル名（<code>getClientOriginalName()</code>）を渡しています。拡張子も、クライアントの指定どおりになります。</li><li><strong>影響</strong>: スクリプトの拡張子で保存された場合、実行される恐れがあります。F-02 と組み合わさると、影響が大きくなります。</li><li><strong>推奨対策</strong>:<ul><li><code>store()</code> や <code>hashName()</code> で、サーバーが生成したファイル名を使う。</li><li><code>mimes:</code> / <code>mimetypes:</code> の検証ルールで、許可する形式を限定する。</li><li>アップロード先を、Web から直接実行できない場所にする。</li></ul></li></ul>
+<h3>F-04 既知の脆弱性のある依存（Low）</h3>
+<ul><li><strong>場所</strong>: <code>package.json</code></li><li><strong>内容</strong>: <code>axios</code> 0.19 に、複数の既知の脆弱性が報告されています。</li><li><strong>推奨対策</strong>: 現行の安定版に更新し、<code>npm audit</code> を CI に組み込む。</li></ul>
+<h2>4. 診断の限界</h2>
+<ul><li><strong>静的解析のみ</strong>です。実際に動かして確認する動的な検証は、行っていません。</li><li>指摘は、<strong>コード上の危険な使い方</strong>です。実際に悪用できるかは、環境（PHP のバージョン、設定、前段の保護）によって変わります。</li><li>見つからなかった領域があることは、<strong>問題がない</strong>ことを意味しません。ビジネスロジックの欠陥や、認可の設計ミスは、静的解析では見つけにくい領域です。</li><li>診断は、合法的な範囲内で、対象のコードに対してのみ行いました。稼働中のサーバーへの接続は、行っていません。</li></ul>
+<h2>5. 次のステップ（実案件の場合）</h2>
+<ol><li>対象リポジトリと、診断範囲の確認（約 1 日）。</li><li>静的解析と、コード確認の実施（対象の規模により 3〜5 日）。</li><li>本レポートの形式での報告と、修正方針の説明会。</li><li>修正後の再診断（任意）。</li></ol></main></body></html>
