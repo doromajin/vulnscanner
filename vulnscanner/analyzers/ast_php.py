@@ -710,6 +710,33 @@ def _is_internal_redirect_target(node) -> bool:
     return False
 
 
+def _url_host_is_fixed(node, url) -> bool:
+    """The URL starts with a literal `https://host/` (directly, or in every assignment of the
+    variable inside the enclosing function): request data can only fill the path / query, so this
+    is not SSRF."""
+    if _is_internal_redirect_target(url):
+        return True
+    if url.type != 'variable_name':
+        return False
+    name = url.text.decode('utf-8', errors='replace')
+    # A `case` / `default` arm is its own flow: assignments in sibling arms do not reach this call.
+    fn = node.parent
+    while fn is not None and fn.type not in ('case_statement', 'default_statement', 'method_declaration',
+                                              'function_definition', 'anonymous_function', 'arrow_function'):
+        fn = fn.parent
+    if fn is None:
+        return False
+    rhs: list = []
+    stack = [fn]
+    while stack:
+        cur = stack.pop()
+        if cur.type == 'assignment_expression' and cur.children and \
+                cur.children[0].text.decode('utf-8', errors='replace') == name:
+            rhs.append(cur.children[-1])
+        stack.extend(cur.children)
+    return bool(rhs) and all(_is_internal_redirect_target(r) for r in rhs)
+
+
 def _has_origin_check(node) -> bool:
     """The enclosing function compares the target's host (parse_url(...)['host']) before redirecting."""
     fn = node.parent
@@ -806,7 +833,8 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                 const_node = args[1]
                 const_text = const_node.text.decode('utf-8', errors='replace') \
                     if const_node else ''
-                if const_text in _CURL_URL_CONSTS and taint(args[2]):
+                if (const_text in _CURL_URL_CONSTS and taint(args[2])
+                        and not _url_host_is_fixed(node, args[2])):
                     _emit(findings, seen, file_path, line, lines, repo_url,
                           VulnType.SSRF, Severity.HIGH, 'PHAST-SSRF-001',
                           "User-controlled URL in curl_setopt(CURLOPT_URL) — SSRF risk")
@@ -973,7 +1001,8 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
             elif mname in _MASS_ASSIGN_METHODS and _is_whole_request(args[0], raw_taint):
                 _emit_mass_assignment(findings, seen, file_path, line, lines, repo_url,
                                       f"{cls}::{mname}()", cls)
-            elif cls == 'Http' and mname in _HTTP_FACADE_METHODS and taint(args[0]):
+            elif (cls == 'Http' and mname in _HTTP_FACADE_METHODS and taint(args[0])
+                  and not _url_host_is_fixed(node, args[0])):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.SSRF, Severity.HIGH, 'PHAST-SSRF-001',
                       f"User-controlled URL flows into Http::{mname}() — SSRF risk")

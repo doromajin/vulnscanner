@@ -5,6 +5,14 @@ from vulnscanner.models import Finding, Severity, VulnType
 
 _HS = VulnType.HARDCODED_SECRET
 
+# `'MAIL_PASSWORD='.$request->pw`: the `=` sits inside the literal, so the next quote closes the
+# string and what follows it is code being concatenated, not a password value.
+_CONCAT_AFTER_KEY_RE = re.compile(r'(?:password|passwd|pwd)\s*=\s*["\']\s*[.+]\s*[\w$(]', re.IGNORECASE)
+
+
+def _is_concatenated_key(line: str) -> bool:
+    return bool(_CONCAT_AFTER_KEY_RE.search(line))
+
 # (rule_id, compiled_re, description, severity, vuln_type)
 _RULES = [
     (
@@ -343,6 +351,8 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                 if _ALLOWLIST_RE.search(line):
                     continue
                 if rule_id == "SEC-001" and (_is_password_label(line) or _TEMPLATE_VALUE_RE.search(line)):
+                    continue
+                if rule_id == "SEC-001" and _is_concatenated_key(line):
                     continue
                 key = (rule_id, lineno)
                 if key in seen:

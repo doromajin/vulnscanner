@@ -76,4 +76,9 @@ class SQLInjectionAnalyzer(BaseAnalyzer):
     supported_extensions = (".php", ".js", ".ts", ".java", ".rb")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        return self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)
+        rules = _RULES
+        if file_path.endswith((".js", ".ts")):
+            # `.raw(` is a Django ORM hook; in JS it is Guid.raw() / String.raw`` / knex.raw(),
+            # and knex.raw with request data is covered by the JS taint analyzer.
+            rules = [r for r in _RULES if r[0] != "SQL-005"]
+        return self._scan_lines(file_path, content, repo_url, rules, guard=_GUARD)
