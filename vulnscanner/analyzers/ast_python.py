@@ -346,6 +346,25 @@ _PATHLIB_IO_METHODS = frozenset({
 })
 
 
+_PATH_METADATA_METHODS = frozenset({"exists", "stat", "is_file", "is_dir", "is_symlink"})
+
+_QUERYSET_METHODS = frozenset({
+    "filter", "exclude", "all", "get", "order_by", "distinct", "values", "values_list",
+    "annotate", "select_related", "prefetch_related", "only", "defer", "none", "union",
+})
+
+
+def _is_queryset_expr(node: ast.expr) -> bool:
+    """`x.filter(...)` / `X.objects...`: a Django QuerySet chain, not a filesystem path."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if node.func.attr in _QUERYSET_METHODS:
+            return True
+        return _is_queryset_expr(node.func.value)
+    if isinstance(node, ast.Attribute):
+        return node.attr == "objects" or _is_queryset_expr(node.value)
+    return False
+
+
 def _find_canonicalized_paths(
     func: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> frozenset[str]:
@@ -1665,8 +1684,14 @@ class _VulnVisitor(ast.NodeVisitor):
             if (attr in ("exists", "is_file", "is_dir")
                     and "pathlib" not in self.content and "Path(" not in self.content):
                 return
+            # `docs.exclude(...).exists()`, `Model.objects.filter(...).exists()`: a QuerySet check.
+            if attr in ("exists", "is_file", "is_dir") and _is_queryset_expr(path_obj):
+                return
             sev = Severity.HIGH if obj_taint.status == TaintStatus.TAINTED else Severity.MEDIUM
             prefix = "" if obj_taint.status == TaintStatus.TAINTED else "[needs_review] "
+            if attr in _PATH_METADATA_METHODS:
+                # Existence / size / type probes read no file content: at most an existence oracle.
+                sev, prefix = Severity.LOW, "[low_reach: metadata probe, no content is read] "
             self._add(node, VulnType.PATH_TRAVERSAL, sev, "AST-PATH-004",
                       f"{prefix}.{attr}() on {'tainted' if obj_taint.status == TaintStatus.TAINTED else 'dynamic'}"
                       f" path — traversal risk: {obj_taint.reason}",
@@ -1813,6 +1838,17 @@ class _VulnVisitor(ast.NodeVisitor):
 
     # ── insecure deserialization ───────────────────────────────────────────────
 
+    def _signature_checked_before(self, node: ast.Call) -> bool:
+        """The enclosing function calls hmac.compare_digest(...) on an earlier line."""
+        fn = self._current_func_node
+        if fn is None:
+            return False
+        return any(
+            isinstance(sub, ast.Call) and _attr_name(sub.func) == "compare_digest"
+            and sub.lineno < node.lineno
+            for sub in ast.walk(fn)
+        )
+
     def _check_deserialization(self, node: ast.Call) -> None:
         full = _full_name(node.func)
 
@@ -1827,6 +1863,11 @@ class _VulnVisitor(ast.NodeVisitor):
                 if taint.status == TaintStatus.CLEAN:
                     self._add_suppressed(node, VulnType.INSECURE_DESERIALIZATION,
                                          rule, "clean_taint_source", taint)
+                    return
+                if self._signature_checked_before(node):
+                    self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.LOW, rule,
+                              "[mitigated] " + desc + " — the data is HMAC-verified (compare_digest) "
+                              "first; this is only exploitable if the signing key leaks", taint)
                     return
                 self._add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL,
                           rule, desc, taint)
@@ -2487,6 +2528,9 @@ class _VulnVisitor(ast.NodeVisitor):
         if len(secret) < 4:
             return
         if _SECRET_SKIP_RE.search(secret):
+            return
+        # `TOKEN_STRATEGY = "pkg.adapter.DrfTokenStrategy"`: a dotted import path to a class.
+        if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\.[A-Z]\w*", secret):
             return
         self._add(
             node, VulnType.HARDCODED_SECRET, Severity.HIGH, "AST-SEC-001",

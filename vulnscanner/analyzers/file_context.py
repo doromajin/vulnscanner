@@ -27,6 +27,7 @@ INCLUDE_VENDOR_FILES: bool = False
 # are NOT matched.
 _TEST_SEGMENTS = frozenset({
     "test", "tests",
+    "e2e", "cypress",   # browser end-to-end suites (src-ui/e2e/)
     "spec", "specs",
     "__tests__",
     "it",           # Java integration tests (src/it/)
