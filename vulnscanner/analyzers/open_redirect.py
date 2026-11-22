@@ -40,7 +40,7 @@ _RULES = [
     ),
     (
         "REDIR-006",
-        re.compile(r'res\.redirect\s*\(\s*(?:\d+\s*,\s*)?`[^`]*\$\{req\.', re.IGNORECASE),
+        re.compile(r'res\.redirect\s*\(\s*(?:\d+\s*,\s*)?`(?!\$\{(?!req\.)[\w.]+\}/)[^`]*\$\{req\.', re.IGNORECASE),
         "Express redirect with URL template containing request data - open redirect risk",
         Severity.HIGH, _OR, (".js", ".ts"),
     ),

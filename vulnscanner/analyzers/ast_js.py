@@ -701,6 +701,13 @@ def _is_regex_receiver(obj_node) -> bool:
     return bool(_REGEX_RECEIVER_RE.match(obj_node.text.decode(errors="replace").strip()))
 
 
+def _first_arg_is_request_object(args_node) -> bool:
+    """`api.users.deleteMany(req, body)`: an application-layer function that takes the request
+    itself first is not a MongoDB driver call, whose first argument is the filter document."""
+    named = args_node.named_children
+    return bool(named) and named[0].type == "identifier" and named[0].text in (b"req", b"request")
+
+
 def _is_jquery_non_recursive_merge(obj_root: str, prop: str, arg_list: list) -> bool:
     """`$.merge(a, b)` concatenates arrays and a shallow `$.extend(target, src)` only copies own
     properties onto `target`: neither reaches Object.prototype. Only the recursive form
@@ -1052,7 +1059,10 @@ def _check_sinks(
 
             # Response output (XSS)
             elif obj_root in ("res", "response") and prop in _RES_SINKS:
-                if tainted_args(args_node):
+                # res.render(view, data): the template engine escapes `data`; only the view
+                # name (first argument) is a sink.
+                _sink_args = args_node.named_children[:1] if prop == "render" else args_node.named_children
+                if any(state.is_tainted_node(x) for x in _sink_args):
                     _emit(findings, seen, file_path, line, lines, repo_url,
                           VulnType.XSS, Severity.HIGH,
                           "JSAST-XSS-001",
@@ -1068,7 +1078,8 @@ def _check_sinks(
 
             # NoSQL injection: collection.find(tainted), db.users.findOne(tainted)
             elif (prop in _NOSQL_METHOD_SINKS and tainted_args(args_node)
-                  and not _is_jquery_receiver(obj_node)):
+                  and not _is_jquery_receiver(obj_node)
+                  and not _first_arg_is_request_object(args_node)):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.NOSQL_INJECTION, Severity.HIGH,
                       "JSAST-NOSQL-001",
