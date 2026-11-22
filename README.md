@@ -220,6 +220,9 @@ vulnscan scan owner/repo -o report.json
 
 # Parallel workers (default: CPU cores × 2, max 16)
 vulnscan scan owner/repo --workers 8
+# Without --workers, local scans also cap the process count by free memory. Tuning (environment):
+#   VULNSCANNER_MEMORY_BUDGET_MB   free memory to plan with (default: detected)
+#   VULNSCANNER_WORKER_BASE_MB / VULNSCANNER_WORKER_TEXT_FACTOR   per-worker estimate (default: 150 MB + 1.0 x source size)
 
 # Exclude paths
 vulnscan scan owner/repo -e "tests/" -e "vendor/"

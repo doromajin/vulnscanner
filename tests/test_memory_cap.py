@@ -96,3 +96,21 @@ def test_a_process_scan_leaves_no_state_file_behind(many_cpus, monkeypatch, tmp_
     S.VulnScanner(workers=2).scan(str(tmp_path))
     after = set(glob.glob(os.path.join(tempfile.gettempdir(), "vulnscan-state-*.pkl")))
     assert after - before == set()
+
+
+def test_worker_estimate_defaults_are_unchanged_without_env(monkeypatch):
+    monkeypatch.delenv("VULNSCANNER_WORKER_BASE_MB", raising=False)
+    monkeypatch.delenv("VULNSCANNER_WORKER_TEXT_FACTOR", raising=False)
+    assert M.worker_memory_bytes(10 * M.MB) == int(M.WORKER_BASE_BYTES + M.WORKER_TEXT_FACTOR * 10 * M.MB)
+
+
+def test_worker_estimate_can_be_tuned_by_environment(monkeypatch):
+    monkeypatch.setenv("VULNSCANNER_WORKER_BASE_MB", "100")
+    monkeypatch.setenv("VULNSCANNER_WORKER_TEXT_FACTOR", "0.5")
+    assert M.worker_memory_bytes(10 * M.MB) == 105 * M.MB
+
+
+def test_unreadable_worker_estimate_falls_back_to_defaults(monkeypatch):
+    monkeypatch.setenv("VULNSCANNER_WORKER_BASE_MB", "abc")
+    monkeypatch.setenv("VULNSCANNER_WORKER_TEXT_FACTOR", "-1")
+    assert M.worker_memory_bytes(0) == M.WORKER_BASE_BYTES

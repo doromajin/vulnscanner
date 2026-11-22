@@ -8,6 +8,7 @@ the parse trees of the file it is working on, so N workers cost N times that.  T
     parent     ~= PARENT_BASE_BYTES + PARENT_TEXT_FACTOR * (size of the repository text)
 
 ``VULNSCANNER_MEMORY_BUDGET_MB`` replaces the detected free memory (tests, containers, shared machines).
+``VULNSCANNER_WORKER_BASE_MB`` / ``VULNSCANNER_WORKER_TEXT_FACTOR`` replace the per-worker estimate.
 """
 from __future__ import annotations
 
@@ -75,9 +76,27 @@ def available_memory_bytes() -> int | None:
     return None
 
 
+def _env_float(name: str, default: float) -> float:
+    """A positive number from the environment, or *default* when unset or unreadable."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
 def worker_memory_bytes(text_bytes: int) -> int:
-    """Planned peak memory of one worker process for a repository holding *text_bytes* of source."""
-    return int(WORKER_BASE_BYTES + WORKER_TEXT_FACTOR * text_bytes)
+    """Planned peak memory of one worker process for a repository holding *text_bytes* of source.
+
+    ``VULNSCANNER_WORKER_BASE_MB`` and ``VULNSCANNER_WORKER_TEXT_FACTOR`` replace the calibrated
+    defaults (re-measure on other hardware without touching the code).
+    """
+    base = _env_float("VULNSCANNER_WORKER_BASE_MB", WORKER_BASE_BYTES / MB) * MB
+    factor = _env_float("VULNSCANNER_WORKER_TEXT_FACTOR", WORKER_TEXT_FACTOR)
+    return int(base + factor * text_bytes)
 
 
 def max_workers_for_memory(text_bytes: int, available_bytes: int | None) -> int | None:
