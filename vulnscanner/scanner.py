@@ -4,6 +4,8 @@ import fnmatch
 import multiprocessing
 import os
 import re
+import sys
+import tempfile
 import time
 import pickle
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -16,6 +18,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 _progress_console = _RichConsole(stderr=True)
 
 from vulnscanner import pool_worker
+from vulnscanner.memory import available_memory_bytes, max_workers_for_memory
 from vulnscanner.analyzers import ALL_ANALYZERS, BaseAnalyzer
 from vulnscanner.analyzers.ast_python import (
     build_cross_file_summary,
@@ -84,6 +87,25 @@ _SECONDS_PER_MB = {
     ".ts": 4.5, ".tsx": 4.5, ".go": 10.0, ".rb": 10.0, ".cs": 10.0, ".rs": 10.0,
 }
 _DEFAULT_SECONDS_PER_MB = 0.4
+
+
+def _write_worker_state(state: tuple) -> str:
+    """Pickle *state* (analyzers, fast, directory, all_contents) to a private temporary file; returns its path."""
+    fd, path = tempfile.mkstemp(prefix="vulnscan-state-", suffix=".pkl")  # mode 0600
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            pickle.dump(state, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    except BaseException:
+        _remove_quietly(path)
+        raise
+    return path
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _estimated_seconds(files) -> float:
@@ -310,15 +332,21 @@ class VulnScanner:
         # the whole-program pre-passes below, and the per-file pre-passes run on them too.
         workers = self._process_workers(files)
         pool = None
+        state_file = None
         if workers:
             # spawn on every OS: fork()ing while the progress-bar thread runs can deadlock,
             # and it keeps Linux, macOS and Windows behaving the same.
-            blob = pickle.dumps((self._analyzers, self._fast, directory, all_contents),
-                                protocol=pickle.HIGHEST_PROTOCOL)
-            pool = ProcessPoolExecutor(
-                max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
-                initializer=pool_worker._init_worker, initargs=(blob,),
-            )
+            # The state goes to workers through a temporary file: a pickled blob has to sit in memory
+            # next to the objects it is turned into, in every worker at the same time.
+            state_file = _write_worker_state((self._analyzers, self._fast, directory, all_contents))
+            try:
+                pool = ProcessPoolExecutor(
+                    max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                    initializer=pool_worker._init_worker, initargs=(state_file,),
+                )
+            except BaseException:
+                _remove_quietly(state_file)
+                raise
         try:
             contexts, pool_ok = self._build_contexts(all_contents, pool, workers)
             if not pool_ok and pool is not None:
@@ -346,6 +374,8 @@ class VulnScanner:
         finally:
             if pool is not None:
                 pool.shutdown(wait=True, cancel_futures=True)
+            if state_file is not None:
+                _remove_quietly(state_file)
 
         result.elapsed_seconds = time.perf_counter() - start
 
@@ -365,6 +395,12 @@ class VulnScanner:
             workers = self._workers
         else:
             workers = min(cpus, int(_estimated_seconds(files) / _SECONDS_PER_WORKER))
+            # Each worker holds a copy of the repository text: do not plan more of them than the
+            # free memory carries (an explicit -w N is the user's call and is left alone).
+            memory_cap = max_workers_for_memory(
+                sum(sys.getsizeof(content) for _, content in files), available_memory_bytes())
+            if memory_cap is not None:
+                workers = min(workers, memory_cap)
             if mode == "process":
                 workers = max(workers, 2)
             if workers < 2:

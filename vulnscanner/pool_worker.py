@@ -14,14 +14,27 @@ import pickle
 _worker_state: tuple | None = None
 
 
-def _init_worker(blob: bytes) -> None:
-    """Process-pool initializer: *blob* is pickle((analyzers, fast, directory, all_contents))."""
+def _init_worker(source: "str | list[bytes] | bytes") -> None:
+    """Process-pool initializer.
+
+    *source* is the path of a file holding ``pickle((analyzers, fast, directory, all_contents))``.  The
+    parent writes the state to a temporary file instead of passing the pickled bytes: the pool keeps its
+    ``initargs`` alive for the whole life of the worker, and unpickling from bytes needs the bytes and the
+    objects in memory together, so every worker briefly held the repository text twice.  Reading from the
+    file builds the objects without a second copy.  (A one-element list or bytes are still accepted.)
+    """
     global _worker_state
     from vulnscanner.scanner import VulnScanner
 
-    # The blob is built by the parent scanner process itself and handed over the
-    # multiprocessing pipe (which is pickle too); no external data reaches it.
-    analyzers, fast, directory, all_contents = pickle.loads(blob)  # vulnscanner: ignore[AST-DESER-001]
+    # The state is written by the parent scanner process itself, into a private temporary file;
+    # no external data reaches it.
+    if isinstance(source, str):
+        with open(source, "rb") as fh:
+            analyzers, fast, directory, all_contents = pickle.load(fh)  # vulnscanner: ignore[AST-DESER-001]
+    else:
+        blob = source.pop() if isinstance(source, list) else source
+        analyzers, fast, directory, all_contents = pickle.loads(blob)  # vulnscanner: ignore[AST-DESER-001]
+        del blob
     _worker_state = (VulnScanner(analyzers=analyzers, fast=fast), directory, all_contents)
 
 

@@ -79,6 +79,7 @@ def test_chunks_are_roughly_byte_balanced():
 def many_cpus(monkeypatch):
     monkeypatch.setattr(S.os, "cpu_count", lambda: 16)
     monkeypatch.delenv("VULNSCANNER_PARALLEL", raising=False)
+    monkeypatch.setenv("VULNSCANNER_MEMORY_BUDGET_MB", "1000000")  # the choice must not depend on this PC's free RAM
 
 
 def test_small_scans_stay_on_threads(many_cpus):

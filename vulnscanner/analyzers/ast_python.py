@@ -989,6 +989,15 @@ class PythonASTAnalyzer(BaseAnalyzer):
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         try:
+            return self._analyze_file(file_path, content, repo_url)
+        finally:
+            # _collect_scope_assignments is keyed by AST nodes.  Left alone it keeps every tree built for
+            # every file alive until the process exits (modules a file imports are parsed again for each
+            # importer: 265 MB retained after scanning a 2 MB project), once per worker process.
+            _collect_scope_assignments.cache_clear()
+
+    def _analyze_file(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
+        try:
             tree = ast.parse(content, filename=file_path)
         except SyntaxError:
             return []
