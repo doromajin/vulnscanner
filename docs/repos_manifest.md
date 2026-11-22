@@ -44,7 +44,10 @@
 | netbox | https://github.com/netbox-community/netbox | f2a4a13b9632 | Python/Django。117 件 → 114 件（誤検出の XSS HIGH 2 件が消えた）。管理者スクリプトの exec、csrf_exempt の GraphQL を妥当な指摘とした |
 | nodebb | https://github.com/NodeBB/NodeBB | 02180152d892 | Node.js/Express。135 件 → 126 件（res.render のデータ、req を先頭に取る呼び出し、固定接頭辞のリダイレクトの 9 件が誤検出）。確定した脆弱性なし |
 
-6 本とも、測定後に削除済み（pterodactyl、crater、bagisto は 2026-11-19、paperless-ngx、netbox、nodebb は 2026-11-22）。
+| pygoat | https://github.com/adeyosemanputra/pygoat | 2aa4cc14f251 | 意図的に脆弱な Django 学習アプリ。再現率の測定用。危険な API の呼び出しはほぼ検出。実質の取りこぼしは Pillow `ImageMath.eval` のみ（追加済み） |
+| django-nv | https://github.com/nVisium/django.nV | a48901f106da | 意図的に脆弱な Django 学習アプリ。SQL・コマンド・パスの 3 種はすべて検出 |
+
+8 本とも、測定後に削除済み（pterodactyl、crater、bagisto は 2026-11-19、それ以外は 2026-11-22）。
 
 取り直し: `git clone --depth 1 <URL>` のあと、`git fetch --depth 1 origin <ID>` と `git checkout <ID>`。
 
