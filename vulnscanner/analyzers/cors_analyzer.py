@@ -26,7 +26,7 @@ _RULES = [
     (
         "CORS-002",
         re.compile(
-            r'CORS_ALLOW_ALL_ORIGINS\s*=\s*True',
+            r'CORS_(?:ALLOW_ALL_ORIGINS|ORIGIN_ALLOW_ALL)\s*=\s*True',
             re.IGNORECASE,
         ),
         "CORS_ALLOW_ALL_ORIGINS = True allows any origin to make cross-origin requests — use CORS_ALLOWED_ORIGINS with an explicit allowlist",
@@ -119,7 +119,7 @@ _RULES = [
 ]
 
 _GUARD = re.compile(
-    r'Access-Control-Allow-Origin|CORS_ALLOW_ALL_ORIGINS|cors\s*\(|@CrossOrigin|setAllowedOrigins|supports_credentials',
+    r'Access-Control-Allow-Origin|CORS_ALLOW_ALL_ORIGINS|CORS_ORIGIN_ALLOW_ALL|cors\s*\(|@CrossOrigin|setAllowedOrigins|supports_credentials',
     re.IGNORECASE,
 )
 
