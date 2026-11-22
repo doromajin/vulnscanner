@@ -40,6 +40,11 @@
 | pterodactyl | https://github.com/pterodactyl/panel | 60a100158158 | 12 件 → 7 件。確定した脆弱性なし |
 | crater | https://github.com/crater-invoice-inc/crater | 05d5ce26fdd8 | 79 件 → 54 件。管理者指定 URL への接続（ExchangeRateProvider.php）を要確認として残した |
 | bagisto | https://github.com/bagisto/bagisto | ac4bd606e7a5 | 76 件 → 75 件（XSS-001 の 9 件は HIGH→LOW）。既定の管理者パスワード、クライアント指定拡張子の保存を妥当な指摘とした |
+| paperless-ngx | https://github.com/paperless-ngx/paperless-ngx | 14252054a150 | Python/Django。189 件 → 182 件（同名メソッドへの汚染の取り違えを修正し、HIGH 8 件が LOW へ）。分類器の pickle を妥当な指摘とした |
+| netbox | https://github.com/netbox-community/netbox | f2a4a13b9632 | Python/Django。117 件 → 114 件（誤検出の XSS HIGH 2 件が消えた）。管理者スクリプトの exec、csrf_exempt の GraphQL を妥当な指摘とした |
+| nodebb | https://github.com/NodeBB/NodeBB | 02180152d892 | Node.js/Express。135 件 → 126 件（res.render のデータ、req を先頭に取る呼び出し、固定接頭辞のリダイレクトの 9 件が誤検出）。確定した脆弱性なし |
+
+6 本とも、測定後に削除済み（pterodactyl、crater、bagisto は 2026-11-19、paperless-ngx、netbox、nodebb は 2026-11-22）。
 
 取り直し: `git clone --depth 1 <URL>` のあと、`git fetch --depth 1 origin <ID>` と `git checkout <ID>`。
 
