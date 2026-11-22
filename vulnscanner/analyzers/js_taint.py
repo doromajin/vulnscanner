@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from vulnscanner.analyzers.db_receiver import file_loads_db_library, receiver_before, receiver_looks_like_db
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
@@ -355,6 +356,7 @@ class JSTaintAnalyzer(BaseAnalyzer):
     ) -> list[Finding]:
         findings: list[Finding] = []
         seen: set[tuple[str, int]] = set()  # (rule_id, lineno) dedup
+        has_db_lib = file_loads_db_library(lines)
 
         for lineno, raw in enumerate(lines, 1):
             line = raw.strip()
@@ -365,6 +367,9 @@ class JSTaintAnalyzer(BaseAnalyzer):
                     var = m.group(1)
                     if var not in tainted:
                         continue
+                    if (sink.rule_id.startswith("JSTAINT-SQL") and not has_db_lib
+                            and not receiver_looks_like_db(receiver_before(raw, m.start()))):
+                        continue  # a generic .query()/.execute() that is not a database call
                     key = (sink.rule_id, lineno)
                     if key in seen:
                         continue

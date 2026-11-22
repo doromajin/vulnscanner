@@ -58,6 +58,7 @@ try:
 except Exception:
     _TS_TS_AVAILABLE = False
 
+from vulnscanner.analyzers.db_receiver import file_loads_db_library, receiver_looks_like_db
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
@@ -674,6 +675,13 @@ _MERGE_METHODS = frozenset({
 _JQUERY_RECEIVER_RE = _re.compile(r"(?:^|\.)\$\w*(?:\.|$|\()|^(?:\$|jQuery)\(")
 
 
+def _sql_receiver_plausible(obj_node, has_db_lib: bool) -> bool:
+    """`.query()` / `.execute()` / `.run()` / `.all()` are generic names: `activitypub.helpers.query(h)`,
+    `$.run(...)`.  Treat the call as SQL only with evidence: a database-looking receiver name, or a file that
+    loads a database library."""
+    return has_db_lib or receiver_looks_like_db(obj_node.text.decode(errors="replace"))
+
+
 def _is_jquery_receiver(obj_node) -> bool:
     """`$el.find(sel)`, `this.$body.find(sel)`, `$(x).filter(...)`: a jQuery selection, whose
     find/filter/... take selectors, not MongoDB queries."""
@@ -918,6 +926,7 @@ def _check_sinks(
 ) -> list[Finding]:
     findings: list[Finding] = []
     seen: set[tuple] = set()
+    has_db_lib = file_loads_db_library(lines)
 
     def tainted_args(args_node) -> list:
         return [c for c in args_node.named_children if state.is_tainted_node(c)]
@@ -1020,7 +1029,7 @@ def _check_sinks(
             obj_root = obj_chain[0] if obj_chain else ""
 
             # SQL injection
-            if prop in _SQL_METHOD_SINKS:
+            if prop in _SQL_METHOD_SINKS and _sql_receiver_plausible(obj_node, has_db_lib):
                 named = list(args_node.named_children)
                 t_args = tainted_args(args_node)
                 has_tainted = bool(t_args)
