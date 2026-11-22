@@ -4753,6 +4753,10 @@ def _build_confirmed_tainted_params(
 
                 # Find calls that receive tainted args
                 for callee, args in facts.call_sites(func_def):
+                    # The map is keyed by bare name: when several functions or methods share
+                    # it (render, value, save …) a tainted call site cannot be tied to one of them.
+                    if len(func_bodies.get(callee, ())) > 1:
+                        continue
                     for i, arg in enumerate(args):
                         if _is_tainted_expr_quick(arg, tainted_vars, global_taint_sources):
                             prev = confirmed.get(callee, set())
