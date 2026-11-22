@@ -64,7 +64,12 @@ class LocalFetcher:
         self,
         root: str,
         is_excluded: Callable[[str], bool] | None = None,
+        include_dotenv: bool = False,
     ) -> None:
+        # Path('.env').suffix is '' so `.env` files are not scanned by extension.  That is deliberate
+        # for scanning one's own checkout (the local .env holds real keys); a customer's repository
+        # is scanned with include_dotenv=True so a committed .env is reported.
+        self._include_dotenv = include_dotenv
         self._root = Path(root).resolve()
         # Predicate on a root-relative path; used to prune excluded directories
         # and to skip excluded files before they are read.
@@ -102,7 +107,8 @@ class LocalFetcher:
                 full_path = Path(dirpath) / filename
                 if self._should_skip(full_path):
                     continue
-                if full_path.suffix not in _SCAN_EXTENSIONS and filename not in _SCAN_FILENAMES:
+                is_dotenv = self._include_dotenv and (filename == ".env" or filename.startswith(".env."))
+                if full_path.suffix not in _SCAN_EXTENSIONS and filename not in _SCAN_FILENAMES and not is_dotenv:
                     continue
                 if full_path.stat().st_size > _MAX_FILE_BYTES:
                     continue

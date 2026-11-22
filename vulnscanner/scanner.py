@@ -188,11 +188,13 @@ class VulnScanner:
         workers: int = 0,
         custom_rules: list | None = None,
         fast: bool = False,
+        include_dotenv: bool = False,
     ) -> None:
         # fast: don't run content analyzers on test / fixture / vendor files (their findings
         # are suppressed anyway).  Off by default because it also drops the "N findings
         # suppressed" count for those paths.
         self._fast = fast
+        self._include_dotenv = include_dotenv  # scan .env files (customer repositories)
         self._github_token = github_token
         self._cli_excludes = tuple(exclude)
         self._workers = workers if workers > 0 else DEFAULT_WORKERS
@@ -277,7 +279,7 @@ class VulnScanner:
 
     def _scan_local(self, directory: str, changed_files: set[str] | None = None) -> ScanResult:
         result = ScanResult(repo_url=directory)
-        fetcher = LocalFetcher(directory)
+        fetcher = LocalFetcher(directory, include_dotenv=self._include_dotenv)
 
         # Load project-level exclusions from .vulnscannerignore
         ignore_path = fetcher.ignore_file_path()
@@ -289,7 +291,8 @@ class VulnScanner:
 
         # Re-create the fetcher with the final exclude list so excluded directories
         # are pruned during the walk and excluded files are never read.
-        fetcher = LocalFetcher(directory, is_excluded=lambda p: _is_excluded(p, excludes))
+        fetcher = LocalFetcher(directory, is_excluded=lambda p: _is_excluded(p, excludes),
+                               include_dotenv=self._include_dotenv)
 
         # Collect all files upfront so the progress bar knows the total
         files = [

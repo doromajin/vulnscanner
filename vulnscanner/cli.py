@@ -50,6 +50,9 @@ def main() -> None:
 @click.option("--fast", is_flag=True, default=False,
               help="Skip analysis of test/fixture/vendor files (their findings are suppressed "
                    "anyway; the suppressed-finding count for those paths is not reported)")
+@click.option("--include-dotenv", "include_dotenv", is_flag=True, default=False,
+              help="Also scan .env files (use for a customer's repository: a committed .env is a finding). "
+                   "Off by default because your own checkout's .env holds real keys")
 @click.option("--since", default=None, metavar="REF",
               help="Incremental scan: only analyse files changed since this git ref (e.g. HEAD~1, main)")
 @click.option("--stdout-json", "stdout_json", is_flag=True, default=False,
@@ -77,6 +80,7 @@ def scan(
     exclude: tuple[str, ...],
     workers: int,
     fast: bool,
+    include_dotenv: bool,
     since: str | None,
     stdout_json: bool,
     rules: tuple[str, ...],
@@ -133,7 +137,7 @@ def scan(
         console.print(f"[dim]Custom rules: {len(custom_rules)} rule(s) loaded[/dim]")
 
     scanner = VulnScanner(github_token=token, exclude=exclude, workers=workers,
-                          custom_rules=custom_rules, fast=fast)
+                          custom_rules=custom_rules, fast=fast, include_dotenv=include_dotenv)
 
     try:
         result = scanner.scan(target, changed_files=changed_files)
