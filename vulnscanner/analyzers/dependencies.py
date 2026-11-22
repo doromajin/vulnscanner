@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from vulnscanner.analyzers.ast_python import get_cross_file_contents
@@ -79,7 +80,27 @@ _OSV_TIMEOUT = 15  # seconds
 _OSV_VULN_API = "https://api.osv.dev/v1/vulns/"
 _OSV_DETAIL_LIMIT = 20  # advisories fetched per package
 _OSV_FETCH_WORKERS = 8  # concurrent advisory lookups; modest to stay polite to api.osv.dev
+_OSV_ATTEMPTS = 3  # tries per request: a full-repository scan fires many at once and api.osv.dev rate-limits
+_OSV_RETRY_DELAY = 0.5  # seconds; doubled after each failed attempt
+_OSV_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _osv_detail_cache: dict[str, dict] = {}
+
+
+def _osv_send(send):
+    """Call *send()* (a zero-argument request) with retries; return the response or raise the last error."""
+    last: Exception | None = None
+    for attempt in range(_OSV_ATTEMPTS):
+        try:
+            resp = send()
+            if getattr(resp, "status_code", None) in _OSV_RETRY_STATUS:
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:  # noqa: BLE001 - any transport or HTTP failure is retried
+            last = exc
+            if attempt + 1 < _OSV_ATTEMPTS:
+                time.sleep(_OSV_RETRY_DELAY * (2 ** attempt))
+    raise last  # type: ignore[misc]
 
 
 def _osv_vuln_detail(req_lib, stub: dict) -> dict:
@@ -89,8 +110,7 @@ def _osv_vuln_detail(req_lib, stub: dict) -> dict:
         return stub
     if vid not in _osv_detail_cache:
         try:
-            resp = req_lib.get(_OSV_VULN_API + vid, timeout=_OSV_TIMEOUT)
-            resp.raise_for_status()
+            resp = _osv_send(lambda: req_lib.get(_OSV_VULN_API + vid, timeout=_OSV_TIMEOUT))
             _osv_detail_cache[vid] = resp.json()
         except Exception:
             return stub  # not cached: a later package may retry
@@ -220,15 +240,28 @@ class DependencyAnalyzer(BaseAnalyzer):
         ]
 
         try:
-            resp = req_lib.post(
+            resp = _osv_send(lambda: req_lib.post(
                 _OSV_API,
                 json={"queries": queries},
                 timeout=_OSV_TIMEOUT,
-            )
-            resp.raise_for_status()
+            ))
             results = resp.json().get("results", [])
-        except Exception:
-            return []  # don't crash the scan when OSV is unreachable
+        except Exception as exc:  # noqa: BLE001
+            # Don't crash the scan when OSV is unreachable, but don't pass for "no vulnerable
+            # dependencies" either: say that this manifest was not checked.
+            return [Finding(
+                vuln_type=VulnType.VULNERABLE_DEPENDENCY,
+                severity=Severity.INFO,
+                file_path=file_path,
+                line_number=1,
+                line_content="",
+                description=(
+                    f"[check_incomplete] dependency vulnerabilities were not checked: api.osv.dev could not "
+                    f"be reached after {_OSV_ATTEMPTS} attempts ({type(exc).__name__}). Re-run the scan to check this file"
+                ),
+                rule_id="DEP-002",
+                repo_url=repo_url,
+            )]
 
         _prefetch_osv_details(req_lib, [
             v for result in results for v in result.get("vulns", [])[:_OSV_DETAIL_LIMIT]
@@ -242,6 +275,10 @@ class DependencyAnalyzer(BaseAnalyzer):
             # querybatch returns only {id, modified}: fetch records for severity and aliases
             vulns = [_osv_vuln_detail(req_lib, v) for v in vulns[:_OSV_DETAIL_LIMIT]] + vulns[_OSV_DETAIL_LIMIT:]
 
+            details_missing = any(
+                v.get("id") not in _osv_detail_cache and "database_specific" not in v and "severity" not in v
+                for v in vulns
+            )
             cve_ids = [
                 a
                 for v in vulns
@@ -269,6 +306,8 @@ class DependencyAnalyzer(BaseAnalyzer):
                     f"; severity is the highest of {count} advisories. "
                     "Exploitability depends on how the library is used (some advisories need non-default options)"
                 )
+            if details_missing:
+                desc += "; [partial: some advisory records could not be fetched, so severity and CVE ids may be incomplete]"
 
             findings.append(Finding(
                 vuln_type=VulnType.VULNERABLE_DEPENDENCY,
