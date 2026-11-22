@@ -82,6 +82,16 @@ _DOM_GATED_RULES = frozenset({"XSS-002", "XSS-003", "XSS-006"})
 
 # ── XSS-001: innerHTML smart analysis ─────────────────────────────────────────
 
+_BLADE_ESCAPED_RE = re.compile(r"\{\{.*?\}\}", re.DOTALL)
+_LITERAL_CHAIN_RE = re.compile(r"""\s*(?:(?:'[^']*'|"[^"]*")\s*\+?\s*)+;?\s*(?://.*)?""")
+
+
+def _blade_literal_only(rhs: str) -> bool:
+    """A Blade `{{ }}` is HTML-escaped on the server, so an innerHTML value made only of string literals and
+    `{{ }}` expressions (`'<span>' + '{{ __("x") }}' + '</span>'`) carries no client data."""
+    return bool(_LITERAL_CHAIN_RE.fullmatch(_BLADE_ESCAPED_RE.sub("x", rhs)))
+
+
 # Browser-controlled input sources.  Keep in sync with evidence_regex in
 # rules/builtin/javascript.yaml.
 _DOM_SOURCE_RE = re.compile(
@@ -396,6 +406,10 @@ class XSSAnalyzer(BaseAnalyzer):
                     i += 1
                     continue
                 rhs_m = re.search(r'innerHTML\s*=\s*([^\n]*)', line)
+                if (rhs_m and file_path.endswith(".blade.php")
+                        and _blade_literal_only(rhs_m.group(1))):
+                    i += 1
+                    continue
                 if rhs_m and _concat_vars_are_i18n(rhs_m.group(1), lines, i):
                     i += 1
                     continue

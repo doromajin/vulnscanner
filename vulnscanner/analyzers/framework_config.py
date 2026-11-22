@@ -95,6 +95,7 @@ class FrameworkConfigAnalyzer(BaseAnalyzer):
         findings: list[Finding] = []
         lines = content.splitlines()
         production = any(re.match(r"\s*APP_ENV\s*=\s*['\"]?production\b", ln) for ln in lines)
+        dev = bool(_DEV_NAME_RE.search(name))  # .env.testing / .env.local: a development file, not the deployment's
         for lineno, line in enumerate(lines, 1):
             if _ENV_KEY_RE.match(line):
                 findings.append(self._make(
@@ -102,8 +103,8 @@ class FrameworkConfigAnalyzer(BaseAnalyzer):
                     "CFG-LV-007",
                     "A committed .env holds a real APP_KEY: whoever can read the repository can forge or decrypt "
                     "sessions and encrypted values. Remove the file from version control, rotate the key",
-                    Severity.HIGH, repo_url, 798))
-            elif _ENV_DEBUG_RE.match(line):
+                    Severity.LOW if dev else Severity.HIGH, repo_url, 798))
+            elif _ENV_DEBUG_RE.match(line) and not dev:
                 findings.append(self._make(
                     path, lineno, line, "CFG-LV-008",
                     "A committed .env turns APP_DEBUG on" + (" for a production environment" if production else ""),

@@ -284,6 +284,24 @@ def _python_docstring_lines(content: str) -> set[int]:
     return lines
 
 
+# CI pipelines start a throw-away database or service next to the tests and pass it a placeholder
+# password (`mysql --password="root"`, `POSTGRES_PASSWORD: postgres`): not a credential of anything real.
+_CI_PATH_RE = re.compile(r"(?:^|/)(?:\.github/workflows/|\.gitlab-ci\.ya?ml$|\.circleci/|azure-pipelines\.ya?ml$|\.travis\.ya?ml$)")
+_CI_THROWAWAY_PASSWORDS = frozenset({
+    "root", "password", "passwd", "secret", "test", "testing", "postgres", "mysql", "admin", "changeme",
+    "pass", "1234", "12345", "123456", "toor", "mariadb", "guest",
+})
+_PASSWORD_VALUE_RE = re.compile(r"""(?:password|passwd|pwd)\w*\s*[=:]\s*["']?([^"'\s]+)""", re.IGNORECASE)
+
+
+def _is_ci_throwaway_password(file_path: str, line: str) -> bool:
+    if not _CI_PATH_RE.search(file_path.replace("\\", "/")):
+        return False
+    m = _PASSWORD_VALUE_RE.search(line)
+    value = m.group(1).lower() if m else ""
+    return value in _CI_THROWAWAY_PASSWORDS
+
+
 class HardcodedSecretsAnalyzer(BaseAnalyzer):
     supported_extensions = (
         ".py", ".js", ".ts", ".java", ".rb", ".php", ".go",
@@ -353,6 +371,8 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                 if rule_id == "SEC-001" and (_is_password_label(line) or _TEMPLATE_VALUE_RE.search(line)):
                     continue
                 if rule_id == "SEC-001" and _is_concatenated_key(line):
+                    continue
+                if rule_id == "SEC-001" and _is_ci_throwaway_password(file_path, line):
                     continue
                 key = (rule_id, lineno)
                 if key in seen:

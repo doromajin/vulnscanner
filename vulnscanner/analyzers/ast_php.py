@@ -463,7 +463,63 @@ def _taint_source_desc(node) -> str:
     return text
 
 
-def _collect_pass(root, tainted: dict, tainted_funcs: set, tainted_props: set) -> bool:
+_SCALAR_TYPES = frozenset({'int', 'float', 'bool'})
+
+
+def _typed_scalar_props(root) -> frozenset:
+    """Properties declared `int` / `float` / `bool` (also promoted constructor parameters): PHP coerces
+    or rejects whatever is assigned, so a request value stored there cannot carry SQL or markup."""
+    names: set[str] = set()
+    for n in _walk(root):
+        if n.type not in ('property_declaration', 'property_promotion_parameter'):
+            continue
+        if not any(c.type == 'primitive_type' and c.text.decode() in _SCALAR_TYPES
+                   or c.type == 'optional_type' and any(g.type == 'primitive_type' and g.text.decode() in _SCALAR_TYPES
+                                                        for g in c.children)
+                   for c in n.children):
+            continue
+        for c in n.children:
+            if c.type == 'property_element':
+                v = _var_name(c.children[0]) if c.children else None
+                if v:
+                    names.add(v)
+            elif c.type == 'variable_name':
+                v = _var_name(c)
+                if v:
+                    names.add(v)
+    return frozenset(names)
+
+
+def _enclosing_function_text(node) -> str:
+    """Text of the outermost method / function around *node* (a closure's output belongs to its method)."""
+    found = None
+    n = node.parent
+    while n is not None:
+        if n.type in ('method_declaration', 'function_definition', 'anonymous_function', 'arrow_function'):
+            found = n
+        n = n.parent
+    return found.text.decode('utf-8', errors='replace') if found is not None else ''
+
+
+_NON_HTML_RESPONSE_RE = re.compile(
+    r"application/pdf|application/octet-stream|text/csv|text/plain|application/json|streamDownload|image/(?:png|jpe?g|gif|webp)",
+    re.IGNORECASE)
+
+
+def _is_uploaded_file_var(arg, node) -> bool:
+    """`$file = $request->file('x'); file_get_contents($file)`: the UploadedFile object stands for the
+    server-side temporary file, not for a path the client chose."""
+    if arg is None or arg.type != 'variable_name':
+        return False
+    name = _var_name(arg)
+    if not name:
+        return False
+    rx = re.compile(r"[$]" + re.escape(name) + r"\s*=\s*[$]\w+->file\(")
+    return bool(rx.search(_enclosing_function_text(node)))
+
+
+def _collect_pass(root, tainted: dict, tainted_funcs: set, tainted_props: set,
+                  clean_props: frozenset = frozenset()) -> bool:
     """Walk all assignments and function defs; update taint. Returns True if changed."""
     changed = False
     for node in _walk(root):
@@ -484,7 +540,7 @@ def _collect_pass(root, tainted: dict, tainted_funcs: set, tainted_props: set) -
             # $this->prop = tainted — class property taint
             if lhs.type == 'member_access_expression' and _member_obj_is_this(lhs):
                 prop = _member_prop_name(lhs)
-                if prop and prop not in tainted_props:
+                if prop and prop not in tainted_props and prop not in clean_props:
                     if _is_tainted_node(rhs, tainted, tainted_funcs, tainted_props):
                         tainted_props.add(prop)
                         changed = True
@@ -643,8 +699,9 @@ def _build_taint(
     tainted_funcs: set[str] = set(seed_funcs or ())
     tainted_props: set[str] = set()
     func_param_map = _build_php_func_param_map(root)
+    clean_props = _typed_scalar_props(root)
     for _ in range(8):
-        c1 = _collect_pass(root, tainted, tainted_funcs, tainted_props)
+        c1 = _collect_pass(root, tainted, tainted_funcs, tainted_props, clean_props)
         c2 = _collect_php_call_site_taint(root, tainted, tainted_funcs,
                                            tainted_props, func_param_map)
         if not c1 and not c2:
@@ -829,7 +886,7 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                       f"User-controlled data flows into {fname}() — OS command injection risk")
 
             # Path traversal (also catches SSRF for URL schemeable paths)
-            elif fname in _PATH_FUNC_SINKS and args and taint(args[0]):
+            elif fname in _PATH_FUNC_SINKS and args and taint(args[0]) and not _is_uploaded_file_var(args[0], node):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.PATH_TRAVERSAL, Severity.HIGH, 'PHAST-PATH-001',
                       f"User-controlled path flows into {fname}() — path traversal risk")
@@ -1041,6 +1098,8 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
         # ── Echo / print sinks ────────────────────────────────────────────────
         elif node.type in ('echo_statement', 'print_intrinsic'):
             line = node.start_point[0] + 1
+            if _NON_HTML_RESPONSE_RE.search(_enclosing_function_text(node)):
+                continue  # the output is a PDF / CSV / image / JSON body, not an HTML page
             for child in node.children:
                 if child.type in ('echo', 'print', ';', ','):
                     continue

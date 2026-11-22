@@ -118,8 +118,8 @@ class CommandInjectionAnalyzer(BaseAnalyzer):
                         if f.rule_id != "CMD-004" or not _exec_param_only_gets_literals(lines, f.line_number)]
         if file_path.endswith(".php") and findings and not has_request_input(content):
             for f in findings:
-                if f.rule_id == "CMD-004":
-                    # exec() in a file that never touches request data: still worth a look
+                if f.rule_id in ("CMD-004", "CMD-005"):
+                    # exec()/shell_exec($x) in a file that never touches request data: still worth a look
                     # (unquoted interpolation), but not an exploitable-by-default CRITICAL.
                     f.severity = Severity.MEDIUM
                     f.taint_status = "unknown"

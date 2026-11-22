@@ -116,7 +116,7 @@ _VENDOR_FILENAME_RE = re.compile(
 
 
 # Minified bundles (`app.min.js`, `site.min.css`) are build output / third-party code.
-_MINIFIED_RE = re.compile(r"\.min\.(?:js|css)$", re.IGNORECASE)
+_MINIFIED_RE = re.compile(r"(?:\.min|[._-]mini)\.(?:js|css)$", re.IGNORECASE)
 
 
 # A line of JS/CSS that is thousands of characters long is minified build output (a webpack
