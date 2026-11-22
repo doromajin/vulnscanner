@@ -112,6 +112,10 @@ class CommandInjectionAnalyzer(BaseAnalyzer):
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         findings = self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)
         findings = [f for f in findings if f.rule_id != "CMD-004" or _call_outside_string(f.line_content)]
+        if file_path.endswith((".js", ".ts")):
+            lines = content.splitlines()
+            findings = [f for f in findings
+                        if f.rule_id != "CMD-004" or not _exec_param_only_gets_literals(lines, f.line_number)]
         if file_path.endswith(".php") and findings and not has_request_input(content):
             for f in findings:
                 if f.rule_id == "CMD-004":
@@ -157,3 +161,44 @@ def _call_outside_string(line: str) -> bool:
     """CMD-004 must match real code, not an 'exec() is disabled' message or label."""
     masked = _mask_quoted(line)
     return True if masked is None else bool(_CMD004_RE.search(masked))
+
+
+_EXEC_PARAM_RE = re.compile(r"(?<![\w.>:'\"])exec\s*\(\s*([A-Za-z_$][\w$]*)\s*[,)]")
+_FUNC_DEF_RE = re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)")
+_LITERAL_ARG_RE = re.compile(r"\(\s*(?:'[^']*'|\"[^\"]*\"|`[^`$]*`)\s*[,)]")
+
+
+def _exec_param_only_gets_literals(lines: list[str], lineno: int) -> bool:
+    """`function get(cmd, cb) { exec(cmd, cb) }` is a command sink only if some caller passes
+    data.  When the helper (or its util.promisify alias) is called in this file and every call
+    passes a plain string literal, nothing variable reaches exec()."""
+    if not 1 <= lineno <= len(lines):
+        return False
+    m = _EXEC_PARAM_RE.search(lines[lineno - 1])
+    if not m:
+        return False
+    param = m.group(1)
+    func = None
+    for i in range(lineno - 2, max(-1, lineno - 40), -1):
+        d = _FUNC_DEF_RE.search(lines[i])
+        if d and d.group(2) == param:
+            func = d.group(1)
+            break
+    if func is None:
+        return False
+    aliases = {func}
+    alias_re = re.compile(r"\b([A-Za-z_$][\w$]*)\s*=\s*[^;]*\bpromisify\(\s*" + re.escape(func) + r"\s*\)")
+    for line in lines:
+        am = alias_re.search(line)
+        if am:
+            aliases.add(am.group(1))
+    calls = 0
+    for line in lines:
+        for name in aliases:
+            for cm in re.finditer(r"(?<![\w$.])" + re.escape(name) + r"\s*\(", line):
+                if re.match(r"\s*(?:async\s+)?function\b", line) or "promisify(" in line:
+                    continue
+                calls += 1
+                if not _LITERAL_ARG_RE.match(line[cm.end() - 1:]):
+                    return False
+    return calls > 0
