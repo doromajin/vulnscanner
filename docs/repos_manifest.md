@@ -50,7 +50,11 @@
 | vapi | https://github.com/roottusk/vapi | 67152695b0ac | 意図的に脆弱な Laravel 8 の API 学習アプリ。SQL・パスは検出。SSRF（`file_get_contents($url)`）と CORS（Origin の反映・ワイルドカード）を取りこぼし、追加済み。他人のデータの参照・権限・マスアサインメントなどの認可の欠陥は静的解析では検出できず |
 | whois | https://github.com/sam-lane/whois | ba69718668c2 | 意図的に脆弱な Laravel サイト。唯一の脆弱性（コマンドインジェクション）を検出 |
 
-10 本とも、測定後に削除済み（pterodactyl、crater、bagisto は 2026-11-19、それ以外は 2026-11-22）。
+| pixelfed | https://github.com/pixelfed/pixelfed | 0f5e5c142a51 | Laravel の SNS。68 件 → 66 件（`shell_exec($bin)` の CRITICAL を MEDIUM へ、アップロードファイルをパス扱いしていた HIGH を除外、`.env.testing` を LOW へ）。確定した脆弱性なし |
+| invoiceninja | https://github.com/invoiceninja/invoiceninja | 15ea35ea63f3 | Laravel の請求書アプリ。146 件 → 142 件（PDF の出力を XSS 扱いしていた HIGH 2 件、翻訳文だけの `innerHTML` を除外）。確定した脆弱性なし |
+| librenms | https://github.com/librenms/librenms | f25325dd8ec8 | Laravel と古い PHP が混在。132 件 → 56 件（ベンダーの `overlib_mini.js` の CMD-004 が 71 件、リクエスト入力のないファイルの `shell_exec` が CRITICAL 9 件、`int` 型のプロパティの SQL が 2 件、CI のパスワードが 1 件）。メモリ測定にも使用（9,263 ファイル、146 MB） |
+
+13 本とも、測定後に削除済み（pterodactyl、crater、bagisto は 2026-11-19、それ以外は 2026-11-22）。
 
 取り直し: `git clone --depth 1 <URL>` のあと、`git fetch --depth 1 origin <ID>` と `git checkout <ID>`。
 
