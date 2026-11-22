@@ -455,6 +455,44 @@ _DB: dict[VulnType, dict] = {
             "[CIS Benchmarks](https://www.cisecurity.org/cis-benchmarks)"
         ),
     },
+
+    VulnType.FRAMEWORK_MISCONFIGURATION: {
+        "cwe": 16,
+        "text": (
+            "Read security-relevant settings from the environment and default to the safe value: "
+            "debug off, an explicit host allowlist, Secure/HttpOnly cookies, no hardcoded application "
+            "key, and an explicit CORS origin list. Keep development overrides in a separate, "
+            "non-deployed settings file."
+        ),
+        "markdown": (
+            "## Fix: Framework Misconfiguration (CWE-16)\n\n"
+            "Default every security setting to the **safe** value and override it per environment.\n\n"
+            "```python\n"
+            "# Django settings.py\n"
+            "# ❌ DEBUG = True\n"
+            "# ❌ ALLOWED_HOSTS = ['*']\n"
+            "# ✅\n"
+            "DEBUG = os.environ.get('DJANGO_DEBUG') == '1'\n"
+            "ALLOWED_HOSTS = os.environ['DJANGO_ALLOWED_HOSTS'].split(',')\n"
+            "SESSION_COOKIE_SECURE = True\nCSRF_COOKIE_SECURE = True\nSESSION_COOKIE_HTTPONLY = True\n"
+            "```\n\n"
+            "```php\n"
+            "// Laravel config/app.php\n"
+            "// ❌ 'debug' => env('APP_DEBUG', true),\n"
+            "// ❌ 'key' => env('APP_KEY', 'a-fixed-fallback-key-value-here'),\n"
+            "// ✅\n"
+            "'debug' => (bool) env('APP_DEBUG', false),\n"
+            "'key' => env('APP_KEY'),   // php artisan key:generate, per environment\n"
+            "```\n\n"
+            "**Laravel CORS (`config/cors.php`):** never combine `'allowed_origins' => ['*']` with "
+            "`'supports_credentials' => true`; list the real origins.\n\n"
+            "**If an `APP_KEY` was ever committed**, rotate it (existing sessions and encrypted values "
+            "become invalid) and treat the old key as compromised.\n\n"
+            "**References:** "
+            "[Django deployment checklist](https://docs.djangoproject.com/en/stable/howto/deployment/checklist/), "
+            "[Laravel configuration](https://laravel.com/docs/configuration)"
+        ),
+    },
 }
 
 # ── Public helpers ────────────────────────────────────────────────────────────

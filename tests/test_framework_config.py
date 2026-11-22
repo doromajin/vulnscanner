@@ -83,3 +83,11 @@ def test_laravel_usable_fallback_key_is_high_for_raw_and_base64_forms():
     b64 = "base64:" + "A" * 43 + "="
     assert ("CFG-LV-002", "HIGH") in _scan("config/app.php", _APP % ("    'key' => env('APP_KEY', '%s')," % raw))
     assert ("CFG-LV-002", "HIGH") in _scan("config/app.php", _APP % ("    'key' => env('APP_KEY', '%s')," % b64))
+
+
+def test_framework_misconfiguration_has_its_own_fix_advice():
+    from vulnscanner.models import VulnType
+    from vulnscanner.reporters.fix_suggestions import get_cwe, get_fix
+    assert get_cwe(VulnType.FRAMEWORK_MISCONFIGURATION) == 16
+    advice = get_fix(VulnType.FRAMEWORK_MISCONFIGURATION)
+    assert "environment" in advice["text"] and "APP_KEY" in advice["markdown"] and "DEBUG" in advice["markdown"]
