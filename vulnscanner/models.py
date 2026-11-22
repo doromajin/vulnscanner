@@ -44,6 +44,7 @@ class VulnType(str, Enum):
     INTENT_INJECTION = "Android Intent Injection"
     EXPOSED_ENDPOINT = "Exposed API Endpoint"
     FILE_UPLOAD = "Unrestricted File Upload"
+    FRAMEWORK_MISCONFIGURATION = "Framework Misconfiguration"
 
 
 @dataclass

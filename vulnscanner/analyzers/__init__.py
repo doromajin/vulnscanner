@@ -31,6 +31,7 @@ from vulnscanner.analyzers.ssti import SSTIAnalyzer
 from vulnscanner.analyzers.iac_analyzer import IaCAnalyzer
 from vulnscanner.analyzers.jwt_analyzer import JWTAnalyzer
 from vulnscanner.analyzers.cors_analyzer import CORSAnalyzer
+from vulnscanner.analyzers.framework_config import FrameworkConfigAnalyzer
 from vulnscanner.analyzers.ldap_injection import LDAPInjectionAnalyzer
 from vulnscanner.analyzers.weak_crypto import WeakCryptoAnalyzer
 from vulnscanner.analyzers.xss import XSSAnalyzer
@@ -89,6 +90,7 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     LDAPInjectionAnalyzer(),
     JWTAnalyzer(),
     CORSAnalyzer(),
+    FrameworkConfigAnalyzer(),
     IaCAnalyzer(),
     MalwareAnalyzer(),
 ]
