@@ -82,6 +82,29 @@ _RULES = [
         "PHP header sets wildcard CORS — any origin can read responses from this endpoint",
         Severity.MEDIUM, _CORS, (".php",),
     ),
+    # PHP / Laravel / Symfony: the request Origin echoed into Access-Control-Allow-Origin
+    (
+        "CORS-009",
+        re.compile(
+            r'Access-Control-Allow-Origin["\']?\s*[,:]\s*["\']?\s*(?:\.\s*)?'
+            r'(?:\$_SERVER\s*\[\s*["\']HTTP_ORIGIN["\']\s*\]'
+            r'|\$\w+\s*->\s*header\s*\(\s*["\']Origin["\']\s*\)'
+            r'|\$\w+\s*->\s*headers\s*->\s*get\s*\(\s*["\']Origin["\']\s*\))',
+            re.IGNORECASE,
+        ),
+        "CORS policy reflects the request Origin header without an allowlist — any site can make credentialed cross-origin requests",
+        Severity.HIGH, _CORS, (".php",),
+    ),
+    # Laravel / Symfony response header: ->header('Access-Control-Allow-Origin', '*')
+    (
+        "CORS-010",
+        re.compile(
+            r'->\s*(?:header|set)\s*\(\s*["\']Access-Control-Allow-Origin["\']\s*,\s*["\'][*]["\']',
+            re.IGNORECASE,
+        ),
+        "Response sets a wildcard Access-Control-Allow-Origin — any origin can read it; restrict to known origins",
+        Severity.MEDIUM, _CORS, (".php",),
+    ),
     # Python: response.headers["Access-Control-Allow-Origin"] = "*" or request.headers.get("Origin")
     (
         "CORS-008",

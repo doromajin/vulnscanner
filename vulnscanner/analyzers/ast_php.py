@@ -214,6 +214,10 @@ _PATH_FUNC_SINKS: frozenset[str] = frozenset({
     'include', 'require',
 })
 
+# Readers that fetch a remote URL when given one (allow_url_fopen): SSRF when the variable is a URL.
+_URL_READ_FUNCS: frozenset[str] = frozenset({'file_get_contents', 'fopen', 'readfile', 'file', 'copy'})
+_URL_NAME_RE = re.compile(r'url|uri|link|endpoint|href|remote', re.IGNORECASE)
+
 # SSRF — curl_setopt with CURLOPT_URL
 _CURL_URL_CONSTS: frozenset[str] = frozenset({'CURLOPT_URL', 'CURLOPT_PROXY'})
 
@@ -829,6 +833,12 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.PATH_TRAVERSAL, Severity.HIGH, 'PHAST-PATH-001',
                       f"User-controlled path flows into {fname}() — path traversal risk")
+                if (fname in _URL_READ_FUNCS
+                        and _URL_NAME_RE.search(args[0].text.decode('utf-8', errors='replace'))
+                        and not _url_host_is_fixed(node, args[0])):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.SSRF, Severity.HIGH, 'PHAST-SSRF-001',
+                          f"User-controlled URL flows into {fname}() — SSRF risk")
 
             # SSRF: curl_setopt($ch, CURLOPT_URL, $url)
             elif fname == 'curl_setopt' and len(args) >= 3:
