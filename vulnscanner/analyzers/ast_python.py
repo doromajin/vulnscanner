@@ -1626,6 +1626,20 @@ class _VulnVisitor(ast.NodeVisitor):
                           f" {taint.reason}",
                           taint)
 
+        # Pillow ImageMath.eval(expr, ...) evaluates its first argument as Python code;
+        # ImageMath.lambda_eval is the safe replacement.
+        elif (full or "").rsplit(".", 2)[-2:] in (["ImageMath", "eval"], ["ImageMath", "unsafe_eval"]):
+            if node.args and not _is_const(node.args[0]):
+                taint = _taint_of(node.args[0], self._assignments, self._class_attrs)
+                if taint.status == TaintStatus.CLEAN:
+                    return
+                sev = Severity.CRITICAL if taint.status == TaintStatus.TAINTED else Severity.HIGH
+                label = "tainted" if taint.status == TaintStatus.TAINTED else "non-literal"
+                self._add(node, VulnType.COMMAND_INJECTION, sev, "AST-CMD-006",
+                          f"{full}() evaluates a {label} expression as code - use ImageMath.lambda_eval:"
+                          f" {taint.reason}",
+                          taint)
+
         # standalone exec(expr)
         elif attr == "exec" and not isinstance(node.func, ast.Attribute):
             if node.args and not _is_const(node.args[0]):
