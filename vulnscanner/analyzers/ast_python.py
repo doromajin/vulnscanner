@@ -1375,12 +1375,8 @@ class _VulnVisitor(ast.NodeVisitor):
                             if _pname not in self._assignments:
                                 self._assignments[_pname] = _clean_sentinel
 
-        _cf_sum_web = getattr(_cross_file_local, "cf_summary", None)
-        _has_confirmed_params = bool(
-            _cf_sum_web and _cf_sum_web.confirmed_tainted_params.get(node.name)
-        )
         self._canonicalized_paths = _find_canonicalized_paths(node)
-        self._current_func_is_web_entry = _func_is_web_entry(node) or _has_confirmed_params
+        self._current_func_is_web_entry = _func_is_web_entry(node)
         self._visit_stmts(node.body)
         self._assignments = saved
         self._canonicalized_paths = saved_canon
