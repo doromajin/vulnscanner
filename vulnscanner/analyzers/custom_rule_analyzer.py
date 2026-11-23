@@ -13,6 +13,9 @@ from vulnscanner.analyzers.xss import (
     _concat_vars_are_i18n,
     _is_static_interpolation,
     _is_static_string_constant,
+    _expr_is_inert,
+    _scan_code,
+    innerhtml_rhs_is_inert,
 )
 from vulnscanner.models import Finding
 from vulnscanner.rules.loader import CustomRule
@@ -50,6 +53,12 @@ def _innerhtml_is_static_text(line: str, lines: list[str], idx: int) -> bool:
     m = re.search(r"\.innerHTML\s*=(?!=)\s*([^\n]*)", line)
     if not m:
         return False
+    # The whole statement, which prettier may wrap onto the following lines
+    text = "\n".join(lines[idx:idx + 40])
+    start = re.search(r"\.innerHTML\s*=(?!=)\s*", text).end()
+    end = _scan_code(text, start, ";")
+    if 0 < end < len(text) and innerhtml_rhs_is_inert(text[start:end], _joined(lines)):
+        return True
     rhs = m.group(1).strip().rstrip(";").strip()
     if _DOM_MARKUP_COPY_RE.fullmatch(rhs):
         return True     # `a.innerHTML = b.innerHTML`: markup already parsed into the DOM once
@@ -61,7 +70,7 @@ def _innerhtml_is_static_text(line: str, lines: list[str], idx: int) -> bool:
         if len(interpolations) != block.count("${"):
             return False  # nested braces: do not guess
         joined = _joined(lines)
-        return all(_is_static_interpolation(e, joined) for e in interpolations)
+        return all(_is_static_interpolation(e, joined) or _expr_is_inert(e, joined) for e in interpolations)
     return False
 
 

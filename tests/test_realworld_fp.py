@@ -586,3 +586,75 @@ class TestMarkupReach:
                 "    return Markup(request.args.get('q'))\n")
         f = self._xss(code)
         assert f and all(x.severity == Severity.HIGH for x in f)
+
+
+# ── 6. innerHTML fed by variables that only ever hold literals, numbers and counters ──────
+
+class TestInertInnerHtmlValues:
+    def _flags(self, code):
+        """Rules that still flag the innerHTML assignment, for the regex rule and XSS-001."""
+        xss = {f.rule_id for f in XSSAnalyzer().analyze("assets/a.js", code) if f.rule_id == "XSS-001"}
+        custom = {f.rule_id for f in CustomRuleAnalyzer(load_rules([_BUILTIN])).analyze("assets/a.js", code)
+                  if f.rule_id == "JS-XSS-001"}
+        return xss | custom
+
+    _SRC = "const q = new URLSearchParams(location.search).get('q');\n"
+
+    def test_counter_derived_id_in_a_template_is_not_flagged(self):
+        code = ("let n = 0;\nclass W {\n  constructor() {\n    this.id = ++n;\n"
+                "    this.boxId = `box-${this.id}`;\n  }\n"
+                "  draw() {\n    const empty = `<div id=\"${this.boxId}\"></div>`;\n"
+                "    this.el.innerHTML = empty;\n    this.el2.innerHTML = `<p>${empty}</p>`;\n  }\n}\n")
+        assert not self._flags(code)
+
+    def test_literal_only_variables_and_ternaries_are_not_flagged(self):
+        code = ("function f(ok) {\n  const a = '<b>hi</b>';\n  const b = ok ? 'yes' : 'no';\n"
+                "  el.innerHTML = a + b;\n}\n")
+        assert not self._flags(code)
+
+    def test_variable_from_a_url_value_is_still_flagged(self):
+        assert self._flags(self._SRC + "el.innerHTML = q;\n")
+        assert self._flags(self._SRC + "const box = `<p>${q}</p>`;\nel.innerHTML = box;\n")
+
+    def test_call_result_is_not_inert(self):
+        code = "const h = location.hash.slice(1);\nel.innerHTML = h;\n"
+        assert self._flags(code)
+
+    def test_one_unsafe_assignment_among_safe_ones_is_flagged(self):
+        code = self._SRC + "let html = '<i>x</i>';\nif (q) {\n  html = q;\n}\nel.innerHTML = html;\n"
+        assert self._flags(code)
+
+    def test_compound_assignment_is_not_inert(self):
+        code = self._SRC + "let html = '<ul>';\nhtml += q;\nel.innerHTML = html;\n"
+        assert self._flags(code)
+
+    def test_a_parameter_is_not_inert(self):
+        code = "function show(html) {\n  el.innerHTML = html;\n}\nconst html = ok ? 'a' : 'b';\n"
+        assert self._flags(code)
+
+    def test_property_assigned_from_input_is_flagged(self):
+        code = self._SRC + "class W {\n  set(v) {\n    this.label = q;\n  }\n  draw() {\n    this.el.innerHTML = `<b>${this.label}</b>`;\n  }\n}\n"
+        assert self._flags(code)
+
+    def test_html_built_with_append_from_literals_and_escaped_values_is_not_flagged(self):
+        code = ("function render(data) {\n  let html = '<table>';\n"
+                "  for (const item of data.items) {\n"
+                "    const cls = item.ok ? 'ok' : 'bad';\n"
+                "    html += `<tr class=\"${cls}\"><td>${escapeHtml(item.name || '-')}</td></tr>`;\n  }\n"
+                "  html += '</table>';\n  el.innerHTML = html;\n}\n")
+        assert not self._flags(code)
+
+    def test_html_built_with_append_from_unescaped_item_is_flagged(self):
+        code = ("function render(data) {\n  let html = '<table>';\n"
+                "  for (const item of data.items) {\n"
+                "    html += `<tr><td>${item.name}</td></tr>`;\n  }\n"
+                "  el.innerHTML = html;\n}\n")
+        assert self._flags(code + "const u = location.hash;\n")
+
+    def test_proof_is_cheap_on_a_file_with_thousands_of_sinks(self):
+        import time
+        body = "".join(f"function f{i}(a) {{ var v{i} = a ? 'x' : 'y'; el{i}.innerHTML = v{i}; }}\n" for i in range(3500))
+        t0 = time.perf_counter()
+        XSSAnalyzer().analyze("assets/bundle.js", body)
+        CustomRuleAnalyzer(load_rules([_BUILTIN])).analyze("assets/bundle.js", body)
+        assert time.perf_counter() - t0 < 5.0
