@@ -126,12 +126,33 @@ _REQUEST_SAFE_METHODS: frozenset[str] = frozenset({
     # UploadedFile attributes the server computes (the client-chosen name is getClientOriginalName)
     'getRealPath', 'getPathname', 'path', 'hashName', 'getSize', 'getMimeType', 'guessExtension',
     'extension', 'getError', 'isValid',
+    # The client's extension cannot leave its directory (no separator survives it), so it is not
+    # path-taint; PHAST-UPLOAD-001 reports the real problem (an extension the client picks).
+    'getClientOriginalExtension',
 })
+# `$_FILES['f']['tmp_name']` is the server's own temporary path, `error` and `size` are numbers.
+_FILES_SERVER_FIELD_RE = re.compile(r"""^\$_FILES\s*\[[^\]]*\]\s*\[\s*['"](?:tmp_name|error|size)['"]\s*\]$""")
 # Path helpers that return a filesystem path built from their argument.
 _PATH_HELPERS: frozenset[str] = frozenset({
     'storage_path', 'public_path', 'base_path', 'app_path', 'resource_path', 'config_path',
     'database_path', 'lang_path',
 })
+# String functions that change the shape of a value without making it safe: what the client sent
+# is still in the result (`trim($_GET['id'])`, `str_replace("'", '', $x)`, `implode(',', $ids)`).
+# Sanitizers (intval, htmlspecialchars, urlencode ...) are not here; they are in _ALL_SANITIZERS.
+_PASSTHROUGH_FUNCS: frozenset[str] = frozenset({
+    'trim', 'ltrim', 'rtrim', 'chop',
+    'strtolower', 'strtoupper', 'ucfirst', 'lcfirst', 'ucwords',
+    'mb_strtolower', 'mb_strtoupper', 'mb_convert_case', 'mb_substr', 'mb_convert_encoding',
+    'substr', 'substr_replace', 'str_replace', 'str_ireplace', 'strtr', 'preg_replace',
+    'str_pad', 'str_repeat', 'strrev', 'wordwrap', 'nl2br', 'strval',
+    'sprintf', 'vsprintf', 'implode', 'join', 'explode', 'str_split', 'preg_split',
+    'urldecode', 'rawurldecode', 'base64_decode', 'stripslashes', 'stripcslashes',
+    'html_entity_decode', 'htmlspecialchars_decode', 'json_decode',
+    'utf8_decode', 'utf8_encode', 'iconv',
+})
+_FORMAT_FUNCS: frozenset[str] = frozenset({'sprintf', 'vsprintf'})
+_FORMAT_SPEC_RE = re.compile(r"%(?:\d+\$)?[-+ 0]*(?:'.)?\d*(?:\.\d+)?([a-zA-Z%])")
 # Query-builder / DB-facade methods that take a raw SQL fragment as their first argument.
 _SQL_RAW_METHODS: frozenset[str] = frozenset({
     'whereRaw', 'orWhereRaw', 'havingRaw', 'orHavingRaw', 'orderByRaw', 'selectRaw', 'groupByRaw',
@@ -394,11 +415,18 @@ def _is_tainted_node(node, tainted: dict, tainted_funcs: set,
 
     # Subscript: $_GET["key"] or $tainted["key"]
     if t == 'subscript_expression':
+        if _FILES_SERVER_FIELD_RE.match(node.text.decode('utf-8', errors='replace')):
+            return False
         obj = node.children[0] if node.children else None
         if obj and obj.type == 'variable_name':
             name = _var_name(obj)
             if name and (name in _SOURCES or name in tainted):
                 return True
+        elif obj is not None and obj.type in ('function_call_expression', 'member_call_expression',
+                                               'scoped_call_expression', 'member_access_expression',
+                                               'parenthesized_expression', 'subscript_expression'):
+            # `json_decode($_POST['d'], true)['k']`, `explode(',', $_GET['x'])[0]`, `$request->all()['k']`
+            return _is_tainted_node(obj, tainted, tainted_funcs, tainted_props)
         return False
 
     # String concatenation / null-coalescing
@@ -444,6 +472,12 @@ def _is_tainted_node(node, tainted: dict, tainted_funcs: set,
             return True
         if fname in _PATH_HELPERS:
             return any(_is_tainted_node(a, tainted, tainted_funcs, tainted_props) for a in _call_args(node))
+        plain = fname.lstrip('\\').lower()
+        if plain in _PASSTHROUGH_FUNCS and not _is_sanitizer_call(node):
+            args = _call_args(node)
+            if plain in _FORMAT_FUNCS and _format_is_numeric_only(args):
+                return False        # sprintf('%d', $x) is how a number is forced
+            return any(_is_tainted_node(a, tainted, tainted_funcs, tainted_props) for a in args)
     if t == 'scoped_call_expression' and len(node.children) >= 3:
         cls, meth = node.children[0], node.children[2]
         return (cls.text.decode('utf-8', errors='replace').lstrip('\\').split('\\')[-1] == 'Request'
@@ -470,6 +504,14 @@ def _is_tainted_node(node, tainted: dict, tainted_funcs: set,
         return obj is not None and _is_tainted_node(obj, tainted, tainted_funcs, tainted_props)
 
     return False
+
+
+def _format_is_numeric_only(args: list) -> bool:
+    """`sprintf('%d', ...)`: the format is a literal and every conversion in it is numeric."""
+    if not args or args[0].type not in ('string', 'encapsed_string'):
+        return False
+    specs = [s for s in _FORMAT_SPEC_RE.findall(args[0].text.decode('utf-8', errors='replace')) if s != '%']
+    return bool(specs) and all(s in 'dDiuUfFeEgG' for s in specs)
 
 
 def _taint_source_desc(node) -> str:
