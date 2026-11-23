@@ -1,4 +1,5 @@
 import re
+import threading
 
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.analyzers.php_input import has_request_input
@@ -116,6 +117,10 @@ class CommandInjectionAnalyzer(BaseAnalyzer):
             lines = content.splitlines()
             findings = [f for f in findings
                         if f.rule_id != "CMD-004" or not _exec_param_only_gets_literals(lines, f.line_number)]
+        if file_path.endswith(".php"):
+            findings = [f for f in findings
+                        if f.rule_id not in ("CMD-004", "CMD-005")
+                        or not _php_cmd_arg_is_constant(f.line_content, content)]
         if file_path.endswith(".php") and findings and not has_request_input(content):
             for f in findings:
                 if f.rule_id in ("CMD-004", "CMD-005"):
@@ -129,6 +134,149 @@ class CommandInjectionAnalyzer(BaseAnalyzer):
 
 
 _CMD004_RE = _RULES[3][1]
+
+
+# ── PHP: a variable that only ever holds string literals is a constant ────────
+# `$cmd = $mode === 'a' ? 'npm run prod' : 'npm run dev'; passthru($cmd);` runs one of two fixed
+# commands.  The proof is deliberately narrow: every write to the variable in the file is a plain
+# `=` of a literal (or a ternary / `.` chain of literals), and nothing in the file can write to it
+# another way (by reference, as a parameter, a loop variable, extract(), `$$`).
+
+_PHP_SQ = r"'(?:[^'\\]|\\.)*'"
+_PHP_DQ = r'"(?:[^"\\$]|\\.)*"'          # no `$`: neither `$x` nor `{$x}` interpolation
+_PHP_LITERAL_RE = re.compile(rf"(?:{_PHP_SQ}|{_PHP_DQ})")
+_PHP_FIRST_ARG_RE = re.compile(
+    r"(?<![\w.>:'\"])(?:shell_exec|passthru|proc_open|popen|system|exec|eval)\s*\(\s*\$([A-Za-z_]\w*)\s*[,)]",
+    re.IGNORECASE,
+)
+_PHP_MAX_RHS = 600
+
+
+def _php_scan(s: str, i: int, stops: str) -> int:
+    """Index of the first char of *stops* at bracket depth 0 outside quotes; len(s) if none, -1 if odd."""
+    depth, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in "'\"":
+            j = i + 1
+            while j < n and s[j] != c:
+                j += 2 if s[j] == "\\" else 1
+            if j >= n:
+                return -1
+            i = j + 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                return i if c in stops else -1
+            depth -= 1
+        elif depth == 0 and c in stops:
+            return i
+        i += 1
+    return n
+
+
+def _php_split(expr: str, ch: str) -> list[str]:
+    parts, start, i = [], 0, 0
+    while True:
+        i = _php_scan(expr, i, ch)
+        if i < 0:
+            return [expr]
+        if i >= len(expr):
+            parts.append(expr[start:])
+            return parts
+        parts.append(expr[start:i])
+        start = i = i + 1
+
+
+def _php_expr_is_literal(expr: str, depth: int = 0) -> bool:
+    expr = expr.strip()
+    if not expr or depth > 4 or len(expr) > _PHP_MAX_RHS:
+        return False
+    q = _php_scan(expr, 0, "?")
+    while 0 <= q < len(expr) and (expr[q + 1:q + 3] == "->" or expr[q + 1:q + 2] == "?" or expr[q - 1:q] == "?"):
+        q = _php_scan(expr, q + 1, "?")      # `?->` (nullsafe) and `??` are not a ternary
+    if 0 <= q < len(expr):
+        c = _php_scan(expr, q + 1, ":")
+        if 0 <= c < len(expr):
+            return (_php_expr_is_literal(expr[q + 1:c], depth + 1)
+                    and _php_expr_is_literal(expr[c + 1:], depth + 1))
+        return False
+    if expr.startswith("(") and expr.endswith(")") and _php_scan(expr, 1, ")") == len(expr) - 1:
+        return _php_expr_is_literal(expr[1:-1], depth + 1)
+    terms = _php_split(expr, ".")
+    return all(_PHP_LITERAL_RE.fullmatch(t.strip()) for t in terms)
+
+
+_PHP_VAR = r"\$([A-Za-z_]\w*)"
+_PHP_ASSIGN_RE = re.compile(r"(?<![\w$>:])" + _PHP_VAR + r"\s*((?:[-+*/.%&|^]|\?\?)?)=(?![=>])\s*")
+# One pattern per way a variable can be written without a plain `$v = <expr>;`.  Group 1 holds the
+# variable name, or a text span whose `$names` are all affected.
+_PHP_WRITE_RES = (
+    re.compile(r"&\s*" + _PHP_VAR + r"\b"),                              # by reference
+    re.compile(r"\$\$" + r"([A-Za-z_]\w*)"),                              # variable variables
+    re.compile(_PHP_VAR + r"\s*\["),                                       # element write
+    re.compile(r"\b(?:global|static)\b([^;]*)"),
+    re.compile(r"\bas\s+((?:[^)]*=>\s*)?&?\s*\$\w+)"),                      # foreach
+    re.compile(r"\b(?:function|fn)\b[^(;{]*\(([^)]*)\)"),                  # parameters
+    re.compile(r"\bcatch\s*\(([^)]*)\)"),
+    re.compile(r"\blist\s*\(([^)]*)\)\s*=(?!=)"),
+    re.compile(r"\[([^\]]*)\]\s*=(?![=>])"),                               # [$a, $b] = ...
+    re.compile(r",\s*" + _PHP_VAR + r"\s*(?=[,)])"),                       # a later argument may be by-reference
+    re.compile(r"(?:\+\+|--)\s*" + _PHP_VAR + r"\b"),
+    re.compile(_PHP_VAR + r"\s*(?:\+\+|--)"),
+)
+_PHP_NAME_RE = re.compile(r"\$([A-Za-z_]\w*)")
+_php_local = threading.local()
+
+
+class _PhpIndex:
+    """One pass per pattern over a file: the right-hand sides assigned to each variable and the set
+    of variables that can be written some other way.  Asking per finding would be quadratic."""
+
+    __slots__ = ("rhs", "unsafe", "all_unsafe")
+
+    def __init__(self, content: str) -> None:
+        self.rhs: dict[str, list[str] | None] = {}
+        self.unsafe: set[str] = set()
+        self.all_unsafe = bool(re.search(r"\b(?:extract|parse_str)\s*\(", content))
+        for m in _PHP_ASSIGN_RE.finditer(content):
+            name = m.group(1)
+            if m.group(2):
+                self.unsafe.add(name)        # `.=`, `+=`, `??=` ...
+                continue
+            end = _php_scan(content, m.end(), ";")
+            entry = self.rhs.setdefault(name, [])
+            if entry is None:
+                continue
+            if end < 0 or end >= len(content) or len(entry) >= 20:
+                self.rhs[name] = None
+            else:
+                entry.append(content[m.end():end])
+        for rx in _PHP_WRITE_RES:
+            for m in rx.finditer(content):
+                self.unsafe.update(_PHP_NAME_RE.findall(m.group(0)))
+
+
+def _php_var_only_holds_literals(content: str, name: str) -> bool:
+    if len(content) > 400_000:
+        return False
+    cache = getattr(_php_local, "entry", None)
+    if cache is None or cache[0] is not content:
+        cache = (content, _PhpIndex(content), {})
+        _php_local.entry = cache
+    idx, verdicts = cache[1], cache[2]
+    if name not in verdicts:
+        rhs = idx.rhs.get(name)
+        verdicts[name] = (not idx.all_unsafe and name not in idx.unsafe and bool(rhs)
+                          and all(_php_expr_is_literal(r) for r in rhs))
+    return verdicts[name]
+
+
+def _php_cmd_arg_is_constant(line: str, content: str) -> bool:
+    m = _PHP_FIRST_ARG_RE.search(line)
+    return bool(m) and _php_var_only_holds_literals(content, m.group(1))
 
 
 

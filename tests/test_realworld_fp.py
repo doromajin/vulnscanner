@@ -658,3 +658,38 @@ class TestInertInnerHtmlValues:
         XSSAnalyzer().analyze("assets/bundle.js", body)
         CustomRuleAnalyzer(load_rules([_BUILTIN])).analyze("assets/bundle.js", body)
         assert time.perf_counter() - t0 < 5.0
+
+
+# ── 7. PHP: a variable that only ever holds string literals is a constant ─────────────────
+
+class TestPhpLiteralOnlyVariable:
+    def _ids(self, php):
+        return {f.rule_id for f in CommandInjectionAnalyzer().analyze("app/job.php", php)
+                if f.rule_id in ("CMD-004", "CMD-005")}
+
+    @pytest.mark.parametrize("php", [
+        "<?php\n$s = $branch === 'master' ? 'npm run prod' : 'npm run dev';\npassthru($s, $code);\n",
+        "<?php\n$c = 'ls -l';\nshell_exec($c);\n",
+        "<?php\n$c = 'ls ' . '-l';\nsystem($c);\n",
+        "<?php\n$c = $o?->ok ? 'a' : 'b';\nshell_exec($c);\n",
+        "<?php\n$c = 'uptime';\nexec($c, $out);\n",
+    ])
+    def test_literal_only_variable_is_not_flagged(self, php):
+        assert not self._ids(php)
+
+    @pytest.mark.parametrize("php", [
+        "<?php\n$c = $_GET['c'];\nshell_exec($c);\n",
+        "<?php\n$c = 'ls';\nif ($x) { $c = $_GET['c']; }\nshell_exec($c);\n",
+        "<?php\n$c = 'ls ';\n$c .= $_GET['d'];\nshell_exec($c);\n",
+        "<?php\n$c = 'ls ' . $dir;\nshell_exec($c);\n",
+        "<?php\n$c = \"ls $dir\";\nshell_exec($c);\n",
+        "<?php\nfunction run($c) { shell_exec($c); }\n$c = 'ls';\n",
+        "<?php\n$c = 'ls';\nforeach ($list as $c) { shell_exec($c); }\n",
+        "<?php\n$c = 'ls';\npreg_match($p, $s, $c);\nshell_exec($c);\n",
+        "<?php\n$c = 'ls';\nextract($_GET);\nshell_exec($c);\n",
+        "<?php\nshell_exec($c);\n",
+        "<?php\n$c = $f ? 'ls' : $_GET['x'];\nshell_exec($c);\n",
+        "<?php\n$code = 'return 1;';\n$code = $_POST['code'];\neval($code);\n",
+    ])
+    def test_variables_that_can_carry_data_are_still_flagged(self, php):
+        assert self._ids(php)
