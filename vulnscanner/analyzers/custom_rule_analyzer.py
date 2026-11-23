@@ -65,12 +65,41 @@ def _innerhtml_is_static_text(line: str, lines: list[str], idx: int) -> bool:
     return False
 
 
+_LOCATION_ASSIGN_RE = re.compile(r"(?:window\.)?location(?:\.href)?\s*=(?!=)\s*([^\n]*)")
+_URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:")
+
+
+def _location_has_fixed_prefix(line: str, lines: list[str], idx: int) -> bool:
+    """`location = "<literal>" + x` where the literal pins the destination to the current origin.
+
+    A prefix that is a relative path (`"orders/show/"`), a same-origin absolute path (`"/orders/"`),
+    a query or a fragment cannot change the host whatever is appended.  `""`, `"/"`, `"//..."`,
+    `"\\..."` and anything starting with a scheme (`"http:"`, `"javascript:"`) still can.  The
+    right-hand side may continue on the following lines (prettier wraps `location =` this way)."""
+    m = _LOCATION_ASSIGN_RE.search(line)
+    if not m:
+        return False
+    rhs = m.group(1).strip()
+    if not rhs:
+        rhs = next((nxt.strip() for nxt in lines[idx + 1:idx + 3] if nxt.strip()), "")
+    lit = re.match(r"(?:\"([^\"\\]*)\"|'([^'\\]*)')", rhs)
+    if not lit:
+        return False
+    text = lit.group(1) if lit.group(1) is not None else lit.group(2)
+    if not text or _URL_SCHEME_RE.match(text):
+        return False
+    if text[0] in "/\\":
+        return len(text) > 1 and text[1] not in "/\\"
+    return True
+
+
 # Built-in rules whose regex alone cannot see that the matched value is safe.
 # Each veto gets (line, all lines, 0-based line index); True drops the match.
 _RULE_VETOES = {
     "JS-XSS-001": lambda line, lines, idx: (
         _innerhtml_is_i18n_concat(line, lines, idx) or _innerhtml_is_static_text(line, lines, idx)
     ),
+    "JS-REDIR-001": _location_has_fixed_prefix,
 }
 
 

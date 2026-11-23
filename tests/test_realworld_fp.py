@@ -117,6 +117,31 @@ class TestDomSinkReach:
         loud = self._custom("a.js", "const n = new URLSearchParams(location.search).get('n');\nwindow.location = n;\n")
         assert [x.severity for x in loud if x.rule_id == "JS-REDIR-001"] == [Severity.MEDIUM]
 
+    _SRC = "const n = new URLSearchParams(location.search).get('n');\n"
+
+    @pytest.mark.parametrize("rhs", [
+        'window.location =\n    "transactions/show/" + id;\n',
+        'window.location = "transactions/show/" + id;\n',
+        "window.location = '/orders/' + id;\n",
+        'window.location = "?page=" + n;\n',
+    ])
+    def test_fixed_same_origin_prefix_is_not_an_open_redirect(self, rhs):
+        r = self._custom("a.js", self._SRC + rhs)
+        assert not [x for x in r if x.rule_id == "JS-REDIR-001"]
+
+    @pytest.mark.parametrize("rhs", [
+        "window.location = n;\n",
+        'window.location =\n    n + "&done=1";\n',
+        'window.location = "" + n;\n',
+        'window.location = "/" + n;\n',
+        'window.location = "//" + n;\n',
+        'window.location = "https://" + n;\n',
+        'window.location = "javascript:" + n;\n',
+    ])
+    def test_open_redirect_shapes_still_flagged(self, rhs):
+        r = self._custom("a.js", self._SRC + rhs)
+        assert [x for x in r if x.rule_id == "JS-REDIR-001"]
+
 
 class TestPhpEscapedInnerHtml:
     def _scan(self, code):
