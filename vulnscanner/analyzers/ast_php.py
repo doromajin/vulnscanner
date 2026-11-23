@@ -240,6 +240,21 @@ def _walk(node):
         yield from _walk(child)
 
 
+# A variable belongs to one method or named function (or to the file's top level): a name that is
+# tainted in one method says nothing about the same name in another.  Closures and arrow functions
+# share the scope of the code around them.
+_SCOPE_TYPES = ('method_declaration', 'function_definition')
+
+
+def _walk_scope(node):
+    """`_walk`, but nested methods / named functions are scopes of their own and are skipped."""
+    yield node
+    for child in node.children:
+        if child.type in _SCOPE_TYPES:
+            continue
+        yield from _walk_scope(child)
+
+
 # HTML-escaping helpers shipped by common frameworks, called as functions (Laravel e(),
 # CakePHP h(), WordPress esc_*) or as static / instance methods (Yii Html::encode,
 # Zend/Laminas ->escapeHtml, Twig Escaper->escape, HTMLPurifier->purify).
@@ -519,10 +534,10 @@ def _is_uploaded_file_var(arg, node) -> bool:
 
 
 def _collect_pass(root, tainted: dict, tainted_funcs: set, tainted_props: set,
-                  clean_props: frozenset = frozenset()) -> bool:
+                  clean_props: frozenset = frozenset(), walker=_walk) -> bool:
     """Walk all assignments and function defs; update taint. Returns True if changed."""
     changed = False
-    for node in _walk(root):
+    for node in walker(root):
         # ── Simple assignment: $var = expr ────────────────────────────────────
         if node.type == 'assignment_expression':
             children = node.children
@@ -668,9 +683,9 @@ def _collect_php_call_site_taint(
     return changed
 
 
-def _seed_request_params(root, tainted: dict) -> None:
+def _seed_request_params(root, tainted: dict, walker=_walk) -> None:
     """`Request $request` / `FormRequest $r` parameters hold the client's request."""
-    for n in _walk(root):
+    for n in walker(root):
         if n.type != 'simple_parameter':
             continue
         type_node = n.child_by_field_name('type')
@@ -694,19 +709,117 @@ def _build_taint(
     seed_funcs: pre-known tainted function names from cross-file analysis.
     Includes interprocedural caller→callee param seeding.
     """
+    scopes, tainted_funcs, tainted_props = _build_taint_scoped(root, seed_funcs)
     tainted: dict[str, tuple[int, str]] = {}
-    _seed_request_params(root, tainted)
+    for _node, scope_taint in scopes:      # flat view for callers that only need the function names
+        for var, entry in scope_taint.items():
+            tainted.setdefault(var, entry)
+    return tainted, tainted_funcs, tainted_props
+
+
+def _php_params(node) -> list[str]:
+    """Parameter variable names (no $) of a method or function, in order."""
+    formal = next((c for c in node.children if c.type == 'formal_parameters'), None)
+    names: list[str] = []
+    if formal is not None:
+        for child in formal.named_children:
+            var_node = next((c for c in child.children if c.type == 'variable_name'), None)
+            names.append((_var_name(var_node) if var_node is not None else None) or '')
+    return names
+
+
+def _php_scope_name(node) -> str:
+    name = next((c for c in node.children if c.type == 'name'), None)
+    return name.text.decode('utf-8', errors='replace') if name is not None else ''
+
+
+def _php_global_names(node) -> set[str]:
+    """`global $a, $b;` inside a function: those names are the file's top-level variables."""
+    names: set[str] = set()
+    for n in _walk_scope(node):
+        if n.type == 'global_declaration':
+            names.update(v for v in (_var_name(c) for c in n.children if c.type == 'variable_name') if v)
+    return names
+
+
+def _callee_key(node) -> tuple[str, str] | None:
+    """('f', name) for `name(...)`, ('m', name) for `$this->name(...)` / `self::name(...)` /
+    `static::name(...)`; None for calls on objects whose class is unknown."""
+    if node.type == 'function_call_expression':
+        name = _call_name(node)
+        return ('f', name) if name else None
+    if node.type == 'member_call_expression':
+        obj = node.children[0] if node.children else None
+        if obj is not None and obj.type == 'variable_name' and _var_name(obj) == 'this':
+            name = _method_name(node)
+            return ('m', name) if name else None
+        return None
+    if node.type == 'scoped_call_expression' and len(node.children) >= 3:
+        cls, meth = node.children[0], node.children[2]
+        if (cls.type == 'relative_scope' and cls.text.decode('utf-8', errors='replace') in ('self', 'static')
+                and meth.type == 'name'):
+            return ('m', meth.text.decode('utf-8', errors='replace'))
+    return None
+
+
+def _seed_callee_params(scopes, callees, tainted_funcs, tainted_props) -> bool:
+    """A call that passes a tainted argument taints the matching parameter of the callee's own scope
+    (functions by name, methods through `$this` / `self` / `static`)."""
+    changed = False
+    for node_s, taint in scopes:
+        for node in _walk_scope(node_s):
+            key = _callee_key(node)
+            if key is None or key not in callees:
+                continue
+            args = _call_args(node)
+            for i, arg in enumerate(args):
+                if not _is_tainted_node(arg, taint, tainted_funcs, tainted_props):
+                    continue
+                for params, callee_taint in callees[key]:
+                    if i < len(params) and params[i] and params[i] not in callee_taint:
+                        callee_taint[params[i]] = (arg.start_point[0] + 1, f"arg #{i} of {key[1]}()")
+                        changed = True
+    return changed
+
+
+def _build_taint_scoped(root, seed_funcs: "frozenset[str] | None" = None) -> tuple[list, set, set]:
+    """Fixed-point taint propagation with one taint map per method / named function.
+
+    Returns ([(scope_node, {var: (line, source)})], tainted_funcs, tainted_props).  The first scope is
+    the file's top level.  Function names that return tainted data and `$this->prop` taint are
+    shared by the whole file; variables are not.
+    """
+    nodes = [root] + [n for n in _walk(root) if n.type in _SCOPE_TYPES]
+    scopes: list[tuple] = []
+    callees: dict[tuple[str, str], list] = {}
+    for n in nodes:
+        taint: dict[str, tuple[int, str]] = {}
+        _seed_request_params(n, taint, _walk_scope)
+        scopes.append((n, taint))
+        if n.type in _SCOPE_TYPES:
+            kind = 'f' if n.type == 'function_definition' else 'm'
+            name = _php_scope_name(n)
+            if name:
+                callees.setdefault((kind, name), []).append((_php_params(n), taint))
     tainted_funcs: set[str] = set(seed_funcs or ())
     tainted_props: set[str] = set()
-    func_param_map = _build_php_func_param_map(root)
     clean_props = _typed_scalar_props(root)
+    module_taint = scopes[0][1]
+    globals_of = [_php_global_names(n) if n.type in _SCOPE_TYPES else set() for n, _ in scopes]
     for _ in range(8):
-        c1 = _collect_pass(root, tainted, tainted_funcs, tainted_props, clean_props)
-        c2 = _collect_php_call_site_taint(root, tainted, tainted_funcs,
-                                           tainted_props, func_param_map)
-        if not c1 and not c2:
+        changed = False
+        for (n, taint), declared in zip(scopes, globals_of):
+            for var in declared:
+                if var in module_taint and var not in taint:
+                    taint[var] = module_taint[var]
+                    changed = True
+            if _collect_pass(n, taint, tainted_funcs, tainted_props, clean_props, _walk_scope):
+                changed = True
+        if _seed_callee_params(scopes, callees, tainted_funcs, tainted_props):
+            changed = True
+        if not changed:
             break
-    return tainted, tainted_funcs, tainted_props
+    return scopes, tainted_funcs, tainted_props
 
 
 # ── Emit helper ───────────────────────────────────────────────────────────────
@@ -843,7 +956,8 @@ def _is_whole_request(node, taint) -> bool:
 
 # ── Sink checker ─────────────────────────────────────────────────────────────
 
-def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, repo_url) -> list:
+def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, repo_url,
+                 walker=_walk) -> list:
     findings: list[Finding] = []
     seen: set = set()
 
@@ -858,7 +972,7 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                 return False
         return _is_tainted_node(n, tainted, tainted_funcs, tainted_props)
 
-    for node in _walk(root):
+    for node in walker(root):
         # ── Function call sinks ───────────────────────────────────────────────
         if node.type == 'function_call_expression':
             fname = _call_name(node)
@@ -1324,10 +1438,13 @@ class PhpASTAnalyzer(BaseAnalyzer):
         lines = content.splitlines()
         cf_ctx = _get_php_cf_ctx()
         seed = cf_ctx.tainted_func_names if cf_ctx else None
-        tainted, tainted_funcs, tainted_props = _build_taint(tree.root_node, seed)
+        scopes, tainted_funcs, tainted_props = _build_taint_scoped(tree.root_node, seed)
 
-        findings = _check_sinks(
-            tree.root_node, tainted, tainted_funcs, tainted_props, file_path, lines, repo_url
-        )
+        findings = []
+        for scope_node, tainted in scopes:
+            findings.extend(_check_sinks(
+                scope_node, tainted, tainted_funcs, tainted_props, file_path, lines, repo_url,
+                walker=_walk_scope,
+            ))
         findings.extend(_check_uploads(tree.root_node, file_path, lines, repo_url))
         return findings
