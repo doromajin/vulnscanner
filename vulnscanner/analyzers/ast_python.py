@@ -1816,7 +1816,8 @@ class _VulnVisitor(ast.NodeVisitor):
         else:
             self._add(node, VulnType.XSS, Severity.MEDIUM, "AST-XSS-001",
                       f"[needs_review] {name}() called with a non-literal value —"
-                      " verify no user input reaches this")
+                      " verify no user input reaches this",
+                      taint)
 
     def _fstring_is_neutral(self, node: ast.JoinedStr, _depth: int = 0) -> bool:
         """An f-string whose substitutions cannot inject markup.

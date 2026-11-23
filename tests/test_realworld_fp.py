@@ -556,3 +556,33 @@ class TestCliArgsReachCodeExecution:
         code = self.PARSER + "    open(args.m).read()\n"
         found = [f for f in PythonASTAnalyzer().analyze("tool.py", code) if "PATH" in f.rule_id]
         assert all(f.severity == Severity.INFO for f in found)
+
+
+# ── 5. Markup() of a value the engine cannot trace, outside any web entry ─────
+
+class TestMarkupReach:
+    def _xss(self, code):
+        from vulnscanner.analyzers.ast_python import PythonASTAnalyzer
+        return [f for f in PythonASTAnalyzer().analyze("lib.py", code) if f.rule_id == "AST-XSS-001"]
+
+    def test_untraced_value_in_a_library_helper_is_low(self):
+        code = ("from markupsafe import Markup\n"
+                "def helper(bits):\n"
+                "    return Markup(''.join(bits))\n")
+        f = self._xss(code)
+        assert f and all(x.severity == Severity.LOW for x in f)
+
+    def test_untraced_value_in_a_request_handler_stays_medium(self):
+        code = ("from markupsafe import Markup\n"
+                "def view(request, bits):\n"
+                "    return Markup(''.join(bits))\n")
+        f = self._xss(code)
+        assert f and all(x.severity == Severity.MEDIUM for x in f)
+
+    def test_tainted_value_is_high_wherever_it_is(self):
+        code = ("from flask import request\n"
+                "from markupsafe import Markup\n"
+                "def helper():\n"
+                "    return Markup(request.args.get('q'))\n")
+        f = self._xss(code)
+        assert f and all(x.severity == Severity.HIGH for x in f)
