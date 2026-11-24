@@ -54,4 +54,4 @@
   vuln_type: LOG_INJECTION
   cwe: 117
   languages: [java]
-  regex: "(?:logger|log|LOG)\\s*\\.\\s*(?:info|warn|error|debug|trace)\\s*\\(.*(?:request|param|input|getParameter)"
+  regex: "(?:logger|log|LOG)\\s*\\.\\s*(?:info|warn|error|debug|trace)\\s*\\(.*(?:request\\s*\\.\\s*(?:getParameter|getHeader|getQueryString|getRequestURI|getRequestURL|getCookies|getParameterMap)|\\bgetParameter\\s*\\()"

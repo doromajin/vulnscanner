@@ -66,5 +66,6 @@ def test_guid_raw_in_js_is_not_django_raw_sql():
 
 
 def test_raw_call_outside_js_is_still_checked():
-    ids = {f.rule_id for f in SQLInjectionAnalyzer().analyze("app/R.java", "var x = repo.raw(q);\n")}
+    code = "import java.sql.Connection;\nvar x = repo.raw(q);\n"
+    ids = {f.rule_id for f in SQLInjectionAnalyzer().analyze("app/R.java", code)}
     assert "SQL-005" in ids

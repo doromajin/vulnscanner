@@ -20,6 +20,9 @@ _DJANGO_TOKEN_RE = re.compile(r'\{%[-\s]*csrf_token[-\s]*%\}', re.IGNORECASE)
 _FORM_END_RE = re.compile(r'</form\s*>', re.IGNORECASE)
 _FORM_TOKEN_RE = re.compile(r'csrf|xsrf|authenticity_token|hidden_tag\s*\(', re.IGNORECASE)
 
+# Thymeleaf renders a hidden CSRF input into every `th:action` form while Spring Security is on.
+_THYMELEAF_ACTION_RE = re.compile(r'\bth:action\s*=', re.IGNORECASE)
+
 # Header-based CSRF defence (Fetch-Metadata / Origin check, Go's http.CrossOriginProtection):
 # needs no token in the form, so a project that implements it is not exposed form by form.
 _HEADER_DEFENCE_EXTS = (".py", ".js", ".ts", ".go", ".rb", ".php", ".java", ".cs")
@@ -162,6 +165,7 @@ class CSRFAnalyzer(BaseAnalyzer):
                 end = _FORM_END_RE.search(tail)
                 window = tail[: end.end()] if end else "\n".join(lines[lineno - 1: lineno + 10])
                 if not (_DJANGO_TOKEN_RE.search(window) or _FORM_TOKEN_RE.search(window)
+                        or _THYMELEAF_ACTION_RE.search(window)
                         or _project_has_header_csrf_defence()):
                     findings.append(self._make(
                         "CSRF-002", Severity.HIGH,

@@ -23,6 +23,7 @@ Rule IDs (GOAST-*):
 """
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
 
@@ -125,6 +126,14 @@ _OS_SINKS = frozenset({
 _FILEPATH_SINKS = frozenset({"Join", "Abs", "EvalSymlinks"})
 _HTTP_SSRF_METHODS = frozenset({"Get", "Post", "Head", "PostForm"})
 # Log injection: standard library and common third-party log packages
+# `.Parse(x)` is a template sink only in a file that imports a template package, and never as
+# a package-level parser of something else (url.Parse, time.Parse, uuid.Parse ...).
+_TEMPLATE_IMPORT_RE = re.compile(r'"(?:html|text)/template"|"github\.com/[^"]*(?:template|tmpl)[^"]*"')
+_NON_TEMPLATE_PARSE_PKGS = frozenset({
+    "url", "time", "uuid", "semver", "version", "netip", "net", "mail", "mime", "strconv",
+    "filepath", "path", "big", "json", "yaml", "toml", "cron", "duration", "ulid", "xml", "html",
+})
+
 _LOG_PKGS = frozenset({"log", "slog", "zap", "zerolog", "logrus", "logging"})
 _LOG_METHODS = frozenset({
     "Print", "Printf", "Println",
@@ -610,6 +619,8 @@ def _check_sinks(
     def taint_check(n):
         return _is_tainted(n, tainted, tainted_funcs)
 
+    imports_template = any(_TEMPLATE_IMPORT_RE.search(l) for l in lines[:200])
+
     for node in _walk(root):
         if node.type != "call_expression":
             continue
@@ -724,7 +735,8 @@ def _check_sinks(
 
         # ── SSTI: .Parse(tainted) — user-controlled template string ──────
         # template.New("name").Parse(userInput) evaluates user-supplied template
-        elif method == "Parse" and arg_nodes and taint_check(arg_nodes[0]):
+        elif (method == "Parse" and arg_nodes and taint_check(arg_nodes[0])
+              and pkg not in _NON_TEMPLATE_PARSE_PKGS and imports_template):
             _emit(findings, seen, file_path, line, lines, repo_url,
                   VulnType.SSTI, Severity.CRITICAL,
                   "GOAST-SSTI-001",

@@ -35,7 +35,9 @@ _RULES = [
     ),
     (
         "SEC-004",
-        re.compile(r'AKIA[0-9A-Z]{16}', re.IGNORECASE),
+        # An access key ID is a standalone upper-case token; the same letters inside a base64 blob
+        # (protobuf descriptors, embedded images) are not one.
+        re.compile(r'(?<![A-Za-z0-9+/=_-])AKIA[0-9A-Z]{16}(?![A-Za-z0-9+/=_-])'),
         "AWS access key ID pattern detected",
         Severity.CRITICAL, _HS,
     ),
