@@ -1,9 +1,9 @@
-"""Known limit: Ruby, Go, JS and Java keep one taint map per file, keyed by variable name.
+"""Known limit: Go, JS and Java keep one taint map per file, keyed by variable name.
 
 `cmd` tainted in method `a` makes `cmd = 'ls'` in method `b` look tainted too (PHP had the same
 bug until `_build_taint_scoped`).  Each case is a strict xfail: the day a language gets scoped
 taint maps, its test starts passing and strict mode forces the marker to be removed.
-Rust is already scoped and runs as a plain test.
+Ruby (since the scoped taint map) and Rust are scoped and run as plain tests.
 """
 import pytest
 
@@ -45,14 +45,15 @@ def _flags_second_function(lang):
     return any(f.line_number == line for f in cls().analyze(path, src))
 
 
-@pytest.mark.parametrize("lang", ["ruby", "go", "js", "java"])
+@pytest.mark.parametrize("lang", ["go", "js", "java"])
 @pytest.mark.xfail(strict=True, reason="taint map is per file, keyed by variable name")
 def test_taint_in_one_function_does_not_reach_a_literal_in_another(lang):
     assert not _flags_second_function(lang)
 
 
-def test_rust_scopes_taint_per_function():
-    assert not _flags_second_function("rust")
+@pytest.mark.parametrize("lang", ["ruby", "rust"])
+def test_scoped_languages_keep_taint_inside_one_function(lang):
+    assert not _flags_second_function(lang)
 
 
 @pytest.mark.parametrize("lang", ["ruby", "go", "js", "java", "rust"])

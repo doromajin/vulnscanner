@@ -70,12 +70,11 @@ def collect_ruby_file(path: str, content: str) -> frozenset[str] | None:
     found: set[str] = set()
     try:
         tree = _ruby_parser.parse(content.encode("utf-8", errors="replace"))
-        tainted, file_methods, tainted_ivars = _build_taint(tree.root_node)
+        _roots, scopes, file_methods, _ivars = _build_taint_scoped(tree.root_node)
         found.update(file_methods)
-        # Also collect methods whose params appear in tainted (callee-param seeding)
-        param_map = _build_method_param_map(tree.root_node)
-        for mname, params in param_map.items():
-            if any(p in tainted for p in params):
+        # Also collect methods whose own params are tainted in their own scope (callee-param seeding)
+        for mname, defs in _method_defs(tree.root_node).items():
+            if any(p in scopes[node.id] for params, node in defs for p in params):
                 found.add(mname)
     except Exception:
         pass  # keep whatever was found before the failure
@@ -247,11 +246,28 @@ def _is_tainted(node, tainted: set[str], tainted_methods: set[str],
 
 # ── Taint collection ──────────────────────────────────────────────────────────
 
+_SCOPE_TYPES = ("method", "singleton_method")
+
+
+def _walk_scope(node):
+    """Like _walk, but does not enter nested method definitions: their locals are their own."""
+    yield node
+    for child in node.children:
+        if child.type in _SCOPE_TYPES:
+            continue
+        yield from _walk_scope(child)
+
+
+def _scope_roots(root) -> list:
+    """The file's top level plus every method definition: one local-variable scope each."""
+    return [root] + [n for n in _walk(root) if n.type in _SCOPE_TYPES]
+
+
 def _collect_assignments(root, tainted: set[str], tainted_methods: set[str],
-                          tainted_ivars: set[str]) -> bool:
+                          tainted_ivars: set[str], walker=_walk) -> bool:
     """Walk assignment nodes and mark tainted variables. Returns True if changed."""
     changed = False
-    for node in _walk(root):
+    for node in walker(root):
         if node.type != "assignment":
             continue
         lhs = node.child_by_field_name("left")
@@ -273,12 +289,18 @@ def _collect_assignments(root, tainted: set[str], tainted_methods: set[str],
 
 
 def _collect_method_taint(root, tainted: set[str], tainted_methods: set[str],
-                           tainted_ivars: set[str]) -> bool:
-    """Find method defs that return tainted data. Returns True if changed."""
+                           tainted_ivars: set[str], scope_of: "dict | None" = None) -> bool:
+    """Find method defs that return tainted data. Returns True if changed.
+
+    scope_of maps a method node id to that method's own local-variable set; without it every
+    method is judged against the shared `tainted` set.
+    """
     changed = False
     for node in _walk(root):
         if node.type != "method":
             continue
+        if scope_of is not None:
+            tainted = scope_of[node.id]
         name_node = node.child_by_field_name("name")
         if name_node is None:
             continue
@@ -312,11 +334,11 @@ def _collect_method_taint(root, tainted: set[str], tainted_methods: set[str],
     return changed
 
 
-def _build_method_param_map(root) -> dict[str, list[str]]:
-    """Build {method_name: [param_names]} for all method defs in this file."""
-    result: dict[str, list[str]] = {}
+def _method_defs(root) -> dict[str, list[tuple[list[str], object]]]:
+    """{method_name: [(param_names, method_node), ...]} — one entry per definition of that name."""
+    result: dict[str, list[tuple[list[str], object]]] = {}
     for node in _walk(root):
-        if node.type != "method":
+        if node.type not in _SCOPE_TYPES:
             continue
         name_node = node.child_by_field_name("name")
         if name_node is None:
@@ -336,71 +358,67 @@ def _build_method_param_map(root) -> dict[str, list[str]]:
                     nm = child.named_children[0] if child.named_children else None
                     if nm:
                         param_names.append(nm.text.decode("utf-8", errors="replace"))
-        result[mname] = param_names
+        result.setdefault(mname, []).append((param_names, node))
     return result
 
 
-def _collect_call_site_taint(
-    root,
-    tainted: set[str],
-    tainted_methods: set[str],
-    tainted_ivars: set[str],
-    method_param_map: dict[str, list[str]],
-) -> bool:
-    """Seed callee param names when a call site passes a tainted argument.
+def _build_method_param_map(root) -> dict[str, list[str]]:
+    """Build {method_name: [param_names]} for all method defs in this file."""
+    return {name: defs[-1][0] for name, defs in _method_defs(root).items()}
 
-    When `vulnerable_method(tainted_var)` is found and `vulnerable_method` is
-    defined locally, add the corresponding parameter name to `tainted`.
-    This propagates taint into method bodies that receive user-controlled data
-    from their call site (interprocedural caller→callee seeding).
-    """
+
+def _seed_callee_params(roots, scopes: dict, tainted_methods: set[str], tainted_ivars: set[str],
+                        defs: dict) -> bool:
+    """Call site passes a tainted argument -> the callee's own parameter is tainted in the
+    callee's scope (and only there).  Same-named methods are all seeded."""
     changed = False
-    for node in _walk(root):
-        if node.type != "call":
-            continue
-        _recv, mname = _call_receiver_method(node)
-        if mname not in method_param_map:
-            continue
-        param_names = method_param_map[mname]
-        if not param_names:
-            continue
-        args_node = node.child_by_field_name("arguments")
-        if args_node is None:
-            continue
-        args = [c for c in args_node.named_children
-                if c.type not in (")", "(", ",")]
-        for i, arg in enumerate(args):
-            if i >= len(param_names):
-                break
-            if _is_tainted(arg, tainted, tainted_methods, tainted_ivars):
-                pname = param_names[i]
-                if pname not in tainted:
-                    tainted.add(pname)
-                    changed = True
+    for scope_root in roots:
+        scope_taint = scopes[scope_root.id]
+        for node in _walk_scope(scope_root):
+            if node.type != "call":
+                continue
+            _recv, mname = _call_receiver_method(node)
+            if mname not in defs:
+                continue
+            args_node = node.child_by_field_name("arguments")
+            if args_node is None:
+                continue
+            args = [c for c in args_node.named_children if c.type not in (")", "(", ",")]
+            for i, arg in enumerate(args):
+                if not _is_tainted(arg, scope_taint, tainted_methods, tainted_ivars):
+                    continue
+                for param_names, def_node in defs[mname]:
+                    if i < len(param_names) and param_names[i] not in scopes[def_node.id]:
+                        scopes[def_node.id].add(param_names[i])
+                        changed = True
     return changed
 
 
-def _build_taint(
+def _build_taint_scoped(
     root,
     seed_methods: "frozenset[str] | None" = None,
-) -> tuple[set[str], set[str], set[str]]:
-    """Fixed-point taint collection, max 8 passes.
+) -> tuple[list, dict, set[str], set[str]]:
+    """Fixed-point taint collection, max 8 passes, one local-variable set per scope.
 
+    Returns (scope_roots, {scope_root.id: tainted locals}, tainted_methods, tainted_ivars).
+    Method names and @ivars are shared by the whole file; locals are not.
     seed_methods: pre-known tainted method names from cross-file analysis.
-    Includes interprocedural caller→callee param seeding.
     """
-    tainted: set[str] = set()
+    roots = _scope_roots(root)
+    scopes: dict = {r.id: set() for r in roots}
     tainted_methods: set[str] = set(seed_methods or ())
     tainted_ivars: set[str] = set()
-    method_param_map = _build_method_param_map(root)
+    defs = _method_defs(root)
     for _ in range(8):
-        c1 = _collect_assignments(root, tainted, tainted_methods, tainted_ivars)
-        c2 = _collect_method_taint(root, tainted, tainted_methods, tainted_ivars)
-        c3 = _collect_call_site_taint(root, tainted, tainted_methods, tainted_ivars,
-                                       method_param_map)
+        c1 = False
+        for r in roots:
+            c1 |= _collect_assignments(r, scopes[r.id], tainted_methods, tainted_ivars,
+                                       walker=_walk_scope)
+        c2 = _collect_method_taint(root, set(), tainted_methods, tainted_ivars, scope_of=scopes)
+        c3 = _seed_callee_params(roots, scopes, tainted_methods, tainted_ivars, defs)
         if not c1 and not c2 and not c3:
             break
-    return tainted, tainted_methods, tainted_ivars
+    return roots, scopes, tainted_methods, tainted_ivars
 
 
 # ── Sink definitions ──────────────────────────────────────────────────────────
@@ -595,6 +613,7 @@ def _check_sinks(
     lines: list[str],
     repo_url: str,
     parent_map: dict,
+    walker=_walk,
 ) -> list[Finding]:
     findings: list[Finding] = []
     seen: set[tuple] = set()
@@ -608,7 +627,7 @@ def _check_sinks(
             return False
         return not _is_branch_guarded(ctx, _tainted_idents(n, tainted), parent_map)
 
-    for node in _walk(root):
+    for node in walker(root):
         # ── Backtick / subshell execution: `ls #{user_input}` ────────────────
         if node.type == "subshell":
             line = node.start_point[0] + 1
@@ -840,12 +859,15 @@ class RubyASTAnalyzer(BaseAnalyzer):
         lines = content.splitlines()
         cf_ctx = _get_ruby_cf_ctx()
         seed = cf_ctx.tainted_method_names if cf_ctx else None
-        tainted, tainted_methods, tainted_ivars = _build_taint(tree.root_node, seed)
-        # Do not bail out when tainted is empty — direct request-source-to-sink flows
+        roots, scopes, tainted_methods, tainted_ivars = _build_taint_scoped(tree.root_node, seed)
+        # Do not bail out when nothing is tainted — direct request-source-to-sink flows
         # (e.g. User.create(params[:user])) are still detected by _is_request_source
         # inside _is_tainted, so _check_sinks must run even with no variable assignments.
         parent_map = _build_parent_map(tree.root_node)
-        return _check_sinks(
-            tree.root_node, tainted, tainted_methods, tainted_ivars,
-            file_path, lines, repo_url, parent_map,
-        )
+        findings: list[Finding] = []
+        for scope_root in roots:
+            findings.extend(_check_sinks(
+                scope_root, scopes[scope_root.id], tainted_methods, tainted_ivars,
+                file_path, lines, repo_url, parent_map, walker=_walk_scope,
+            ))
+        return findings
