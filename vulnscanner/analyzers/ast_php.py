@@ -411,11 +411,15 @@ def _is_tainted_node(node, tainted: dict, tainted_funcs: set,
     # Direct superglobal bare variable: $_{GET,POST,...}
     if t == 'variable_name':
         name = _var_name(node)
-        return name is not None and (name in _SOURCES or name in tainted)
+        if name is None or not (name in _SOURCES or name in tainted):
+            return False
+        return not _is_guarded(tainted, name, node)
 
     # Subscript: $_GET["key"] or $tainted["key"]
     if t == 'subscript_expression':
         if _FILES_SERVER_FIELD_RE.match(node.text.decode('utf-8', errors='replace')):
+            return False
+        if getattr(tainted, 'guards', None) and _is_guarded(tainted, _guard_key(node), node):
             return False
         obj = node.children[0] if node.children else None
         if obj and obj.type == 'variable_name':
@@ -512,6 +516,276 @@ def _format_is_numeric_only(args: list) -> bool:
         return False
     specs = [s for s in _FORMAT_SPEC_RE.findall(args[0].text.decode('utf-8', errors='replace')) if s != '%']
     return bool(specs) and all(s in 'dDiuUfFeEgG' for s in specs)
+
+
+# ── Validation guards ─────────────────────────────────────────────────────────
+# `if (in_array($sort, ['id', 'name'], true)) { ...$sort... }` and
+# `if (!is_numeric($id)) { abort(404); }  ...$id...` leave the variable holding a value the client
+# could not choose freely.  A guard is a byte range in which a variable (or `$_GET['id']`) counts as
+# clean.  The taint map itself stays flow-insensitive; ranges are consulted when a variable is read.
+
+class _ScopeTaint(dict):
+    """The taint map of one scope, with the byte ranges where guarded variables are clean."""
+
+    guards: dict
+    guard_signature: tuple | None
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.guards = {}
+        self.guard_signature = None
+
+
+_NUMERIC_GUARDS = frozenset({
+    'is_numeric', 'ctype_digit', 'ctype_alnum', 'ctype_alpha', 'ctype_xdigit',
+    'is_int', 'is_integer', 'is_float', 'is_bool',
+})
+_ABORT_IF = {'abort_if': False, 'throw_if': False, 'abort_unless': True, 'throw_unless': True}
+_TERMINATOR_CALLS = frozenset({'die', 'exit', 'abort'})
+# Inside [...]: escapes, same-kind ranges and single characters; a bare `-` only as the first or last
+# character (anywhere else it would join two characters into a range such as 0-z).
+_REGEX_CLASS_TOKEN = r"(?:\\[dw]|\\-|[a-z]-[a-z]|[A-Z]-[A-Z]|[0-9]-[0-9]|[A-Za-z0-9_])"
+_REGEX_ITEM_RE = re.compile(
+    r"(?:\\[dw]|\[-?" + _REGEX_CLASS_TOKEN + r"+-?\]|[A-Za-z0-9_])(?:[+*?]|\{\d+(?:,\d*)?\})?")
+
+
+def _regex_pins_safe_chars(pattern: str) -> bool:
+    """`/^[a-z0-9_-]+$/i`: the whole string is made of letters, digits, `_` and `-` (no quote,
+    backslash, space, dot, or anything else an injection needs)."""
+    if len(pattern) < 4:
+        return False
+    closing = {'(': ')', '{': '}', '[': ']', '<': '>'}.get(pattern[0], pattern[0])
+    end = pattern.rfind(closing)
+    if end <= 0:
+        return False
+    body, flags = pattern[1:end], pattern[end + 1:]
+    if any(f in flags for f in 'mxe'):      # `m` lets ^ and $ match at any line; x / e change meaning
+        return False
+    if body.startswith('^'):
+        core = body[1:]
+    elif body.startswith('\\A'):
+        core = body[2:]
+    else:
+        return False
+    for tail in ('$', '\\z', '\\Z'):
+        if core.endswith(tail):
+            core = core[:-len(tail)]
+            break
+    else:
+        return False
+    pos = 0
+    while pos < len(core):
+        m = _REGEX_ITEM_RE.match(core, pos)
+        if not m:
+            return False
+        pos = m.end()
+    return pos > 0
+
+
+def _guard_key(node) -> str | None:
+    """Name a guarded subject: `$id` -> 'id', `$_GET['id']` -> "_GET['id']"; None for anything else."""
+    if node is None:
+        return None
+    if node.type == 'variable_name':
+        name = _var_name(node)
+        return name if name and name != 'this' else None
+    if node.type == 'subscript_expression' and len(node.children) >= 3:
+        obj = node.children[0]
+        index = next((c for c in node.children[1:] if c.type in ('string', 'integer', 'encapsed_string')), None)
+        base = _var_name(obj) if obj.type == 'variable_name' else None
+        if base and index is not None and index.type != 'encapsed_string':
+            return f"{base}[{index.text.decode('utf-8', errors='replace')}]"
+    return None
+
+
+def _is_guarded(tainted, key: str | None, node) -> bool:
+    guards = getattr(tainted, 'guards', None)
+    if not guards or key is None or key not in guards:
+        return False
+    pos = node.start_byte
+    return any(start <= pos < end for start, end in guards[key])
+
+
+def _unwrap(node):
+    while node is not None and node.type in ('parenthesized_expression', 'argument') and node.named_children:
+        node = node.named_children[0]
+    return node
+
+
+def _server_side_value(node, tainted, funcs, props) -> bool:
+    """The other side of `$v == <this>`: a literal, a constant, or something read off an object
+    or call that is not client data.  A bare variable is not accepted: where it came from is unknown."""
+    node = _unwrap(node)
+    if node is None or node.type == 'variable_name':
+        return False
+    return not _is_tainted_node(node, tainted, funcs, props)
+
+
+def _array_is_server_side(node, tainted, funcs, props, strict: bool) -> bool:
+    node = _unwrap(node)
+    if node is None or _is_tainted_node(node, tainted, funcs, props):
+        return False
+    if node.type == 'array_creation_expression' and not strict:
+        # PHP's loose comparison makes "1abc" == 1: only string members are safe without `true`
+        for el in _walk(node):
+            if el.type in ('integer', 'float'):
+                return False
+    return True
+
+
+def _guard_sets(expr, tainted, funcs, props) -> tuple[frozenset, frozenset]:
+    """(subjects that are safe when `expr` is true, subjects that are safe when it is false)."""
+    expr = _unwrap(expr)
+    none: frozenset = frozenset()
+    if expr is None:
+        return none, none
+    t = expr.type
+    if t == 'unary_op_expression' and expr.children and expr.children[0].type == '!':
+        inner_true, inner_false = _guard_sets(expr.children[-1], tainted, funcs, props)
+        return inner_false, inner_true
+    if t == 'binary_expression' and len(expr.children) == 3:
+        left, op, right = expr.children
+        op_t = op.type
+        if op_t in ('&&', 'and', '||', 'or'):
+            lt, lf = _guard_sets(left, tainted, funcs, props)
+            rt, rf = _guard_sets(right, tainted, funcs, props)
+            if op_t in ('&&', 'and'):
+                return lt | rt, lf & rf
+            return lt & rt, lf | rf
+        if op_t in ('==', '===', '!=', '!=='):
+            for subject, other in ((left, right), (right, left)):
+                key = _guard_key(_unwrap(subject))
+                if key and _server_side_value(other, tainted, funcs, props):
+                    s = frozenset({key})
+                    return (s, none) if op_t in ('==', '===') else (none, s)
+        return none, none
+    if t == 'function_call_expression':
+        name = _call_name(expr).lstrip('\\').lower()
+        args = [_unwrap(a) for a in _call_args(expr)]
+        if name in _NUMERIC_GUARDS and args:
+            key = _guard_key(args[0])
+            return (frozenset({key}), none) if key else (none, none)
+        if name == 'in_array' and len(args) >= 2:
+            strict = len(args) >= 3 and args[2] is not None and args[2].text.decode('utf-8').lower() == 'true'
+            key = _guard_key(args[0])
+            if key and _array_is_server_side(args[1], tainted, funcs, props, strict):
+                return frozenset({key}), none
+        if name == 'array_key_exists' and len(args) >= 2:
+            key = _guard_key(args[0])
+            if key and _array_is_server_side(args[1], tainted, funcs, props, True):
+                return frozenset({key}), none
+        if name == 'preg_match' and len(args) >= 2 and args[0] is not None and args[0].type == 'string':
+            key = _guard_key(args[1])
+            # the raw text, not the string_content pieces: an escape such as \' splits the literal
+            # and would otherwise vanish from the pattern we judge
+            pattern = args[0].text.decode('utf-8', errors='replace')[1:-1]
+            if key and _regex_pins_safe_chars(pattern):
+                return frozenset({key}), none
+    return none, none
+
+
+def _block_terminates(block) -> bool:
+    """The branch ends in return / throw / exit / die / abort / continue / break."""
+    if block is None:
+        return False
+    stmts = block.named_children if block.type in ('compound_statement', 'colon_block') else [block]
+    stmts = [s for s in stmts if s.type != 'comment']
+    if not stmts:
+        return False
+    last = stmts[-1]
+    if last.type in ('return_statement', 'exit_statement', 'continue_statement', 'break_statement'):
+        return True
+    if last.type == 'expression_statement' and last.named_children:
+        inner = last.named_children[0]
+        if inner.type == 'throw_expression':
+            return True
+        if inner.type == 'function_call_expression' and _call_name(inner).lstrip('\\').lower() in _TERMINATOR_CALLS:
+            return True
+    return False
+
+
+def _enclosing_block_end(node) -> int:
+    n = node.parent
+    while n is not None and n.type not in ('compound_statement', 'colon_block', 'case_statement',
+                                           'default_statement', 'declaration_list', 'program'):
+        n = n.parent
+    return n.end_byte if n is not None else node.end_byte
+
+
+def _guard_candidates(scope_node) -> list:
+    """The `if` statements and `abort_if()`-style calls of one scope: where a guard can start.
+    Collected once; most scopes have none and then cost nothing afterwards."""
+    found = []
+    for node in _walk_scope(scope_node):
+        if node.type == 'if_statement':
+            found.append(node)
+        elif node.type == 'expression_statement' and node.named_children:
+            call = node.named_children[0]
+            if (call.type == 'function_call_expression'
+                    and _call_name(call).lstrip('\\').lower() in _ABORT_IF):
+                found.append(node)
+    return found
+
+
+def _compute_guards(scope_node, candidates, tainted, funcs, props) -> dict:
+    """{subject: [(start_byte, end_byte)]} where the subject is checked by the surrounding code."""
+    ranges: dict[str, list[tuple[int, int]]] = {}
+
+    def add(keys, start, end):
+        for k in keys:
+            ranges.setdefault(k, []).append((start, end))
+
+    for node in candidates:
+        if node.type == 'expression_statement' and node.named_children:
+            call = node.named_children[0]
+            if call.type == 'function_call_expression':
+                name = _call_name(call).lstrip('\\').lower()
+                args = _call_args(call)
+                if name in _ABORT_IF and args:
+                    when_true, when_false = _guard_sets(args[0], tainted, funcs, props)
+                    # abort_if(C): the code after it runs when C is false; abort_unless(C): when C is true
+                    add(when_true if _ABORT_IF[name] else when_false, node.end_byte, _enclosing_block_end(node))
+            continue
+        if node.type != 'if_statement':
+            continue
+        cond = next((c for c in node.named_children if c.type == 'parenthesized_expression'), None)
+        if cond is None:
+            continue
+        clauses = [c for c in node.named_children if c.type in ('else_if_clause', 'else_clause')]
+        then_body = next((c for c in node.named_children
+                          if c is not cond and c.type not in ('else_if_clause', 'else_clause', 'comment')), None)
+        when_true, when_false = _guard_sets(cond, tainted, funcs, props)
+        if then_body is not None:
+            add(when_true, then_body.start_byte, then_body.end_byte)
+        not_taken = set(when_false)            # known once every earlier condition was false
+        for clause in clauses:
+            if clause.type == 'else_if_clause':
+                c_cond = next((c for c in clause.named_children if c.type == 'parenthesized_expression'), None)
+                c_body = next((c for c in clause.named_children
+                               if c is not c_cond and c.type != 'comment'), None)
+                if c_cond is not None and c_body is not None:
+                    c_true, c_false = _guard_sets(c_cond, tainted, funcs, props)
+                    add(set(c_true) | not_taken, c_body.start_byte, c_body.end_byte)
+                    not_taken |= set(c_false)
+            else:
+                body = next((c for c in clause.named_children if c.type != 'comment'), None)
+                if body is not None:
+                    add(not_taken, body.start_byte, body.end_byte)
+        if not clauses and _block_terminates(then_body):
+            add(when_false, node.end_byte, _enclosing_block_end(node))
+    if not ranges:
+        return {}
+    # a guard says nothing about a value that is overwritten inside its range
+    assigned: dict[str, list[int]] = {}
+    for node in _walk_scope(scope_node):
+        if node.type == 'assignment_expression' and node.children:
+            key = _guard_key(node.children[0])
+            if key in ranges:
+                assigned.setdefault(key, []).append(node.start_byte)
+    for key, spans in list(ranges.items()):
+        later = assigned.get(key, ())
+        ranges[key] = [(s, e) for s, e in spans if not any(s <= p < e for p in later)]
+    return {k: v for k, v in ranges.items() if v}
 
 
 def _taint_source_desc(node) -> str:
@@ -835,7 +1109,7 @@ def _build_taint_scoped(root, seed_funcs: "frozenset[str] | None" = None) -> tup
     scopes: list[tuple] = []
     callees: dict[tuple[str, str], list] = {}
     for n in nodes:
-        taint: dict[str, tuple[int, str]] = {}
+        taint = _ScopeTaint()
         _seed_request_params(n, taint, _walk_scope)
         scopes.append((n, taint))
         if n.type in _SCOPE_TYPES:
@@ -848,19 +1122,32 @@ def _build_taint_scoped(root, seed_funcs: "frozenset[str] | None" = None) -> tup
     clean_props = _typed_scalar_props(root)
     module_taint = scopes[0][1]
     globals_of = [_php_global_names(n) if n.type in _SCOPE_TYPES else set() for n, _ in scopes]
+    candidates = [_guard_candidates(n) for n, _ in scopes]
+
+    def refresh_guards(i: int) -> None:
+        """Guards depend on the map (is the other side of `==` client data?): redo them only when it moved."""
+        n, taint = scopes[i]
+        signature = (len(taint), len(tainted_funcs), len(tainted_props))
+        if candidates[i] and taint.guard_signature != signature:
+            taint.guards = _compute_guards(n, candidates[i], taint, tainted_funcs, tainted_props)
+            taint.guard_signature = signature
+
     for _ in range(8):
         changed = False
-        for (n, taint), declared in zip(scopes, globals_of):
+        for i, ((n, taint), declared) in enumerate(zip(scopes, globals_of)):
             for var in declared:
                 if var in module_taint and var not in taint:
                     taint[var] = module_taint[var]
                     changed = True
+            refresh_guards(i)
             if _collect_pass(n, taint, tainted_funcs, tainted_props, clean_props, _walk_scope):
                 changed = True
         if _seed_callee_params(scopes, callees, tainted_funcs, tainted_props):
             changed = True
         if not changed:
             break
+    for i in range(len(scopes)):                # the sinks are judged against the final map
+        refresh_guards(i)
     return scopes, tainted_funcs, tainted_props
 
 
