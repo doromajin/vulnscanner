@@ -1177,6 +1177,17 @@ def _node_line(node) -> int:
     return 0
 
 
+def _creator_line(path, node) -> int:
+    """Line of a `new X(...)`: javalang gives ClassCreator no position, so use the nearest ancestor's."""
+    line = _node_line(node)
+    if not line:
+        for anc in reversed(path):
+            line = _node_line(anc)
+            if line:
+                break
+    return line
+
+
 def _is_android_source(node) -> bool:
     """True if node is an Android AOSP taint source (Intent, Bundle, Cursor, external storage)."""
     if not isinstance(node, jt.MethodInvocation):
@@ -3802,7 +3813,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 q = str(node.qualifier or "")
                 if node.member == "sendRedirect" and q in _RESPONSE_OBJECTS:
                     args = node.arguments or []
-                    if args and _is_tainted(args[0], tainted):
+                    if args and _is_tainted(args[0], _eff_tainted(node)):
                         _add(node, VulnType.OPEN_REDIRECT, Severity.HIGH, "JAST-REDIRECT-001",
                              "response.sendRedirect() with user-controlled URL — open redirect; "
                              "validate against a whitelist of allowed destinations")
@@ -3827,7 +3838,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         or q.lower().endswith("logger")):
                     continue
                 for arg in (node.arguments or []):
-                    if _is_tainted(arg, tainted):
+                    if _is_tainted(arg, _eff_tainted(node)):
                         _add(node, VulnType.LOG_INJECTION, Severity.MEDIUM, "JAST-LOG-001",
                              f"{q}.{node.member}() logs user-controlled data — log forging "
                              "via newline injection; strip \\n/\\r or use structured logging")
@@ -3852,9 +3863,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 args = node.arguments or []
                 # Use tainted_raw: HTML encoding doesn't fix session-storage violations.
                 key_tainted = len(args) >= 1 and (
-                    _is_tainted(args[0], tainted) or _is_tainted_raw(args[0], tainted_raw, _const_ints))
+                    _is_tainted(args[0], _eff_tainted(node)) or _is_tainted_raw(args[0], tainted_raw, _const_ints))
                 val_tainted = len(args) >= 2 and (
-                    _is_tainted(args[1], tainted) or _is_tainted_raw(args[1], tainted_raw, _const_ints))
+                    _is_tainted(args[1], _eff_tainted(node)) or _is_tainted_raw(args[1], tainted_raw, _const_ints))
                 if key_tainted or val_tainted:
                     which = "key" if key_tainted else "value"
                     _add(node, VulnType.TRUST_BOUNDARY_VIOLATION, Severity.MEDIUM, "JAST-TBV-001",
@@ -3870,26 +3881,30 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     continue
                 if node.member == "exec":
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        if _is_tainted(arg, _eff_tainted(node)):
                             _add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "JAST-CMD-001",
                                  "Runtime.exec() with user-controlled argument — "
                                  "command injection; use allowlisted fixed commands")
                             break
-            for _, node in tree.filter(jt.ClassCreator):
+            for _pb_path, node in tree.filter(jt.ClassCreator):
                 if _type_name(node.type) == "ProcessBuilder":
+                    _pb_line = _creator_line(_pb_path, node)
+                    if _pb_line in dead_lines:
+                        continue
                     for arg in (node.arguments or []):
                         _arg_name = arg.member if isinstance(arg, jt.MemberReference) else ""
-                        if (_is_tainted(arg, tainted)
+                        if (_is_tainted(arg, _eff_tainted(_pb_line))
                                 or (_arg_name and _arg_name in list_tainted_vars)):
                             _add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "JAST-CMD-002",
                                  "new ProcessBuilder() with user-controlled argument — "
-                                 "command injection; validate and allowlist commands")
+                                 "command injection; validate and allowlist commands",
+                                 line_override=_pb_line)
                             break
             for _, node in tree.filter(jt.MethodInvocation):
                 if node.member == "command":
                     for arg in (node.arguments or []):
                         _arg_name = arg.member if isinstance(arg, jt.MemberReference) else ""
-                        if (_is_tainted(arg, tainted)
+                        if (_is_tainted(arg, _eff_tainted(node))
                                 or (_arg_name and _arg_name in list_tainted_vars)):
                             _add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "JAST-CMD-003",
                                  "ProcessBuilder.command() with user-controlled argument — "
@@ -4513,11 +4528,15 @@ class JavaASTAnalyzer(BaseAnalyzer):
 
         # ── Weak cryptography — new Random() or Math.random() ────────────────
         try:
-            for _, node in tree.filter(jt.ClassCreator):
+            for _rnd_path, node in tree.filter(jt.ClassCreator):
                 if _type_name(node.type) == "Random":
+                    _rnd_line = _creator_line(_rnd_path, node)
+                    if _rnd_line in dead_lines:
+                        continue
                     _add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "JAST-CRYPTO-001",
                          "new Random() is not cryptographically secure — "
-                         "use java.security.SecureRandom for security-sensitive randomness")
+                         "use java.security.SecureRandom for security-sensitive randomness",
+                         line_override=_rnd_line)
         except Exception:
             pass
         try:
@@ -4583,7 +4602,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     if node.member not in _LDAP_SEARCH_METHODS:
                         continue
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        if _is_tainted(arg, _eff_tainted(node)):
                             _add(node, VulnType.LDAP_INJECTION, Severity.HIGH, "JAST-LDAP-001",
                                  f".{node.member}() with user-controlled argument — "
                                  "LDAP injection; sanitize input with ESAPI or whitelist")
@@ -4593,23 +4612,26 @@ class JavaASTAnalyzer(BaseAnalyzer):
 
         # ── SSRF ──────────────────────────────────────────────────────────────
         try:
-            for _, node in tree.filter(jt.ClassCreator):
-                if _node_line(node) in dead_lines:
+            for _ssrf_path, node in tree.filter(jt.ClassCreator):
+                _ssrf_line = _creator_line(_ssrf_path, node)
+                if _ssrf_line in dead_lines:
                     continue
                 ctype = _type_name(node.type)
                 if ctype == "URL":
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        if _is_tainted(arg, _eff_tainted(_ssrf_line)):
                             _add(node, VulnType.SSRF, Severity.HIGH, "JAST-SSRF-001",
                                  "new URL() with user-controlled string — "
-                                 "SSRF; validate scheme/host against an allowlist")
+                                 "SSRF; validate scheme/host against an allowlist",
+                                 line_override=_ssrf_line)
                             break
                 elif ctype in _HTTP_CLIENT_URL_CTORS:
                     first = (node.arguments or [None])[0]
-                    if first is not None and _is_tainted(first, tainted):
+                    if first is not None and _is_tainted(first, _eff_tainted(_ssrf_line)):
                         _add(node, VulnType.SSRF, Severity.HIGH, "JAST-SSRF-001",
                              f"new {ctype}() with user-controlled URL — "
-                             "SSRF; validate scheme/host against an allowlist before making HTTP requests")
+                             "SSRF; validate scheme/host against an allowlist before making HTTP requests",
+                             line_override=_ssrf_line)
         except Exception:
             pass
 
@@ -4626,7 +4648,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         or q.lower().endswith("webclient")):
                     continue
                 first = (node.arguments or [None])[0]
-                if first is not None and _is_tainted(first, tainted):
+                if first is not None and _is_tainted(first, _eff_tainted(node)):
                     _add(node, VulnType.SSRF, Severity.HIGH, "JAST-SSRF-002",
                          f"Spring {q}.{node.member}() with user-controlled URL — "
                          "SSRF; validate scheme/host or use allowlist before making external requests")
@@ -4645,11 +4667,15 @@ class JavaASTAnalyzer(BaseAnalyzer):
 
         # ── Insecure deserialization (always flag) ────────────────────────────
         try:
-            for _, node in tree.filter(jt.ClassCreator):
+            for _des_path, node in tree.filter(jt.ClassCreator):
                 if _type_name(node.type) in _DESER_CLASSES:
+                    _des_line = _creator_line(_des_path, node)
+                    if _des_line in dead_lines:
+                        continue
                     _add(node, VulnType.INSECURE_DESERIALIZATION, Severity.CRITICAL, "JAST-DESER-001",
                          "new ObjectInputStream() — deserializes untrusted data; "
-                         "use ObjectInputFilter (Java 9+) or a safe format like JSON")
+                         "use ObjectInputFilter (Java 9+) or a safe format like JSON",
+                         line_override=_des_line)
         except Exception:
             pass
 
@@ -4657,8 +4683,11 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # new Yaml() / new Yaml(new Constructor(...)) allows arbitrary class
         # instantiation.  Only new Yaml(new SafeConstructor(...)) is safe.
         try:
-            for _, node in tree.filter(jt.ClassCreator):
+            for _yml_path, node in tree.filter(jt.ClassCreator):
                 if _type_name(node.type) != "Yaml":
+                    continue
+                _yml_line = _creator_line(_yml_path, node)
+                if _yml_line in dead_lines:
                     continue
                 args = node.arguments or []
                 has_safe = any(
@@ -4678,7 +4707,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
                          "JAST-DESER-002",
                          f"new Yaml({arg_desc}) without SafeConstructor: SnakeYAML can "
                          "instantiate arbitrary Java types; use "
-                         "new Yaml(new SafeConstructor(new LoaderOptions())) (CVE-2022-1471)")
+                         "new Yaml(new SafeConstructor(new LoaderOptions())) (CVE-2022-1471)",
+                         line_override=_yml_line)
         except Exception:
             pass
 
@@ -4689,7 +4719,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     continue
                 if node.member == "lookup":
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        if _is_tainted(arg, _eff_tainted(node)):
                             _add(node, VulnType.JNDI_INJECTION, Severity.CRITICAL, "JAST-JNDI-001",
                                  "JNDI lookup() with user-controlled name — "
                                  "Log4Shell-style injection; never pass user input to JNDI lookup")
@@ -4704,7 +4734,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     continue
                 if node.member in _SPEL_METHODS:
                     for arg in (node.arguments or []):
-                        if _is_tainted(arg, tainted):
+                        if _is_tainted(arg, _eff_tainted(node)):
                             _add(node, VulnType.SSTI, Severity.CRITICAL, "JAST-SPEL-001",
                                  "SpEL parseExpression() with user-controlled input — "
                                  "Spring Expression Language injection allows RCE; avoid dynamic SpEL on user data")
@@ -4723,7 +4753,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     if node.member not in _XPATH_SINK_METHODS:
                         continue
                     args = node.arguments or []
-                    if args and _is_tainted(args[0], tainted):
+                    if args and _is_tainted(args[0], _eff_tainted(node)):
                         _add(node, VulnType.XPATH_INJECTION, Severity.HIGH, "JAST-XPATH-001",
                              f"XPath {node.member}() with user-controlled expression — "
                              "allows attacker to manipulate XPath query and bypass authentication "
