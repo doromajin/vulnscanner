@@ -99,7 +99,7 @@ _FILE_STATIC_METHODS: frozenset[str] = frozenset({
     "AppendAllText", "AppendAllTextAsync",
     "Open", "OpenRead", "OpenWrite",
     "Create", "CreateText",
-    "Delete", "Exists",
+    "Delete",
     "Copy", "Move",
 })
 # Constructor types where arg 0 is path
@@ -111,7 +111,7 @@ _PATH_CTOR_TYPES: frozenset[str] = frozenset({
 # Directory static methods (arg 0 = path)
 _DIR_STATIC_METHODS: frozenset[str] = frozenset({
     "GetFiles", "GetDirectories", "GetFileSystemEntries",
-    "CreateDirectory", "Delete", "Move", "Exists",
+    "CreateDirectory", "Delete", "Move",
     "EnumerateFiles", "EnumerateDirectories",
 })
 
@@ -181,6 +181,14 @@ def _txt(node) -> str:
         return ""
 
 
+def _simple_name(node) -> str:
+    """Method name without type arguments: `Query<Foo>` -> `Query`."""
+    if node.type == "generic_name":
+        ident = next((c for c in node.children if c.type == "identifier"), None)
+        return _txt(ident) if ident is not None else _txt(node).split("<")[0]
+    return _txt(node)
+
+
 def _invocation_method_name(node) -> str:
     """Extract method name from invocation_expression.function."""
     fn = node.child_by_field_name("function")
@@ -188,9 +196,9 @@ def _invocation_method_name(node) -> str:
         return ""
     if fn.type == "member_access_expression":
         name = fn.child_by_field_name("name")
-        return _txt(name) if name else ""
-    if fn.type == "identifier":
-        return _txt(fn)
+        return _simple_name(name) if name else ""
+    if fn.type in ("identifier", "generic_name"):
+        return _simple_name(fn)
     # Generic: last segment
     raw = _txt(fn)
     return raw.rsplit(".", 1)[-1].split("(")[0].strip()
@@ -349,7 +357,7 @@ def _is_tainted(node, tainted: set[str]) -> bool:
         if method == "Format":
             return any(_is_tainted(a, tainted) for a in args)
         # String.Concat / String.Join
-        if method in ("Concat", "Join"):
+        if method in ("Concat", "Join", "Combine"):
             return any(_is_tainted(a, tainted) for a in args)
         # Encoding.UTF8.GetString(tainted_bytes)
         if method == "GetString" and args:
