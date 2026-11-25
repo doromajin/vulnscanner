@@ -7,6 +7,10 @@ Rule IDs (RAST-*):
   RAST-SQL-001   SQL injection (sqlx, diesel, rusqlite, tokio-postgres)
   RAST-CMD-001   Command injection (std::process::Command with tainted arg/path)
   RAST-PATH-001  Path traversal (std::fs operations with tainted path)
+  RAST-SSRF-001  SSRF (reqwest/ureq/isahc/surf/hyper request with tainted URL)
+  RAST-REDIR-001 Open redirect (Location header / Redirect::to with tainted target)
+  RAST-XSS-001   XSS (HTML response body / Html() built from tainted data)
+  RAST-SQL-002   SQL string built with tainted data (no visible sink in the function)
 """
 from __future__ import annotations
 
@@ -172,6 +176,17 @@ _PATH_SINKS: dict[str, tuple[int, str]] = {
     "remove_dir_all":(0, "Path traversal via std::fs::remove_dir_all()"),
 }
 
+# ── SSRF / redirect / XSS / SQL-string heuristics ─────────────────────────────
+_HTTP_CLIENT_CRATES: frozenset[str] = frozenset({"reqwest", "ureq", "isahc", "surf", "attohttpc", "minreq"})
+_HTTP_VERBS: frozenset[str] = frozenset({"get", "post", "put", "delete", "head", "patch"})
+_CLIENT_RECV_RE = re.compile(r"(?:Client|Agent|reqwest|ureq|isahc|surf)::")
+_CLIENT_NAME_RE = re.compile(r"(?:client|agent)$", re.I)
+_REDIRECT_FUNCS: frozenset[str] = frozenset({"to", "temporary", "permanent", "found", "see_other", "moved"})
+_HTML_TAG_RE = re.compile(r"<[A-Za-z/!]")
+_SQL_BUILD_RE = re.compile(
+    r"^\s*(?:select\b.+\bfrom\b|insert\s+into\b|update\b.+\bset\b|delete\s+from\b)",
+    re.I | re.S)
+
 # ── AST helpers ───────────────────────────────────────────────────────────────
 
 def _walk(node):
@@ -195,6 +210,11 @@ def _call_fname(node) -> str:
     if fn is None:
         return ""
     t = fn.type
+    if t == "generic_function":  # sqlx::query_as::<_, T>(..), x.collect::<Vec<_>>()
+        inner = fn.child_by_field_name("function")
+        if inner is not None:
+            fn = inner
+            t = fn.type
     if t == "identifier":
         return _txt(fn)
     if t == "field_expression":
@@ -212,6 +232,8 @@ def _call_fname(node) -> str:
 def _call_recv(node):
     """Return the receiver node for a method call (obj.method(args)) or None."""
     fn = node.child_by_field_name("function")
+    if fn is not None and fn.type == "generic_function":
+        fn = fn.child_by_field_name("function")
     if fn is not None and fn.type == "field_expression":
         return fn.child_by_field_name("value")
     return None
@@ -264,6 +286,61 @@ def _closure_result_tainted(closure, tainted: set[str]) -> bool:
             if sub.type == "identifier":
                 names.add(_txt(sub))
     return _is_tainted(closure.child_by_field_name("body"), tainted | names)
+
+
+_INLINE_CAPTURE_RE = re.compile(r"(?<!\{)\{([A-Za-z_]\w*)\s*(?::[^{}]*)?\}")
+
+
+def _format_literal(node) -> tuple[str, bool]:
+    """(format-string text, is_format_macro) of a `format!(..)` macro_invocation."""
+    if node is None or node.type != "macro_invocation" or not node.named_children:
+        return "", False
+    if _txt(node.named_children[0]).rsplit("::", 1)[-1] != "format" or len(node.named_children) < 2:
+        return "", False
+    for child in node.named_children[1].named_children:
+        if child.type in ("string_literal", "raw_string_literal"):
+            return _txt(child).lstrip("r#").strip('"'), True
+        break
+    return "", True
+
+
+def _unwrap_value(node):
+    """Strip `&x`, `(x)`, `x.to_string()/into()/clone()` wrappers down to the core expression."""
+    while node is not None:
+        if node.type in ("reference_expression", "parenthesized_expression"):
+            node = next(iter(node.named_children), None)
+        elif node.type == "call_expression" and _call_fname(node) in (
+                "to_string", "into", "to_owned", "clone", "as_str", "to_str") and _call_recv(node) is not None:
+            node = _call_recv(node)
+        else:
+            break
+    return node
+
+
+def _has_local_prefix(node) -> bool:
+    """True for values that begin with a fixed same-site path ("/home/{}", "/a" + x).
+
+    A bare "/" followed by a placeholder is not enough (protocol-relative "//host")."""
+    node = _unwrap_value(node)
+    if node is None:
+        return False
+    if node.type == "macro_invocation":
+        lit, ok = _format_literal(node)
+        prefix = lit.split("{", 1)[0]
+        return ok and len(prefix) >= 2 and prefix[0] == "/" and prefix[1] not in "/\\"
+    if node.type == "binary_expression":
+        left = node.child_by_field_name("left")
+        if left is not None and left.type == "string_literal":
+            lit = _txt(left).strip('"')
+            return len(lit) >= 2 and lit[0] == "/" and lit[1] not in "/\\"
+    return False
+
+
+def _has_fixed_host(node) -> bool:
+    """format!("https://api.example.com/{}", x): the host is literal, only the path varies."""
+    node = _unwrap_value(node)
+    lit, ok = _format_literal(node)
+    return ok and re.match(r"^[a-zA-Z][\w+.-]*://[^/{}\s]+/", lit) is not None
 
 
 # ── Taint expression evaluator ────────────────────────────────────────────────
@@ -372,6 +449,10 @@ def _is_tainted(node, tainted: set[str]) -> bool:
                 for child in token_tree.named_children:
                     if child.type == "identifier" and _txt(child) in tainted:
                         return True
+                # inline captures: format!("{name} ..")
+                lit, _ = _format_literal(node)
+                if any(n in tainted for n in _INLINE_CAPTURE_RE.findall(lit)):
+                    return True
         return False
 
     return False
@@ -522,6 +603,65 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                     _emit("RAST-CMD-001", VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                           "Command injection: user-controlled argument passed to Command::arg()")
 
+        # SSRF (CWE-918)
+        fn_text = _txt(node.child_by_field_name("function") or node)
+        ssrf_arg = None
+        if recv is None:
+            crate = fn_text.split("::", 1)[0]
+            if "::" in fn_text and crate in _HTTP_CLIENT_CRATES:
+                if fname in _HTTP_VERBS and args:
+                    ssrf_arg = args[0]
+                elif fname == "request" and len(args) > 1:
+                    ssrf_arg = args[1]
+        else:
+            rtxt = _txt(recv)
+            last = recv.child_by_field_name("field") if recv.type == "field_expression" else recv
+            named_client = recv.type in ("identifier", "field_expression") and \
+                _CLIENT_NAME_RE.search(_txt(last) or "") is not None
+            if named_client or _CLIENT_RECV_RE.search(rtxt):
+                if fname in _HTTP_VERBS and args:
+                    ssrf_arg = args[0]
+                elif fname == "request" and len(args) > 1:
+                    ssrf_arg = args[1]
+            if fname == "uri" and args and re.search(r"Request|builder", rtxt, re.I):
+                ssrf_arg = args[0]
+        if ssrf_arg is not None and _is_tainted(ssrf_arg, tainted) and not _has_fixed_host(ssrf_arg):
+            _emit("RAST-SSRF-001", VulnType.SSRF, Severity.HIGH,
+                  "SSRF: user-controlled URL passed to an HTTP client request")
+
+        # Open redirect (CWE-601)
+        redir_arg = None
+        if fname in ("header", "append_header", "insert_header") and args:
+            if fname == "header" and len(args) > 1 and "location" in _txt(args[0]).lower():
+                redir_arg = args[1]
+            elif fname != "header" and args[0].type == "tuple_expression":
+                items = list(args[0].named_children)
+                if len(items) == 2 and "location" in _txt(items[0]).lower():
+                    redir_arg = items[1]
+        elif fname in _REDIRECT_FUNCS and args and recv is None and "Redirect" in fn_text:
+            redir_arg = args[0]
+        if redir_arg is not None and _is_tainted(redir_arg, tainted) \
+                and not _has_local_prefix(redir_arg):
+            _emit("RAST-REDIR-001", VulnType.OPEN_REDIRECT, Severity.MEDIUM,
+                  "Open redirect: user-controlled target used as redirect location")
+
+        # XSS (CWE-79)
+        xss_arg = None
+        if fname == "body" and recv is not None and args and re.search(r"HttpResponse|Response::build", _txt(recv)):
+            ct = re.search(r"content_type\(([^)]*)\)", _txt(recv))
+            if ct is not None:
+                if "html" in ct.group(1).lower():
+                    xss_arg = args[0]
+            else:
+                lit, ok = _format_literal(_unwrap_value(args[0]))
+                if ok and _HTML_TAG_RE.search(lit):
+                    xss_arg = args[0]
+        elif recv is None and args and (fname in ("Html", "RawHtml") or fn_text.endswith("reply::html")):
+            xss_arg = args[0]
+        if xss_arg is not None and _is_tainted(xss_arg, tainted):
+            _emit("RAST-XSS-001", VulnType.XSS, Severity.HIGH,
+                  "XSS: user-controlled data embedded in an HTML response body without escaping")
+
         # Path traversal
         if fname in _PATH_SINKS:
             arg_idx, desc = _PATH_SINKS[fname]
@@ -532,6 +672,27 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
             # Also handle: File::open(path) where the path is the first arg
             elif fname == "open" and args and _is_tainted(args[0], tainted):
                 _emit("RAST-PATH-001", VulnType.PATH_TRAVERSAL, Severity.HIGH, desc)
+
+
+def _detect_sql_strings(body_node, tainted: set[str], lines: list[str],
+                        file_path: str, findings: list[Finding]) -> None:
+    """format!("SELECT .. {}", tainted): the query is built unsafely even when it is
+    executed through a wrapper this analyzer cannot see."""
+    if any(f.rule_id == "RAST-SQL-001" for f in findings):
+        return
+    for node in _walk(body_node):
+        if node.type != "macro_invocation":
+            continue
+        lit, ok = _format_literal(node)
+        if ok and _SQL_BUILD_RE.search(lit) and _is_tainted(node, tainted):
+            ln = node.start_point[0]
+            findings.append(Finding(
+                vuln_type=VulnType.SQL_INJECTION, severity=Severity.HIGH,
+                file_path=file_path, line_number=ln + 1,
+                line_content=lines[ln].strip() if ln < len(lines) else "",
+                description="SQL query string built with user-controlled data via format!() "
+                            "(use bound parameters instead)",
+                rule_id="RAST-SQL-002"))
 
 
 # ── Top-level analysis ────────────────────────────────────────────────────────
@@ -549,7 +710,10 @@ def _analyze_function(func_node, lines: list[str],
         if not _propagate(body, tainted):
             break
 
-    _detect_sinks(body, tainted, lines, file_path, findings)
+    local: list[Finding] = []
+    _detect_sinks(body, tainted, lines, file_path, local)
+    _detect_sql_strings(body, tainted, lines, file_path, local)
+    findings.extend(local)
 
 
 def _is_test_attr(attr_node) -> bool:
