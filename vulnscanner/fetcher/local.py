@@ -8,6 +8,7 @@ from typing import Callable, Iterator
 _SCAN_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".php", ".java", ".rb", ".go", ".cs", ".rs",
+    ".mjs", ".cjs",
     ".html", ".htm", ".sh",
     ".env", ".yml", ".yaml", ".json", ".config", ".tf",
     ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx",
@@ -20,6 +21,7 @@ _SCAN_FILENAMES = frozenset({
     "package.json",
     "Gemfile.lock",
     "go.mod",
+    "composer.lock", ".php-version",
 })
 
 # Directory names that are always skipped (exact match on any path component)

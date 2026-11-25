@@ -7,6 +7,8 @@ nightly_runs/
 benchmark_python/
 owasp_benchmark/
 recall/
+# git worktree の作業コピー（並列レーン用。本体と同じコードを重複して走査してしまう）
+worktrees/
 scan_results/
 
 # スキャン出力 JSON（ルートレベル）
