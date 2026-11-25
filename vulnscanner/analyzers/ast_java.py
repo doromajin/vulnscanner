@@ -9,6 +9,7 @@ the file uses unsupported Java syntax.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -921,6 +922,39 @@ _SPRING_JDBC_METHODS = frozenset({
 })
 
 _SQL_EXEC_METHODS = _JDBC_EXEC_METHODS | _SPRING_JDBC_METHODS
+
+# `update` / `query` also exist on MessageDigest, Mac, Signature, Cipher, checksums and many
+# domain classes. A receiver whose declared type is known and not JDBC-like is not a SQL sink.
+_JDBC_TYPE_HINT_RE = re.compile(
+    r"jdbc|template|statement|entitymanager|session|dao|repositor|connection|query|sql|"
+    r"database|datasource|operations|mapper|persist|criteria|builder|dsl|jooq", re.I)
+_NON_JDBC_TYPES = frozenset({
+    "MessageDigest", "Mac", "Signature", "Cipher", "Checksum", "CRC32", "CRC32C", "Adler32",
+})
+
+
+def _receiver_may_be_jdbc(qualifier: str, declared: dict) -> bool:
+    """False only when the receiver's declared type is known and clearly not a JDBC/ORM type."""
+    types = declared.get(qualifier.split(".")[0]) if qualifier else None
+    if not types:
+        return True
+    return any(t not in _NON_JDBC_TYPES and _JDBC_TYPE_HINT_RE.search(t) for t in types)
+
+
+def _declared_types(tree) -> dict:
+    """{variable name: {declared type names}} over locals, parameters and fields of the file."""
+    out: dict = {}
+    for node_cls in (jt.LocalVariableDeclaration, jt.FieldDeclaration):
+        for _, d in tree.filter(node_cls):
+            tname = getattr(getattr(d, "type", None), "name", None)
+            if tname:
+                for decl in d.declarators:
+                    out.setdefault(decl.name, set()).add(str(tname))
+    for _, p in tree.filter(jt.FormalParameter):
+        tname = getattr(getattr(p, "type", None), "name", None)
+        if tname and getattr(p, "name", None):
+            out.setdefault(p.name, set()).add(str(tname))
+    return out
 
 _JPA_METHODS = frozenset({
     "createQuery", "createNativeQuery", "createNamedQuery",
@@ -3624,6 +3658,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
         try:
             # Map: method_name → list of (callee_midx, [param_names])
             _ipt_local: dict[str, list[tuple[int, list[str]]]] = {}
+            _ipt_nodes: dict[int, list] = {}
             for _, _ipt_m in tree.filter(jt.MethodDeclaration):
                 _ipt_pos = getattr(_ipt_m, "position", None)
                 _ipt_ln = _ipt_pos.line if _ipt_pos else -1
@@ -3637,6 +3672,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         break
                 _ipt_params = [getattr(p, "name", "") for p in (_ipt_m.parameters or [])]
                 _ipt_local.setdefault(_ipt_m.name, []).append((_ipt_midx, _ipt_params))
+                _ipt_nodes.setdefault(_ipt_midx, []).append(_ipt_m)
 
             for _, _ipc in tree.filter(jt.MethodInvocation):
                 if _node_line(_ipc) in dead_lines or _ipc.member not in _ipt_local:
@@ -3648,6 +3684,34 @@ class JavaASTAnalyzer(BaseAnalyzer):
                             _pn = _ipc_ps[_ipc_ai]
                             if _pn:
                                 _infile_extra_taint.setdefault(_ipc_cm, set()).add(_pn)
+
+            # A seeded parameter also taints the locals derived from it inside the callee
+            # (`query = "..." + name;` then `stmt.executeQuery(query)`), including a local
+            # pre-initialised with a literal and reassigned later in a try/resource body.
+            for _ipd_midx, _ipd_seeds in _infile_extra_taint.items():
+                for _ipd_m in _ipt_nodes.get(_ipd_midx, []):
+                    for _ in range(6):
+                        _ipd_chg = False
+                        for _, _ipd_lvd in _ipd_m.filter(jt.LocalVariableDeclaration):
+                            if _node_line(_ipd_lvd) in dead_lines:
+                                continue
+                            for _ipd_d in _ipd_lvd.declarators:
+                                if (_ipd_d.name not in _ipd_seeds and _ipd_d.initializer is not None
+                                        and _is_tainted(_ipd_d.initializer, _ipd_seeds, _const_ints)):
+                                    _ipd_seeds.add(_ipd_d.name)
+                                    _ipd_chg = True
+                        for _, _ipd_se in _ipd_m.filter(jt.StatementExpression):
+                            _ipd_a = getattr(_ipd_se, "expression", None)
+                            if not isinstance(_ipd_a, jt.Assignment) or _node_line(_ipd_se) in dead_lines:
+                                continue
+                            _ipd_l = _ipd_a.expressionl
+                            if (isinstance(_ipd_l, jt.MemberReference) and not str(_ipd_l.qualifier or "")
+                                    and _ipd_l.member not in _ipd_seeds
+                                    and _is_tainted(_ipd_a.value, _ipd_seeds, _const_ints)):
+                                _ipd_seeds.add(_ipd_l.member)
+                                _ipd_chg = True
+                        if not _ipd_chg:
+                            break
         except Exception:
             pass
 
@@ -3694,6 +3758,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
 
         # ── SQL injection ──────────────────────────────────────────────────────
         try:
+            _decl_types = _declared_types(tree)
+            _own_method_names = {m.name for _, m in tree.filter(jt.MethodDeclaration)}
             for _, node in tree.filter(jt.MethodInvocation):
                 if _node_line(node) in dead_lines:
                     continue
@@ -3755,6 +3821,10 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                                  "(getenv/getProperty) in SQL concat")
                                             break
                 elif node.member in _SPRING_JDBC_METHODS:
+                    if not _receiver_may_be_jdbc(q, _decl_types):
+                        continue
+                    if not q and node.member in _own_method_names:
+                        continue  # unqualified call to a method this file defines itself
                     # Only the FIRST argument is the SQL string; subsequent args are bound
                     # parameters and are safe (e.g. queryForObject(sql, type, param...)).
                     first_arg = (node.arguments or [None])[0]

@@ -104,6 +104,9 @@ _PROPAGATING_METHODS: frozenset[str] = frozenset({
     "to_os_string", "into_os_string",
     "to_path_buf", "into_path_buf",
     "display",
+    # actix-web / http request accessors: only taint when the receiver is tainted
+    "query_string", "uri", "match_info", "headers", "path", "query", "cookie",
+    "param", "get_ref", "into_inner",
     # Read
     "lines", "read_line",
 })
@@ -115,6 +118,11 @@ _PROPAGATING_FUNCS: dict[str, list[int]] = {
     "into":    [0],   # Into::into(tainted)
     "format":  [],    # format!(..., tainted) — handled via macro_invocation
     "concat":  [0, 1, 2, 3],
+    # Parse calls (serde_urlencoded::from_str, serde_json::from_str, Query::from_query ...)
+    "from_str":   [0],
+    "from_query": [0],
+    "from_slice": [0],
+    "from_bytes": [0],
     "push_str": [1],  # s.push_str(tainted) → s is now tainted
     "push":    [1],
 }
@@ -240,6 +248,24 @@ def _is_literal(node) -> bool:
     )
 
 
+# Combinators that run a closure over the receiver's value; the result is
+# tainted when the closure body, with its parameters tainted, is tainted.
+_CLOSURE_COMBINATORS: frozenset[str] = frozenset({
+    "map", "and_then", "or_else", "map_or", "map_or_else", "filter", "filter_map",
+    "inspect", "then",
+})
+
+
+def _closure_result_tainted(closure, tainted: set[str]) -> bool:
+    params = closure.child_by_field_name("parameters")
+    names: set[str] = set()
+    if params is not None:
+        for sub in _walk(params):
+            if sub.type == "identifier":
+                names.add(_txt(sub))
+    return _is_tainted(closure.child_by_field_name("body"), tainted | names)
+
+
 # ── Taint expression evaluator ────────────────────────────────────────────────
 
 def _is_tainted(node, tainted: set[str]) -> bool:
@@ -305,6 +331,15 @@ def _is_tainted(node, tainted: set[str]) -> bool:
         if fname in _PROPAGATING_METHODS:
             if recv and _is_tainted(recv, tainted):
                 return True
+
+        # opt.map(|s| ...) etc.: tainted receiver whose closure keeps its input
+        if fname in _CLOSURE_COMBINATORS and recv and _is_tainted(recv, tainted):
+            for a in args:
+                if a.type == "closure_expression":
+                    if _closure_result_tainted(a, tainted):
+                        return True
+                elif _is_tainted(a, tainted):
+                    return True
 
         # String::from(tainted), Into::into(tainted)
         if fname in _PROPAGATING_FUNCS:

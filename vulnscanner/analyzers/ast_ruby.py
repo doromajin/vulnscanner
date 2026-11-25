@@ -178,6 +178,40 @@ _TAINT_CLEAR_FUNCTIONS = frozenset({"Integer", "Float", "Rational", "Complex"})
 
 # ── Taint state helpers ───────────────────────────────────────────────────────
 
+_COND_TYPES = frozenset({"conditional", "if", "unless", "elsif", "if_modifier", "unless_modifier", "case"})
+_ARM_CONTAINERS = frozenset({"then", "else"})
+
+
+def _cond_arms(node) -> list:
+    """Value-producing arms of a conditional: the last expression of each branch body."""
+    t = node.type
+    arms: list = []
+    if t == "conditional":
+        arms = [node.child_by_field_name("consequence"), node.child_by_field_name("alternative")]
+    elif t in ("if_modifier", "unless_modifier"):
+        arms = [node.child_by_field_name("body")]
+    elif t in ("if", "unless", "elsif"):
+        arms = [node.child_by_field_name("consequence"), node.child_by_field_name("alternative")]
+    elif t == "case":
+        for ch in node.named_children:
+            if ch.type == "when":
+                arms.append(ch.child_by_field_name("body"))
+            elif ch.type == "else":
+                arms.append(ch)
+    out = []
+    for a in arms:
+        if a is None:
+            continue
+        if a.type in _ARM_CONTAINERS or a.type == "elsif":
+            if a.type == "elsif":
+                out.append(a)
+            elif a.named_children:
+                out.append(a.named_children[-1])
+        else:
+            out.append(a)
+    return out
+
+
 def _is_tainted(node, tainted: set[str], tainted_methods: set[str],
                 tainted_ivars: "frozenset | set" = frozenset()) -> bool:
     """Return True if this node carries taint."""
@@ -236,6 +270,13 @@ def _is_tainted(node, tainted: set[str], tainted_methods: set[str],
             return True
         nc = node.named_children
         return bool(nc) and _is_tainted(nc[0], tainted, tainted_methods, tainted_ivars)
+
+    # Conditionals used as values: any arm that is tainted taints the whole expression
+    if node.type in _COND_TYPES:
+        for arm in _cond_arms(node):
+            if _is_tainted(arm, tainted, tainted_methods, tainted_ivars):
+                return True
+        return False
 
     # Parenthesized / grouped expression
     if node.type == "parenthesized_statements" and node.named_children:

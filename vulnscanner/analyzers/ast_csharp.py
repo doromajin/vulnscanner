@@ -169,6 +169,27 @@ _PROPAGATING_METHODS: frozenset[str] = frozenset({
 })
 
 
+# StringBuilder mutators: a tainted argument taints the builder (and so its ToString())
+_BUILDER_MUTATORS: frozenset[str] = frozenset({
+    "Append", "AppendFormat", "AppendLine", "AppendJoin", "Insert",
+})
+
+
+def _chain_root_identifier(node):
+    """Root identifier of `sb.Append(a).Append(b)` / `sb` -> `sb`; None for anything else."""
+    cur = node
+    while cur is not None:
+        if cur.type == "identifier":
+            return cur
+        if cur.type == "invocation_expression":
+            cur = _invocation_receiver(cur)
+        elif cur.type == "parenthesized_expression" and cur.named_children:
+            cur = cur.named_children[0]
+        else:
+            return None
+    return None
+
+
 # ── AST helpers ───────────────────────────────────────────────────────────────
 
 def _walk(node):
@@ -375,6 +396,10 @@ def _is_tainted(node, tainted: set[str]) -> bool:
         if method in _PROPAGATING_METHODS:
             if recv and _is_tainted(recv, tainted):
                 return True
+        # sb.Append(tainted) / new StringBuilder().Append(tainted): the builder carries the taint
+        if method in _BUILDER_MUTATORS and recv is not None and (
+                _is_tainted(recv, tainted) or any(_is_tainted(a, tainted) for a in args)):
+            return True
         # String.Format(tainted_fmt, ...) or String.Format("...", tainted_arg)
         if method == "Format":
             return any(_is_tainted(a, tainted) for a in args)
@@ -390,7 +415,7 @@ def _is_tainted(node, tainted: set[str]) -> bool:
         ctor = _ctor_type_name(node)
         args = _ctor_args(node)
         # String / Uri wrapper ctors propagate taint from first argument
-        if ctor in ("String",) or ctor in _URI_CTOR_TYPES:
+        if ctor in ("String", "StringBuilder") or ctor in _URI_CTOR_TYPES:
             return bool(args) and _is_tainted(args[0], tainted)
         return False
 
@@ -483,6 +508,16 @@ def _propagate(body_node, tainted: set[str]) -> bool:
                         if obj_name not in tainted:
                             tainted.add(obj_name)
                             changed = True
+
+        # sb.Append(tainted); sb.Insert(0, tainted); sb.Append(a).Append(tainted);
+        elif t == "invocation_expression":
+            if _invocation_method_name(node) in _BUILDER_MUTATORS:
+                args = _invocation_args(node)
+                if any(_is_tainted(a, tainted) for a in args):
+                    root = _chain_root_identifier(_invocation_receiver(node))
+                    if root is not None and _txt(root) not in tainted:
+                        tainted.add(_txt(root))
+                        changed = True
 
         # string q = new SqlCommand("SELECT * FROM t WHERE n=" + name).CommandText;
         # object_creation_expression — if SQL cmd type with tainted arg, mark result
