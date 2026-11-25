@@ -1,6 +1,7 @@
 import re
 
 from vulnscanner.analyzers.base import BaseAnalyzer
+from vulnscanner.analyzers.file_context import rust_test_lines
 from vulnscanner.models import Finding, Severity, VulnType
 
 _HS = VulnType.HARDCODED_SECRET
@@ -235,7 +236,7 @@ _GUARD = re.compile(
     r'|xox[bpsa]-'
     r'|sk_live_|rk_live_|sk_test_'
     r'|SG\.[A-Za-z0-9_-]{10}'
-    r'|npm_',
+    r'|npm_|credential|secret_key_base|_KEY\b|\bKEY\b',
     re.IGNORECASE,
 )
 
@@ -285,6 +286,63 @@ def _is_name_word_value(line: str) -> bool:
     return re.sub(r"[-_.\s]", "", m.group(1)).lower() in _NAME_WORD_VALUES
 
 
+# SEC-015 / SEC-016: credential constants in Go, Rust, C# and Ruby, whose declaration syntax the
+# generic `password = "..."` rules above do not cover (`const X: &str = "..."`, `private const string X = "..."`).
+_CRED_NAME = (
+    r'(?P<name>\w*(?:secret|passw(?:or)?d|pwd|passphrase|api_?key|apikey|token|credential'
+    r'|(?:private|signing|encryption|auth|access|master|jwt|crypto|aes|hmac)_?key)s?)'
+)
+_CRED_VALUE = r'"(?P<val>[^"\\]{6,})"'
+_LANG_SECRET_RULES = [
+    (  # Go: `const jwtSecret = "..."` / `var apiKey string = "..."` / a bare line inside a const block
+        re.compile(r'^\s*(?:(?:const|var)\s+)?' + _CRED_NAME + r'\s*(?:string\s*)?=\s*' + _CRED_VALUE + r'\s*$', re.IGNORECASE),
+        (".go",),
+    ),
+    (  # Rust: `const JWT_SECRET: &str = "...";`
+        re.compile(
+            r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(?P<name>\w*(?:SECRET|PASSW(?:OR)?D|PWD|PASSPHRASE|API_?KEY|TOKEN|CREDENTIAL|_KEY)S?|KEY)'
+            r'\s*:\s*&(?:\'static\s+)?str\s*=\s*' + _CRED_VALUE + r'\s*;',
+            re.IGNORECASE,
+        ),
+        (".rs",),
+    ),
+    (  # C#: `private const string ApiSecret = "...";`
+        re.compile(
+            r'^\s*(?:(?:public|private|protected|internal|static|readonly|const)\s+)+string\s+' + _CRED_NAME +
+            r'\s*=\s*' + _CRED_VALUE + r'\s*;',
+            re.IGNORECASE,
+        ),
+        (".cs",),
+    ),
+    (  # Ruby: `SECRET = "..."` / `KEY = "..."` upper-case constants
+        re.compile(r"^\s*(?P<name>[A-Z][A-Z0-9_]*(?:SECRET|PASSW(?:OR)?D|PWD|PASSPHRASE|API_?KEY|TOKEN|CREDENTIAL|_KEY)S?|KEY)\s*=\s*['\"](?P<val>[^'\"\\]{6,})['\"]"),
+        (".rb",),
+    ),
+]
+_RAILS_SECRET_BASE_RE = re.compile(r"""\bsecret_key_base\s*=\s*["'](?P<val>[A-Za-z0-9]{20,})["']""")
+_SLUG_LABEL_RE = re.compile(r'[A-Za-z]+(?:[-_.:/ ][A-Za-z]+)*')
+_ENV_NAME_RE = re.compile(r'[A-Z][A-Z0-9_]+')
+_PLAIN_RE = re.compile(r'[A-Za-z0-9\-_.:/ ]*')
+_LINE_ALREADY_REPORTED = ("SEC-001", "SEC-002", "SEC-003", "SEC-006")
+
+
+def _credential_like_value(value: str) -> bool:
+    """False for header names, route paths, URLs, env-var names and the field's own name; True for
+    values with a digit or a symbol, which look like actual secrets."""
+    if "://" in value or "{" in value or "%s" in value or "$" in value or value.startswith("/") or re.search(r"\s", value):
+        return False
+    if re.sub(r"[-_.\s]", "", value).lower() in _NAME_WORD_VALUES:
+        return False
+    if _SLUG_LABEL_RE.fullmatch(value) or _ENV_NAME_RE.fullmatch(value):
+        return False
+    return not _PLAIN_RE.fullmatch(value) or bool(re.search(r"\d", value))
+
+
+
+_PLACEHOLDER_PAREN_RE = re.compile(r"(?:password|passwd|pwd)\s*=\s*[\"']\([^\"')]*\)[\"']", re.IGNORECASE)  # "(removed)", "(hidden)"
+_EF_MIGRATION_RE = re.compile(r"(?:^|/)Migrations/")
+
+
 def _python_docstring_lines(content: str) -> set[int]:
     """1-based line numbers covered by module / class / function docstrings."""
     import ast
@@ -322,13 +380,16 @@ def _is_ci_throwaway_password(file_path: str, line: str) -> bool:
 
 class HardcodedSecretsAnalyzer(BaseAnalyzer):
     supported_extensions = (
-        ".py", ".js", ".ts", ".java", ".rb", ".php", ".go",
+        ".py", ".js", ".ts", ".java", ".rb", ".php", ".go", ".rs", ".cs",
         ".env", ".yml", ".yaml", ".json", ".config", ".tf",
     )
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         if not _GUARD.search(content):
             return []
+
+        if file_path.endswith(".cs") and _EF_MIGRATION_RE.search(file_path.replace("\\", "/")):
+            return []  # generated EF Core migration / model snapshot: seed data repeated from the DbContext
 
         lines = content.splitlines()
         findings: list[Finding] = []
@@ -374,6 +435,8 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
         # ------------------------------------------------------------------ #
         rules_except_d = [r for r in _RULES if not (r[0] == "SEC-009" and r[1].flags & re.MULTILINE and r[1].pattern.startswith(r'\bprivate_key\s*:\s*[|>]'))]
         doc_lines = _python_docstring_lines(content) if file_path.endswith(".py") else set()
+        if file_path.endswith(".rs"):
+            doc_lines = rust_test_lines(content)  # #[cfg(test)] modules and #[test] fns hold sample values, not product secrets
         for lineno, line in enumerate(lines, 1):
             if self._is_comment(line) or lineno in doc_lines:
                 continue
@@ -389,6 +452,8 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                 if rule_id == "SEC-001" and (_is_password_label(line) or _TEMPLATE_VALUE_RE.search(line)):
                     continue
                 if rule_id == "SEC-001" and _is_name_word_value(line):
+                    continue
+                if rule_id == "SEC-001" and _PLACEHOLDER_PAREN_RE.search(line):
                     continue
                 if rule_id == "SEC-001" and _is_concatenated_key(line):
                     continue
@@ -412,4 +477,39 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                     repo_url=repo_url,
                     snippet=self._extract_snippet(lines, lineno),
                 ))
+            self._language_credentials(file_path, line, lineno, stripped, lines, seen, findings, repo_url)
         return findings
+
+    def _language_credentials(self, file_path, line, lineno, stripped, lines, seen, findings, repo_url) -> None:
+        """SEC-015 (credential constants) and SEC-016 (Rails secret_key_base) for Go, Rust, C# and Ruby."""
+        if not file_path.endswith((".go", ".rs", ".cs", ".rb")):
+            return
+        if _ALLOWLIST_RE.search(line) or any((r, lineno) in seen for r in _LINE_ALREADY_REPORTED):
+            return
+        if file_path.endswith(".rb"):
+            m = _RAILS_SECRET_BASE_RE.search(line)
+            if m:
+                seen.add(("SEC-016", lineno))
+                findings.append(Finding(
+                    vuln_type=_HS, severity=Severity.HIGH, file_path=file_path, line_number=lineno,
+                    line_content=stripped, rule_id="SEC-016", repo_url=repo_url,
+                    description="Hardcoded Rails secret_key_base — session cookies and signed data can be forged; load it from credentials or ENV",
+                    snippet=self._extract_snippet(lines, lineno),
+                ))
+                return
+        for rx, exts in _LANG_SECRET_RULES:
+            if not file_path.endswith(exts):
+                continue
+            m = rx.search(line)
+            if not m or not _credential_like_value(m.group("val")):
+                continue
+            if ("SEC-015", lineno) in seen:
+                return
+            seen.add(("SEC-015", lineno))
+            findings.append(Finding(
+                vuln_type=_HS, severity=Severity.HIGH, file_path=file_path, line_number=lineno,
+                line_content=stripped, rule_id="SEC-015", repo_url=repo_url,
+                description=f"Hardcoded credential constant '{m.group('name')}' — load it from the environment or a secrets manager",
+                snippet=self._extract_snippet(lines, lineno),
+            ))
+            return
