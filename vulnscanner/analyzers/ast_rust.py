@@ -29,11 +29,49 @@ _RUST_EXTS = (".rs",)
 # ── Web framework parameter types that carry user-controlled data ─────────────
 # If a function parameter's type contains any of these keywords, the parameter
 # is treated as a taint source (actix-web, axum, warp, rocket patterns).
-_WEB_PARAM_TYPE_KEYWORDS: frozenset[str] = frozenset({
-    "Query", "Path", "Form", "Json", "Body",
-    "HttpRequest", "Request", "WebQuery",
-    "Params", "Headers",
+# Matched as a whole type identifier, never as a substring: std `&Path` / `PathBuf`
+# are ordinary filesystem types, and `Params` / `Headers` are arbitrary names.
+_WEB_GENERIC_EXTRACTORS: frozenset[str] = frozenset({
+    "Query", "Path", "Form", "Json", "Request", "Multipart",
 })
+_WEB_BARE_EXTRACTORS: frozenset[str] = frozenset({"HttpRequest", "Multipart"})
+_GENERIC_TYPE_RE = re.compile(r"(?<![\w])(?:\w+::)*(\w+)\s*<")
+_BARE_TYPE_RE = re.compile(r"(?<![\w])(?:\w+::)*(\w+)(?![\w<])")
+
+
+def _is_web_extractor_type(type_text: str) -> bool:
+    """True if the type names an axum/actix/rocket request extractor.
+
+    `Path` only counts in its generic form (`Path<T>`, `web::Path<T>`): std's
+    `Path` is unsized and is never generic.
+    """
+    for m in _GENERIC_TYPE_RE.finditer(type_text):
+        if m.group(1) in _WEB_GENERIC_EXTRACTORS:
+            return True
+    for m in _BARE_TYPE_RE.finditer(type_text):
+        if m.group(1) in _WEB_BARE_EXTRACTORS:
+            return True
+    return False
+
+
+def _param_pattern_names(pat) -> list[str]:
+    """Bound identifiers of a parameter pattern: `p`, `mut p`, `Query(p)`, `Path((a, b))`."""
+    if pat is None:
+        return []
+    t = pat.type
+    if t == "identifier":
+        return [_txt(pat)]
+    if t in ("shorthand_field_identifier",):
+        return [_txt(pat)]
+    names: list[str] = []
+    type_child = pat.child_by_field_name("type") if t == "tuple_struct_pattern" else None
+    for child in pat.named_children:
+        if type_child is not None and child.id == type_child.id:
+            continue
+        if t == "field_pattern" and child.type == "field_identifier":
+            continue
+        names.extend(_param_pattern_names(child))
+    return names
 
 # ── Methods that propagate taint from receiver to return value ─────────────────
 _PROPAGATING_METHODS: frozenset[str] = frozenset({
@@ -213,6 +251,10 @@ def _is_tainted(node, tainted: set[str]) -> bool:
     if t == "identifier":
         return _txt(node) in tainted
 
+    if t == "field_expression":
+        # p.name — tainted if the base value is tainted
+        return _is_tainted(node.child_by_field_name("value"), tainted)
+
     if t == "index_expression":
         # args[1] — tainted if args is tainted
         nc = node.named_children
@@ -318,12 +360,9 @@ def _seed_function_params(func_node, tainted: set[str]) -> None:
         if type_node is None:
             continue
         type_text = _txt(type_node)
-        # If type contains any web framework keyword, the param is user-controlled
-        if any(kw in type_text for kw in _WEB_PARAM_TYPE_KEYWORDS):
-            pat = param.child_by_field_name("pattern")
-            name = _txt(pat) if pat else None
-            if name:
-                tainted.add(name)
+        # A request-extractor type means the bound names are user-controlled
+        if _is_web_extractor_type(type_text):
+            tainted.update(_param_pattern_names(param.child_by_field_name("pattern")))
         # String / &str params in public handlers — too broad, skip
 
 
@@ -478,6 +517,30 @@ def _analyze_function(func_node, lines: list[str],
     _detect_sinks(body, tainted, lines, file_path, findings)
 
 
+def _is_test_attr(attr_node) -> bool:
+    txt = _txt(attr_node).replace(" ", "")
+    return "cfg(test)" in txt or txt in ("#[test]", "#[tokio::test]") or txt.startswith("#[tokio::test(")
+
+
+def _has_test_attr(item) -> bool:
+    prev = item.prev_named_sibling
+    while prev is not None and prev.type in ("attribute_item", "line_comment", "block_comment"):
+        if prev.type == "attribute_item" and _is_test_attr(prev):
+            return True
+        prev = prev.prev_named_sibling
+    return False
+
+
+def _in_test_code(node) -> bool:
+    """True for #[test] fns and anything inside a #[cfg(test)] item."""
+    cur = node
+    while cur is not None:
+        if cur.type in ("function_item", "mod_item", "impl_item") and _has_test_attr(cur):
+            return True
+        cur = cur.parent
+    return False
+
+
 def _analyze_content(content: str, file_path: str) -> list[Finding]:
     try:
         tree = _rust_parser.parse(content.encode("utf-8", errors="replace"))
@@ -488,7 +551,7 @@ def _analyze_content(content: str, file_path: str) -> list[Finding]:
     findings: list[Finding] = []
 
     for node in _walk(tree.root_node):
-        if node.type == "function_item":
+        if node.type == "function_item" and not _in_test_code(node):
             _analyze_function(node, lines, file_path, findings)
 
     return findings

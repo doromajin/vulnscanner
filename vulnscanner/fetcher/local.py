@@ -7,7 +7,7 @@ from typing import Callable, Iterator
 
 _SCAN_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx",
-    ".php", ".java", ".rb", ".go", ".cs",
+    ".php", ".java", ".rb", ".go", ".cs", ".rs",
     ".html", ".htm", ".sh",
     ".env", ".yml", ".yaml", ".json", ".config", ".tf",
     ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx",
