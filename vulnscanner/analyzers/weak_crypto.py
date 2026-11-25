@@ -170,6 +170,31 @@ _MD5_SHA1_PWD = {
 }
 
 
+_SENSITIVE_CTX_RE = re.compile(
+    r'pass(?:word|wd|phrase)|\bpwd|secret|token|\bauth|session|\bsign|hmac|verif|credential|login|\bsalt', _I)
+_IDENTITY_CTX_RE = re.compile(r'hash|digest|checksum|etag|fingerprint|cache|content_?md5|dedup|\bmd5\b|\bsha1\b', _I)
+_IDENTITY_NEAR_RE = re.compile(
+    r'hashcode|\bhashed\b|checksum|etag|fingerprint|cache[_ ]?key|content-?md5|dedup|\b(?:id|key)\w*\s*=', _I)
+_FUNC_START_RE = re.compile(
+    r'^\s*(?:func\s+(?:\([^)]*\)\s*)?(\w+)|def\s+(?:self\.)?(\w+[?!]?)|(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)'
+    r'|(?:(?:public|private|protected|internal|static|override|virtual|async|unsafe)\s+)+[\w<>\[\],.?]+\s+(\w+)\s*(?:<[^>]*>)?\()')
+
+
+def _enclosing_function(lines, idx):
+    """(start, end, name) of the nearest function declaration at or above `idx`; start == end when none."""
+    for i in range(idx, max(-1, idx - 80), -1):
+        m = _FUNC_START_RE.match(lines[i])
+        if m:
+            name = next(g for g in m.groups() if g)
+            end = min(len(lines), idx + 80)
+            for j in range(idx + 1, end):
+                if _FUNC_START_RE.match(lines[j]):
+                    end = j
+                    break
+            return i, end, name
+    return 0, 0, ""
+
+
 def _hash_rules():
     out = []
     for ext, rx in _MD5_SHA1.items():
@@ -382,7 +407,7 @@ class WeakCryptoAnalyzer(BaseAnalyzer):
         if is_lang and any(f.rule_id == "WCRYPTO-013" for f in findings):
             self._demote_conditional_tls_opt_out(content, findings)
         if is_lang and any(f.rule_id == "WCRYPTO-010" for f in findings):
-            findings = self._drop_benign_digest_context(content, findings)
+            findings = self._drop_benign_digest_context(content, findings, file_path)
         if file_path.endswith(".go"):
             findings += self._go_secret_function_prng(file_path, content, repo_url, findings)
         elif file_path.endswith(".rs"):
@@ -405,15 +430,35 @@ class WeakCryptoAnalyzer(BaseAnalyzer):
                 f.description += " (conditional opt-out: verify the default path keeps validation on)"
 
     @staticmethod
-    def _drop_benign_digest_context(content: str, findings: list[Finding]) -> list[Finding]:
-        """A digest inside a method that builds an avatar URL / ETag / checksum / cache key is not a security control."""
+    def _drop_benign_digest_context(content: str, findings: list[Finding], file_path: str = "") -> list[Finding]:
+        """WCRYPTO-010 context heuristic (MD5/SHA-1 in Go / Ruby / Rust / C#).
+
+        1. A digest next to an ETag / checksum / cache key / HMAC marker is dropped (not a control).
+        2. If the enclosing function (or +-6 lines when there is none) mentions a credential/auth word
+           (password, secret, token, auth, session, sign, hmac, verify, credential, login, salt), or the
+           file name does, severity stays MEDIUM.
+        3. Otherwise, if the function name, the file name, or the 3 lines around the digest say it is an
+           identity / integrity helper (hash, digest, checksum, etag, fingerprint, hashcode, cache key,
+           content-md5, dedupe, id/key derivation), severity drops to LOW: still reported, but it is
+           not a security control.
+        """
         lines = content.splitlines()
+        base = file_path.replace("\\", "/").rsplit("/", 1)[-1]
         kept = []
         for f in findings:
             if f.rule_id == "WCRYPTO-010":
                 window = "\n".join(lines[max(0, f.line_number - 9):f.line_number + 4])
                 if _HASH_BENIGN_RE.search(window):
                     continue
+                start, end, name = _enclosing_function(lines, f.line_number - 1)
+                body = "\n".join(lines[start:end])
+                if start == end:
+                    body = "\n".join(lines[max(0, f.line_number - 7):f.line_number + 6])
+                if not _SENSITIVE_CTX_RE.search(body) and not _SENSITIVE_CTX_RE.search(base):
+                    near = "\n".join(lines[max(0, f.line_number - 4):f.line_number + 3])
+                    if _IDENTITY_CTX_RE.search(name) or _IDENTITY_CTX_RE.search(base) or _IDENTITY_NEAR_RE.search(near):
+                        f.severity = Severity.LOW
+                        f.description += " (identity/integrity use: no credential context in this function)"
             kept.append(f)
         return kept
 
