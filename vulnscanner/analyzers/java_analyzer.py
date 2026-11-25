@@ -6,6 +6,7 @@ higher precision for overlapping concepts (SQL, path, SSRF).
 """
 import re
 
+from vulnscanner.analyzers.java_xxe import factory_var, is_hardened
 from vulnscanner.analyzers.base import BaseAnalyzer
 from vulnscanner.models import Finding, Severity, VulnType
 
@@ -233,8 +234,20 @@ _GUARD = re.compile(
 )
 
 
+_XXE_REGEX_RULES = frozenset({"JAVA-XXE-001", "JAVA-XXE-002", "JAVA-XXE-003"})
+
+
 class JavaAnalyzer(BaseAnalyzer):
     supported_extensions = (".java",)
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
-        return self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)
+        findings = self._scan_lines(file_path, content, repo_url, _RULES, guard=_GUARD)
+        if any(f.rule_id in _XXE_REGEX_RULES for f in findings):
+            # A factory hardened in the same method (DOCTYPE / external entities disabled) is not a finding.
+            lines = content.splitlines()
+            findings = [
+                f for f in findings
+                if f.rule_id not in _XXE_REGEX_RULES
+                or not is_hardened(lines, f.line_number, factory_var(lines[f.line_number - 1]))
+            ]
+        return findings

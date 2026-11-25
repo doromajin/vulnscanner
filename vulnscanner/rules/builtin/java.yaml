@@ -8,14 +8,6 @@
   languages: [java]
   regex: "\\.readObject\\s*\\(\\s*\\)"
 
-- id: JAVA-REFLECT-001
-  message: "Class.forName() with dynamic argument — may load arbitrary classes if user-controlled"
-  severity: HIGH
-  vuln_type: COMMAND_INJECTION
-  cwe: 470
-  languages: [java]
-  regex: "Class\\.forName\\s*\\(\\s*[^\"'\\n)]"
-
 - id: JAVA-RAND-001
   message: "java.util.Random is not cryptographically secure — use java.security.SecureRandom for security-sensitive values"
   severity: MEDIUM
@@ -39,14 +31,6 @@
   cwe: 328
   languages: [java]
   regex: "MessageDigest\\.getInstance\\s*\\(\\s*\"SHA-?1\"\\s*\\)"
-
-- id: JAVA-XXE-001
-  message: "DocumentBuilderFactory without XXE mitigations — external entity injection risk; disable external entities"
-  severity: HIGH
-  vuln_type: XXE
-  cwe: 611
-  languages: [java]
-  regex: "DocumentBuilderFactory\\.newInstance\\s*\\(\\s*\\)"
 
 - id: JAVA-LOG-001
   message: "Logging user-controlled data may cause log injection (CRLF injection)"

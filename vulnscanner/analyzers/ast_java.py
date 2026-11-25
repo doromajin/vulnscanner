@@ -22,6 +22,7 @@ except ImportError:
     _HAS_JAVALANG = False
 
 from vulnscanner.analyzers.base import BaseAnalyzer
+from vulnscanner.analyzers.java_xxe import factory_var as _xxe_factory_var, is_hardened as _xxe_is_hardened, method_region as _xxe_method_region
 from vulnscanner.models import Finding, Severity, VulnType
 
 
@@ -974,6 +975,42 @@ _DESER_CLASSES = frozenset({"ObjectInputStream"})
 
 _SPEL_METHODS = frozenset({"parseExpression"})
 
+# XXE parser sinks: variable type (or factory method) -> methods whose first argument is the XML input.
+_XXE_PARSER_TYPES = {
+    "SAXBuilder": frozenset({"build"}),
+    "SAXReader": frozenset({"read"}),
+    "Digester": frozenset({"parse"}),
+    "XMLReader": frozenset({"parse"}),
+}
+_XXE_XBPROJECTOR_METHODS = frozenset({"projectXMLString", "projectInputStream", "projectReader"})
+
+# Script / template engines that evaluate their (first string) argument as code.
+_SCRIPT_ENGINE_TYPES = frozenset({"ScriptEngine", "GroovyShell", "GroovyClassLoader", "Invocable"})
+_SCRIPT_ENGINE_METHODS = frozenset({"eval", "evaluate", "parse", "parseClass"})
+_VELOCITY_EVAL_QUALIFIERS = frozenset({"Velocity", "VelocityEngine", "velocityEngine", "engine"})
+
+# Spring handler annotations: an unannotated String parameter of such a method is bound from the request.
+_SPRING_HANDLER_ANNOTATIONS = frozenset({
+    "RequestMapping", "GetMapping", "PostMapping", "PutMapping", "DeleteMapping", "PatchMapping",
+})
+# Values reduced to a bare file name: path taint does not survive them.
+_BASENAME_METHODS = frozenset({"getName", "getBaseName", "getFilename"})
+
+
+def _implicit_spring_params(method) -> "list[str]":
+    """Names of unannotated plain-String parameters of a Spring request-handler method."""
+    anns = {getattr(a, "name", "") for a in (getattr(method, "annotations", None) or [])}
+    if not (anns & _SPRING_HANDLER_ANNOTATIONS):
+        return []
+    out = []
+    for p in (method.parameters or []):
+        if getattr(p, "annotations", None):
+            continue
+        t = getattr(p, "type", None)
+        if _type_name(t) == "String" and not getattr(t, "dimensions", None) and not getattr(p, "varargs", False):
+            out.append(p.name)
+    return out
+
 # Spring RestTemplate / WebClient methods: first arg is the URL.
 _SPRING_REST_URL_METHODS = frozenset({
     "getForObject", "getForEntity", "postForObject", "postForEntity",
@@ -1265,6 +1302,10 @@ def _is_request_source(node) -> bool:
         q = str(node.qualifier or "")
         if q and q != "System":
             return True
+    if node.member in ("getRequestBody", "readRequestBody"):
+        # helper(request): returns the raw body of the request passed in
+        return any(isinstance(a, jt.MemberReference) and not a.qualifier and a.member in _REQUEST_OBJECTS
+                   for a in (node.arguments or []))
     if node.member not in _REQUEST_METHODS:
         return False
     q = node.qualifier or ""
@@ -1619,6 +1660,14 @@ _COLLECTION_MUTATE_METHODS = frozenset({
 })
 
 
+def _is_basename_chain(node) -> bool:
+    """`new File(x).getName()`: only the last path segment of x is used."""
+    if not isinstance(node, jt.ClassCreator) or _type_name(node.type) != "File":
+        return False
+    return any(isinstance(sel, jt.MethodInvocation) and sel.member in _BASENAME_METHODS
+               for sel in (node.selectors or []))
+
+
 def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> bool:
     """Recursively check whether a javalang expression node carries taint."""
     if node is None:
@@ -1626,6 +1675,9 @@ def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> 
     if isinstance(node, jt.MethodInvocation):
         if _is_request_source(node):
             return True
+        # Reduced to a bare file name: FilenameUtils.getName(x) / FilenameUtils.getBaseName(x)
+        if node.member in _BASENAME_METHODS and str(node.qualifier or "") == "FilenameUtils":
+            return False
         # Known XSS sanitizers: taint is neutralized, do not propagate
         if node.member in _XSS_SANITIZER_METHODS:
             return False
@@ -1657,6 +1709,8 @@ def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> 
     if isinstance(node, jt.Literal):
         return False
     if isinstance(node, jt.ClassCreator):
+        if _is_basename_chain(node):
+            return False
         return any(_is_tainted(a, tainted, const_ints) for a in (node.arguments or []))
     if isinstance(node, jt.ArrayInitializer):
         return any(_is_tainted(x, tainted, const_ints) for x in (node.initializers or []))
@@ -1985,6 +2039,9 @@ def _collect_tainted(tree) -> "tuple[set[str], set[str]]":
                             tainted.add(pname)
                             tainted_raw.add(pname)
                         break
+            for pname in _implicit_spring_params(method):
+                tainted.add(pname)
+                tainted_raw.add(pname)
     except Exception:
         pass
 
@@ -3040,6 +3097,9 @@ def _compute_method_local_clean(
                             _has_taint_pm[(pname, m)] = True
                             # No _taint_inits entry → direct source, never re-classifiable
                         break
+            for pname in _implicit_spring_params(method):
+                if pname in tainted:
+                    _has_taint_pm[(pname, m)] = True
     except Exception:
         pass
 
@@ -3997,7 +4057,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 if _cc_line in dead_lines:
                     continue
                 class_name = _type_name(node.type)
-                if class_name in _FILE_CLASSES:
+                if class_name in _FILE_CLASSES and not _is_basename_chain(node):
                     _et_cc = _eff_tainted(_cc_line)
                     for arg in (node.arguments or []):
                         if _is_tainted(arg, _et_cc):
@@ -4725,13 +4785,124 @@ class JavaASTAnalyzer(BaseAnalyzer):
         except Exception:
             pass
 
-        # ── XXE (always flag — factory needs hardening) ───────────────────────
+        # ── XXE ───────────────────────────────────────────────────────────────
+        # Factories: flagged unless the same method hardens that factory variable.
+        # Parsers (SAXBuilder/SAXReader/Digester/XMLReader/XBProjector): flagged when the input is tainted
+        # and the same method does not harden that parser.
+        try:
+            _xx_lines = content.splitlines()
+            for _, node in tree.filter(jt.MethodInvocation):
+                if node.member in ("newInstance", "newFactory") and str(node.qualifier or "") in _XXE_FACTORIES:
+                    _xl = _node_line(node)
+                    if _xl in dead_lines:
+                        continue
+                    _src = _xx_lines[_xl - 1] if 0 < _xl <= len(_xx_lines) else ""
+                    if _xxe_is_hardened(_xx_lines, _xl, _xxe_factory_var(_src)):
+                        continue
+                    _add(node, VulnType.XXE, Severity.HIGH, "JAST-XXE-001",
+                         f"{node.qualifier}.{node.member}() without XXE hardening — "
+                         "disable external entities with setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)")
+            _xx_vars: dict = {}      # var -> [(type, is_field, region_start_line, region_end_line)]
+            for _, _fd in tree.filter(jt.FieldDeclaration):
+                _t = _type_name(_fd.type)
+                if _t in _XXE_PARSER_TYPES or _t == "XBProjector":
+                    for _d in _fd.declarators:
+                        _xx_vars.setdefault(_d.name, []).append((_t, True, 0, 10 ** 9))
+            for _lp, _lv in tree.filter(jt.LocalVariableDeclaration):
+                _t = _type_name(_lv.type)
+                _dl = _creator_line(_lp, _lv)
+                _rs, _re = _xxe_method_region(_xx_lines, _dl)
+                for _d in _lv.declarators:
+                    _ini = _d.initializer
+                    _isx = isinstance(_ini, jt.MethodInvocation) and _ini.member == "createXMLReader"
+                    if _t in _XXE_PARSER_TYPES or _t == "XBProjector":
+                        if _t != "XMLReader" or _isx:
+                            _xx_vars.setdefault(_d.name, []).append((_t, False, _rs + 1, _re))
+                    elif _isx:
+                        _xx_vars.setdefault(_d.name, []).append(("XMLReader", False, _rs + 1, _re))
+            if _xx_vars:
+                for _, node in tree.filter(jt.MethodInvocation):
+                    _q = str(node.qualifier or "")
+                    if _q not in _xx_vars:
+                        continue
+                    _xl = _node_line(node)
+                    if _xl in dead_lines:
+                        continue
+                    _hit = next((v for v in _xx_vars[_q] if v[2] <= _xl <= v[3]), None)
+                    if _hit is None:
+                        continue
+                    _vt, _is_field = _hit[0], _hit[1]
+                    _sink = (node.member in _XXE_XBPROJECTOR_METHODS if _vt == "XBProjector"
+                             else node.member in _XXE_PARSER_TYPES[_vt])
+                    if not _sink:
+                        continue
+                    _args = node.arguments or []
+                    if not _args or not _is_tainted(_args[0], _eff_tainted(node)):
+                        continue
+                    if _xxe_is_hardened(_xx_lines, _xl, _q, whole_file=_is_field):
+                        continue
+                    _add(node, VulnType.XXE, Severity.HIGH, "JAST-XXE-002",
+                         f"{_vt}.{node.member}() parses user-controlled XML without disabling DOCTYPE / "
+                         "external entities — XXE; set disallow-doctype-decl or disable external entities")
+        except Exception:
+            pass
+
+        # ── Script / template evaluation of user input (CWE-94 / CWE-1336) ───
+        try:
+            _sc_vars = set()
+            for _, _lv in tree.filter(jt.LocalVariableDeclaration):
+                if _type_name(_lv.type) in _SCRIPT_ENGINE_TYPES:
+                    _sc_vars.update(d.name for d in _lv.declarators)
+            for _, _fd in tree.filter(jt.FieldDeclaration):
+                if _type_name(_fd.type) in _SCRIPT_ENGINE_TYPES:
+                    _sc_vars.update(d.name for d in _fd.declarators)
+            for _, node in tree.filter(jt.MethodInvocation):
+                _xl = _node_line(node)
+                if _xl in dead_lines or node.member not in _SCRIPT_ENGINE_METHODS:
+                    continue
+                _q = str(node.qualifier or "")
+                _is_velocity = node.member == "evaluate" and _q in _VELOCITY_EVAL_QUALIFIERS and "velocity" in content.lower()
+                _is_engine = _q in _sc_vars and node.member in ("eval", "evaluate", "parse", "parseClass")
+                if not (_is_velocity or _is_engine):
+                    continue
+                _et = _eff_tainted(node)
+                _args = node.arguments or []
+                # Velocity.evaluate(ctx, writer, logTag, template): the template string is the code
+                _cands = _args[-1:] if _is_velocity else _args[:1]
+                if any(_is_tainted(a, _et) for a in _cands):
+                    _add(node, VulnType.SSTI, Severity.HIGH, "JAST-SCRIPT-001",
+                         f"{_q}.{node.member}() evaluates user-controlled script/template text — "
+                         "code injection; never evaluate request data, or run it in a sandbox with an allowlist")
+            # new GroovyShell().evaluate(x) / new GroovyShell().parse(x): receiver is a ClassCreator
+            for _, node in tree.filter(jt.ClassCreator):
+                if _type_name(node.type) not in ("GroovyShell", "ScriptEngineManager"):
+                    continue
+                _cl = _creator_line(_, node)
+                for _sel in (node.selectors or []):
+                    if (isinstance(_sel, jt.MethodInvocation) and _sel.member in ("evaluate", "parse")
+                            and _type_name(node.type) == "GroovyShell" and _cl not in dead_lines):
+                        _sa = _sel.arguments or []
+                        if _sa and _is_tainted(_sa[0], _eff_tainted(_cl)):
+                            _add(node, VulnType.SSTI, Severity.HIGH, "JAST-SCRIPT-001",
+                                 f"GroovyShell.{_sel.member}() evaluates user-controlled script text — "
+                                 "code injection; never evaluate request data",
+                                 line_override=_cl)
+        except Exception:
+            pass
+
+        # ── Class.forName with a request-derived name (CWE-470) ───────────────
         try:
             for _, node in tree.filter(jt.MethodInvocation):
-                if node.member == "newInstance" and str(node.qualifier or "") in _XXE_FACTORIES:
-                    _add(node, VulnType.XXE, Severity.HIGH, "JAST-XXE-001",
-                         f"{node.qualifier}.newInstance() without XXE hardening — "
-                         "disable external entities with setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)")
+                if node.member != "forName" or str(node.qualifier or "") != "Class":
+                    continue
+                _xl = _node_line(node)
+                if _xl in dead_lines:
+                    continue
+                _args = node.arguments or []
+                if _args and _is_tainted(_args[0], _eff_tainted(node)):
+                    _add(node, VulnType.COMMAND_INJECTION, Severity.HIGH, "JAST-REFLECT-001",
+                         "Class.forName() with a request-controlled class name — "
+                         "unsafe reflection (CWE-470); map input to an allowlist of class names")
         except Exception:
             pass
 
