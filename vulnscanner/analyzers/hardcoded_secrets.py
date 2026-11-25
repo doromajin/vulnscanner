@@ -269,6 +269,22 @@ def _is_password_label(line: str) -> bool:
     return bool(_CONST_DECL_RE.search(line)) and bool(_LABEL_WORD_RE.search(value))
 
 
+# `FieldNamePassword = "password"` / `MFAMethodPassword = "password"`: the right side is only the
+# word that names the field (an identifier / enum value), whatever the left side looks like.
+_ANY_PASSWORD_VALUE_RE = re.compile(
+    r'(?:password|passwd|pwd)\w*\s*(?::[^=]*)?=\s*["\']([^"\']{4,})["\']', re.IGNORECASE)
+_NAME_WORD_VALUES = frozenset({
+    "password", "passwd", "pwd", "passphrase", "secret", "token", "apikey", "secretkey", "authtoken",
+})
+
+
+def _is_name_word_value(line: str) -> bool:
+    m = _ANY_PASSWORD_VALUE_RE.search(line)
+    if not m:
+        return False
+    return re.sub(r"[-_.\s]", "", m.group(1)).lower() in _NAME_WORD_VALUES
+
+
 def _python_docstring_lines(content: str) -> set[int]:
     """1-based line numbers covered by module / class / function docstrings."""
     import ast
@@ -371,6 +387,8 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                 if _ALLOWLIST_RE.search(line):
                     continue
                 if rule_id == "SEC-001" and (_is_password_label(line) or _TEMPLATE_VALUE_RE.search(line)):
+                    continue
+                if rule_id == "SEC-001" and _is_name_word_value(line):
                     continue
                 if rule_id == "SEC-001" and _is_concatenated_key(line):
                     continue

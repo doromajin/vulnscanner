@@ -81,6 +81,32 @@ _TWIG_SANDBOX_ON = re.compile(
 )
 
 
+# A template read from the page itself (`<script type="text/template">`) with a literal selector / id
+# is static markup shipped with the app, not attacker-controlled input.
+_DOM_TEMPLATE_READ = (
+    r'(?:(?:\$|jQuery)\s*\(\s*[\'"][^\'"`$+{}]+[\'"]\s*\)\s*\.\s*(?:html|text)\s*\(\s*\)'
+    r'|document\s*\.\s*getElementById\s*\(\s*[\'"][^\'"`$+{}]+[\'"]\s*\)\s*\.\s*(?:innerHTML|textContent|text|innerText)'
+    r'|document\s*\.\s*querySelector\s*\(\s*[\'"][^\'"`$+{}]+[\'"]\s*\)\s*\.\s*(?:innerHTML|textContent|text|innerText))'
+)
+_DOM_READ_FULL_RE = re.compile(r'^\s*' + _DOM_TEMPLATE_READ + r'\s*$')
+_COMPILE_IDENT_RE = re.compile(r'\bHandlebars\.compile\s*\(\s*([A-Za-z_$][\w$]*)\s*[,)]')
+
+
+def _is_dom_template_compile(line: str, lines: list[str], lineno: int) -> bool:
+    ident = _COMPILE_IDENT_RE.search(line)
+    if ident:
+        name = re.escape(ident.group(1))
+        assign = re.compile(r'(?:\b(?:var|let|const)\s+)?\b' + name + r'\s*=\s*(.+?)\s*;?\s*$')
+        values = []
+        for prev in lines[:lineno - 1]:
+            m = assign.search(prev)
+            if m and not re.search(r'\b' + name + r'\s*=[=>]', prev):
+                values.append(m.group(1))
+        return bool(values) and all(_DOM_READ_FULL_RE.match(v) for v in values)
+    m = re.search(r'\bHandlebars\.compile\s*\(\s*(' + _DOM_TEMPLATE_READ + r')\s*[,)]', line)
+    return bool(m)
+
+
 class SSTIAnalyzer(BaseAnalyzer):
     supported_extensions = (".py", ".php", ".rb", ".js", ".ts")
 
@@ -97,6 +123,13 @@ class SSTIAnalyzer(BaseAnalyzer):
             f for f in findings
             if not (f.rule_id == "SSTI-001" and _PY_DEF_RE.match(f.line_content))
         ]
+        if any(f.rule_id == "SSTI-007" for f in findings):
+            src_lines = content.splitlines()
+            findings = [
+                f for f in findings
+                if not (f.rule_id == "SSTI-007"
+                        and _is_dom_template_compile(f.line_content, src_lines, f.line_number))
+            ]
         if findings and _TWIG_SANDBOX_ON.search(content):
             findings = [f for f in findings if f.rule_id != "SSTI-003"]
         return findings
