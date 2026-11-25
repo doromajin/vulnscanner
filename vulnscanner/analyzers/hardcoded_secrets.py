@@ -236,7 +236,7 @@ _GUARD = re.compile(
     r'|xox[bpsa]-'
     r'|sk_live_|rk_live_|sk_test_'
     r'|SG\.[A-Za-z0-9_-]{10}'
-    r'|npm_|credential|secret_key_base|_KEY\b|\bKEY\b',
+    r'|npm_|credential|secret_key_base|_KEY\b|\bKEY\b|secret|\w_pass\b|\$pass\b|createHmac',
     re.IGNORECASE,
 )
 
@@ -378,6 +378,68 @@ def _is_ci_throwaway_password(file_path: str, line: str) -> bool:
     return value in _CI_THROWAWAY_PASSWORDS
 
 
+# ---- SEC-017: secret stored as a config-dict subscript, object-literal property, PHP variable or define() ----
+# `app.config['SECRET_KEY'] = '...'`, `{ cookieSecret: '...' }`, `$db_pass = '...'`, `define('DB_PASSWORD', '...')`,
+# `crypto.createHmac(alg, '...')`. The key name decides whether the literal is a credential.
+_LIT = r"""(?P<vq>["'])(?P<val>[^"'\\\r\n$]{4,200})(?P=vq)"""
+_SUBSCRIPT_RE = re.compile(r"""\[\s*(?P<q>["'])(?P<key>[\w.\-]{2,60})(?P=q)\s*\]\s*=(?!=)\s*""" + _LIT + r"""\s*[;,)]?\s*$""")
+_PROPERTY_RE = re.compile(r"""(?:^|[\s{,(])["']?(?P<key>[A-Za-z_$][\w$]{1,60})["']?\s*:\s*""" + _LIT + r"""\s*[,})]*\s*;?\s*$""")
+_PHP_VAR_RE = re.compile(r"""^\s*\$(?P<key>\w{2,60})\s*=\s*""" + _LIT + r"""\s*;""")
+_PHP_DEFINE_RE = re.compile(r"""\bdefine\s*\(\s*["'](?P<key>\w{2,60})["']\s*,\s*""" + _LIT + r"""\s*\)""")
+_HMAC_RE = re.compile(r"""\bcreateHmac\s*\(\s*["'][\w-]+["']\s*,\s*""" + _LIT + r"""\s*\)""")
+
+_CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_SECRET_WORDS = frozenset({"secret", "secrets", "password", "passwd", "pwd", "passphrase", "pass"})  # not `credentials`: fetch({credentials: "include"})
+_KEY_QUALIFIERS = frozenset({"api", "private", "signing", "encryption", "encrypt", "crypto", "cookie", "session", "hmac", "jwt",
+                             "auth", "access", "master", "aes", "secret", "app", "hash", "salt"})
+_TOKEN_QUALIFIERS = frozenset({"api", "auth", "access", "bearer", "secret", "private", "refresh"})
+_NON_SECRET_TAIL = frozenset({
+    "field", "name", "label", "url", "uri", "path", "header", "param", "params", "type", "file", "length", "len", "placeholder",
+    "text", "message", "msg", "required", "hint", "min", "max", "regex", "pattern", "id", "route", "page", "prompt", "title",
+    "error", "expiry", "expires", "ttl", "lifetime", "class", "html", "selector", "prefix", "suffix", "env", "var", "attr",
+    "policy", "rule", "rules", "strength", "confirmation", "confirm", "reset", "status", "mode", "format", "cookie", "ext",
+})
+_PLACEHOLDER_VALUES = frozenset({"true", "false", "none", "null", "nil", "undefined", "todo", "tbd", "n/a", "changeme",
+                                 "change_me", "change-me", "secret_here", "key_here", "password_here", "token_here"})
+_NON_VALUE_RE = re.compile(r"""\{\{|\{%|\$\{|<[^>]+>|%[sd]|\bos\.environ|\bgetenv|\bprocess\.env|\benv\(|\bconfig\(|^\s|\s$""")
+
+
+def _key_words(key: str) -> list[str]:
+    return [w for w in re.split(r"[_\-.\s]+", _CAMEL_RE.sub("_", key).lower()) if w]
+
+
+def _secret_named(key: str) -> bool:
+    words = _key_words(key)
+    if not words or words[-1] in _NON_SECRET_TAIL:
+        return False
+    if any(w in _SECRET_WORDS for w in words):
+        return True
+    for i, w in enumerate(words):
+        if w == "key" and i > 0 and words[i - 1] in _KEY_QUALIFIERS:
+            return True
+        if w in ("token", "tokens") and ((i == 0 and len(words) == 1) or (i > 0 and words[i - 1] in _TOKEN_QUALIFIERS)):
+            return True
+    return False
+
+
+def _config_secret_value_ok(key: str, val: str, *, strong_form: bool) -> bool:
+    """True when `val` looks like a literal credential for the secret-named `key`."""
+    if val.lower() in _PLACEHOLDER_VALUES or _NON_VALUE_RE.search(val) or re.search(r"\s", val):
+        return False
+    if "://" in val or val.startswith(("/", ".", "#")):
+        return False
+    words = _key_words(key)
+    norm_val = re.sub(r"[-_.]", "", val).lower()
+    if norm_val in _NAME_WORD_VALUES or norm_val == "".join(words) or norm_val in words:
+        # `PASSWORD = 'password'` is an identifier; `SECRET_KEY = 'secret'` / `secret: 'secret'` is a weak real secret.
+        return strong_form and val == val.lower() and norm_val in ("secret", "secretkey", "key") and ("secret" in words or "key" in words)
+    if "token" in words and not _credential_like_value(val):
+        return False  # `token: "disable-auth"`: a sentinel word, not a token value
+    if _ENV_NAME_RE.fullmatch(val):
+        return False  # `SESSION_SECRET`: the name of an environment variable
+    return True
+
+
 class HardcodedSecretsAnalyzer(BaseAnalyzer):
     supported_extensions = (
         ".py", ".js", ".ts", ".java", ".rb", ".php", ".go", ".rs", ".cs",
@@ -478,6 +540,7 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                     snippet=self._extract_snippet(lines, lineno),
                 ))
             self._language_credentials(file_path, line, lineno, stripped, lines, seen, findings, repo_url)
+            self._config_assignment_secrets(file_path, line, lineno, stripped, lines, seen, findings, repo_url)
         return findings
 
     def _language_credentials(self, file_path, line, lineno, stripped, lines, seen, findings, repo_url) -> None:
@@ -513,3 +576,36 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                 snippet=self._extract_snippet(lines, lineno),
             ))
             return
+
+    def _config_assignment_secrets(self, file_path, line, lineno, stripped, lines, seen, findings, repo_url) -> None:
+        """SEC-017: literal secrets assigned to secret-named dict keys, object properties, PHP variables and define()."""
+        if not file_path.endswith((".py", ".rb", ".php", ".js", ".ts")):
+            return
+        if _ALLOWLIST_RE.search(line) or any(
+                (r, lineno) in seen for r in _LINE_ALREADY_REPORTED + ("SEC-007", "SEC-008", "SEC-015", "SEC-016")):
+            return
+        ext = file_path.rsplit(".", 1)[-1]
+        candidates = [(_SUBSCRIPT_RE, True)]
+        if ext in ("js", "ts"):
+            candidates.append((_PROPERTY_RE, True))
+        if ext == "php":
+            candidates += [(_PHP_VAR_RE, False), (_PHP_DEFINE_RE, False)]
+        label = None
+        for rx, strong_form in candidates:
+            m = rx.search(line)
+            if m and _secret_named(m.group("key")) and _config_secret_value_ok(m.group("key"), m.group("val"), strong_form=strong_form):
+                label = m.group("key")
+                break
+        if label is None and ext in ("js", "ts"):
+            m = _HMAC_RE.search(line)
+            if m and _config_secret_value_ok("hmac_key", m.group("val"), strong_form=False):
+                label = "createHmac key"
+        if label is None:
+            return
+        seen.add(("SEC-017", lineno))
+        findings.append(Finding(
+            vuln_type=_HS, severity=Severity.HIGH, file_path=file_path, line_number=lineno,
+            line_content=stripped, rule_id="SEC-017", repo_url=repo_url,
+            description=f"Hardcoded secret literal assigned to '{label}' — load it from the environment or a secrets manager",
+            snippet=self._extract_snippet(lines, lineno),
+        ))
