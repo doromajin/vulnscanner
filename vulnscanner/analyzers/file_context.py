@@ -66,6 +66,9 @@ _TEST_FILENAME_RE = re.compile(
 )
 
 
+_DOTNET_TEST_PROJECT_RE = re.compile(r"\w\.(?:unit|integration|functional|e2e)?tests?$")
+
+
 def is_test_path(path: str) -> bool:
     """Return True if *path* resides in a test directory or has a test filename.
 
@@ -75,6 +78,9 @@ def is_test_path(path: str) -> bool:
     norm = path.replace("\\", "/")
     parts = norm.lower().split("/")
     if any(p in _TEST_SEGMENTS for p in parts):
+        return True
+    # .NET convention: one test project per product project (NzbDrone.Core.Test/, Foo.UnitTests/)
+    if any(_DOTNET_TEST_PROJECT_RE.search(p) for p in parts[:-1]):
         return True
     return bool(_TEST_FILENAME_RE.search(norm))
 
@@ -176,3 +182,46 @@ def classify_file_context(path: str) -> dict:
         "is_vendor": vendor,
         "reason": reason,
     }
+
+
+_RUST_TEST_ATTR_RE = re.compile(r"^\s*#\[(?:cfg\(test\)|test|tokio::test(?:\([^)]*\))?)\]")
+_RUST_TEST_MOD_RE = re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{")
+_RUST_STRIP_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)\'|//.*')
+
+
+def rust_test_lines(content: str) -> set[int]:
+    """1-based line numbers inside ``#[cfg(test)]`` items and ``#[test]`` functions of a Rust file."""
+    lines = content.splitlines()
+    out: set[int] = set()
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not _RUST_TEST_ATTR_RE.match(lines[i]):
+            i += 1
+            continue
+        start = i
+        if "cfg(test)" in lines[i] and not lines[i].startswith(" "):
+            nxt = next((l for l in lines[i + 1:] if not l.lstrip().startswith("#[")), "")
+            if _RUST_TEST_MOD_RE.match(nxt):
+                out.update(range(i + 1, n + 1))  # a top-level `#[cfg(test)] mod` runs to the end of the file
+                break
+        depth = 0
+        seen_brace = False
+        j = i
+        while j < n:
+            code = _RUST_STRIP_RE.sub("", lines[j])
+            if not _RUST_TEST_ATTR_RE.match(lines[j]):
+                for ch in code:
+                    if ch == "{":
+                        depth += 1
+                        seen_brace = True
+                    elif ch == "}":
+                        depth -= 1
+            if seen_brace and depth <= 0:
+                break
+            if not seen_brace and j > start and code.rstrip().endswith(";"):
+                break
+            j += 1
+        out.update(range(start + 1, min(j, n - 1) + 2))
+        i = j + 1
+    return out

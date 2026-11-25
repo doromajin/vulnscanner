@@ -5,6 +5,15 @@ from typing import Optional
 # Specific rule overrides (checked before prefix lookup)
 _SPECIFIC: dict[str, int] = {
     "WCRYPTO-008": 338,  # Use of Cryptographically Weak Pseudo-Random Number Generator
+    "WCRYPTO-010": 328,  # Use of Weak Hash
+    "WCRYPTO-011": 328,
+    "WCRYPTO-012": 327,  # Use of a Broken or Risky Cryptographic Algorithm
+    "WCRYPTO-013": 295,  # Improper Certificate Validation
+    "WCRYPTO-014": 326,  # Inadequate Encryption Strength (legacy protocol versions)
+    "WCRYPTO-015": 338,  # Cryptographically Weak PRNG
+    "WCRYPTO-016": 338,
+    "WCRYPTO-017": 327,
+    "WCRYPTO-018": 328,
     "SEC-005": 312,       # Cleartext Storage of Sensitive Information (private keys)
 }
 
