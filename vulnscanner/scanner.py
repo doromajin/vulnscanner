@@ -51,6 +51,10 @@ from vulnscanner.analyzers.ast_php import (
     merge_php_cross_file_parts,
     set_php_cross_file_context,
 )
+from vulnscanner.analyzers.ast_csharp import (
+    build_csharp_cross_file_context,
+    set_csharp_cross_file_context,
+)
 from vulnscanner.analyzers.file_context import (
     INCLUDE_TEST_FILES,
     INCLUDE_VENDOR_FILES,
@@ -427,6 +431,7 @@ class VulnScanner:
         cf_summary = build_cross_file_summary(all_contents)
         java_cf_ctx = build_java_cross_file_context(all_contents)
         go_cf_ctx = build_go_cross_file_context(all_contents)
+        cs_cf_ctx = build_csharp_cross_file_context(all_contents)
 
         parts = None
         if job is not None:
@@ -444,7 +449,7 @@ class VulnScanner:
             js_cf_ctx = build_js_cross_file_context(all_contents)
             ruby_cf_ctx = build_ruby_cross_file_context(all_contents)
             php_cf_ctx = build_php_cross_file_context(all_contents)
-        contexts = (cf_summary, java_cf_ctx, go_cf_ctx, js_cf_ctx, ruby_cf_ctx, php_cf_ctx)
+        contexts = (cf_summary, java_cf_ctx, go_cf_ctx, js_cf_ctx, ruby_cf_ctx, php_cf_ctx, cs_cf_ctx)
         return contexts, parts is not None
 
     def _analyze_all(self, files, directory: str, all_contents: dict, contexts: tuple,
@@ -484,6 +489,7 @@ class VulnScanner:
         js_cf_ctx=None,
         ruby_cf_ctx=None,
         php_cf_ctx=None,
+        cs_cf_ctx=None,
     ) -> _FileResult:
         """Analyze a single file; returns results without mutating shared state."""
         # Provide cross-file content map and Phase C summary via thread-local storage.
@@ -495,6 +501,7 @@ class VulnScanner:
         set_js_cross_file_context(js_cf_ctx)
         set_ruby_cross_file_context(ruby_cf_ctx)
         set_php_cross_file_context(php_cf_ctx)
+        set_csharp_cross_file_context(cs_cf_ctx)
 
         partial = _FileResult(scanned_lines=content.count("\n") + 1)
         lines = content.splitlines()
