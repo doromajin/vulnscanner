@@ -45,3 +45,33 @@ def test_directory_exists_alone_is_not_a_path_traversal_sink():
 
 def test_directory_delete_with_tainted_path_is_still_flagged():
     assert _rules("  Directory.Delete(id, true);\n") == [("CSAST-PATH-001", 3)]
+
+
+def test_delete_on_a_service_is_not_a_file_sink():
+    assert _rules("  _blocklistService.Delete(id);\n") == []
+
+
+def test_get_files_on_a_service_is_not_a_directory_sink():
+    assert _rules("  var f = _mediaFileService.GetFiles(id);\n") == []
+
+
+def test_file_delete_with_tainted_path_is_flagged_even_when_fully_qualified():
+    assert _rules("  System.IO.File.Delete(id);\n") == [("CSAST-PATH-001", 3)]
+
+
+def test_delete_async_on_a_repository_is_not_ssrf():
+    assert _rules("  await _repo.DeleteAsync(id);\n") == []
+
+
+def test_http_client_get_async_with_tainted_url_is_flagged():
+    assert _rules("  var r = await _httpClient.GetAsync(id);\n") == [("CSAST-SSRF-001", 3)]
+
+
+def test_get_string_async_is_flagged_whatever_the_receiver_is_called():
+    assert _rules("  var r = await c.GetStringAsync(id);\n") == [("CSAST-SSRF-001", 3)]
+
+
+def test_very_long_concatenation_chain_does_not_exhaust_the_recursion_limit():
+    chain = " + ".join('"a%d"' % i for i in range(3000))
+    code = "public class C {\n void X() {\n  var s = %s;\n }\n}\n" % chain
+    CSharpASTAnalyzer().analyze("C.cs", code)

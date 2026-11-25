@@ -121,6 +121,11 @@ _HTTP_CLIENT_ASYNC_METHODS: frozenset[str] = frozenset({
     "GetAsync", "PostAsync", "PutAsync", "PatchAsync", "DeleteAsync", "SendAsync",
     "GetStringAsync", "GetByteArrayAsync", "GetStreamAsync",
 })
+# Names only HttpClient has; the rest (DeleteAsync, GetAsync...) also exist on repositories and services,
+# so those need a receiver that looks like an HTTP client.
+_HTTP_CLIENT_UNIQUE_METHODS: frozenset[str] = frozenset({
+    "GetStringAsync", "GetByteArrayAsync", "GetStreamAsync",
+})
 _WEB_CLIENT_METHODS: frozenset[str] = frozenset({
     "DownloadString", "DownloadStringAsync", "DownloadStringTaskAsync",
     "DownloadData", "DownloadDataAsync", "DownloadDataTaskAsync",
@@ -167,9 +172,12 @@ _PROPAGATING_METHODS: frozenset[str] = frozenset({
 # ── AST helpers ───────────────────────────────────────────────────────────────
 
 def _walk(node):
-    yield node
-    for child in node.children:
-        yield from _walk(child)
+    """Pre-order walk; iterative so a very deep expression (long `a + b + ...` chain) cannot hit the recursion limit."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        stack.extend(reversed(n.children))
 
 
 def _txt(node) -> str:
@@ -187,6 +195,16 @@ def _simple_name(node) -> str:
         ident = next((c for c in node.children if c.type == "identifier"), None)
         return _txt(ident) if ident is not None else _txt(node).split("<")[0]
     return _txt(node)
+
+
+def _recv_last(recv_text: str) -> str:
+    """Last dotted segment of a receiver: `System.IO.File` -> `File`."""
+    return recv_text.rsplit(".", 1)[-1].strip()
+
+
+def _recv_names_http_client(recv_text: str) -> bool:
+    low = recv_text.lower()
+    return "client" in low or "http" in low or "web" in low
 
 
 def _invocation_method_name(node) -> str:
@@ -292,9 +310,13 @@ def _is_tainted(node, tainted: set[str]) -> bool:
         return _is_tainted(expr, tainted)
 
     if t == "binary_expression":
-        left = node.child_by_field_name("left")
-        right = node.child_by_field_name("right")
-        return _is_tainted(left, tainted) or _is_tainted(right, tainted)
+        # `a + b + c + ...` nests to the left: walk that spine in a loop, not by recursion
+        cur = node
+        while cur is not None and cur.type == "binary_expression":
+            if _is_tainted(cur.child_by_field_name("right"), tainted):
+                return True
+            cur = cur.child_by_field_name("left")
+        return _is_tainted(cur, tainted)
 
     if t == "interpolated_string_expression":
         # $"...{userId}..." — tainted if any interpolation is tainted
@@ -569,14 +591,14 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                              line_no, line_text)
 
             # PATH: File.ReadAllText(path) / File.WriteAllText(path, ...) etc.
-            if method in _FILE_STATIC_METHODS:
+            if method in _FILE_STATIC_METHODS and _recv_last(recv_text) == "File":
                 if args and _is_tainted(args[0], tainted):
                     emit("CSAST-PATH-001", VulnType.PATH_TRAVERSAL, Severity.HIGH,
                          f"Path traversal via File.{method}() with user-controlled path",
                          line_no, line_text)
 
             # PATH: Directory.GetFiles(path) etc.
-            if method in _DIR_STATIC_METHODS:
+            if method in _DIR_STATIC_METHODS and _recv_last(recv_text) == "Directory":
                 if args and _is_tainted(args[0], tainted):
                     emit("CSAST-PATH-001", VulnType.PATH_TRAVERSAL, Severity.HIGH,
                          f"Path traversal via Directory.{method}() with user-controlled path",
@@ -592,7 +614,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                          line_no, line_text)
 
             # SSRF: HttpClient.*Async(url) with user-controlled URL
-            if method in _HTTP_CLIENT_ASYNC_METHODS:
+            if method in _HTTP_CLIENT_ASYNC_METHODS and (
+                    method in _HTTP_CLIENT_UNIQUE_METHODS or _recv_names_http_client(recv_text)):
                 # First arg is URL (string or Uri); check it for taint
                 if args and _is_tainted(args[0], tainted):
                     emit("CSAST-SSRF-001", VulnType.SSRF, Severity.HIGH,
@@ -601,7 +624,8 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                          line_no, line_text)
 
             # SSRF: WebClient.DownloadString/DownloadData/etc. with user-controlled URL
-            if method in _WEB_CLIENT_METHODS:
+            if method in _WEB_CLIENT_METHODS and (
+                    not method.startswith("OpenRead") or _recv_names_http_client(recv_text)):
                 if args and _is_tainted(args[0], tainted):
                     emit("CSAST-SSRF-001", VulnType.SSRF, Severity.HIGH,
                          f"SSRF via WebClient.{method}() with user-controlled URL — "
