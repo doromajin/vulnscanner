@@ -12,6 +12,9 @@ Rule IDs (CSAST-*):
 """
 from __future__ import annotations
 
+import threading
+from dataclasses import dataclass, field
+
 try:
     import tree_sitter_c_sharp as _tscs
     from tree_sitter import Language, Parser as _TSParser
@@ -103,6 +106,7 @@ _FILE_STATIC_METHODS: frozenset[str] = frozenset({
     "Copy", "Move",
 })
 # Constructor types where arg 0 is path
+_METADATA_CTOR_TYPES: frozenset[str] = frozenset({"FileInfo", "DirectoryInfo"})
 _PATH_CTOR_TYPES: frozenset[str] = frozenset({
     "FileStream", "StreamReader", "StreamWriter",
     "FileInfo", "DirectoryInfo",
@@ -363,6 +367,8 @@ def _is_tainted(node, tainted: set[str]) -> bool:
         expr = node.child_by_field_name("expression")
         name = node.child_by_field_name("name")
         name_text = _txt(name) if name else ""
+        if expr is not None and _txt(expr) == "this":
+            return name_text in tainted  # this.Title: a [BindProperty] property or tainted field
         # Propagating properties
         if name_text in ("Value", "Result", "Content", "Data", "Body",
                          "Name", "FileName", "Extension",
@@ -535,7 +541,10 @@ def _propagate(body_node, tainted: set[str]) -> bool:
 
 def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                   file_path: str, findings: list[Finding],
-                  pinvoke_methods: "set[str] | None" = None) -> None:
+                  pinvoke_methods: "set[str] | None" = None,
+                  callee_only: bool = False) -> None:
+    # callee_only: taint reached this method only through a call site (service layer); new FileInfo(x) /
+    # new DirectoryInfo(x) merely build a metadata handle there and are too noisy to report.
     seen: set[tuple] = set()
 
     def emit(rule_id, vtype, sev, desc, line_no, line_text):
@@ -577,7 +586,7 @@ def _detect_sinks(body_node, tainted: set[str], lines: list[str],
                          f"Command injection via new {ctor}() with user-controlled command",
                          line_no, line_text)
             # Path traversal constructors: new FileStream(path, ...)
-            if ctor in _PATH_CTOR_TYPES:
+            if ctor in _PATH_CTOR_TYPES and not (callee_only and ctor in _METADATA_CTOR_TYPES):
                 args = _ctor_args(node)
                 if args and _is_tainted(args[0], tainted):
                     emit("CSAST-PATH-001", VulnType.PATH_TRAVERSAL, Severity.HIGH,
@@ -709,22 +718,183 @@ def _collect_pinvoke_methods(class_body_node) -> set[str]:
     return result
 
 
-def _analyze_method(method_node, lines: list[str], file_path: str,
-                    findings: list[Finding], in_controller: bool,
-                    pinvoke_methods: "set[str] | None" = None) -> None:
-    tainted: set[str] = set()
-    _seed_method_params(method_node, tainted, in_controller)
+# ── Service-layer seeding (controller -> injected service, cross-file by name + arity) ──
 
+@dataclass
+class CSharpCrossFileContext:
+    """Method (name, argument count) -> parameter positions that receive tainted arguments somewhere."""
+    confirmed_tainted_params: dict = field(default_factory=dict)
+
+
+_cs_cf_local = threading.local()
+
+
+def set_csharp_cross_file_context(ctx: "CSharpCrossFileContext | None") -> None:
+    _cs_cf_local.ctx = ctx
+
+
+def _get_cs_cf_ctx() -> "CSharpCrossFileContext | None":
+    return getattr(_cs_cf_local, "ctx", None)
+
+
+# Value types that cannot carry an injection string: never seeded through a call.
+_NON_STRING_TYPES: frozenset[str] = frozenset({
+    "int", "long", "short", "byte", "sbyte", "uint", "ulong", "ushort", "decimal", "double",
+    "float", "bool", "char", "Guid", "DateTime", "DateTimeOffset", "TimeSpan",
+    "Int32", "Int64", "Boolean", "Decimal", "Double", "CancellationToken",
+})
+_MAX_CANDIDATE_DEFS = 4  # a method name defined this many times or more is too ambiguous to seed
+
+
+def _bind_property_names(class_node) -> set[str]:
+    """Names of [BindProperty] properties (Razor Pages / MVC model binding) declared in the class."""
+    body = class_node.child_by_field_name("body")
+    if body is None:
+        return set()
+    all_props = any(c.type == "attribute_list" and "BindProperties" in _txt(c)
+                    for c in class_node.named_children)
+    names: set[str] = set()
+    for member in body.named_children:
+        if member.type != "property_declaration":
+            continue
+        bound = all_props or any(c.type == "attribute_list" and "BindProperty" in _txt(c)
+                                 for c in member.named_children)
+        name = member.child_by_field_name("name")
+        if bound and name is not None:
+            names.add(_txt(name))
+    return names
+
+
+def _param_list(method_node) -> list:
+    """[(name, type_text, has_default)] of the method's parameters."""
+    params = method_node.child_by_field_name("parameters")
+    if params is None:
+        return []
+    out = []
+    for p in params.named_children:
+        if p.type != "parameter":
+            continue
+        name = _txt(p.child_by_field_name("name"))
+        typ = p.child_by_field_name("type")
+        out.append((name, _txt(typ).rstrip("?").strip() if typ is not None else "",
+                    "=" in _txt(p).replace("==", "")))
+    return out
+
+
+def _callee_seed_names(method_node, cf_ctx) -> set[str]:
+    """Parameter names of *method_node* that some call site feeds a tainted, string-like value."""
+    if cf_ctx is None or not cf_ctx.confirmed_tainted_params:
+        return set()
+    nm = method_node.child_by_field_name("name")
+    plist = _param_list(method_node)
+    if nm is None or not plist:
+        return set()
+    name = _txt(nm)
+    required = sum(1 for _, _, d in plist if not d)
+    positions: set[int] = set()
+    for n in range(required, len(plist) + 1):
+        positions |= cf_ctx.confirmed_tainted_params.get((name, n), frozenset())
+    return {plist[i][0] for i in positions
+            if i < len(plist) and plist[i][1] not in _NON_STRING_TYPES}
+
+
+def _iter_methods(root):
+    """Yield (class_node, method_node) for every method declared directly in a class body."""
+    for node in _walk(root):
+        if node.type == "class_declaration":
+            body = node.child_by_field_name("body")
+            if body is None:
+                continue
+            for child in body.named_children:
+                if child.type == "method_declaration":
+                    yield node, child
+
+
+def _prepare_method(method_node, in_controller: bool, bind_props: set[str], cf_ctx):
+    """Seed + propagate taint for one method; returns (tainted, body) (body None when abstract)."""
+    tainted: set[str] = set(bind_props)
+    _seed_method_params(method_node, tainted, in_controller)
+    tainted |= _callee_seed_names(method_node, cf_ctx)
     body = method_node.child_by_field_name("body")
     if body is None:
-        return
+        return tainted, None
+    if tainted:
+        for _ in range(10):
+            if not _propagate(body, tainted):
+                break
+    return tainted, body
 
-    for _ in range(10):
-        if not _propagate(body, tainted):
+
+def build_csharp_cross_file_context(all_contents: dict[str, str]) -> CSharpCrossFileContext:
+    """Which service-method parameters receive tainted arguments from callers elsewhere in the scan.
+
+    Roots are controller actions and [BindProperty] page models (already seeded); every call
+    `x.M(args)` / `M(args)` with a tainted positional argument marks parameter i of the
+    project-defined method M (matched by name + argument count) and the walk repeats from those
+    callees until stable.
+    """
+    ctx = CSharpCrossFileContext()
+    if not _TS_CS_AVAILABLE:
+        return ctx
+    methods = []   # (method_node, in_ctrl, bind_props)
+    defs: dict[str, int] = {}
+    keep = []      # keep the trees alive while their nodes are used
+    for path, content in all_contents.items():
+        if not path.endswith(".cs"):
+            continue
+        try:
+            tree = _cs_parser.parse(content.encode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        keep.append(tree)
+        for cls, m in _iter_methods(tree.root_node):
+            nm = m.child_by_field_name("name")
+            if nm is None:
+                continue
+            defs[_txt(nm)] = defs.get(_txt(nm), 0) + 1
+            methods.append((m, _class_is_controller(cls), _bind_property_names(cls)))
+    confirmed: dict[tuple, set[int]] = {}
+    for _ in range(6):
+        changed = False
+        for m, in_ctrl, bind in methods:
+            tainted, body = _prepare_method(m, in_ctrl, bind, ctx)
+            if body is None or not tainted:
+                continue
+            for node in _walk(body):
+                if node.type != "invocation_expression":
+                    continue
+                name = _invocation_method_name(node)
+                if not name or defs.get(name, 0) == 0 or defs[name] >= _MAX_CANDIDATE_DEFS:
+                    continue
+                args_node = node.child_by_field_name("arguments")
+                if args_node is None or any(
+                        c.type == "argument" and any(x.type == "name_colon" for x in c.named_children)
+                        for c in args_node.named_children):
+                    continue
+                args = _invocation_args(node)
+                for i, a in enumerate(args):
+                    if _is_tainted(a, tainted):
+                        slot = confirmed.setdefault((name, len(args)), set())
+                        if i not in slot:
+                            slot.add(i)
+                            changed = True
+        ctx.confirmed_tainted_params = {k: frozenset(v) for k, v in confirmed.items()}
+        if not changed:
             break
+    return ctx
 
+
+def _analyze_method(method_node, lines: list[str], file_path: str,
+                    findings: list[Finding], in_controller: bool,
+                    pinvoke_methods: "set[str] | None" = None,
+                    bind_props: "set[str] | None" = None, cf_ctx=None) -> None:
+    tainted, body = _prepare_method(method_node, in_controller, bind_props or set(), cf_ctx)
+    if body is None:
+        return
+    direct: set[str] = set(bind_props or ())
+    _seed_method_params(method_node, direct, in_controller)
     _detect_sinks(body, tainted, lines, file_path, findings,
-                  pinvoke_methods=pinvoke_methods or set())
+                  pinvoke_methods=pinvoke_methods or set(), callee_only=not direct)
 
 
 def _analyze_content(content: str, file_path: str) -> list[Finding]:
@@ -733,6 +903,10 @@ def _analyze_content(content: str, file_path: str) -> list[Finding]:
     except Exception:
         return []
 
+    cf_ctx = _get_cs_cf_ctx()
+    if cf_ctx is None:
+        # single-file use: calls inside this file still seed the methods declared here
+        cf_ctx = build_csharp_cross_file_context({file_path if file_path.endswith(".cs") else "x.cs": content})
     lines = content.splitlines()
     findings: list[Finding] = []
 
@@ -743,10 +917,11 @@ def _analyze_content(content: str, file_path: str) -> list[Finding]:
             if body is None:
                 continue
             pinvoke = _collect_pinvoke_methods(body)
+            bind = _bind_property_names(node)
             for child in body.named_children:
                 if child.type == "method_declaration":
                     _analyze_method(child, lines, file_path, findings, in_ctrl,
-                                    pinvoke_methods=pinvoke)
+                                    pinvoke_methods=pinvoke, bind_props=bind, cf_ctx=cf_ctx)
 
     return findings
 
