@@ -295,11 +295,11 @@ def _lhs_names(expr_list) -> list[str]:
     return names
 
 
-def _collect_pass(root, tainted: set[str], tainted_funcs: set[str]) -> bool:
+def _collect_pass(root, tainted: set[str], tainted_funcs: set[str], walker=_walk) -> bool:
     """Single taint-collection pass. Returns True if any new variable was tainted."""
     changed = False
 
-    for node in _walk(root):
+    for node in walker(root):
         # x := rhs   (short variable declaration)
         if node.type == "short_var_declaration":
             lhs_list = node.named_children[0] if node.named_children else None
@@ -395,12 +395,18 @@ def _collect_pass(root, tainted: set[str], tainted_funcs: set[str]) -> bool:
     return changed
 
 
-def _collect_func_taint(root, tainted: set[str], tainted_funcs: set[str]) -> bool:
-    """Find named functions that return tainted data."""
+def _collect_func_taint(root, tainted: set[str], tainted_funcs: set[str], scope_of=None) -> bool:
+    """Find named functions that return tainted data.
+
+    scope_of: {function node id: tainted locals}; when given, each function's returns are
+    judged against its own scope instead of the single ``tainted`` set.
+    """
     changed = False
     for node in _walk(root):
         if node.type != "function_declaration":
             continue
+        if scope_of is not None:
+            tainted = scope_of.get(node.id, tainted)
         name_node = node.child_by_field_name("name")
         if name_node is None:
             continue
@@ -436,6 +442,139 @@ def _build_taint(root) -> tuple[set[str], set[str]]:
         if not c1 and not c2:
             break
     return tainted, tainted_funcs
+
+
+# ── Per-function taint scopes ────────────────────────────────────────────────
+
+_FUNC_DECLS = ("function_declaration", "method_declaration")
+
+
+def _walk_scope(node):
+    """Like _walk, but does not descend into nested function/method declarations.
+
+    Func literals are not declarations, so they stay inside the enclosing scope and
+    share its locals (closures).
+    """
+    yield node
+    for child in node.children:
+        if child.type in _FUNC_DECLS:
+            continue
+        yield from _walk_scope(child)
+
+
+class _ScopeTaint:
+    """Tainted names visible in one function: its own locals plus file-shared names.
+
+    Package-level variables are shared by every function in the file; everything else
+    is local.  Only ``in``, ``add`` and ``copy`` are used by the collectors.
+    """
+
+    def __init__(self, shared: set[str], pkg_vars: frozenset[str], local: "set[str] | None" = None):
+        self.local: set[str] = set(local or ())
+        self.shared = shared
+        self.pkg_vars = pkg_vars
+
+    def __contains__(self, name) -> bool:
+        return name in self.local or name in self.shared
+
+    def add(self, name: str) -> None:
+        (self.shared if name in self.pkg_vars else self.local).add(name)
+
+    def copy(self) -> "_ScopeTaint":
+        return _ScopeTaint(self.shared, self.pkg_vars, self.local)
+
+    def __bool__(self) -> bool:
+        return bool(self.local or self.shared)
+
+
+def _package_vars(root) -> frozenset[str]:
+    """Names declared by top-level ``var`` declarations."""
+    names: set[str] = set()
+    for child in root.children:
+        if child.type != "var_declaration":
+            continue
+        for sub in _walk(child):
+            if sub.type == "var_spec":
+                for n in sub.children_by_field_name("name"):
+                    names.add(n.text.decode("utf-8", errors="replace"))
+    return frozenset(names)
+
+
+def _decl_param_names(func_node) -> list[str]:
+    """Positional parameter names, expanding ``a, b string`` and variadics."""
+    params_node = func_node.child_by_field_name("parameters")
+    if params_node is None:
+        return []
+    result: list[str] = []
+    for param in params_node.named_children:
+        if param.type not in ("parameter_declaration", "variadic_parameter_declaration"):
+            continue
+        names = [n.text.decode("utf-8", errors="replace") for n in param.children_by_field_name("name")]
+        result.extend(names or [""])
+    return result
+
+
+def _seed_callee_params(roots, scopes, tainted_funcs, defs, method_defs) -> bool:
+    """A callee's parameter is tainted when an in-file call passes it a tainted argument."""
+    changed = False
+    for r in roots:
+        scope = scopes[r.id]
+        for node in _walk_scope(r):
+            if node.type != "call_expression":
+                continue
+            fn = node.child_by_field_name("function")
+            args_node = node.child_by_field_name("arguments")
+            if fn is None or args_node is None:
+                continue
+            chain = _selector_chain(fn)
+            if len(chain) == 1:
+                targets = defs.get(chain[0], ())
+            elif len(chain) >= 2 and fn.type == "selector_expression":
+                targets = method_defs.get(chain[-1], ())
+            else:
+                continue
+            if not targets:
+                continue
+            for i, arg in enumerate(args_node.named_children):
+                if not _is_tainted(arg, scope, tainted_funcs):
+                    continue
+                for names, def_node in targets:
+                    if i < len(names) and names[i] and names[i] not in scopes[def_node.id]:
+                        scopes[def_node.id].add(names[i])
+                        changed = True
+    return changed
+
+
+def _build_taint_scoped(root):
+    """Fixed-point taint collection (max 8 passes), one local set per function.
+
+    Returns (scope_roots, {root.id: _ScopeTaint}, tainted_funcs).  Package-level vars and
+    tainted function names are shared by the file; locals are not.  The file level
+    (outside any function) is a scope of its own.
+    """
+    roots = [root] + [n for n in _walk(root) if n.type in _FUNC_DECLS]
+    shared: set[str] = set()
+    pkg_vars = _package_vars(root)
+    scopes = {r.id: _ScopeTaint(shared, pkg_vars) for r in roots}
+    tainted_funcs: set[str] = set()
+    defs: dict[str, list] = {}
+    method_defs: dict[str, list] = {}
+    for r in roots[1:]:
+        name_node = r.child_by_field_name("name")
+        if name_node is None:
+            continue
+        entry = (_decl_param_names(r), r)
+        target = defs if r.type == "function_declaration" else method_defs
+        target.setdefault(name_node.text.decode("utf-8", errors="replace"), []).append(entry)
+    for _ in range(8):
+        changed = False
+        for r in roots:
+            changed |= _collect_pass(r, scopes[r.id], tainted_funcs, walker=_walk_scope)
+        changed |= _collect_func_taint(root, shared, tainted_funcs, scope_of=scopes)
+        changed |= _seed_callee_params(roots, scopes, tainted_funcs, defs, method_defs)
+        if not changed:
+            break
+    return roots, scopes, tainted_funcs
 
 
 # ── Cross-file helpers ────────────────────────────────────────────────────────
@@ -612,6 +751,7 @@ def _check_sinks(
     file_path: str,
     lines: list[str],
     repo_url: str,
+    walker=_walk,
 ) -> list[Finding]:
     findings: list[Finding] = []
     seen: set[tuple] = set()
@@ -621,7 +761,7 @@ def _check_sinks(
 
     imports_template = any(_TEMPLATE_IMPORT_RE.search(l) for l in lines[:200])
 
-    for node in _walk(root):
+    for node in walker(root):
         if node.type != "call_expression":
             continue
 
@@ -755,6 +895,7 @@ def _check_sinks(
 
 def _check_cross_file_sinks(
     root,
+    scopes: dict,
     global_tainted: set[str],
     global_tainted_funcs: set[str],
     cf_ctx: GoCrossFileContext,
@@ -776,7 +917,7 @@ def _check_cross_file_sinks(
             continue
 
         params = _get_param_names(node)
-        local_tainted = global_tainted.copy()
+        local_tainted = scopes[node.id].copy() if node.id in scopes else global_tainted.copy()
         added = False
         for i in cf_ctx.confirmed_tainted_params[fname]:
             if i < len(params) and params[i] and params[i] not in local_tainted:
@@ -822,19 +963,22 @@ class GoASTAnalyzer(BaseAnalyzer):
             return []
 
         lines = content.splitlines()
-        tainted, tainted_funcs = _build_taint(tree.root_node)
+        roots, scopes, tainted_funcs = _build_taint_scoped(tree.root_node)
 
         findings: list[Finding] = []
-        if tainted or tainted_funcs:
-            findings.extend(
-                _check_sinks(tree.root_node, tainted, tainted_funcs, file_path, lines, repo_url)
-            )
+        if tainted_funcs or any(scopes[r.id] for r in roots):
+            for r in roots:
+                findings.extend(
+                    _check_sinks(r, scopes[r.id], tainted_funcs, file_path, lines, repo_url,
+                                 walker=_walk_scope)
+                )
 
         cf_ctx = _get_go_cf_ctx()
         if cf_ctx and cf_ctx.confirmed_tainted_params:
             findings.extend(
                 _check_cross_file_sinks(
-                    tree.root_node, tainted, tainted_funcs, cf_ctx, file_path, lines, repo_url
+                    tree.root_node, scopes, scopes[tree.root_node.id], tainted_funcs, cf_ctx,
+                    file_path, lines, repo_url
                 )
             )
 
