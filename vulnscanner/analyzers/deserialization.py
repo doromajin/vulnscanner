@@ -112,6 +112,52 @@ _PHP_REQUEST_INPUT_RE = re.compile(
 )
 
 
+# Java: a deserialization stream that is already restricted.  A subclass of ObjectInputStream whose
+# resolveClass() rejects classes (allow/deny list), ValidatingObjectInputStream or an ObjectInputFilter
+# make DESER-005 (generic ObjectInputStream/readObject) a false positive.
+_JAVA_OIS_FILTER_RE = re.compile(
+    r"\bValidatingObjectInputStream\b|\bsetObjectInputFilter\b|\bObjectInputFilter\s*\.\s*Config\b"
+    r"|\bcreateFilter\s*\(|\bsetSerialFilter\b")
+_JAVA_OIS_SUBCLASS_RE = re.compile(r"\bclass\s+\w+\s+extends\s+\w*ObjectInputStream\b")
+_JAVA_RESOLVE_REJECT_RE = re.compile(r"resolveClass\s*\([^)]*\)[^{]*\{(?:(?!\n\s*\}\s*\n\s*(?:public|protected|private)).)*?"
+                                     r"(?:InvalidClassException|throw\s+new)", re.DOTALL)
+_JAVA_CUSTOM_OIS_NEW_RE = re.compile(r"\bnew\s+(\w+ObjectInputStream)\s*\(")
+_ois_checked: dict = {}
+
+
+def _java_ois_restricted(file_path: str, content: str) -> bool:
+    if _JAVA_OIS_FILTER_RE.search(content):
+        return True
+    if _JAVA_OIS_SUBCLASS_RE.search(content) and _JAVA_RESOLVE_REJECT_RE.search(content):
+        return True
+    names = {n for n in _JAVA_CUSTOM_OIS_NEW_RE.findall(content)
+             if n not in ("ObjectInputStream", "SmartObjectInputStream")}
+    if not names:
+        return False
+    norm = file_path.replace("\\", "/")
+    idx = norm.find("/src/")
+    if idx < 0:
+        return False
+    root = norm[:idx + 5]
+    for n in names:
+        key = (root, n)
+        if key not in _ois_checked:
+            ok = False
+            try:
+                from pathlib import Path as _P
+                for cand in list(_P(root).rglob(n + ".java"))[:3]:
+                    txt = cand.read_text(encoding="utf-8", errors="ignore")
+                    if _JAVA_OIS_SUBCLASS_RE.search(txt) and _JAVA_RESOLVE_REJECT_RE.search(txt):
+                        ok = True
+                        break
+            except Exception:
+                ok = False
+            _ois_checked[key] = ok
+        if _ois_checked[key]:
+            return True
+    return False
+
+
 def _is_migration_path(path: str) -> bool:
     parts = path.replace("\\", "/").lower().split("/")
     return "migrations" in parts[:-1] and path.endswith(".php")
@@ -169,6 +215,9 @@ class DeserializationAnalyzer(BaseAnalyzer):
                     # Confirmed FP: bludit dbjson.class.php private method wrapping json_decode()
                     if _PHP_USER_UNSERIALIZE_RE.search(line):
                         continue
+
+                if rule_id == "DESER-005" and _java_ois_restricted(file_path, content):
+                    continue
 
                 if rule_id == "DESER-004" and _is_migration_path(file_path):
                     severity = Severity.LOW

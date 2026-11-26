@@ -74,7 +74,7 @@ _RULES = [
     (
         "JAVA-JNDI-001",
         re.compile(
-            r'InitialContext\(\)\.lookup\s*\(',
+            r'InitialContext\(\)\.lookup\s*\(\s*(?!"[^"]*"\s*\))',  # a literal name (java:comp/env/...) is configuration
             re.IGNORECASE,
         ),
         "Java JNDI lookup with potentially user-controlled name — Log4Shell-style injection",

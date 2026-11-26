@@ -179,3 +179,72 @@ def test_math_random_for_delay_is_low():
     body = _m("    long delay = (long) (Math.random() * 100);")
     sev = {f.severity.name for f in _find(body) if f.rule_id == "JAST-CRYPTO-001B"}
     assert sev and sev == {"LOW"}
+
+
+# ── 5. deserialization allow-lists, JNDI literal names, AUTH-002 severity ─────
+
+def _deser005(src: str, path: str = "A.java") -> list:
+    from vulnscanner.analyzers.deserialization import DeserializationAnalyzer
+    return [f for f in DeserializationAnalyzer().analyze(path, src) if f.rule_id == "DESER-005"]
+
+
+_PLAIN_OIS = ("import java.io.*;\nclass R {\n  Object r(InputStream in) throws Exception {\n"
+              "    ObjectInputStream ois = new ObjectInputStream(in);\n    return ois.readObject();\n  }\n}\n")
+
+_ALLOW_LIST_OIS = ("import java.io.*;\npublic class SafeOIS extends ObjectInputStream {\n"
+                   "  public SafeOIS(InputStream in) throws IOException { super(in); }\n"
+                   "  @Override\n  protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException, ClassNotFoundException {\n"
+                   "    if (!desc.getName().startsWith(\"com.example.dto.\")) {\n"
+                   "      throw new InvalidClassException(\"Unauthorized deserialization attempt\", desc.getName());\n    }\n"
+                   "    return super.resolveClass(desc);\n  }\n}\n")
+
+
+def test_deser005_plain_object_input_stream_is_reported():
+    assert _deser005(_PLAIN_OIS)
+
+
+def test_deser005_allow_list_subclass_is_silent():
+    assert not _deser005(_ALLOW_LIST_OIS)
+
+
+def test_deser005_object_input_filter_is_silent():
+    src = _PLAIN_OIS.replace("    return ois.readObject();",
+                             "    ois.setObjectInputFilter(ObjectInputFilter.Config.createFilter(\"com.example.*;!*\"));\n"
+                             "    return ois.readObject();")
+    assert not _deser005(src)
+
+
+def test_deser005_plain_subclass_without_reject_is_reported():
+    src = _ALLOW_LIST_OIS.replace("throw new InvalidClassException(\"Unauthorized deserialization attempt\", desc.getName());",
+                                  "System.out.println(desc.getName());")
+    assert _deser005(src + _PLAIN_OIS)
+
+
+def _jndi(src: str) -> list:
+    from vulnscanner.analyzers.java_analyzer import JavaAnalyzer
+    return [f for f in JavaAnalyzer().analyze("A.java", src) if f.rule_id == "JAVA-JNDI-001"]
+
+
+def test_jndi_literal_environment_name_is_silent():
+    assert not _jndi('class A { void f() throws Exception { Object o = new InitialContext().lookup("java:comp/env"); } }\n')
+
+
+def test_jndi_dynamic_name_is_reported():
+    assert _jndi('class A { void f(String n) throws Exception { Object o = new InitialContext().lookup(n); } }\n')
+
+
+def _auth(path: str, name: str):
+    from vulnscanner.analyzers.missing_auth import MissingAuthAnalyzer
+    src = (f"@RestController\npublic class C {{\n  @PostMapping(\"{path}\")\n"
+           f"  public String {name}(@RequestParam String v) {{ return v; }}\n}}\n")
+    return [f for f in MissingAuthAnalyzer().analyze("src/main/java/C.java", src) if f.rule_id == "AUTH-002"]
+
+
+def test_auth002_generic_endpoint_is_medium():
+    fs = _auth("/echo", "echo")
+    assert fs and {f.severity.name for f in fs} == {"MEDIUM"}
+
+
+def test_auth002_sensitive_endpoint_stays_high():
+    fs = _auth("/admin/delete", "deleteUser")
+    assert fs and {f.severity.name for f in fs} == {"HIGH"}
