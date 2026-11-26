@@ -746,6 +746,42 @@ def _starts_with_local_path(args_node) -> bool:
     return text.startswith("/") and not text.startswith(("//", "/" + chr(92)))
 
 
+def _redirect_target_guarded(call_node, args_node) -> bool:
+    """`if (!next.startsWith('/') || next.startsWith('//')) return res.redirect('/'); res.redirect(next)`
+    (or the same test as a positive `if (...) res.redirect(next)`): the redirect target is a variable
+    that an enclosing / preceding `if` restricts to a same-origin path (leading `/` and not `//`)."""
+    named = args_node.named_children
+    if len(named) < 1 or named[0].type != "identifier":
+        return False
+    name = _re.escape(named[0].text.decode(errors="replace"))
+    one_slash = _re.compile(name + r"\s*(?:\.startsWith\(\s*['\"]/['\"]\s*\)|\[\s*0\s*\]\s*[=!]==?\s*['\"]/['\"]|\.charAt\(\s*0\s*\)\s*[=!]==?\s*['\"]/['\"])")
+    two_slash = _re.compile(name + r"\s*(?:\.startsWith\(\s*['\"]//['\"]\s*\)|\[\s*1\s*\]\s*[=!]==?\s*['\"]/['\"]|\.charAt\(\s*1\s*\)\s*[=!]==?\s*['\"]/['\"])")
+
+    def _tests_same_origin(cond: str) -> bool:
+        return bool(one_slash.search(cond) and two_slash.search(cond))
+
+    node = call_node
+    while node is not None and node.type not in ("function_declaration", "arrow_function", "function_expression",
+                                                 "function", "method_definition", "program"):
+        parent = node.parent
+        if parent is not None and parent.type == "if_statement":
+            cond = parent.child_by_field_name("condition")
+            if cond is not None and node is not cond and _tests_same_origin(cond.text.decode(errors="replace")):
+                return True
+        if parent is not None:
+            for sib in parent.named_children:
+                if sib.start_byte >= node.start_byte:
+                    break
+                if sib.type == "if_statement":
+                    cond = sib.child_by_field_name("condition")
+                    body = sib.child_by_field_name("consequence")
+                    if (cond is not None and body is not None and _tests_same_origin(cond.text.decode(errors="replace"))
+                            and _re.search(r"\b(?:return|throw)\b", body.text.decode(errors="replace"))):
+                        return True
+        node = parent
+    return False
+
+
 def _first_arg_is_request_object(args_node) -> bool:
     """`api.users.deleteMany(req, body)`: an application-layer function that takes the request
     itself first is not a MongoDB driver call, whose first argument is the filter document."""
@@ -1117,7 +1153,8 @@ def _check_sinks(
 
             # Open redirect: res.redirect(tainted_url)
             elif obj_root in ("res", "response") and prop == "redirect":
-                if tainted_args(args_node) and not _starts_with_local_path(args_node):
+                if (tainted_args(args_node) and not _starts_with_local_path(args_node)
+                        and not _redirect_target_guarded(node, args_node)):
                     _emit(findings, seen, file_path, line, lines, repo_url,
                           VulnType.OPEN_REDIRECT, Severity.MEDIUM,
                           "JSAST-REDIR-001",
