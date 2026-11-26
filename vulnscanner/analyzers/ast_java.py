@@ -3683,7 +3683,8 @@ _GUARD_UNSAFE_NAME_RE = re.compile(
     r"(?i)(invalid|internal|private|loopback|sitelocal|linklocal|anylocal|block|danger|malicious|"
     r"illegal|forbidden|black|unsafe|denied|deny|reserved)")
 _GUARD_SAFE_NAME_RE = re.compile(
-    r"(?i)(check|valid|verify|sanitiz|safe|allow|white|trust|permit|accept)")
+    r"(?i)(check|verify|sanitiz|safe|allow|white|trust|permit|accept)")  # not "valid": isUrlValid() is syntax only
+_GUARD_ALLOWISH_RE = re.compile(r"(?:(?i:allow|white|valid|trusted|permitted|known))|^[A-Z][A-Z0-9_]+$")
 _GUARD_STR_METHODS = frozenset({
     "matches", "contains", "containsKey", "startsWith", "endsWith", "equals", "equalsIgnoreCase",
 })
@@ -3750,6 +3751,18 @@ def _guard_pred_kind(call) -> "str | None":
                              if isinstance(s, jt.MethodInvocation)]
     if any(_GUARD_UNSAFE_NAME_RE.search(n or "") for n in names):
         return "unsafe"
+    _plain_str = [n for n in names if n in _GUARD_STR_METHODS and n != "matches"]
+    if (_plain_str and not any(_GUARD_SAFE_NAME_RE.search(n or "") for n in names)
+            and not any(n == "matches" for n in names)):
+        # equals/contains/startsWith ...: a check against a literal or an allow-list / constant.
+        # Comparing one request value with another (pass.equals(confirmPass)) validates nothing.
+        _ops = list(call.arguments or []) + [call.qualifier or ""]
+        if not any(isinstance(o, jt.Literal)
+                   or (isinstance(o, jt.MemberReference) and _GUARD_ALLOWISH_RE.search(o.member or "")
+                       and not o.qualifier)
+                   or (isinstance(o, str) and o and _GUARD_ALLOWISH_RE.search(o.split(".")[-1]))
+                   for o in _ops):
+            return None
     if any(_GUARD_SAFE_NAME_RE.search(n or "") or n in _GUARD_STR_METHODS for n in names):
         if call.member == "startsWith" or any(
                 isinstance(s, jt.MethodInvocation) and s.member == "startsWith" for s in (call.selectors or ())):
@@ -3810,7 +3823,16 @@ def _collect_scoped_guards(tree) -> "list[tuple[int, int, frozenset]]":
                          if stmts is not None else isinstance(then, (jt.ThrowStatement, jt.ReturnStatement)))
                 rej = _guard_reject_vars(ifn.condition)
                 if rej and exits and not ifn.else_statement:
-                    regions.append((ip.line + 1, end, _closure(rej)))
+                    # the reject branch itself (logging / echoing the bad value) is not covered
+                    then_last = ip.line
+                    try:
+                        for _, n in (then.filter(javalang.ast.Node) if hasattr(then, "filter") else ()):
+                            pp = getattr(n, "position", None)
+                            if pp and pp.line > then_last:
+                                then_last = pp.line
+                    except Exception:
+                        pass
+                    regions.append((then_last + 1, end, _closure(rej)))
                     continue
                 acc = _guard_accept_vars(ifn.condition)
                 if acc:

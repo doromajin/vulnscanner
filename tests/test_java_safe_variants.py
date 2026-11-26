@@ -248,3 +248,19 @@ def test_auth002_generic_endpoint_is_medium():
 def test_auth002_sensitive_endpoint_stays_high():
     fs = _auth("/admin/delete", "deleteUser")
     assert fs and {f.severity.name for f in fs} == {"HIGH"}
+
+
+def test_comparing_two_request_values_is_not_a_guard():
+    body = _m('    String a = request.getParameter("a");\n    String b = request.getParameter("b");\n'
+              '    if (a.equals(b)) {\n      new URL(a);\n    }')
+    assert "JAST-SSRF-001" in _rules(body)
+
+
+def test_syntax_only_validity_check_is_not_a_guard():
+    body = _m(_URL + "    if (isUrlValid(url)) {\n      URL u = new URL(url);\n    }")
+    assert "JAST-SSRF-001" in _rules(body)
+
+
+def test_reject_branch_logging_is_not_covered_by_the_guard():
+    body = _m(_URL + "    if (!SecurityUtil.checkURL(url)) {\n      logger.error(\"bad \" + url);\n      return \"no\";\n    }")
+    assert "JAST-LOG-001" in _rules(body)
