@@ -46,10 +46,14 @@ def test_comments_and_escaped_at_ignored():
     assert _hits("<code>@@Html.Raw(item.Text)</code>") == set()
 
 
-def test_encoded_or_constant_values_are_low():
-    for expr in ("Html.Encode(Model.X)", "HttpUtility.HtmlEncode(Model.X)", "sanitizer.Sanitize(Model.X)",
-                 'Localizer["Hello"]', 'Configuration["Footer"]'):
+def test_encoded_values_are_low():
+    for expr in ("Html.Encode(Model.X)", "HttpUtility.HtmlEncode(Model.X)", "sanitizer.Sanitize(Model.X)"):
         assert _hits(f"<p>@Html.Raw({expr})</p>") == {("CSHTML-XSS-002", "LOW")}, expr
+
+
+def test_localised_and_configuration_text_is_not_reported():
+    for expr in ('Localizer["Hello"]', 'Configuration["Footer"]', 'Localizer["Hello"].Value'):
+        assert _hits(f"<p>@Html.Raw({expr})</p>") == set(), expr
 
 
 def test_json_in_script_is_medium():
@@ -71,5 +75,5 @@ def test_script_block_innerhtml_in_view_is_reported_but_razor_lines_are_not():
     assert [f.rule_id for f in got] == ['XSS-001']
 
 
-def test_local_member_without_content_name_is_medium():
-    assert _hits('<p>@Html.Raw(style.Tag)</p>') == {('CSHTML-XSS-004', 'MEDIUM')}
+def test_local_member_without_content_name_is_low():
+    assert _hits('<p>@Html.Raw(style.Tag)</p>') == {('CSHTML-XSS-004', 'LOW')}

@@ -4,9 +4,12 @@
 whatever reaches them must already be trusted. Rules:
 
 CSHTML-XSS-001  raw output of request/view data or a model/loop value (stored or reflected XSS) - HIGH
-CSHTML-XSS-002  raw output of a value that is encoded, localised, configuration or otherwise not
-                user-shaped - LOW, a review pointer
+CSHTML-XSS-002  raw output of a value that is encoded or otherwise not user-shaped - LOW, a review pointer
 CSHTML-XSS-003  `Html.Raw(Json.Serialize(...))` inside <script> (the data-embedding idiom) - MEDIUM
+CSHTML-XSS-004  raw output of a local member that is not shown to be user content (style.Tag) - LOW
+
+Localised / configuration text (`Localizer[..]`, `Configuration[..]`) is not reported at all: it is server-side
+content and made up 35 of the 40 findings on a clean CMS (piranha.core).
 """
 from __future__ import annotations
 
@@ -98,11 +101,11 @@ class CshtmlXSSAnalyzer(BaseAnalyzer):
             elif _REQUEST_RE.search(expr):
                 rule_id, severity, why = "CSHTML-XSS-001", Severity.HIGH, "request/view data is printed unencoded"
             elif _CONSTANT_RE.search(expr):
-                rule_id, severity, why = "CSHTML-XSS-002", Severity.LOW, "localised/configuration value"
+                continue  # localised / configuration text is server-side content: reporting it only adds noise
             elif _MODEL_RE.search(expr) or (_LOCAL_RE.search(expr) and _CONTENT_NAME_RE.search(expr)):
                 rule_id, severity, why = "CSHTML-XSS-001", Severity.HIGH, "model/content value is printed unencoded"
             elif _LOCAL_RE.search(expr):
-                rule_id, severity, why = "CSHTML-XSS-004", Severity.MEDIUM, "local value not shown to be user-controlled"
+                rule_id, severity, why = "CSHTML-XSS-004", Severity.LOW, "local value not shown to be user-controlled"
             else:
                 rule_id, severity, why = "CSHTML-XSS-002", Severity.LOW, "value not shown to be user-controlled"
             line_no = text.count("\n", 0, m.start()) + 1
