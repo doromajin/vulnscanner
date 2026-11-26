@@ -50,6 +50,10 @@ def test_header_fp_safe_values():
         assert "JAST-HEADER-001" not in _rules(_m(s)), s
 
 
+def test_header_fp_cors_header_left_to_cors_analyzer():
+    assert "JAST-HEADER-001" not in _rules(_m('response.setHeader("Access-Control-Allow-Origin", v);'))
+
+
 def test_header_fn_guard_non_response_receiver():
     # a header setter on a non-response object is not flagged
     assert "JAST-HEADER-001" not in _rules(_m('conn.setHeader("X-A", v);'))

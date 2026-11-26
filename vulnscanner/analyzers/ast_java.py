@@ -4117,7 +4117,10 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 args = node.arguments or []
                 if _g_hdr and m in ("setHeader", "addHeader") and len(args) >= 2 and (
                         q in _RESPONSE_OBJECTS or q.lower().endswith("response")):
-                    if _r3_taint(args[1], et) or _r3_taint(args[0], et):
+                    _h0 = args[0].value if isinstance(args[0], jt.Literal) else ""
+                    if str(_h0).strip('"').lower().startswith("access-control-"):
+                        pass  # reflected CORS origin is reported by the CORS analyzer
+                    elif _r3_taint(args[1], et) or _r3_taint(args[0], et):
                         _r3_add(node, VulnType.HEADER_INJECTION, Severity.MEDIUM, "JAST-HEADER-001",
                                 f"{q}.{m}() with a request-controlled header name/value — HTTP header "
                                 "(CRLF) injection / response splitting (CWE-113); encode the value or "
