@@ -157,7 +157,7 @@ def _java_reflected_origin(analyzer, file_path, content, repo_url):
     for i, ln in enumerate(lines):
         m = _JAVA_ORIGIN_VAR.search(ln)
         if m:
-            assigned[m.group(1)] = i
+            assigned.setdefault(m.group(1), []).append(i)
     out = []
     for i, ln in enumerate(lines):
         if analyzer._is_comment(ln):
@@ -169,14 +169,15 @@ def _java_reflected_origin(analyzer, file_path, content, repo_url):
         if _JAVA_ORIGIN_SRC.search(arg):
             reflected = True
             var = None
-        elif re.fullmatch(r'\w+', arg) and arg in assigned and assigned[arg] < i:
+        elif re.fullmatch(r'\w+', arg) and any(a < i for a in assigned.get(arg, ())):
             reflected, var = True, arg
         else:
             continue
         if var:
             vre = re.compile(r'(?:^|[^\w.])' + re.escape(var) + r'(?![\w])')
             validated = False
-            for j in range(assigned[var] + 1, i):
+            start = max(a for a in assigned[var] if a < i)
+            for j in range(start + 1, i):
                 seg = lines[j]
                 if _JAVA_LOG.search(seg) or not vre.search(seg):
                     continue

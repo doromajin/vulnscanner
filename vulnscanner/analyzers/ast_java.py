@@ -1049,7 +1049,7 @@ _JSON_PRODUCERS = frozenset({
 
 
 _STRING_PASSTHROUGH = frozenset({
-    "format", "formatted", "valueOf", "concat", "trim", "strip", "toString", "replace", "replaceAll",
+    "format", "formatted", "valueOf", "concat", "trim", "strip", "replace", "replaceAll",
     "toLowerCase", "toUpperCase", "substring", "join", "repeat", "getOrDefault", "orElse",
 })
 
@@ -1067,7 +1067,7 @@ def _rest_xss_direct(expr, tainted) -> bool:
         return _rest_xss_direct(expr.expression, tainted)
     if isinstance(expr, jt.MethodInvocation):
         if _is_request_source(expr):
-            return True
+            return expr.member not in ("getRemoteAddr", "getRemotePort", "getMethod")
         if expr.member in _STRING_PASSTHROUGH:
             if str(expr.qualifier or "") in tainted:
                 return True

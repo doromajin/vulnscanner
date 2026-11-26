@@ -179,3 +179,12 @@ def test_rest_xss_fp_dto_json_sanitized_literal():
 def test_rest_xss_fn_plain_controller_view_name_not_flagged():
     # @Controller without @ResponseBody returns a view name, not a body
     assert "JAST-XSS-REST" not in _x(_rest('  public String h(@RequestParam String n) {\n    return n;\n  }', cls="@Controller"))
+
+
+def test_cors_reflected_origin_two_methods_same_variable_name():
+    src = ("import javax.servlet.http.*;\nclass C {\n"
+           " void a(HttpServletRequest request, HttpServletResponse response) {\n"
+           '  String origin = request.getHeader("Origin");\n'
+           '  response.setHeader("Access-Control-Allow-Origin", origin);\n }\n'
+           " void b(HttpServletRequest request) {\n  String origin = request.getHeader(\"Origin\");\n }\n}\n")
+    assert [f.line_number for f in CORSAnalyzer().analyze("A.java", src) if f.rule_id == "CORS-011"] == [5]
