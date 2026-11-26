@@ -74,3 +74,11 @@ def test_google_api_key_shape_in_php_variable():
 ])
 def test_fetch_option_and_sentinel_word_are_not_secrets(code):
     assert not _hit("web.ts", code)
+
+
+def test_cypress_config_credentials_are_test_data():
+    from vulnscanner.analyzers.file_context import is_test_path
+    assert is_test_path("cypress.config.ts")
+    assert is_test_path("web/playwright.config.js")
+    assert not is_test_path("src/config.ts")
+    assert not is_test_path("webpack.config.js")

@@ -58,6 +58,7 @@ _TEST_FILENAME_RE = re.compile(
     r"|(?:^|[\\/])test_[^/\\]+\.py$"        # Python       test_foo.py
     r"|\.test\.[jt]sx?$"                     # JS/TS        *.test.js/ts
     r"|\.spec\.[jt]sx?$"                     # JS/TS        *.spec.js/ts
+    r"|(?:^|[\\/])(?:cypress|playwright|jest|vitest|karma|wdio|protractor)\.conf(?:ig)?\.[jt]s$"  # JS/TS test-runner config
     r"|_spec\.rb$"                           # Ruby         foo_spec.rb
     r"|_test\.(?:go|rb|c|cc|cpp|cxx)$"       # Go / minitest / C/C++ foo_test.go, foo_test.cc
     r"|(?-i:[a-z0-9_]Tests?\.(?:java|kt|groovy|cs)$)"  # JUnit / xUnit UserTests.cs
