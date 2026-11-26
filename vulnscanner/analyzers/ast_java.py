@@ -4139,7 +4139,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                             "(autoType gadgets, CWE-502); upgrade fastjson / enable safeMode or use Jackson",
                             line)
                 if _g_jk:
-                    if m == "enableDefaultTyping":
+                    if m == "enableDefaultTyping" and q != "SecurityJackson2Modules":
                         _r3_add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH, "JAST-DESER-004",
                                 "ObjectMapper.enableDefaultTyping() lets JSON choose the Java class — "
                                 "polymorphic deserialization (CWE-502); use a restrictive "
@@ -4224,7 +4224,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
                                     "parameters are needed and responses carry no sensitive data",
                         rule_id="JAST-JSONP-002", repo_url=repo_url,
                         snippet=self._extract_snippet(lines, _al)))
-            if "JsonTypeInfo" in content:
+            # Spring Security session mixins use Id.CLASS on server-side data behind an allowlist
+            if "JsonTypeInfo" in content and not re.search(r'Mix[Ii]n|SecurityJackson2Modules', content):
                 for _mm in _JSON_TYPE_INFO_RE.finditer(content):
                     _al = content.count("\n", 0, _mm.start()) + 1
                     if _al in dead_lines:

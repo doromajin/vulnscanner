@@ -115,6 +115,14 @@ def test_deser_fp():
         assert not ({"JAST-DESER-003", "JAST-DESER-004", "JAST-DESER-006"} & r), s
 
 
+def test_deser_fp_spring_security_mixin_and_modules():
+    src = ("import com.fasterxml.jackson.annotation.JsonTypeInfo;\n"
+           "@JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)\nabstract class FooMixin {}\n")
+    assert "JAST-DESER-005" not in {f.rule_id for f in JavaASTAnalyzer().analyze("FooMixin.java", src)}
+    src2 = "class M { void f(Object c) { SecurityJackson2Modules.enableDefaultTyping(c); } }\n"
+    assert "JAST-DESER-004" not in {f.rule_id for f in JavaASTAnalyzer().analyze("M.java", src2)}
+
+
 def test_deser_fn_guard_no_fastjson_import():
     src = ("public class B {\n  public Object h(String v) { return JSON.parse(v); }\n}\n")
     assert "JAST-DESER-003" not in {f.rule_id for f in JavaASTAnalyzer().analyze("B.java", src)}

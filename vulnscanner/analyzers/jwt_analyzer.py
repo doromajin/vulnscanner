@@ -95,7 +95,7 @@ class JWTAnalyzer(BaseAnalyzer):
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         if not _GUARD.search(content):
-            return []
+            return _java_hardcoded_key(file_path, content, repo_url) if file_path.endswith(".java") else []
         applicable = [
             (rid, re_obj, desc, sev, vt)
             for rid, re_obj, desc, sev, vt, exts in _RULES
@@ -103,5 +103,46 @@ class JWTAnalyzer(BaseAnalyzer):
         ]
         if not applicable:
             return []
-        return self._scan_lines(file_path, content, repo_url, applicable, guard=None,
-                                mask_strings_py=True)
+        found = self._scan_lines(file_path, content, repo_url, applicable, guard=None,
+                                 mask_strings_py=True)
+        if file_path.endswith(".java"):
+            found = found + _java_hardcoded_key(file_path, content, repo_url)
+        return found
+
+
+_JAVA_STR_CONST_RE = re.compile(
+    r'(?:static\s+final|final\s+static)\s+String\s+(\w+)\s*=\s*([^;]+);')
+_JAVA_KEY_SINK_RE = re.compile(
+    r'(?:\bHMAC(?:256|384|512)\s*\(|\.setSigningKey\s*\(|\bhmacShaKeyFor\s*\('
+    r'|\.signWith\s*\([^;(]*?,)\s*("(?:[^"\\]|\\.)+"|\w+)')
+
+
+def _java_hardcoded_key(file_path: str, content: str, repo_url: str) -> list:
+    """HMAC/JWT signing key that is a string literal (or a constant derived only from one)."""
+    if "jwt" not in content.lower():
+        return []
+    if "HMAC" not in content and "SigningKey" not in content and "signWith" not in content \
+            and "hmacShaKeyFor" not in content:
+        return []
+    literal_consts: set = set()
+    for _ in range(2):  # constants derived from an earlier literal constant (e.g. Base64 of SECRET)
+        for m in _JAVA_STR_CONST_RE.finditer(content):
+            rhs = m.group(2).strip()
+            if re.fullmatch(r'"(?:[^"\\]|\\.)*"', rhs) and len(rhs) > 2:
+                literal_consts.add(m.group(1))
+            elif any(re.search(r'\b' + re.escape(c) + r'\b', rhs) for c in literal_consts) \
+                    and "System." not in rhs and "getenv" not in rhs and "getProperty" not in rhs:
+                literal_consts.add(m.group(1))
+    out = []
+    lines = content.split("\n")
+    for m in _JAVA_KEY_SINK_RE.finditer(content):
+        arg = m.group(1)
+        if arg.startswith('"') or arg in literal_consts:
+            ln = content.count("\n", 0, m.start()) + 1
+            out.append(Finding(
+                vuln_type=_JWT, severity=Severity.HIGH, file_path=file_path, line_number=ln,
+                line_content=lines[ln - 1].strip() if ln <= len(lines) else "",
+                description="JWT/HMAC signing key is a hard-coded string in source (CWE-798/CWE-347) — "
+                            "anyone with the source can forge tokens; load the key from a secret store",
+                rule_id="JWT-008", repo_url=repo_url))
+    return out
