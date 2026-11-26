@@ -176,11 +176,20 @@ def _spring_project_requires_auth(root: str) -> bool:
     return False
 
 
-def _project_root_of(file_path: str) -> str:
+def _project_root_of(file_path: str, repo_url: str = "") -> str:
+    """Module root (the directory holding src/main/java) of *file_path*; relative paths resolve
+    against the scanned directory, which the scanner passes as *repo_url* for local scans."""
     norm = file_path.replace("\\", "/")
-    i = norm.find(_JAVA_SRC_MARK)
-    return norm[:i] if i > 0 else ""
-
+    i = ("/" + norm).find(_JAVA_SRC_MARK)
+    if i < 0:
+        return ""
+    prefix = norm[:i - 1] if i > 0 else ""          # `i` is an index into "/" + norm
+    if os.path.isabs(file_path):
+        return prefix
+    base = repo_url.replace("\\", "/").rstrip("/") if repo_url and os.path.isdir(repo_url) else ""
+    if not base:
+        return ""
+    return base + ("/" + prefix if prefix else "")
 
 
 class MissingAuthAnalyzer(BaseAnalyzer):
@@ -366,7 +375,7 @@ class MissingAuthAnalyzer(BaseAnalyzer):
     def _analyze_java(self, file_path: str, content: str, repo_url: str) -> list[Finding]:
         lines = content.splitlines()
         findings: list[Finding] = []
-        root = _project_root_of(file_path)
+        root = _project_root_of(file_path, repo_url)
         project_auth = bool(root) and _spring_project_requires_auth(root)
 
         for i, line in enumerate(lines):

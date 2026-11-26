@@ -40,3 +40,13 @@ def test_anyrequest_authenticated_lowers_to_low(tmp_path):
 
 def test_anyrequest_permitall_keeps_high(tmp_path):
     assert _sev(tmp_path, _cfg("      .anyRequest().permitAll()")) == {"HIGH"}
+
+
+def test_relative_path_resolves_against_scanned_directory(tmp_path):
+    missing_auth._spring_project_requires_auth.cache_clear()
+    java = tmp_path / "src" / "main" / "java" / "app"
+    java.mkdir(parents=True)
+    (java / "WebSecurityConfig.java").write_text(
+        _cfg("      .anyRequest().authenticated()"), encoding="utf-8")
+    found = MissingAuthAnalyzer().analyze("src/main/java/app/C.java", _CTRL, str(tmp_path))
+    assert {f.severity.name for f in found} == {"LOW"}
