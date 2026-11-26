@@ -570,7 +570,7 @@ def _innerhtml_is_unsafe(block: str, content: str | None = None) -> bool:
 
 
 class XSSAnalyzer(BaseAnalyzer):
-    supported_extensions = (".js", ".ts", ".jsx", ".tsx", ".html", ".php", ".py")
+    supported_extensions = (".js", ".ts", ".jsx", ".tsx", ".html", ".php", ".py", ".cshtml", ".razor")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         findings: list[Finding] = []
@@ -578,6 +578,11 @@ class XSSAnalyzer(BaseAnalyzer):
 
         # XSS-001: smart innerHTML check (handles multiline template literals)
         findings.extend(self._check_innerhtml(file_path, lines, repo_url))
+
+        # Razor views: only the innerHTML check applies to their <script> blocks; the per-line rules
+        # below are not written for Razor syntax (`@` expressions).
+        if file_path.endswith((".cshtml", ".razor")):
+            return findings
 
         # XSS-002 to XSS-007: simple per-line regex rules (single-pass, pre-compiled)
         if _SIMPLE_GUARD.search(content):
@@ -649,7 +654,7 @@ class XSSAnalyzer(BaseAnalyzer):
     ) -> list[Finding]:
         # innerHTML is a DOM API — not applicable to Python source files.
         # Guarding here prevents false positives from docstrings that mention innerHTML.
-        if not file_path.endswith(_JS_HTML_EXTS + (".php",)):
+        if not file_path.endswith(_JS_HTML_EXTS + (".php", ".cshtml", ".razor")):
             return []
         findings: list[Finding] = []
         content = "\n".join(lines)
