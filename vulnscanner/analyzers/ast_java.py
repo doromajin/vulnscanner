@@ -176,6 +176,7 @@ def build_java_cross_file_context(all_contents: dict[str, str]) -> JavaCrossFile
                             pname = getattr(param, "name", "")
                             if pname:
                                 spring_params.add(pname)
+                spring_params.update(_implicit_spring_params(method))
                 if spring_params:
                     _propagate_from_method(method, spring_params)
         except Exception:
@@ -1007,9 +1008,199 @@ def _implicit_spring_params(method) -> "list[str]":
         if getattr(p, "annotations", None):
             continue
         t = getattr(p, "type", None)
-        if _type_name(t) == "String" and not getattr(t, "dimensions", None) and not getattr(p, "varargs", False):
+        if (_type_name(t) in ("String", "MultipartFile") and not getattr(t, "dimensions", None)
+                and not getattr(p, "varargs", False)):
             out.append(p.name)
     return out
+
+_BASE64_DECODER_GETTERS = frozenset({"getDecoder", "getUrlDecoder", "getMimeDecoder"})
+_SHELL_PROGRAMS = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "csh", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh",
+    "/bin/sh", "/bin/bash", "/usr/bin/sh", "/usr/bin/bash", "/bin/zsh", "/bin/dash",
+})
+
+
+def _argv_elements(args) -> list:
+    """Elements of a process argv given as call arguments: varargs, an inline array literal,
+    Arrays.asList(...) or List.of(...).  A single opaque argument is returned as is."""
+    args = list(args or [])
+    if len(args) != 1:
+        return args
+    a0 = args[0]
+    if isinstance(a0, jt.ArrayCreator):
+        inner = getattr(a0, "initializer", None)
+        return list(getattr(inner, "initializers", None) or []) if inner is not None else args
+    if isinstance(a0, jt.ArrayInitializer):
+        return list(a0.initializers or [])
+    if (isinstance(a0, jt.MethodInvocation) and a0.member in ("asList", "of")
+            and str(a0.qualifier or "") in ("Arrays", "List")):
+        return list(a0.arguments or [])
+    return args
+
+
+def _is_argument_injection_only(args) -> bool:
+    """True for a fixed non-shell program whose later argv entries are tainted (argument injection,
+    not a command string): first element is a literal naming a program other than a shell."""
+    els = _argv_elements(args)
+    if len(els) < 2 or not isinstance(els[0], jt.Literal):
+        return False
+    prog = str(getattr(els[0], "value", "") or "").strip("\"'").lower()
+    if not prog or prog.rsplit("/", 1)[-1] in {x.rsplit("/", 1)[-1] for x in _SHELL_PROGRAMS}:
+        return False
+    return not any(isinstance(e, jt.Literal) and str(getattr(e, "value", "")).strip("\"'").lower() in ("-c", "/c", "/k", "-command")
+                   for e in els[1:])
+
+
+def _concat_parts(node) -> list:
+    """Operands of a left-nested `a + b + c` string concatenation, in source order."""
+    out: list = []
+    while isinstance(node, jt.BinaryOperation) and node.operator == "+":
+        out.append(node.operandr)
+        node = node.operandl
+    out.append(node)
+    out.reverse()
+    return out
+
+
+def _lit_text(node) -> "str | None":
+    if isinstance(node, jt.Literal) and isinstance(node.value, str) and node.value[:1] == '"':
+        return node.value[1:-1]
+    return None
+
+
+_JAVA_QL_TYPES = frozenset({"ExpressRunner"})
+_AE_GATE = ("DriverManager", "redirect:", "forward:", "RedirectView", "ModelAndView", "getRequestDispatcher",
+            "DocumentHelper", "XSSFWorkbook", "OPCPackage", "StreamingReader", "WorkbookFactory", "ExpressRunner")
+
+
+def _java_web_sinks_ae(tree, content, eff_tainted, add, dead_lines, xxe_hardened) -> None:
+    """JDBC connection-string injection, Spring view-name redirects/forwards, RequestDispatcher,
+    dom4j / POI / xlsx-streamer XXE parsers and QLExpress evaluation (one pass, gated on content)."""
+    if not any(g in content for g in _AE_GATE):
+        return
+    ql_vars: set = set()
+    if "ExpressRunner" in content:
+        for node_cls in (jt.LocalVariableDeclaration, jt.FieldDeclaration):
+            for _, d in tree.filter(node_cls):
+                if _type_name(d.type) in _JAVA_QL_TYPES:
+                    ql_vars.update(x.name for x in d.declarators)
+    xx_lines = content.splitlines()
+    seen: set = set()
+
+    def emit(node, vt, sev, rid, desc, line):
+        if not line or line in dead_lines or (rid, line) in seen:
+            return
+        seen.add((rid, line))
+        add(node, vt, sev, rid, desc, line_override=line)
+
+    for path, node in tree.filter(jt.MethodInvocation):
+        mem = node.member
+        q = str(node.qualifier or "")
+        if mem == "getConnection" and q == "DriverManager":
+            ln = _creator_line(path, node)
+            a = node.arguments or []
+            if a and _is_tainted(a[0], eff_tainted(ln)):
+                emit(node, VulnType.SQL_INJECTION, Severity.HIGH, "JAST-JDBC-URL-001",
+                     "DriverManager.getConnection() with a user-controlled JDBC URL — connection-string injection "
+                     "(attacker-chosen host/driver properties); build the URL from fixed values and allowlist the target",
+                     ln)
+        elif mem == "getRequestDispatcher":
+            ln = _creator_line(path, node)
+            a = node.arguments or []
+            if a and not isinstance(a[0], jt.Literal) and _is_tainted(a[0], eff_tainted(ln)):
+                emit(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "JAST-FORWARD-001",
+                     "RequestDispatcher target is user-controlled — unvalidated forward/include (reaches internal "
+                     "resources); map the request value to a fixed allowlist of views",
+                     ln)
+        elif mem == "parseText" and q == "DocumentHelper":
+            ln = _creator_line(path, node)
+            a = node.arguments or []
+            if a and _is_tainted(a[0], eff_tainted(ln)) and not xxe_hardened(xx_lines, ln, None):
+                emit(node, VulnType.XXE, Severity.MEDIUM, "JAST-XXE-003",
+                     "dom4j DocumentHelper.parseText() parses user-controlled XML — XXE on dom4j < 2.1.1; "
+                     "upgrade dom4j or parse with a SAXReader that disables DOCTYPE declarations",
+                     ln)
+        elif mem == "open" and q == "OPCPackage":
+            ln = _creator_line(path, node)
+            a = node.arguments or []
+            if a and _is_tainted(a[0], eff_tainted(ln)) and not xxe_hardened(xx_lines, ln, None):
+                emit(node, VulnType.XXE, Severity.MEDIUM, "JAST-XXE-003",
+                     "Apache POI OPCPackage.open() reads a user-supplied OOXML package — XXE in older POI releases; "
+                     "keep poi-ooxml current", ln)
+        elif mem == "create" and q == "WorkbookFactory":
+            ln = _creator_line(path, node)
+            a = node.arguments or []
+            if a and _is_tainted(a[0], eff_tainted(ln)) and not xxe_hardened(xx_lines, ln, None):
+                emit(node, VulnType.XXE, Severity.MEDIUM, "JAST-XXE-003",
+                     "Apache POI WorkbookFactory.create() reads a user-supplied workbook — XXE in older POI releases; "
+                     "keep poi-ooxml current", ln)
+        elif mem == "builder" and q == "StreamingReader":
+            ln = _creator_line(path, node)
+            for sel in (node.selectors or ()):
+                if isinstance(sel, jt.MethodInvocation) and sel.member == "open":
+                    a = sel.arguments or []
+                    if a and _is_tainted(a[0], eff_tainted(ln)) and not xxe_hardened(xx_lines, ln, None):
+                        emit(node, VulnType.XXE, Severity.MEDIUM, "JAST-XXE-003",
+                             "xlsx-streamer StreamingReader.open() reads a user-supplied workbook — XXE in "
+                             "xlsx-streamer < 2.1.0; upgrade the library", ln)
+        elif mem == "execute" and q in ql_vars:
+            ln = _creator_line(path, node)
+            a = node.arguments or []
+            if a and _is_tainted(a[0], eff_tainted(ln)):
+                emit(node, VulnType.SSTI, Severity.HIGH, "JAST-SCRIPT-001",
+                     "QLExpress ExpressRunner.execute() evaluates user-controlled expression text — "
+                     "expression/code injection (CWE-917/94); never evaluate request data, or run it with a "
+                     "sandboxed QLExpressRunStrategy and an allowlist",
+                     ln)
+
+    for path, node in tree.filter(jt.ClassCreator):
+        tname = _type_name(node.type)
+        if tname not in ("XSSFWorkbook", "RedirectView", "ModelAndView"):
+            continue
+        ln = _creator_line(path, node)
+        a = node.arguments or []
+        if not a:
+            continue
+        et = eff_tainted(ln)
+        if tname == "XSSFWorkbook":
+            if not isinstance(a[0], jt.Literal) and _is_tainted(a[0], et) and not xxe_hardened(xx_lines, ln, None):
+                emit(node, VulnType.XXE, Severity.MEDIUM, "JAST-XXE-003",
+                     "Apache POI XSSFWorkbook reads a user-supplied OOXML stream — XXE in older POI releases "
+                     "(poi-ooxml < 3.15); keep poi-ooxml current", ln)
+        elif tname == "RedirectView":
+            if _is_tainted(a[0], et):
+                emit(node, VulnType.OPEN_REDIRECT, Severity.MEDIUM, "JAST-REDIRECT-002",
+                     "new RedirectView() with a user-controlled URL — open redirect; allowlist the target host "
+                     "or accept only a relative path", ln)
+        elif tname == "ModelAndView":
+            a0 = a[0]
+            if isinstance(a0, (jt.MemberReference, jt.MethodInvocation)) and _is_tainted(a0, et):
+                emit(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "JAST-FORWARD-001",
+                     "new ModelAndView() with a user-controlled view name — view-name injection (also allows "
+                     "'redirect:'/'forward:' prefixes); resolve the request value against a fixed allowlist", ln)
+
+    if '"redirect:' in content or '"forward:' in content:
+        for path, node in tree.filter(jt.BinaryOperation):
+            if node.operator != "+":
+                continue
+            parts = _concat_parts(node)
+            if len(parts) < 2:
+                continue
+            pre = _lit_text(parts[0])
+            if pre is None or pre.strip() not in ("redirect:", "forward:"):
+                continue
+            ln = _creator_line(path, node)
+            if not _is_tainted(parts[1], eff_tainted(ln)):
+                continue
+            if pre.strip() == "redirect:":
+                emit(node, VulnType.OPEN_REDIRECT, Severity.MEDIUM, "JAST-REDIRECT-002",
+                     "Spring view name \"redirect:\" + user-controlled value — open redirect; allowlist the target "
+                     "host or accept only a relative path", ln)
+            else:
+                emit(node, VulnType.PATH_TRAVERSAL, Severity.MEDIUM, "JAST-FORWARD-001",
+                     "Spring view name \"forward:\" + user-controlled value — unvalidated forward to internal "
+                     "resources; resolve the request value against a fixed allowlist", ln)
+
 
 # Spring RestTemplate / WebClient methods: first arg is the URL.
 _SPRING_REST_URL_METHODS = frozenset({
@@ -1793,6 +1984,12 @@ def _is_tainted(node, tainted: "set[str]", const_ints: "dict | None" = None) -> 
             return True
         if any(_is_tainted(a, tainted, const_ints) for a in (node.arguments or [])):
             return True
+        # Base64.getDecoder().decode(tainted): the argument lives on the chained selector
+        if node.member in _BASE64_DECODER_GETTERS and node.selectors:
+            for sel in node.selectors:
+                if (isinstance(sel, jt.MethodInvocation) and sel.member == "decode"
+                        and any(_is_tainted(a, tainted, const_ints) for a in (sel.arguments or []))):
+                    return True
         return False
     if isinstance(node, jt.MemberReference):
         if node.member in tainted:
@@ -2916,6 +3113,7 @@ def _build_method_scope_tainted(method_node, tree, const_ints: dict, dead_lines:
                     if pname:
                         m_tainted.add(pname)
                     break
+        m_tainted.update(_implicit_spring_params(method_node))
     except Exception:
         pass
 
@@ -3953,6 +4151,8 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 if _node_line(node) in dead_lines:
                     continue
                 q = str(node.qualifier or "")
+                if node.member == "execute" and "ExpressRunner" in _decl_types.get(q, ()):
+                    continue  # QLExpress expression evaluation, reported by _java_web_sinks_ae
                 if node.member in _JDBC_EXEC_METHODS:
                     # Case 1: any tainted arg  (executeQuery(sql), prepareStatement(sql), addBatch(sql))
                     _et = _eff_tainted(node)
@@ -4298,7 +4498,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 if node.member == "exec":
                     for arg in (node.arguments or []):
                         if _is_tainted(arg, _eff_tainted(node)):
-                            _add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "JAST-CMD-001",
+                            _add(node, VulnType.COMMAND_INJECTION,
+                                 Severity.MEDIUM if _is_argument_injection_only(node.arguments) else Severity.CRITICAL,
+                                 "JAST-CMD-001",
                                  "Runtime.exec() with user-controlled argument — "
                                  "command injection; use allowlisted fixed commands")
                             break
@@ -4311,7 +4513,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         _arg_name = arg.member if isinstance(arg, jt.MemberReference) else ""
                         if (_is_tainted(arg, _eff_tainted(_pb_line))
                                 or (_arg_name and _arg_name in list_tainted_vars)):
-                            _add(node, VulnType.COMMAND_INJECTION, Severity.CRITICAL, "JAST-CMD-002",
+                            _add(node, VulnType.COMMAND_INJECTION,
+                                 Severity.MEDIUM if _is_argument_injection_only(node.arguments) else Severity.CRITICAL,
+                                 "JAST-CMD-002",
                                  "new ProcessBuilder() with user-controlled argument — "
                                  "command injection; validate and allowlist commands",
                                  line_override=_pb_line)
@@ -5202,6 +5406,11 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     _add(node, VulnType.XXE, Severity.HIGH, "JAST-XXE-002",
                          f"{_vt}.{node.member}() parses user-controlled XML without disabling DOCTYPE / "
                          "external entities — XXE; set disallow-doctype-decl or disable external entities")
+        except Exception:
+            pass
+
+        try:
+            _java_web_sinks_ae(tree, content, _eff_tainted, _add, dead_lines, _xxe_is_hardened)
         except Exception:
             pass
 
