@@ -178,6 +178,10 @@ _HTTP_FACADE_METHODS: frozenset[str] = frozenset({
 
 # ── Sanitizer definitions ─────────────────────────────────────────────────────
 
+# Variables that conventionally accumulate output markup, and a markup tag inside the expression.
+_OUTPUT_BUFFER_NAME_RE = re.compile(r'(?:html|output|out|content|body|response|msg|message)\Z', re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r'<[A-Za-z/!]')
+
 # HTML output sanitizers (XSS)
 _XSS_SANITIZERS: frozenset[str] = frozenset({
     'htmlspecialchars', 'htmlentities', 'strip_tags',
@@ -855,7 +859,7 @@ def _collect_pass(root, tainted: dict, tainted_funcs: set, tainted_props: set,
     changed = False
     for node in walker(root):
         # ── Simple assignment: $var = expr ────────────────────────────────────
-        if node.type == 'assignment_expression':
+        if node.type in ('assignment_expression', 'augmented_assignment_expression'):
             children = node.children
             # find the assignment operator (= or .= or compound)
             eq_idx = next(
@@ -1289,6 +1293,7 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                  walker=_walk) -> list:
     findings: list[Finding] = []
     seen: set = set()
+    buffer_assigns: list = []
 
     def raw_taint(n):
         return _is_tainted_node(n, tainted, tainted_funcs, tainted_props)
@@ -1567,6 +1572,15 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                                       "use htmlspecialchars()")
                                 break
 
+        # ── HTML output buffer: $html .= '<p>' . $_GET['x'] . '</p>' (echoed elsewhere) ──
+        elif node.type in ('assignment_expression', 'augmented_assignment_expression'):
+            ch = node.children
+            if (len(ch) >= 3 and ch[0].type == 'variable_name' and ch[1].type in ('=', '.=')
+                    and _OUTPUT_BUFFER_NAME_RE.match(_var_name(ch[0]) or '')
+                    and _HTML_TAG_RE.search(ch[2].text.decode('utf-8', errors='replace'))
+                    and not _is_sanitizer_call(ch[2]) and taint(ch[2])):
+                buffer_assigns.append((_var_name(ch[0]), node.start_point[0] + 1))
+
         # ── include / require sinks ───────────────────────────────────────────
         elif node.type in ('include_expression', 'include_once_expression',
                             'require_expression', 'require_once_expression'):
@@ -1589,6 +1603,16 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
                           VulnType.COMMAND_INJECTION, Severity.CRITICAL, 'PHAST-CMD-002',
                           "User-controlled data in backtick shell execution — OS command injection risk")
                     break
+
+    # A buffer that this file already echoes is reported by the echo sink (HIGH); the rest are
+    # built here and output elsewhere (view file reached through include/require): MEDIUM.
+    for vname, line in buffer_assigns:
+        if any(f.rule_id == 'PHAST-XSS-001' and f.description.startswith(f'${vname} ') for f in findings):
+            continue
+        _emit(findings, seen, file_path, line, lines, repo_url,
+              VulnType.XSS, Severity.MEDIUM, 'PHAST-XSS-002',
+              f"${vname} is built as HTML from user-controlled input without encoding; it is output "
+              "elsewhere (include/return) — use htmlspecialchars()")
 
     return findings
 
