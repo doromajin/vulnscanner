@@ -1946,7 +1946,22 @@ def _find_setter_field(tree, method_name: str) -> "str | None":
 
     Matches the pattern: void methodName(Type p) { this.field = p; }
     In javalang, `this.field = p` has LHS as This{selectors=[MemberReference{field}]}.
+    Results are cached per tree: the fixed-point taint loop asks for the same names many times
+    and each lookup walks every method of the file.
     """
+    cache = getattr(tree, "_vs_setter_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            tree._vs_setter_cache = cache
+        except Exception:
+            pass
+    if method_name not in cache:
+        cache[method_name] = _find_setter_field_uncached(tree, method_name)
+    return cache[method_name]
+
+
+def _find_setter_field_uncached(tree, method_name: str) -> "str | None":
     try:
         for _, method in tree.filter(jt.MethodDeclaration):
             if method.name != method_name:
@@ -3233,6 +3248,21 @@ def _compute_method_local_clean(
     except Exception:
         pass
 
+    _callers_cache: list = []
+
+    def _caller_invocations() -> list:
+        """(line, [MethodInvocation, ...]) per method, built once: walking every method's body for
+        every callee made this pass quadratic in the number of methods."""
+        if not _callers_cache:
+            built = []
+            for _, _caller in tree.filter(jt.MethodDeclaration):
+                _c_ln = getattr(getattr(_caller, "position", None), "line", -1)
+                if _c_ln < 0:
+                    continue
+                built.append((_c_ln, [mi for _, mi in _caller.filter(jt.MethodInvocation)]))
+            _callers_cache.append(built)
+        return _callers_cache[0]
+
     try:
         sorted_methods = sorted(
             (m for _, m in tree.filter(jt.MethodDeclaration)),
@@ -3312,15 +3342,11 @@ def _compute_method_local_clean(
                 if _m_params and _m_name:
                     _receives_taint_params: set = set()
                     try:
-                        for _, _caller in tree.filter(jt.MethodDeclaration):
-                            _c_ln = getattr(
-                                getattr(_caller, "position", None), "line", -1)
-                            if _c_ln < 0:
-                                continue
+                        for _c_ln, _c_invs in _caller_invocations():
                             _c_idx = _midx(_c_ln)
                             _c_clean = method_local_clean.get(_c_idx, set())
                             _c_eff = tainted - _c_clean
-                            for _, _cmi in _caller.filter(jt.MethodInvocation):
+                            for _cmi in _c_invs:
                                 if _cmi.member != _m_name:
                                     continue
                                 _cq = str(_cmi.qualifier or "")
