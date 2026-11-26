@@ -14,6 +14,40 @@ _CONCAT_AFTER_KEY_RE = re.compile(r'(?:password|passwd|pwd)\s*=\s*["\']\s*[.+]\s
 def _is_concatenated_key(line: str) -> bool:
     return bool(_CONCAT_AFTER_KEY_RE.search(line))
 
+
+_SQL_STMT_RE = re.compile(r"\b(?:SELECT\b.+\bFROM|UPDATE\b.+\bSET|INSERT\s+INTO|DELETE\s+FROM|\bWHERE)\b", re.IGNORECASE)
+_SEC001_VALUE_RE = re.compile(r"""(?:password|passwd|pwd)\s*=\s*["']([^"']{4,})["']""", re.IGNORECASE)
+_INTERPOLATED_VALUE_RE = re.compile(r"""\{?\$\{?\w|%\(?\w*\)?s|:\w+$|\{\w+\}|#\{""")
+
+
+def _is_sql_fragment_with_interpolation(line: str) -> bool:
+    """`"... WHERE user='$u' AND password='$pass'"`: a SQL statement built around a variable.  The
+    quoted text after `password =` is the variable being interpolated, not a literal password."""
+    if not _SQL_STMT_RE.search(line):
+        return False
+    values = [m.group(1) for m in _SEC001_VALUE_RE.finditer(line)]
+    return bool(values) and all(_INTERPOLATED_VALUE_RE.match(v) for v in values)
+
+
+_PEM_HEADER_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_PEM_BODY_RUN_RE = re.compile(r"[A-Za-z0-9+/]{24,}")
+_PEM_BODY_LINE_RE = re.compile(r"[A-Za-z0-9+/=]{24,}")
+_PEM_LINE_NOISE_RE = re.compile(r"""\\[nrt]|["'`+,.;)\s]""")
+
+
+def _pem_has_body(lines: list[str], idx: int) -> bool:
+    """A PEM header counts as key material only when base64 follows it (same line or the next few
+    lines).  `BEGIN_TOKEN = "-----BEGIN PRIVATE KEY-----"` is a parser marker, not a key."""
+    m = _PEM_HEADER_RE.search(lines[idx])
+    rest = _PEM_LINE_NOISE_RE.sub("", lines[idx][m.end():]) if m else ""
+    if _PEM_BODY_LINE_RE.search(rest):
+        return True
+    for nxt in lines[idx + 1: idx + 4]:
+        cleaned = _PEM_LINE_NOISE_RE.sub("", nxt)
+        if _PEM_BODY_LINE_RE.fullmatch(cleaned):
+            return True
+    return False
+
 # (rule_id, compiled_re, description, severity, vuln_type)
 _RULES = [
     (
@@ -388,6 +422,7 @@ _PHP_VAR_RE = re.compile(r"""^\s*\$(?P<key>\w{2,60})\s*=\s*""" + _LIT + r"""\s*;
 _PHP_DEFINE_RE = re.compile(r"""\bdefine\s*\(\s*["'](?P<key>\w{2,60})["']\s*,\s*""" + _LIT + r"""\s*\)""")
 _HMAC_RE = re.compile(r"""\bcreateHmac\s*\(\s*["'][\w-]+["']\s*,\s*""" + _LIT + r"""\s*\)""")
 
+_LABEL_SHORT_VALUE_RE = re.compile(r"[A-Za-z_]+[:=]\w{1,6}")
 _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _SECRET_WORDS = frozenset({"secret", "secrets", "password", "passwd", "pwd", "passphrase", "pass"})  # not `credentials`: fetch({credentials: "include"})
 _KEY_QUALIFIERS = frozenset({"api", "private", "signing", "encryption", "encrypt", "crypto", "cookie", "session", "hmac", "jwt",
@@ -428,6 +463,8 @@ def _config_secret_value_ok(key: str, val: str, *, strong_form: bool) -> bool:
         return False
     if "://" in val or val.startswith(("/", ".", "#")):
         return False
+    if _LABEL_SHORT_VALUE_RE.fullmatch(val):
+        return False  # `token = "userid:2"`: a name and a short number, not a credential
     words = _key_words(key)
     norm_val = re.sub(r"[-_.]", "", val).lower()
     if norm_val in _NAME_WORD_VALUES or norm_val == "".join(words) or norm_val in words:
@@ -520,6 +557,10 @@ class HardcodedSecretsAnalyzer(BaseAnalyzer):
                 if rule_id == "SEC-001" and _is_concatenated_key(line):
                     continue
                 if rule_id == "SEC-001" and _is_ci_throwaway_password(file_path, line):
+                    continue
+                if rule_id == "SEC-001" and _is_sql_fragment_with_interpolation(line):
+                    continue
+                if rule_id == "SEC-005" and not _pem_has_body(lines, lineno - 1):
                     continue
                 key = (rule_id, lineno)
                 if key in seen:
