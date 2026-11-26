@@ -1021,6 +1021,17 @@ _SPRING_REST_QUALIFIERS = frozenset({
     "restTemplate", "RestTemplate", "rt", "template", "webClient", "WebClient",
 })
 
+_SPRING_REST_UNQUALIFIED = frozenset({
+    "getForObject", "getForEntity", "postForObject", "postForEntity", "exchange",
+})
+_REST_VAR_RE = re.compile(
+    r"\b(?:Async|Test)?(?:RestTemplate|RestClient|WebClient)\s+(\w+)\s*[=;,)]")
+_HUTOOL_URL_METHODS = frozenset({
+    "get", "post", "createGet", "createPost", "downloadString", "downloadFile", "downloadBytes",
+    "head", "put", "delete", "patch", "options", "trace",
+})
+_FLUENT_URL_METHODS = frozenset({"Get", "Post", "Put", "Delete", "Head", "Options", "Patch", "Trace"})
+
 # HTTP client constructors that take a URL string directly.
 _HTTP_CLIENT_URL_CTORS = frozenset({
     "HttpGet", "HttpPost", "HttpPut", "HttpDelete", "HttpPatch", "HttpHead",
@@ -4791,23 +4802,51 @@ class JavaASTAnalyzer(BaseAnalyzer):
         except Exception:
             pass
 
-        # Spring RestTemplate / WebClient: first arg is the URL.
+        # Spring RestTemplate / WebClient / hutool / fluent-hc / OkHttp: URL argument sinks.
         try:
-            for _, node in tree.filter(jt.MethodInvocation):
-                if _node_line(node) in dead_lines:
-                    continue
-                if node.member not in _SPRING_REST_URL_METHODS:
-                    continue
-                q = str(node.qualifier or "")
-                if not (q in _SPRING_REST_QUALIFIERS
-                        or q.lower().endswith("resttemplate")
-                        or q.lower().endswith("webclient")):
-                    continue
-                first = (node.arguments or [None])[0]
-                if first is not None and _is_tainted(first, _eff_tainted(node)):
+            _rest_vars = set(m.group(1) for m in _REST_VAR_RE.finditer(content))
+            _has_rest = "RestTemplate" in content or "RestClient" in content
+            _has_wc = "WebClient" in content or "RestClient" in content
+            _has_fluent = "client.fluent" in content
+            _has_okhttp = "okhttp3" in content or "com.squareup.okhttp" in content
+            _has_hutool = "hutool" in content
+            _url_methods = _SPRING_REST_URL_METHODS
+            def _ssrf_check(node, q, member, args, line):
+                if not args or line in dead_lines:
+                    return
+                hit = False
+                if member in _url_methods and (
+                        q in _SPRING_REST_QUALIFIERS or q in _rest_vars
+                        or q.lower().endswith("resttemplate") or q.lower().endswith("webclient")
+                        or (q == "" and _has_rest and member in _SPRING_REST_UNQUALIFIED)):
+                    hit = _is_tainted(args[0], _eff_tainted(line))
+                elif member == "uri" and q == "" and _has_wc:
+                    hit = _is_tainted(args[0], _eff_tainted(line))
+                elif member == "url" and q == "" and _has_okhttp:
+                    hit = _is_tainted(args[0], _eff_tainted(line))
+                elif _has_hutool and q in ("HttpUtil", "HttpRequest") and member in _HUTOOL_URL_METHODS:
+                    hit = _is_tainted(args[0], _eff_tainted(line))
+                elif _has_fluent and q == "Request" and member in _FLUENT_URL_METHODS:
+                    hit = _is_tainted(args[0], _eff_tainted(line))
+                if hit:
                     _add(node, VulnType.SSRF, Severity.HIGH, "JAST-SSRF-002",
-                         f"Spring {q}.{node.member}() with user-controlled URL — "
-                         "SSRF; validate scheme/host or use allowlist before making external requests")
+                         f"{q + '.' if q else ''}{member}() with user-controlled URL — "
+                         "SSRF; validate scheme/host or use allowlist before making external requests",
+                         line_override=line)
+            for _, node in tree.filter(jt.MethodInvocation):
+                _l = _node_line(node)
+                if not _l:
+                    continue  # chain selectors carry no position; handled via their root below
+                q = str(node.qualifier or "")
+                _ssrf_check(node, q, node.member, node.arguments, _l)
+                for sel in (node.selectors or ()):
+                    if isinstance(sel, jt.MethodInvocation):
+                        _ssrf_check(sel, "", sel.member, sel.arguments, _l)
+            for _p, node in tree.filter(jt.ClassCreator):
+                _l = _creator_line(_p, node)
+                for sel in (node.selectors or ()):
+                    if isinstance(sel, jt.MethodInvocation):
+                        _ssrf_check(sel, "", sel.member, sel.arguments, _l)
         except Exception:
             pass
 
