@@ -1048,6 +1048,36 @@ _JSON_PRODUCERS = frozenset({
 
 
 
+_STRING_PASSTHROUGH = frozenset({
+    "format", "formatted", "valueOf", "concat", "trim", "strip", "toString", "replace", "replaceAll",
+    "toLowerCase", "toUpperCase", "substring", "join", "repeat", "getOrDefault", "orElse",
+})
+
+
+def _rest_xss_direct(expr, tainted) -> bool:
+    """Request data reaches the returned String itself: a tainted variable/source, a concatenation or ternary
+    containing one, or a plain String method applied to it.  A call to some other method with a tainted
+    argument (service.process(x)) is not treated as reflecting the input."""
+    if isinstance(expr, jt.BinaryOperation):
+        return expr.operator == "+" and (_rest_xss_direct(expr.operandl, tainted)
+                                          or _rest_xss_direct(expr.operandr, tainted))
+    if isinstance(expr, jt.TernaryExpression):
+        return _rest_xss_direct(expr.if_true, tainted) or _rest_xss_direct(expr.if_false, tainted)
+    if isinstance(expr, jt.Cast):
+        return _rest_xss_direct(expr.expression, tainted)
+    if isinstance(expr, jt.MethodInvocation):
+        if _is_request_source(expr):
+            return True
+        if expr.member in _STRING_PASSTHROUGH:
+            if str(expr.qualifier or "") in tainted:
+                return True
+            return any(_rest_xss_direct(a, tainted) for a in (expr.arguments or ()))
+        return str(expr.qualifier or "") in tainted
+    if isinstance(expr, jt.Literal):
+        return False
+    return _is_tainted(expr, tainted)
+
+
 def _rest_xss_json_or_sanitized(expr) -> bool:
     """The returned expression is built by a JSON serializer or passes through an HTML sanitizer."""
     for _, n in expr.filter(jt.MethodInvocation):
@@ -4899,7 +4929,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         if expr is None or isinstance(expr, jt.Literal):
                             continue
                         _rl = _node_line(ret) or _node_line(meth)
-                        if _rl in dead_lines or not _is_tainted(expr, _eff_tainted(_rl)):
+                        if _rl in dead_lines or not _rest_xss_direct(expr, _eff_tainted(_rl)):
                             continue
                         if _rest_xss_json_or_sanitized(expr):
                             continue
