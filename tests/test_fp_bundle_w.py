@@ -125,3 +125,20 @@ def test_redirect_with_tainted_prefix_or_double_slash_stays_open_redirect():
     b = "def v(request):\n    p = request.GET['p']\n    return redirect('//' + p)\n"
     assert _redir(a) != []
     assert _redir(b) != []
+
+
+def _js_redir(src: str):
+    return [f.rule_id for f in JSASTAnalyzer().analyze("routes/r.js", src) if f.rule_id == "JSAST-REDIR-001"]
+
+
+def test_js_redirect_with_local_prefix_is_not_open_redirect():
+    a = "exports.r = function (req, res) {\n  res.redirect('/items/' + req.query.id);\n}\n"
+    b = "exports.r = function (req, res) {\n  res.redirect(`/items/${req.query.id}`);\n}\n"
+    assert _js_redir(a) == [] and _js_redir(b) == []
+
+
+def test_js_redirect_to_request_value_or_double_slash_stays():
+    a = "exports.r = function (req, res) {\n  res.redirect(req.query.url);\n}\n"
+    b = "exports.r = function (req, res) {\n  res.redirect('//' + req.query.id);\n}\n"
+    c = "exports.r = function (req, res) {\n  res.redirect(req.query.id + '/x');\n}\n"
+    assert _js_redir(a) and _js_redir(b) and _js_redir(c)
