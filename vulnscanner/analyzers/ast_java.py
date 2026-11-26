@@ -1073,6 +1073,24 @@ _AE_GATE = ("DriverManager", "redirect:", "forward:", "RedirectView", "ModelAndV
             "DocumentHelper", "XSSFWorkbook", "OPCPackage", "StreamingReader", "WorkbookFactory", "ExpressRunner")
 
 
+def _config_only_expr(node, inits: dict, depth: int = 0) -> bool:
+    """True when an expression is built only from literals and Properties/System getProperty|getenv reads
+    (deployment configuration, not request data), following local variables through `inits`."""
+    if depth > 4 or node is None:
+        return False
+    if isinstance(node, jt.Literal):
+        return True
+    if isinstance(node, jt.MethodInvocation):
+        return node.member in ("getProperty", "getenv")
+    if isinstance(node, jt.BinaryOperation):
+        return (_config_only_expr(node.operandl, inits, depth + 1)
+                and _config_only_expr(node.operandr, inits, depth + 1))
+    if isinstance(node, jt.MemberReference) and not node.qualifier:
+        srcs = inits.get(node.member)
+        return bool(srcs) and all(_config_only_expr(x, inits, depth + 1) for x in srcs)
+    return False
+
+
 def _java_web_sinks_ae(tree, content, eff_tainted, add, dead_lines, xxe_hardened) -> None:
     """JDBC connection-string injection, Spring view-name redirects/forwards, RequestDispatcher,
     dom4j / POI / xlsx-streamer XXE parsers and QLExpress evaluation (one pass, gated on content)."""
@@ -1086,6 +1104,29 @@ def _java_web_sinks_ae(tree, content, eff_tainted, add, dead_lines, xxe_hardened
                     ql_vars.update(x.name for x in d.declarators)
     xx_lines = content.splitlines()
     seen: set = set()
+    cache: dict = {}
+
+    def get_inits() -> dict:
+        """variable name -> initializer expressions (one walk per file, built on first use)."""
+        if "inits" not in cache:
+            inits: dict = {}
+            for _, vd in tree.filter(jt.VariableDeclarator):
+                if vd.initializer is not None:
+                    inits.setdefault(vd.name, []).append(vd.initializer)
+            cache["inits"] = inits
+            cache["finals"] = {d.name for _, fd in tree.filter(jt.FieldDeclaration)
+                               if "final" in (fd.modifiers or ()) for d in fd.declarators}
+        return cache["inits"]
+
+    def from_constant_lookup(node) -> bool:
+        """`dest = ALLOWED.getOrDefault(key, "/home")`: the value comes out of a final lookup table,
+        so a tainted key cannot introduce a new target."""
+        if not (isinstance(node, jt.MemberReference) and not node.qualifier):
+            return False
+        srcs = get_inits().get(node.member)
+        finals = cache["finals"]
+        return bool(srcs) and all(isinstance(x, jt.MethodInvocation) and x.member in ("get", "getOrDefault")
+                                  and str(x.qualifier or "") in finals for x in srcs)
 
     def emit(node, vt, sev, rid, desc, line):
         if not line or line in dead_lines or (rid, line) in seen:
@@ -1100,6 +1141,8 @@ def _java_web_sinks_ae(tree, content, eff_tainted, add, dead_lines, xxe_hardened
             ln = _creator_line(path, node)
             a = node.arguments or []
             if a and _is_tainted(a[0], eff_tainted(ln)):
+                if _config_only_expr(a[0], get_inits()):
+                    continue
                 emit(node, VulnType.SQL_INJECTION, Severity.HIGH, "JAST-JDBC-URL-001",
                      "DriverManager.getConnection() with a user-controlled JDBC URL — connection-string injection "
                      "(attacker-chosen host/driver properties); build the URL from fixed values and allowlist the target",
@@ -1190,7 +1233,7 @@ def _java_web_sinks_ae(tree, content, eff_tainted, add, dead_lines, xxe_hardened
             if pre is None or pre.strip() not in ("redirect:", "forward:"):
                 continue
             ln = _creator_line(path, node)
-            if not _is_tainted(parts[1], eff_tainted(ln)):
+            if not _is_tainted(parts[1], eff_tainted(ln)) or from_constant_lookup(parts[1]):
                 continue
             if pre.strip() == "redirect:":
                 emit(node, VulnType.OPEN_REDIRECT, Severity.MEDIUM, "JAST-REDIRECT-002",

@@ -177,3 +177,15 @@ def test_qlexpress_is_code_injection():
 
 def test_real_jdbc_execute_still_sql():
     assert "JAST-SQL-001" in _rules(_m("java.sql.Statement st = null;\n st.execute(p);"))
+
+
+def test_jdbc_url_from_config_file_is_clean():
+    body = _m('Properties pr = new Properties();\n String u = pr.getProperty("dburl") + pr.getProperty("dbname");\n'
+              ' DriverManager.getConnection(u, "sa", "x");', "String path")
+    assert "JAST-JDBC-URL-001" not in _rules(body)
+
+
+def test_redirect_from_constant_lookup_table_is_clean():
+    hdr = _H.replace("public class A {\n", "public class A {\n  private static final Map<Integer, String> DEST = Map.of(1, \"/a\");\n")
+    body = _m('String d = DEST.getOrDefault(id, "/a");\n String s = "redirect:" + d;', "Integer id")
+    assert "JAST-REDIRECT-002" not in {r for r, _ in _find(body, hdr)}
