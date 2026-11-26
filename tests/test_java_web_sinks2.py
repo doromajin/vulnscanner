@@ -188,3 +188,9 @@ def test_cors_reflected_origin_two_methods_same_variable_name():
            '  response.setHeader("Access-Control-Allow-Origin", origin);\n }\n'
            " void b(HttpServletRequest request) {\n  String origin = request.getHeader(\"Origin\");\n }\n}\n")
     assert [f.line_number for f in CORSAnalyzer().analyze("A.java", src) if f.rule_id == "CORS-011"] == [5]
+
+
+def test_rest_xss_fp_session_attribute_value():
+    assert "JAST-XSS-REST" not in _x(_rest(
+        '  public String h(javax.servlet.http.HttpServletRequest request) {\n'
+        '    String k = (String) request.getSession().getAttribute("k");\n    return k;\n  }'))

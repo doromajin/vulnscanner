@@ -4924,12 +4924,19 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     if any("json" in str(a.element).lower() for a in _man.values()
                            if a.name in _SPRING_MAPPING_ANNS):
                         continue
+                    # values read back from session/request attributes were stored by the server
+                    _srv_vars = set()
+                    for _, _lv in meth.filter(jt.LocalVariableDeclaration):
+                        for _d in _lv.declarators:
+                            if _d.initializer is not None and any(
+                                    n.member == "getAttribute" for _, n in _d.initializer.filter(jt.MethodInvocation)):
+                                _srv_vars.add(_d.name)
                     for _, ret in meth.filter(jt.ReturnStatement):
                         expr = ret.expression
                         if expr is None or isinstance(expr, jt.Literal):
                             continue
                         _rl = _node_line(ret) or _node_line(meth)
-                        if _rl in dead_lines or not _rest_xss_direct(expr, _eff_tainted(_rl)):
+                        if _rl in dead_lines or not _rest_xss_direct(expr, _eff_tainted(_rl) - _srv_vars):
                             continue
                         if _rest_xss_json_or_sanitized(expr):
                             continue
