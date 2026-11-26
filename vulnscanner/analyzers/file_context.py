@@ -138,6 +138,24 @@ def is_minified_line(path: str, line: str) -> bool:
     return len(line) > _MINIFIED_LINE_LEN and path.lower().endswith(_MINIFIED_EXTS)
 
 
+# A compiler-minified file whose lines stay under the per-line limit (Closure-compiled Google
+# libraries wrap at ~500 chars): judged on the file as a whole - big, and almost all of it in long lines.
+_MINIFIED_FILE_MIN_CHARS = 20000
+_MINIFIED_FILE_LONG_LINE = 200
+_MINIFIED_FILE_LONG_SHARE = 0.8
+
+
+def is_minified_file(path: str, lines: list[str]) -> bool:
+    """Return True if the JS/CSS file *path* (given as *lines*) is machine-minified build output."""
+    if not path.lower().endswith(_MINIFIED_EXTS):
+        return False
+    total = sum(len(l) for l in lines)
+    if total < _MINIFIED_FILE_MIN_CHARS:
+        return False
+    long_chars = sum(len(l) for l in lines if len(l) > _MINIFIED_FILE_LONG_LINE)
+    return long_chars >= _MINIFIED_FILE_LONG_SHARE * total
+
+
 def is_vendor_file(path: str) -> bool:
     """Return True if *path* is a third-party vendor or library file."""
     norm = path.replace("\\", "/")
