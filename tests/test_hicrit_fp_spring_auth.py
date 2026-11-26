@@ -7,7 +7,7 @@ _CTRL = (
     "package app;\n"
     "@RestController\n"
     "public class C {\n"
-    "    @PostMapping(\"/items\")\n"
+    "    @PostMapping(\"/users\")\n"
     "    public String create(@RequestBody String b) { return b; }\n"
     "}\n"
 )

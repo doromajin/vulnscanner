@@ -976,6 +976,29 @@ _DESER_CLASSES = frozenset({"ObjectInputStream"})
 
 _SPEL_METHODS = frozenset({"parseExpression"})
 
+_RAND_SENSITIVE_RE = re.compile(r"(?i)token|password|passwd|secret|key|nonce|session|otp|salt|csrf|auth")
+# Any API that can actually open an outbound request; a bare `new URI(x)` in a file without one
+# only parses a string.
+_NET_API_RE = re.compile(
+    r"openConnection|openStream|toURL\(|HttpClient|HttpRequest|RestTemplate|WebClient|HttpGet|HttpPost"
+    r"|HttpURLConnection|okhttp|OkHttp|Jsoup|URLConnection|\.exchange\(|\.getForObject|\.postForObject|HttpUtil")
+_URL_ORIGIN_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://[^/]+")
+
+
+def _url_fixed_origin(arg) -> bool:
+    """True when a URL/URI expression starts with a literal that fixes the origin: a root-relative
+    path ("/x?id=" + v) or scheme + host followed by more literal text ("https://api.example.com/" + v)."""
+    node = arg
+    while isinstance(node, jt.BinaryOperation) and node.operator == "+":
+        node = node.operandl
+    if not isinstance(node, jt.Literal) or not isinstance(node.value, str):
+        return False
+    lit = node.value.strip('"')
+    if lit.startswith("/") and not lit.startswith("//"):
+        return True
+    m = _URL_ORIGIN_RE.match(lit)
+    return bool(m) and len(lit) > m.end()
+
 # XXE parser sinks: variable type (or factory method) -> methods whose first argument is the XML input.
 _XXE_PARSER_TYPES = {
     "SAXBuilder": frozenset({"build"}),
@@ -3892,6 +3915,182 @@ def _collect_java_guards(tree) -> "set[str]":
     return guarded
 
 
+# ── Method-scoped validation guards (allow-list / host / format checks) ─────────
+# A tainted value that is checked by a validator before the sink, inside the SAME method, is
+# treated as clean for that region.  Unlike _collect_java_guards (file-wide, format methods only)
+# this is scoped to one method and to the lines the guard actually covers, so a vulnerable
+# handler and a safe handler that reuse the same parameter name in one class stay independent.
+_GUARD_UNSAFE_NAME_RE = re.compile(
+    r"(?i)(invalid|internal|private|loopback|sitelocal|linklocal|anylocal|block|danger|malicious|"
+    r"illegal|forbidden|black|unsafe|denied|deny|reserved)")
+_GUARD_SAFE_NAME_RE = re.compile(
+    r"(?i)(check|verify|sanitiz|safe|allow|white|trust|permit|accept)")  # not "valid": isUrlValid() is syntax only
+_GUARD_ALLOWISH_RE = re.compile(r"(?:(?i:allow|white|valid|trusted|permitted|known))|^[A-Z][A-Z0-9_]+$")
+_GUARD_STR_METHODS = frozenset({
+    "matches", "contains", "containsKey", "startsWith", "endsWith", "equals", "equalsIgnoreCase",
+})
+_GUARD_SKIP_NAMES = frozenset({"request", "req", "response", "resp", "res", "this"})
+
+
+def _guard_names_in(node) -> "set[str]":
+    """Simple identifiers referenced inside a guard term (arguments and call qualifiers)."""
+    names: set = set()
+    if node is None:
+        return names
+    try:
+        for _, n in node.filter(jt.MemberReference):
+            if not n.qualifier and n.member:
+                names.add(n.member)
+            elif n.qualifier:
+                names.add(str(n.qualifier).split(".")[0])
+        for _, n in node.filter(jt.MethodInvocation):
+            if n.qualifier:
+                names.add(str(n.qualifier).split(".")[0])
+    except Exception:
+        pass
+    return {n for n in names if n and n not in _GUARD_SKIP_NAMES}
+
+
+def _guard_reject_vars(term) -> "set[str]":
+    """Names validated by `term` when `term` being true means the value is REJECTED.
+
+    Recognised: !validator(x), !x.matches(..), !pattern.matcher(x).matches(), !allow.contains(x),
+    validator(x) == null / == false, isInternal*/isPrivate*/isBlocked*(x) (unsafe predicates), and
+    `||` chains of those.  `&&` chains are not guards (a null/other precondition would bypass them).
+    """
+    if term is None:
+        return set()
+    if isinstance(term, jt.BinaryOperation):
+        op = term.operator
+        if op == "||":
+            return _guard_reject_vars(term.operandl) | _guard_reject_vars(term.operandr)
+        if op in ("==", "!="):
+            for call, other in ((term.operandl, term.operandr), (term.operandr, term.operandl)):
+                if isinstance(call, jt.MethodInvocation) and isinstance(other, jt.Literal):
+                    lit = str(other.value)
+                    inner_neg = "!" in (call.prefix_operators or ())
+                    if inner_neg or lit not in ("null", "false", "true"):
+                        continue
+                    rejects_on_eq = lit in ("null", "false")
+                    if (op == "==") != rejects_on_eq:
+                        continue
+                    if _guard_pred_kind(call) == "safe":
+                        return _guard_names_in(call)
+        return set()
+    if isinstance(term, jt.MethodInvocation):
+        neg = "!" in (term.prefix_operators or ())
+        kind = _guard_pred_kind(term)
+        if kind == "safe" and neg:
+            return _guard_names_in(term)
+        if kind == "unsafe" and not neg:
+            return _guard_names_in(term)
+    return set()
+
+
+def _guard_pred_kind(call) -> "str | None":
+    names = [call.member] + [s.member for s in (call.selectors or ())
+                             if isinstance(s, jt.MethodInvocation)]
+    if any(_GUARD_UNSAFE_NAME_RE.search(n or "") for n in names):
+        return "unsafe"
+    _plain_str = [n for n in names if n in _GUARD_STR_METHODS and n != "matches"]
+    if (_plain_str and not any(_GUARD_SAFE_NAME_RE.search(n or "") for n in names)
+            and not any(n == "matches" for n in names)):
+        # equals/contains/startsWith ...: a check against a literal or an allow-list / constant.
+        # Comparing one request value with another (pass.equals(confirmPass)) validates nothing.
+        _ops = list(call.arguments or []) + [call.qualifier or ""]
+        if not any(isinstance(o, jt.Literal)
+                   or (isinstance(o, jt.MemberReference) and _GUARD_ALLOWISH_RE.search(o.member or "")
+                       and not o.qualifier)
+                   or (isinstance(o, str) and o and _GUARD_ALLOWISH_RE.search(o.split(".")[-1]))
+                   for o in _ops):
+            return None
+    if any(_GUARD_SAFE_NAME_RE.search(n or "") or n in _GUARD_STR_METHODS for n in names):
+        if call.member == "startsWith" or any(
+                isinstance(s, jt.MethodInvocation) and s.member == "startsWith" for s in (call.selectors or ())):
+            # startsWith("/") alone still admits "//host": require a longer fixed prefix
+            lits = [a.value for _, a in call.filter(jt.Literal) if isinstance(a.value, str)]
+            if lits and all(len(v.strip('"')) <= 1 for v in lits):
+                return None
+        return "safe"
+    return None
+
+
+def _guard_accept_vars(term) -> "set[str]":
+    """Names validated by `term` when `term` being true means the value is ACCEPTED."""
+    if isinstance(term, jt.MethodInvocation):
+        neg = "!" in (term.prefix_operators or ())
+        kind = _guard_pred_kind(term)
+        if kind == "safe" and not neg:
+            return _guard_names_in(term)
+        if kind == "unsafe" and neg:
+            return _guard_names_in(term)
+    elif isinstance(term, jt.BinaryOperation) and term.operator == "&&":
+        return _guard_accept_vars(term.operandl) | _guard_accept_vars(term.operandr)
+    return set()
+
+
+def _collect_scoped_guards(tree) -> "list[tuple[int, int, frozenset]]":
+    """(first_line, last_line, validated names) regions, one set of regions per method."""
+    regions: list = []
+    try:
+        methods = []
+        for _, m in tree.filter(jt.MethodDeclaration):
+            p = getattr(m, "position", None)
+            if p:
+                methods.append((p.line, m))
+        methods.sort(key=lambda t: t[0])
+        for idx, (start, m) in enumerate(methods):
+            end = methods[idx + 1][0] - 1 if idx + 1 < len(methods) else 10 ** 9
+            # name -> names it was derived from (host = new URI(url).getHost(); u = new URL(url))
+            deps: dict = {}
+            for _, d in m.filter(jt.VariableDeclarator):
+                if d.initializer is not None and not isinstance(d.initializer, jt.BinaryOperation):
+                    deps.setdefault(d.name, set()).update(_guard_names_in(d.initializer))
+
+            def _closure(names: set) -> frozenset:
+                out = set(names)
+                for _ in range(4):
+                    for n in list(out):
+                        out |= deps.get(n, set())
+                return frozenset(out)
+
+            for _, ifn in m.filter(jt.IfStatement):
+                ip = getattr(ifn, "position", None)
+                if not ip:
+                    continue
+                then = ifn.then_statement
+                stmts = getattr(then, "statements", None)
+                exits = (any(isinstance(s, (jt.ThrowStatement, jt.ReturnStatement)) for s in stmts)
+                         if stmts is not None else isinstance(then, (jt.ThrowStatement, jt.ReturnStatement)))
+                rej = _guard_reject_vars(ifn.condition)
+                if rej and exits and not ifn.else_statement:
+                    # the reject branch itself (logging / echoing the bad value) is not covered
+                    then_last = ip.line
+                    try:
+                        for _, n in (then.filter(javalang.ast.Node) if hasattr(then, "filter") else ()):
+                            pp = getattr(n, "position", None)
+                            if pp and pp.line > then_last:
+                                then_last = pp.line
+                    except Exception:
+                        pass
+                    regions.append((then_last + 1, end, _closure(rej)))
+                    continue
+                acc = _guard_accept_vars(ifn.condition)
+                if acc:
+                    last = ip.line
+                    try:
+                        for _, n in (then.filter(javalang.ast.Node) if hasattr(then, "filter") else ()):
+                            pp = getattr(n, "position", None)
+                            if pp and pp.line > last:
+                                last = pp.line
+                    except Exception:
+                        pass
+                    regions.append((ip.line, max(last, ip.line + 1), _closure(acc)))
+    except Exception:
+        return []
+    return regions
+
+
 class JavaASTAnalyzer(BaseAnalyzer):
     """AST-level analyzer for .java files using javalang."""
 
@@ -4054,7 +4253,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
         # Populated below before any _eff_tainted call; read by closure.
         _infile_extra_taint: dict[int, set] = {}
 
-        def _eff_tainted(node_or_line) -> set:
+        def _eff_tainted_base(node_or_line) -> set:
             """Return effective tainted set for the enclosing method.
 
             = (global_tainted − locally_clean_vars) ∪ interprocedural_callee_params
@@ -4079,6 +4278,42 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 extra = _infile_extra_taint.get(midx, frozenset())
                 _eff_cache[midx] = base | extra
             return _eff_cache[midx]
+
+        # Method-scoped validation guards (allow-list / host / format checks before the sink).
+        _scoped_guards = _collect_scoped_guards(tree)
+
+        def _eff_tainted(node_or_line) -> set:
+            res = _eff_tainted_base(node_or_line)
+            if not _scoped_guards:
+                return res
+            ln = node_or_line if isinstance(node_or_line, int) else _node_line(node_or_line)
+            cleaned = set()
+            for g_from, g_to, g_names in _scoped_guards:
+                if g_from <= ln <= g_to:
+                    cleaned |= g_names
+            return (res - cleaned) if cleaned & res else res
+
+        # Enclosing-method helpers (line ranges from MethodDeclaration starts).
+        _gm_methods: list = []
+        try:
+            _gm_raw = sorted(
+                ((m.position.line, m) for _, m in tree.filter(jt.MethodDeclaration) if m.position),
+                key=lambda t: t[0])
+            for _gi, (_gs, _gm) in enumerate(_gm_raw):
+                _ge = _gm_raw[_gi + 1][0] - 1 if _gi + 1 < len(_gm_raw) else len(lines)
+                _gm_methods.append((_gs, _ge, _gm))
+        except Exception:
+            _gm_methods = []
+
+        def _enclosing_method(ln: int):
+            for _gs, _ge, _gm in _gm_methods:
+                if _gs <= ln <= _ge:
+                    return _gs, _ge, _gm
+            return None
+
+        def _method_text(ln: int) -> str:
+            em = _enclosing_method(ln)
+            return "\n".join(lines[em[0] - 1:em[1]]) if em else ""
 
         # ── A-1: Build in-file interprocedural callee-param taint map ────────
         # For each call site foo(tainted_arg) where foo is defined in this file,
@@ -4174,6 +4409,10 @@ class JavaASTAnalyzer(BaseAnalyzer):
 
         def _add(node, vuln_type, severity, rule_id, desc, *, line_override: int = 0):
             ln = line_override or _node_line(node)
+            _am = _enclosing_method(ln)
+            if (_am is not None and _am[2].name == "main" and len(_am[2].parameters or []) == 1
+                    and getattr(_am[2].parameters[0].type, "name", "") == "String"):
+                return  # demo / test entry point, not reachable from a request
             findings.append(Finding(
                 vuln_type=vuln_type,
                 severity=severity,
@@ -5190,13 +5429,35 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 pass
 
         # ── Weak cryptography — new Random() or Math.random() ────────────────
+        # HIGH only when the value looks security relevant (token / password / key / session ...
+        # in the variable, the method or the lines that use the variable); LOW elsewhere
+        # (file names, delays, shuffles, lesson ids).
+        def _rand_severity(ln: int):
+            src = lines[ln - 1] if 0 < ln <= len(lines) else ""
+            _vm = re.search(r"(\w+)\s*=\s*(?:new\s+(?:java\.util\.)?Random|(?:java\.lang\.)?Math\.random)", src)
+            ctx = [src]
+            _em = _enclosing_method(ln)
+            if _em is not None:
+                ctx.append(_em[2].name)
+            if _vm:
+                _vre = re.compile(r"\b" + re.escape(_vm.group(1)) + r"\b")
+                _lo, _hi = (_em[0], _em[1]) if _em is not None else (1, len(lines))
+                for _ui in range(_lo, _hi + 1):
+                    if _vre.search(lines[_ui - 1]):
+                        ctx.append(lines[_ui - 1])
+                        _um = _enclosing_method(_ui)
+                        if _um is not None:
+                            ctx.append(_um[2].name)
+            ctx.append(Path(file_path).stem)  # class / file name (PasswordResetService ...)
+            return Severity.HIGH if _RAND_SENSITIVE_RE.search("\n".join(ctx)) else Severity.LOW
+
         try:
             for _rnd_path, node in tree.filter(jt.ClassCreator):
                 if _type_name(node.type) == "Random":
                     _rnd_line = _creator_line(_rnd_path, node)
                     if _rnd_line in dead_lines:
                         continue
-                    _add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "JAST-CRYPTO-001",
+                    _add(node, VulnType.WEAK_CRYPTOGRAPHY, _rand_severity(_rnd_line), "JAST-CRYPTO-001",
                          "new Random() is not cryptographically secure — "
                          "use java.security.SecureRandom for security-sensitive randomness",
                          line_override=_rnd_line)
@@ -5208,7 +5469,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                     q = str(node.qualifier or "")
                     # Math.random() or java.lang.Math.random()
                     if q == "Math" or q.endswith(".Math") or q == "java.lang.Math":
-                        _add(node, VulnType.WEAK_CRYPTOGRAPHY, Severity.HIGH, "JAST-CRYPTO-001B",
+                        _add(node, VulnType.WEAK_CRYPTOGRAPHY, _rand_severity(_node_line(node)), "JAST-CRYPTO-001B",
                              "Math.random() is not cryptographically secure — "
                              "use java.security.SecureRandom for security-sensitive randomness")
         except Exception:
@@ -5290,6 +5551,12 @@ class JavaASTAnalyzer(BaseAnalyzer):
                             break
                 elif ctype in _HTTP_CLIENT_URL_CTORS:
                     first = (node.arguments or [None])[0]
+                    if ctype == "URI" and (
+                            _url_fixed_origin(first)
+                            or not _NET_API_RE.search(content)
+                            or _GUARD_SAFE_NAME_RE.search((_enclosing_method(_ssrf_line) or (0, 0, None))[2].name
+                                                          if _enclosing_method(_ssrf_line) else "")):
+                        continue  # parse-only URI / fixed origin / validator method: no outbound request
                     if first is not None and _is_tainted(first, _eff_tainted(_ssrf_line)):
                         _add(node, VulnType.SSRF, Severity.HIGH, "JAST-SSRF-001",
                              f"new {ctype}() with user-controlled URL — "
@@ -5584,6 +5851,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 if _node_line(node) in dead_lines:
                     continue
                 if node.member in _SPEL_METHODS:
+                    _spel_txt = _method_text(_node_line(node))
+                    if "SimpleEvaluationContext" in _spel_txt and "StandardEvaluationContext" not in _spel_txt:
+                        continue  # read-only evaluation context: no type references / constructors / bean access
                     for arg in (node.arguments or []):
                         if _is_tainted(arg, _eff_tainted(node)):
                             _add(node, VulnType.SSTI, Severity.CRITICAL, "JAST-SPEL-001",

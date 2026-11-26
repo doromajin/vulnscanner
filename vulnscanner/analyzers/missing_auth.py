@@ -118,6 +118,13 @@ _PY_GUARD_RE = re.compile(
 # ── Java patterns ──────────────────────────────────────────────────────────────
 
 # State-changing Spring mapping annotations
+# Endpoints whose path / method name points at privileged or user-specific operations keep HIGH when
+# the application has no security configuration at all; everything else is MEDIUM.
+_JAVA_SENSITIVE_ENDPOINT_RE = re.compile(
+    r'admin|delete|remove|update|edit|payment|pay|password|passwd|transfer|user|account|role|permission|withdraw|order|upload|config|credential|token|profile',
+    re.IGNORECASE,
+)
+
 _JAVA_STATE_MAP_RE = re.compile(
     r'@\s*(?:PostMapping|PutMapping|DeleteMapping|PatchMapping'
     r'|RequestMapping\s*\([^)]*method\s*=\s*(?:RequestMethod\.)?(?:POST|PUT|DELETE|PATCH))',
@@ -418,7 +425,9 @@ class MissingAuthAnalyzer(BaseAnalyzer):
 
             findings.append(Finding(
                 vuln_type=_MA,
-                severity=Severity.LOW if project_auth else Severity.HIGH,
+                severity=(Severity.LOW if project_auth else
+                          Severity.HIGH if _JAVA_SENSITIVE_ENDPOINT_RE.search(f"{path} {func_name}") else
+                          Severity.MEDIUM),
                 file_path=file_path,
                 line_number=func_lineno,
                 line_content=lines[func_lineno - 1].strip(),
