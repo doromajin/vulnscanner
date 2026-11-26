@@ -36,6 +36,7 @@ from vulnscanner.analyzers.ldap_injection import LDAPInjectionAnalyzer
 from vulnscanner.analyzers.weak_crypto import WeakCryptoAnalyzer
 from vulnscanner.analyzers.xss import XSSAnalyzer
 from vulnscanner.analyzers.blade_xss import BladeXSSAnalyzer
+from vulnscanner.analyzers.ejs_xss import EjsXSSAnalyzer
 from vulnscanner.analyzers.cshtml_xss import CshtmlXSSAnalyzer
 from vulnscanner.analyzers.mybatis import MyBatisAnalyzer
 
@@ -47,6 +48,8 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     XSSAnalyzer(),
     # Laravel Blade: unescaped {!! !!} output
     BladeXSSAnalyzer(),
+    # EJS: unescaped <%- %> output
+    EjsXSSAnalyzer(),
     # ASP.NET Razor: Html.Raw / HtmlString output
     CshtmlXSSAnalyzer(),
     # MyBatis ${} substitution in mapper XML and @Select/@Update annotations
