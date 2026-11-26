@@ -9,6 +9,8 @@ Java:   Spring MVC / Spring Boot
 """
 from __future__ import annotations
 
+import functools
+import os
 import re
 
 from vulnscanner.analyzers.base import BaseAnalyzer
@@ -141,6 +143,44 @@ _JAVA_METHOD_RE = re.compile(
 _JAVA_GUARD_RE = re.compile(
     r'@(?:Post|Put|Delete|Patch)Mapping|@RequestMapping',
 )
+
+
+# ── Project-wide Spring Security ───────────────────────────────────────────────
+# `http.authorizeRequests()...anyRequest().authenticated()` (or hasRole/hasAuthority/access) in a
+# security configuration class protects every endpoint that is not explicitly opened with permitAll().
+_SPRING_SEC_CFG_RE = re.compile(r"@EnableWebSecurity|SecurityFilterChain|WebSecurityConfigurerAdapter")
+_SPRING_ANY_REQUEST_AUTH_RE = re.compile(
+    r"\.anyRequest\(\)\s*\.\s*(?:authenticated\s*\(|hasAnyRole\s*\(|hasRole\s*\(|hasAuthority\s*\(|hasAnyAuthority\s*\()"
+)
+_JAVA_SRC_MARK = "/src/main/java/"
+
+
+@functools.lru_cache(maxsize=64)
+def _spring_project_requires_auth(root: str) -> bool:
+    """True when a Spring Security config under *root*/src/main/java makes every request authenticated."""
+    base = root + _JAVA_SRC_MARK.rstrip("/")
+    try:
+        for dirpath, _dirs, files in os.walk(base):
+            for fn in files:
+                if not fn.endswith(".java") or not re.search(r"Security|Config|Auth|WebMvc", fn):
+                    continue
+                try:
+                    with open(os.path.join(dirpath, fn), encoding="utf-8", errors="replace") as fh:
+                        text = fh.read(200_000)
+                except OSError:
+                    continue
+                if _SPRING_SEC_CFG_RE.search(text) and _SPRING_ANY_REQUEST_AUTH_RE.search(text):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _project_root_of(file_path: str) -> str:
+    norm = file_path.replace("\\", "/")
+    i = norm.find(_JAVA_SRC_MARK)
+    return norm[:i] if i > 0 else ""
+
 
 
 class MissingAuthAnalyzer(BaseAnalyzer):
@@ -326,6 +366,8 @@ class MissingAuthAnalyzer(BaseAnalyzer):
     def _analyze_java(self, file_path: str, content: str, repo_url: str) -> list[Finding]:
         lines = content.splitlines()
         findings: list[Finding] = []
+        root = _project_root_of(file_path)
+        project_auth = bool(root) and _spring_project_requires_auth(root)
 
         for i, line in enumerate(lines):
             lineno = i + 1
@@ -367,7 +409,7 @@ class MissingAuthAnalyzer(BaseAnalyzer):
 
             findings.append(Finding(
                 vuln_type=_MA,
-                severity=Severity.HIGH,
+                severity=Severity.LOW if project_auth else Severity.HIGH,
                 file_path=file_path,
                 line_number=func_lineno,
                 line_content=lines[func_lineno - 1].strip(),
@@ -375,6 +417,9 @@ class MissingAuthAnalyzer(BaseAnalyzer):
                     f"Spring endpoint{' ' + repr(path) if path else ''} handles "
                     f"state-changing requests without @PreAuthorize, @Secured, "
                     f"or @RolesAllowed."
+                    + (" [low_reach: the project's Spring Security configuration requires authentication for "
+                       "anyRequest(); this path is covered unless it is opened with permitAll()]"
+                       if project_auth else "")
                 ),
                 rule_id="AUTH-002",
                 repo_url=repo_url,
