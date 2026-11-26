@@ -116,12 +116,87 @@ _RULES = [
         "CORS header set to wildcard or reflected request origin — restrict to known origins to prevent CSRF via CORS",
         Severity.MEDIUM, _CORS, (".py",),
     ),
+    # Java: response header / Spring config allowing every origin
+    (
+        "CORS-012",
+        re.compile(
+            r'(?:(?:set|add)Header\s*\(\s*"Access-Control-Allow-Origin"\s*,\s*"[*]"'
+            r'|(?:addAllowedOrigin|allowedOrigins|allowedOriginPatterns|addAllowedOriginPattern'
+            r'|setAllowedOriginPatterns)\s*\(\s*(?:(?:Arrays\.asList|List\.of)\s*\(\s*)?"[*]")',
+        ),
+        "CORS policy allows every origin (wildcard) - restrict to an explicit origin allowlist; with credentials this exposes authenticated responses",
+        Severity.MEDIUM, _CORS, (".java",),
+    ),
+    # Java Spring: @CrossOrigin("*") shorthand
+    (
+        "CORS-013",
+        re.compile(r'@CrossOrigin\s*\(\s*(?:value\s*=\s*)?"[*]"'),
+        "@CrossOrigin(\"*\") allows any site to make cross-origin requests to this endpoint",
+        Severity.MEDIUM, _CORS, (".java",),
+    ),
 ]
 
 _GUARD = re.compile(
-    r'Access-Control-Allow-Origin|CORS_ALLOW_ALL_ORIGINS|CORS_ORIGIN_ALLOW_ALL|cors\s*\(|@CrossOrigin|setAllowedOrigins|supports_credentials',
+    r'Access-Control-Allow-Origin|CORS_ALLOW_ALL_ORIGINS|CORS_ORIGIN_ALLOW_ALL|cors\s*\(|@CrossOrigin|llowedOrigin|supports_credentials',
     re.IGNORECASE,
 )
+
+
+_JAVA_ACAO = re.compile(r'(?:set|add)Header\s*\(\s*"Access-Control-Allow-Origin"\s*,\s*([^;]+?)\)\s*;')
+_JAVA_ORIGIN_SRC = re.compile(r'getHeader\s*\(\s*"[Oo]rigin"\s*\)')
+_JAVA_ORIGIN_VAR = re.compile(r'(?:String\s+)?(\w+)\s*=\s*[^;]*getHeader\s*\(\s*"[Oo]rigin"\s*\)')
+_JAVA_LOG = re.compile(r'(?:log(?:ger)?|System\.out|System\.err)\b', re.IGNORECASE)
+
+
+def _java_reflected_origin(analyzer, file_path, content, repo_url):
+    """response.setHeader("Access-Control-Allow-Origin", <request Origin>) without a validation of that value."""
+    if "Access-Control-Allow-Origin" not in content or not _JAVA_ORIGIN_SRC.search(content):
+        return []
+    lines = content.splitlines()
+    assigned = {}  # var -> line index of assignment
+    for i, ln in enumerate(lines):
+        m = _JAVA_ORIGIN_VAR.search(ln)
+        if m:
+            assigned[m.group(1)] = i
+    out = []
+    for i, ln in enumerate(lines):
+        if analyzer._is_comment(ln):
+            continue
+        m = _JAVA_ACAO.search(ln)
+        if not m:
+            continue
+        arg = m.group(1).strip()
+        if _JAVA_ORIGIN_SRC.search(arg):
+            reflected = True
+            var = None
+        elif re.fullmatch(r'\w+', arg) and arg in assigned and assigned[arg] < i:
+            reflected, var = True, arg
+        else:
+            continue
+        if var:
+            vre = re.compile(r'(?:^|[^\w.])' + re.escape(var) + r'(?![\w])')
+            validated = False
+            for j in range(assigned[var] + 1, i):
+                seg = lines[j]
+                if _JAVA_LOG.search(seg) or not vre.search(seg):
+                    continue
+                # the value is handed to a call or compared/looked up inside a condition = validated
+                if re.search(r'(?:if|while|assert)\s*\(', seg) and re.search(
+                        r'\w\s*\([^;]*' + re.escape(var) + r'|' + re.escape(var) + r'\s*\.\s*(?:equals|matches|startsWith|endsWith|contains)\s*\(', seg):
+                    validated = True
+                    break
+                if re.search(r'(?:equals|matches|contains|startsWith|endsWith)\s*\(\s*' + re.escape(var) + r'\b', seg):
+                    validated = True
+                    break
+            if validated:
+                continue
+        out.append(Finding(
+            vuln_type=_CORS, severity=Severity.HIGH, file_path=file_path, line_number=i + 1,
+            line_content=ln.strip(),
+            description="Access-Control-Allow-Origin is set from the request Origin header without an allowlist check - any site can make credentialed cross-origin requests; compare the origin against a fixed allowlist",
+            rule_id="CORS-011", repo_url=repo_url, snippet=analyzer._extract_snippet(lines, i + 1),
+        ))
+    return out
 
 
 class CORSAnalyzer(BaseAnalyzer):
@@ -137,5 +212,8 @@ class CORSAnalyzer(BaseAnalyzer):
         ]
         if not applicable:
             return []
-        return self._scan_lines(file_path, content, repo_url, applicable, guard=None,
-                                mask_strings_py=True)
+        found = self._scan_lines(file_path, content, repo_url, applicable, guard=None,
+                                 mask_strings_py=True)
+        if file_path.endswith(".java"):
+            found += _java_reflected_origin(self, file_path, content, repo_url)
+        return found

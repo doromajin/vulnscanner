@@ -53,3 +53,53 @@ def test_ssrf_fn_guard_other_param_not_url():
     # tainted value in a non-URL position (body/ variables) is not flagged
     r = _rules(_m('RestTemplate rt2 = new RestTemplate();\n rt2.postForObject("http://a.example/x", url, String.class);'))
     assert "JAST-SSRF-002" not in r
+
+
+# ── 2. CORS ──────────────────────────────────────────────────────────────────
+from vulnscanner.analyzers.cors_analyzer import CORSAnalyzer
+
+
+def _cors(src: str) -> set:
+    return {f.rule_id for f in CORSAnalyzer().analyze("A.java", src)}
+
+
+def _ctl(stmts: str) -> str:
+    return ("import javax.servlet.http.*;\nimport org.springframework.web.bind.annotation.*;\n"
+            "@RestController\npublic class C {\n  @GetMapping(\"/x\")\n"
+            "  public String h(HttpServletRequest request, HttpServletResponse response) {\n"
+            f"{stmts}\n    return \"\";\n  }}\n}}\n")
+
+
+def test_cors_reflected_origin_tp():
+    assert "CORS-011" in _cors(_ctl(
+        '    String origin = request.getHeader("Origin");\n'
+        '    response.setHeader("Access-Control-Allow-Origin", origin);\n'
+        '    response.setHeader("Access-Control-Allow-Credentials", "true");'))
+    assert "CORS-011" in _cors(_ctl(
+        '    response.addHeader("Access-Control-Allow-Origin", request.getHeader("origin"));'))
+
+
+def test_cors_wildcard_and_config_tp():
+    assert "CORS-012" in _cors(_ctl('    response.setHeader("Access-Control-Allow-Origin", "*");'))
+    cfg = ("class K {\n void f(org.springframework.web.cors.CorsConfiguration c) {\n"
+           '  c.addAllowedOrigin("*");\n  c.setAllowCredentials(true);\n }\n}\n')
+    assert "CORS-012" in _cors(cfg)
+    reg = 'class K { void f(R r){ r.addMapping("/**").allowedOriginPatterns("*").allowCredentials(true); } }\n'
+    assert "CORS-012" in _cors(reg)
+
+
+def test_cors_fp_constant_allowlist_and_validated():
+    assert not _cors(_ctl('    response.setHeader("Access-Control-Allow-Origin", "https://app.example.org");'))
+    assert not _cors(_ctl(
+        '    String origin = request.getHeader("Origin");\n'
+        '    if (!ALLOWED.contains(origin)) { return "no"; }\n'
+        '    response.setHeader("Access-Control-Allow-Origin", origin);'))
+    assert not _cors(_ctl(
+        '    String origin = request.getHeader("Origin");\n'
+        '    if (origin != null && SecurityUtil.checkURL(origin) == null) { return "no"; }\n'
+        '    response.setHeader("Access-Control-Allow-Origin", origin);'))
+    assert not _cors('class K { void f(C c){ c.addAllowedOrigin("https://a.example.org"); } }\n')
+
+
+def test_cors_fn_guard_unrelated_header():
+    assert not _cors(_ctl('    String o = request.getHeader("Origin");\n    response.setHeader("X-Origin-Seen", o);'))
