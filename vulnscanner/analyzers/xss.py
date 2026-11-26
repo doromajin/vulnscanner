@@ -95,9 +95,13 @@ def _blade_literal_only(rhs: str) -> bool:
 # Browser-controlled input sources.  Keep in sync with evidence_regex in
 # rules/builtin/javascript.yaml.
 _DOM_SOURCE_RE = re.compile(
-    r'\blocation\.(?:search|hash|href)|document\.(?:URL|documentURI|referrer|cookie)'
-    r'|window\.name|URLSearchParams|postMessage'
-    r'|\baddEventListener\s*\(\s*[\x22\x27]message|\bonmessage\b|\bevent\.data\b'
+    # Only READS of a browser-controlled value count: an assignment (`location.href = u`,
+    # `document.cookie = 'k=v'`, `ws.onmessage = null`) or an empty `new URLSearchParams()` that is only
+    # being filled in for a request carries no attacker data into the page.
+    r'\blocation\.(?:search|hash)|\blocation\.href\b(?!\s*=(?!=))|document\.(?:URL|documentURI|referrer)'
+    r'|document\.cookie\b(?!\s*[-+]?=(?!=))'
+    r'|window\.name|URLSearchParams\s*\(\s*[^\s)]|postMessage'
+    r'|\baddEventListener\s*\(\s*[\x22\x27]message|\bonmessage\b(?!\s*=\s*null\b)|\bevent\.data\b'
 )
 
 # PHP emitting a JS handler: `... b.innerHTML='<span>' . $var . '` — the RHS is a
@@ -107,6 +111,9 @@ _PHP_CONCAT_VAR_RE = re.compile(r"\.\s*\$(\w+)")
 _PHP_SANITIZED_ASSIGN = (
     r"\$%s\s*=\s*(?:\w+::)?(?:html|htmlspecialchars|htmlentities|esc_\w+|escape\w*|encode|e|h)\s*\("
 )
+
+# innerHTML fed straight from an input element's value or the location object on the same line
+_DOM_DIRECT_READ_RE = re.compile(r'\binnerHTML\s*=[^;\n]*(?:\.value\b|\blocation\.(?:search|hash|href)\b)')
 
 # Functions whose return value is safe to assign to innerHTML.
 _SAFE_FUNCS = frozenset({
@@ -684,7 +691,7 @@ class XSSAnalyzer(BaseAnalyzer):
                     # A .blade.php <script> block is plain browser JS, not PHP emitting a handler.
                     if dom_source_in_file is None:     # once per file: it scans the whole text
                         dom_source_in_file = bool(_DOM_SOURCE_RE.search(content))
-                    reachable = (is_php and not file_path.endswith(".blade.php")) or dom_source_in_file
+                    reachable = (is_php and not file_path.endswith(".blade.php")) or dom_source_in_file or bool(_DOM_DIRECT_READ_RE.search(line))
                     findings.append(Finding(
                         vuln_type=VulnType.XSS,
                         severity=Severity.HIGH if reachable else Severity.LOW,
