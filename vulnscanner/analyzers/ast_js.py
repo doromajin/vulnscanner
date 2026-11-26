@@ -709,6 +709,43 @@ def _is_regex_receiver(obj_node) -> bool:
     return bool(_REGEX_RECEIVER_RE.match(obj_node.text.decode(errors="replace").strip()))
 
 
+_SEQUELIZE_IMPORT_RE = _re.compile(r"""(?:require\(\s*|from\s+|import\s+)['"]sequelize(?:-typescript)?['"]|\bsequelize\.define\(""")
+_SEQUELIZE_OPTION_KEYS = frozenset({"where", "include", "attributes", "order", "limit", "offset", "raw", "transaction"})
+
+
+def _is_sequelize_options_arg(args_node) -> bool:
+    """`Model.findOne({ where: { id: x } })`: Sequelize query options.  `where` is bound as a
+    parameter, so request data inside it is not a MongoDB operator document."""
+    named = args_node.named_children
+    if not named or named[0].type != "object":
+        return False
+    for pair in named[0].named_children:
+        if pair.type != "pair":
+            continue
+        key = pair.child_by_field_name("key")
+        if key is not None and key.text.decode(errors="replace").strip("'\"") in _SEQUELIZE_OPTION_KEYS:
+            return True
+    return False
+
+
+def _starts_with_local_path(args_node) -> bool:
+    """`res.redirect('/app/' + id)` / res.redirect(`/app/${id}`): the leading local path literal
+    (not `//host`) fixes scheme and host, so the request value cannot move the redirect off-site."""
+    named = args_node.named_children
+    if not named:
+        return False
+    node = named[0]
+    while node.type == "binary_expression" and node.child_by_field_name("left") is not None:
+        op = node.child_by_field_name("operator")
+        if op is None or op.text != b"+":
+            return False
+        node = node.child_by_field_name("left")
+    if node.type not in ("string", "template_string"):
+        return False
+    text = node.text.decode(errors="replace")[1:]
+    return text.startswith("/") and not text.startswith(("//", "/" + chr(92)))
+
+
 def _first_arg_is_request_object(args_node) -> bool:
     """`api.users.deleteMany(req, body)`: an application-layer function that takes the request
     itself first is not a MongoDB driver call, whose first argument is the filter document."""
@@ -927,6 +964,7 @@ def _check_sinks(
     findings: list[Finding] = []
     seen: set[tuple] = set()
     has_db_lib = file_loads_db_library(lines)
+    uses_sequelize = any(_SEQUELIZE_IMPORT_RE.search(ln) for ln in lines)
 
     def tainted_args(args_node) -> list:
         return [c for c in args_node.named_children if state.is_tainted_node(c)]
@@ -1079,7 +1117,7 @@ def _check_sinks(
 
             # Open redirect: res.redirect(tainted_url)
             elif obj_root in ("res", "response") and prop == "redirect":
-                if tainted_args(args_node):
+                if tainted_args(args_node) and not _starts_with_local_path(args_node):
                     _emit(findings, seen, file_path, line, lines, repo_url,
                           VulnType.OPEN_REDIRECT, Severity.MEDIUM,
                           "JSAST-REDIR-001",
@@ -1088,7 +1126,9 @@ def _check_sinks(
             # NoSQL injection: collection.find(tainted), db.users.findOne(tainted)
             elif (prop in _NOSQL_METHOD_SINKS and tainted_args(args_node)
                   and not _is_jquery_receiver(obj_node)
-                  and not _first_arg_is_request_object(args_node)):
+                  and not _first_arg_is_request_object(args_node)
+                  and not uses_sequelize
+                  and not _is_sequelize_options_arg(args_node)):
                 _emit(findings, seen, file_path, line, lines, repo_url,
                       VulnType.NOSQL_INJECTION, Severity.HIGH,
                       "JSAST-NOSQL-001",

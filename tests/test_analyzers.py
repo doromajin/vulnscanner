@@ -281,7 +281,7 @@ class TestHardcodedSecrets:
 
     def test_analyzer_reports_critical_in_test_file(self):
         # Analyzer reports at CRITICAL regardless of path. Scanner suppresses.
-        code = 'String key = "-----BEGIN RSA PRIVATE KEY-----";'
+        code = 'String key = "-----BEGIN RSA PRIVATE KEY-----MIIEowIBAAKCAQEA7VJTUt9Us8cKjMzEfYyjiWA4R4";'
         findings = HardcodedSecretsAnalyzer().analyze("src/test/CryptoTest.java", code)
         crit = [f for f in findings if f.rule_id == "SEC-005"]
         assert crit and crit[0].severity == Severity.CRITICAL

@@ -2055,6 +2055,15 @@ class _VulnVisitor(ast.NodeVisitor):
                     return True
         return False
 
+    def _starts_with_local_path(self, node: ast.expr, _depth: int) -> bool:
+        """The first piece of a concatenation is a local path literal (`'/app/'`, not a protocol-relative `'//host'`) or an internal URL builder such as `reverse(...)`."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            v = node.value
+            return v.startswith("/") and not v.startswith(("//", "/" + chr(92)))
+        if isinstance(node, ast.Call):
+            return self._redirect_value_is_internal(node, _depth + 1)
+        return False
+
     def _redirect_value_is_internal(self, node: ast.expr, _depth: int = 0) -> bool:
         """The redirect target is one of the application's own URLs, or a value a validator in this
         repository has already checked (`obj.get_absolute_url()`, `request.get_full_path()`,
@@ -2073,6 +2082,14 @@ class _VulnVisitor(ast.NodeVisitor):
             return all(self._redirect_value_is_internal(v, _depth + 1) for v in node.values)
         if isinstance(node, ast.Constant):
             return isinstance(node.value, str)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            # `'/app/' + pk + '/'`: the scheme and host are fixed by the leading local path
+            left = node
+            while isinstance(left, ast.BinOp) and isinstance(left.op, ast.Add):
+                left = left.left
+            return self._starts_with_local_path(left, _depth)
+        if isinstance(node, ast.JoinedStr):
+            return bool(node.values) and self._starts_with_local_path(node.values[0], _depth)
         if isinstance(node, ast.Attribute):
             recv = node.value
             return node.attr in ("path", "path_info") and isinstance(recv, ast.Name) and recv.id == "request"
