@@ -37,6 +37,7 @@ from vulnscanner.analyzers.weak_crypto import WeakCryptoAnalyzer
 from vulnscanner.analyzers.xss import XSSAnalyzer
 from vulnscanner.analyzers.blade_xss import BladeXSSAnalyzer
 from vulnscanner.analyzers.cshtml_xss import CshtmlXSSAnalyzer
+from vulnscanner.analyzers.mybatis import MyBatisAnalyzer
 
 ALL_ANALYZERS: list[BaseAnalyzer] = [
     # Python: AST-based (high precision, covers SQL/CMD/PATH/XSS/DESER/SSRF/REDIR/SSTI)
@@ -48,6 +49,8 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     BladeXSSAnalyzer(),
     # ASP.NET Razor: Html.Raw / HtmlString output
     CshtmlXSSAnalyzer(),
+    # MyBatis ${} substitution in mapper XML and @Select/@Update annotations
+    MyBatisAnalyzer(),
     # PHP: AST-based multi-hop XSS taint (2-hop, null-coalescing, function propagation)
     PhpASTAnalyzer(),
     CommandInjectionAnalyzer(),

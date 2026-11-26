@@ -103,3 +103,43 @@ def test_cors_fp_constant_allowlist_and_validated():
 
 def test_cors_fn_guard_unrelated_header():
     assert not _cors(_ctl('    String o = request.getHeader("Origin");\n    response.setHeader("X-Origin-Seen", o);'))
+
+
+# ── 3. MyBatis ${} ───────────────────────────────────────────────────────────
+from vulnscanner.analyzers.mybatis import MyBatisAnalyzer
+
+
+def _mb(path: str, src: str) -> list:
+    return MyBatisAnalyzer().analyze(path, src)
+
+
+_XML_HEAD = '<?xml version="1.0"?>\n<mapper namespace="a.UserMapper">\n'
+
+
+def test_mybatis_xml_tp():
+    f = _mb("UserMapper.xml", _XML_HEAD + '  <select id="s" resultType="U">\n    select * from users order by ${order} asc\n'
+            '  </select>\n</mapper>\n')
+    assert [(x.rule_id, x.line_number, x.severity.name) for x in f] == [("MYBATIS-001", 4, "HIGH")]
+    f = _mb("UserMapper.xml", _XML_HEAD + "  <select id=\"s\">\n select * from users where name like '%${_parameter}%'\n  </select>\n</mapper>\n")
+    assert f and f[0].severity.name == "HIGH"
+
+
+def test_mybatis_annotation_tp():
+    src = ('public interface M {\n  @Select("select * from users where username = \'${username}\'")\n'
+           '  User find(@Param("username") String username);\n}\n')
+    f = _mb("M.java", src)
+    assert [(x.rule_id, x.line_number, x.severity.name) for x in f] == [("MYBATIS-002", 2, "HIGH")]
+
+
+def test_mybatis_fp_bound_params_comments_conditions():
+    assert not _mb("U.xml", _XML_HEAD + '  <select id="s">\n select * from users where username = #{name}\n  </select>\n</mapper>\n')
+    assert not _mb("U.xml", _XML_HEAD + '  <!-- old: order by ${order} -->\n  <select id="s">\n select 1\n'
+                   '  <if test="${x} != null"> and a = #{a}</if>\n  </select>\n</mapper>\n')
+    assert not _mb("pom.xml", '<project><x>${java.version}</x></project>\n')
+    assert not _mb("M.java", 'public interface M {\n  @Select("select * from users where username = #{username}")\n  User f(String username);\n}\n')
+    assert not _mb("M.java", 'public class M {\n  // @Select("x ${y}")\n  String s = "${placeholder}";\n}\n')
+
+
+def test_mybatis_fn_other_annotation_mixed():
+    src = ('public interface M {\n  @Update({"update t set a = #{a}", "where id = ${id}"})\n  int u(String a, String id);\n}\n')
+    assert [x.rule_id for x in _mb("M.java", src)] == ["MYBATIS-002"]

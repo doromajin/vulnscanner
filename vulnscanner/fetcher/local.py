@@ -9,7 +9,7 @@ _SCAN_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".php", ".java", ".rb", ".go", ".cs", ".rs",
     ".mjs", ".cjs",
-    ".html", ".htm", ".sh", ".cshtml", ".razor",
+    ".html", ".htm", ".sh", ".cshtml", ".razor", ".xml",
     ".env", ".yml", ".yaml", ".json", ".config", ".tf",
     ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx",
 }
