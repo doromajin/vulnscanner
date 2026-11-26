@@ -48,3 +48,8 @@ def test_non_markup_or_non_buffer_names_are_ignored():
     assert not {h for h in _hits("<?php\n$id = 'x' . $_GET['n'];\n") if h[0].startswith("PHAST-XSS")}
     assert not {h for h in _hits("<?php\n$html .= 'plain text only';\n") if h[0].startswith("PHAST-XSS")}
     assert not {h for h in _hits("<?php\n$html .= 'Hello ' . $_GET['n'];\n") if h[0] == "PHAST-XSS-002"}
+
+
+def test_page_body_buffer_via_subscript_is_medium():
+    php = "<?php\n$page[ 'body' ] .= \"\n\t<script src='\" . $_POST['include'] . \"'></script>\n\";\n"
+    assert ("PHAST-XSS-002", "MEDIUM") in _hits(php)

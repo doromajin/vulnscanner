@@ -1289,6 +1289,19 @@ def _is_whole_request(node, taint) -> bool:
 
 # ── Sink checker ─────────────────────────────────────────────────────────────
 
+def _output_buffer_name(lhs) -> str | None:
+    """`$html` / `$page['body']` when the target conventionally accumulates output markup."""
+    if lhs.type == 'variable_name':
+        name = _var_name(lhs) or ''
+        return name if _OUTPUT_BUFFER_NAME_RE.match(name) else None
+    if lhs.type == 'subscript_expression' and lhs.children and lhs.children[0].type == 'variable_name':
+        key = next((c for c in lhs.children if c.type == 'encapsed_string' or c.type == 'string'), None)
+        text = key.text.decode('utf-8', errors='replace').strip("'\"") if key is not None else ''
+        if _OUTPUT_BUFFER_NAME_RE.match(text):
+            return f"{_var_name(lhs.children[0])}['{text}']"
+    return None
+
+
 def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, repo_url,
                  walker=_walk) -> list:
     findings: list[Finding] = []
@@ -1575,11 +1588,11 @@ def _check_sinks(root, tainted, tainted_funcs, tainted_props, file_path, lines, 
         # ── HTML output buffer: $html .= '<p>' . $_GET['x'] . '</p>' (echoed elsewhere) ──
         elif node.type in ('assignment_expression', 'augmented_assignment_expression'):
             ch = node.children
-            if (len(ch) >= 3 and ch[0].type == 'variable_name' and ch[1].type in ('=', '.=')
-                    and _OUTPUT_BUFFER_NAME_RE.match(_var_name(ch[0]) or '')
+            buf = _output_buffer_name(ch[0]) if len(ch) >= 3 and ch[1].type in ('=', '.=') else None
+            if (buf and len(ch) >= 3
                     and _HTML_TAG_RE.search(ch[2].text.decode('utf-8', errors='replace'))
                     and not _is_sanitizer_call(ch[2]) and taint(ch[2])):
-                buffer_assigns.append((_var_name(ch[0]), node.start_point[0] + 1))
+                buffer_assigns.append((buf, node.start_point[0] + 1))
 
         # ── include / require sinks ───────────────────────────────────────────
         elif node.type in ('include_expression', 'include_once_expression',
