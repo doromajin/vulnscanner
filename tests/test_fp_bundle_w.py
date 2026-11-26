@@ -142,3 +142,11 @@ def test_js_redirect_to_request_value_or_double_slash_stays():
     b = "exports.r = function (req, res) {\n  res.redirect('//' + req.query.id);\n}\n"
     c = "exports.r = function (req, res) {\n  res.redirect(req.query.id + '/x');\n}\n"
     assert _js_redir(a) and _js_redir(b) and _js_redir(c)
+
+
+def test_ssrf_name_match_is_not_a_substring_of_security():
+    from vulnscanner.analyzers.ast_php import PhpASTAnalyzer
+    safe = '<?php\n$security = $_GET["s"];\n$x = file_get_contents("vulnerabilities/{$security}/source.php");\n'
+    real = '<?php\n$url = $_GET["u"];\n$x = file_get_contents($url);\n'
+    assert not [f for f in PhpASTAnalyzer().analyze("a.php", safe) if "SSRF" in f.rule_id]
+    assert [f for f in PhpASTAnalyzer().analyze("a.php", real) if "SSRF" in f.rule_id]

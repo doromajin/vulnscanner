@@ -241,7 +241,10 @@ _PATH_FUNC_SINKS: frozenset[str] = frozenset({
 
 # Readers that fetch a remote URL when given one (allow_url_fopen): SSRF when the variable is a URL.
 _URL_READ_FUNCS: frozenset[str] = frozenset({'file_get_contents', 'fopen', 'readfile', 'file', 'copy'})
-_URL_NAME_RE = re.compile(r'url|uri|link|endpoint|href|remote', re.IGNORECASE)
+# A URL-ish word at a name boundary ($url, $remote_url, {$link}) or a camelCase boundary ($imageUrl);
+# a bare substring match fired on the 'uri' inside "security".
+_URL_NAME_RE = re.compile(
+    r'(?:^|[^A-Za-z])(?i:url|uri|link|endpoint|href|remote)|(?<=[a-z])(?:Url|Uri|Link|Endpoint|Href|Remote)')
 
 # SSRF — curl_setopt with CURLOPT_URL
 _CURL_URL_CONSTS: frozenset[str] = frozenset({'CURLOPT_URL', 'CURLOPT_PROXY'})
