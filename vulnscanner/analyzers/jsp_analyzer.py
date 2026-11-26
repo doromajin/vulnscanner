@@ -69,6 +69,12 @@ _OUT_CALL_RE = re.compile(
     r"\b(?:out|(?:response\s*\.\s*getWriter\s*\(\s*\)))\s*\.\s*(?:print|println|write|append)\s*\(", re.IGNORECASE
 )
 
+_STRING_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+_METHOD_DEF_RE = re.compile(r"\b(\w+)\s*\([^()]*\)\s*(?:throws[\w\s,.]+)?\{")
+_ENTITY_RE = re.compile(r"&(?:lt|amp|gt|quot|#\d+|#x[0-9a-fA-F]+)[;]")
+_NAMED_ENCODER_RE = re.compile(r"(?<![.\w])(?:h|e|esc\w*|enc\w*|html\w*|xml\w*|san\w*|clean\w*|safe\w*)\s*\(", re.IGNORECASE)
+_DB_RESULT_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|createQuery|createNativeQuery|prepareStatement)\s*\(")
+
 _HEADER = ("import java.io.*; import java.util.*; import java.sql.*; import javax.servlet.*; "
            "import javax.servlet.http.*; import javax.servlet.jsp.*; ")
 _CLASS_OPEN = ("public class JspPage_ { void _jspService(HttpServletRequest request, HttpServletResponse response, "
@@ -116,6 +122,18 @@ class JspAnalyzer(BaseAnalyzer):
         scriptlet_code = "\n".join(m.group(2) for m in blocks if m.group(1) == "")
         decl_code = "\n".join(m.group(2) for m in blocks if m.group(1) == "!")
         tainted = self._tainted_vars(scriptlet_code + "\n" + decl_code)
+        # page-local helper methods that HTML-escape (declared in <%! %>) count as encoders
+        helpers: set[str] = set()
+        defs = list(_METHOD_DEF_RE.finditer(decl_code))
+        for i, d in enumerate(defs):
+            body = decl_code[d.end(): defs[i + 1].start() if i + 1 < len(defs) else len(decl_code)]
+            if _ENTITY_RE.search(body) or _SANITIZER_RE.search(body) or _NAMED_ENCODER_RE.search(body):
+                helpers.add(d.group(1))
+        declared = {d.group(1) for d in defs} - {"if", "for", "while", "switch", "catch"}
+        declared_re = (re.compile(r"(?<![.\w])(?:" + "|".join(map(re.escape, declared)) + r")\s*\(")
+                       if declared else None)
+        helper_re = (re.compile(r"(?<![.\w])(?:" + "|".join(map(re.escape, helpers)) + r")\s*\(")
+                     if helpers else None)
 
         findings: list[Finding] = []
 
@@ -131,7 +149,13 @@ class JspAnalyzer(BaseAnalyzer):
             return text.count("\n", 0, idx) + 1
 
         def req_derived(expr: str) -> bool:
-            if _SANITIZER_RE.search(expr) or _NUMERIC_RE.search(expr.strip()):
+            if _ENTITY_RE.search(expr):
+                return False  # inline entity replacement
+            expr = _STRING_RE.sub('""', expr)
+            if declared_re and declared_re.search(expr):
+                return False  # value produced by a page-local method: not followed (first version)
+            if (_SANITIZER_RE.search(expr) or _NAMED_ENCODER_RE.search(expr) or _NUMERIC_RE.search(expr.strip())
+                    or (helper_re and helper_re.search(expr))):
                 return False
             if _REQ_JAVA_RE.search(expr):
                 return True
@@ -217,11 +241,13 @@ class JspAnalyzer(BaseAnalyzer):
     @staticmethod
     def _tainted_vars(code: str) -> set[str]:
         """Names assigned (directly or transitively) from request data and never from an encoder."""
-        assigns = [(t, n, op, rhs) for t, n, op, rhs in _ASSIGN_RE.findall(code)
+        code = _STRING_RE.sub(lambda m: m.group(0).replace(";", chr(1)), code)  # `;` inside a literal
+        assigns = [(t, n, op, rhs if _ENTITY_RE.search(rhs) else _STRING_RE.sub('""', rhs)) for t, n, op, rhs in _ASSIGN_RE.findall(code)
                    if n not in {"return", "else", "new", "if", "while", "for"}]
         clean: set[str] = set()
         for t, n, _op, rhs in assigns:
-            if (t in _PRIMITIVES) or _SANITIZER_RE.search(rhs) or _NUMERIC_RE.search(rhs.strip()):
+            if (t in _PRIMITIVES) or _ENTITY_RE.search(rhs) or _SANITIZER_RE.search(rhs) or _NAMED_ENCODER_RE.search(rhs) \
+                    or _DB_RESULT_RE.search(rhs) or _NUMERIC_RE.search(rhs.strip()):
                 clean.add(n)
         tainted: set[str] = set()
         for _ in range(4):

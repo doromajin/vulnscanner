@@ -159,3 +159,27 @@ def test_scriptlet_split_across_template_blocks():
 def test_declaration_block_and_unparsable_page_do_not_crash():
     assert isinstance(_f("<%! int counter = 0; String f(String s){ return s; } %>\n<%= f(\"a\") %>\n"), list)
     assert isinstance(_f("<% if ( ( %>\n<%= request.getParameter(\"q\") %>\n"), list)
+
+
+def test_variable_names_inside_string_literals_and_db_values_are_not_request_data():
+    src = (
+        "<%\n"
+        '  String payee = request.getParameter("payee");\n'
+        '  out.print("{\\"error\\":\\"Enter a payee.\\"}");\n'
+        '  ResultSet rs = stmt.executeQuery("select * from t where n=\'" + payee + "\'");\n'
+        '  out.print(rs.getString("name"));\n'
+        "%>\n"
+    )
+    assert not [f for f in _f(src) if f.rule_id.startswith("JSP-XSS")]
+
+
+def test_page_local_escape_helper_counts_as_encoder():
+    src = (
+        "<%!\n"
+        "  static String esc(String s) { return s.replace(\"&\", \"&amp;\").replace(\"<\", \"&lt;\"); }\n"
+        "  static String row(String k, String v) { return \"<td>\" + esc(v) + \"</td>\"; }\n"
+        "%>\n"
+        '<% String q = request.getParameter("q"); out.print(row("k", q)); %>\n'
+        "<%= esc(q) %>\n"
+    )
+    assert not [f for f in _f(src) if f.rule_id.startswith("JSP-XSS")]
