@@ -1072,7 +1072,7 @@ def _rest_xss_direct(expr, tainted) -> bool:
             if str(expr.qualifier or "") in tainted:
                 return True
             return any(_rest_xss_direct(a, tainted) for a in (expr.arguments or ()))
-        return str(expr.qualifier or "") in tainted
+        return False
     if isinstance(expr, jt.Literal):
         return False
     return _is_tainted(expr, tainted)
