@@ -4811,8 +4811,9 @@ class JavaASTAnalyzer(BaseAnalyzer):
             _has_okhttp = "okhttp3" in content or "com.squareup.okhttp" in content
             _has_hutool = "hutool" in content
             _url_methods = _SPRING_REST_URL_METHODS
+            _ssrf_seen: set = set()
             def _ssrf_check(node, q, member, args, line):
-                if not args or line in dead_lines:
+                if not args or line in dead_lines or (line, member) in _ssrf_seen:
                     return
                 hit = False
                 if member in _url_methods and (
@@ -4829,6 +4830,7 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 elif _has_fluent and q == "Request" and member in _FLUENT_URL_METHODS:
                     hit = _is_tainted(args[0], _eff_tainted(line))
                 if hit:
+                    _ssrf_seen.add((line, member))
                     _add(node, VulnType.SSRF, Severity.HIGH, "JAST-SSRF-002",
                          f"{q + '.' if q else ''}{member}() with user-controlled URL — "
                          "SSRF; validate scheme/host or use allowlist before making external requests",
