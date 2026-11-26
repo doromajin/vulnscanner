@@ -388,6 +388,21 @@ _DB: dict[VulnType, dict] = {
         ),
     },
 
+    VulnType.HEADER_INJECTION: {
+        "cwe": 113,
+        "text": (
+            "Never place request data in a response header name or value or in a "
+            "cookie value without neutralising CR and LF. Encode the value "
+            "(URLEncoder / UriUtils) or reject values containing control characters."
+        ),
+        "markdown": (
+            "## Fix: HTTP Header Injection (CWE-113)\n\n"
+            "Encode or reject CR/LF in any request-derived header or cookie value.\n\n"
+            "**References:** "
+            "[CWE-113](https://cwe.mitre.org/data/definitions/113.html)"
+        ),
+    },
+
     VulnType.EMAIL_INJECTION: {
         "cwe": 93,
         "text": (

@@ -46,6 +46,7 @@ class VulnType(str, Enum):
     FILE_UPLOAD = "Unrestricted File Upload"
     FRAMEWORK_MISCONFIGURATION = "Framework Misconfiguration"
     MASS_ASSIGNMENT = "Mass Assignment"
+    HEADER_INJECTION = "HTTP Header Injection (CRLF)"
 
 
 @dataclass

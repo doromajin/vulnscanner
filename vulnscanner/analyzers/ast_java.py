@@ -1324,6 +1324,44 @@ def _creator_line(path, node) -> int:
     return line
 
 
+# ── Round 3: header/CRLF, JSONP, JSON/XML deserialization helpers ─────────────
+_CRLF_STRIP_MEMBERS = frozenset({"replaceAll", "replace", "replaceFirst"})
+_CRLF_STRIP_PAT_RE = re.compile(r'\\[rnsRpWw]|\[\^|\\\\u000[aAdD]|\\u000[aAdD]')
+_CRLF_SAFE_MEMBERS = frozenset({"escapeJava", "escapeEcmaScript", "deleteWhitespace",
+                                "encodeForHTML", "encodeURIComponent", "encodeUriComponent"})
+_JSONP_NAME_RE = re.compile(r"(?i)callback|jsonp|^cb$|^func(tion)?(name)?$|^fn$")
+_FASTJSON_QUALIFIERS = frozenset({"JSON", "JSONObject", "JSONArray"})
+_XSTREAM_GUARDS = ("allowTypes", "addPermission", "setupDefaultSecurity", "allowTypeHierarchy",
+                   "allowTypesByWildcard", "allowTypesByRegExp", "denyTypes", "SecurityPermission")
+_JSON_TYPE_INFO_RE = re.compile(r'@\s*(?:\w+\.)*JsonTypeInfo\s*\(\s*use\s*=\s*(?:\w+\.)*(?:Id\.)?(?:MINIMAL_)?CLASS\b')
+
+
+def _crlf_neutralised(node) -> bool:
+    """True if the expression strips/encodes CR/LF (regex strip, StringUtils.remove*, escapeJava ...)."""
+    cur = [node]
+    seen = 0
+    while cur and seen < 12:
+        n = cur.pop()
+        seen += 1
+        if isinstance(n, jt.MethodInvocation):
+            m = n.member
+            if m in _CRLF_SAFE_MEMBERS or m.startswith("remove") or m == "encode":
+                return True
+            if m in _CRLF_STRIP_MEMBERS:
+                for a in (n.arguments or [])[:1]:
+                    if isinstance(a, jt.Literal) and _CRLF_STRIP_PAT_RE.search(str(a.value)):
+                        return True
+            for s in (n.selectors or []):
+                cur.append(s)
+    return False
+
+
+def _flatten_plus(node) -> list:
+    if isinstance(node, jt.BinaryOperation) and node.operator == "+":
+        return _flatten_plus(node.operandl) + _flatten_plus(node.operandr)
+    return [node]
+
+
 def _is_android_source(node) -> bool:
     """True if node is an Android AOSP taint source (Intent, Bundle, Cursor, external storage)."""
     if not isinstance(node, jt.MethodInvocation):
@@ -4038,6 +4076,159 @@ class JavaASTAnalyzer(BaseAnalyzer):
                         _add(node, VulnType.OPEN_REDIRECT, Severity.HIGH, "JAST-REDIRECT-001",
                              "response.sendRedirect() with user-controlled URL — open redirect; "
                              "validate against a whitelist of allowed destinations")
+        except Exception:
+            pass
+
+        # ── Round 3: header/CRLF injection, JSONP callback, unsafe JSON/XML deser ──
+        # One pass over method invocations / creators, gated on cheap content checks.
+        try:
+            _lc = content.lower()
+            _g_hdr = "setHeader" in content or "addHeader" in content or "Cookie(" in content
+            _g_jsonp = "jsonp" in _lc
+            _g_fj = ("com.alibaba.fastjson" in content and "fastjson2" not in content
+                     and "SafeMode" not in content)
+            _g_jk = "DefaultTyping" in content
+            _g_xs = "XStream" in content and not any(g in content for g in _XSTREAM_GUARDS)
+            _g_cat = '"(' in content
+            _r3_safe_vars: set = set()
+            if _g_hdr:
+                for _, _lvd in tree.filter(jt.VariableDeclarator):
+                    if _lvd.initializer is not None and _crlf_neutralised(_lvd.initializer):
+                        _r3_safe_vars.add(_lvd.name)
+
+            def _r3_taint(arg, et) -> bool:
+                if isinstance(arg, jt.MemberReference) and not arg.qualifier and arg.member in _r3_safe_vars:
+                    return False
+                if _crlf_neutralised(arg):
+                    return False
+                return _is_tainted(arg, et)
+
+            _r3_seen: set = set()
+
+            def _r3_add(node, vt, sev, rid, desc, line):
+                if (rid, line) in _r3_seen:
+                    return
+                _r3_seen.add((rid, line))
+                _add(node, vt, sev, rid, desc, line_override=line)
+
+            def _r3_invocation(node, line, et):
+                m = node.member
+                q = str(node.qualifier or "")
+                args = node.arguments or []
+                if _g_hdr and m in ("setHeader", "addHeader") and len(args) >= 2 and (
+                        q in _RESPONSE_OBJECTS or q.lower().endswith("response")):
+                    if _r3_taint(args[1], et) or _r3_taint(args[0], et):
+                        _r3_add(node, VulnType.HEADER_INJECTION, Severity.MEDIUM, "JAST-HEADER-001",
+                                f"{q}.{m}() with a request-controlled header name/value — HTTP header "
+                                "(CRLF) injection / response splitting (CWE-113); encode the value or "
+                                "reject CR/LF", line)
+                if _g_jsonp and args:
+                    if m == "setJsonpFunction" or "jsonp" in m.lower():
+                        if _is_tainted(args[0], et):
+                            _r3_add(node, VulnType.XSS, Severity.HIGH, "JAST-JSONP-001",
+                                    f"{m}() uses a request-supplied callback as the JSONP function name — "
+                                    "script injection (CWE-79); allowlist the callback to [A-Za-z0-9_.]+",
+                                    line)
+                if _g_fj and m in ("parseObject", "parse", "parseArray") and q in _FASTJSON_QUALIFIERS \
+                        and args and _is_tainted(args[0], et):
+                    _r3_add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH, "JAST-DESER-003",
+                            f"fastjson {q}.{m}() on request data — unsafe JSON deserialization "
+                            "(autoType gadgets, CWE-502); upgrade fastjson / enable safeMode or use Jackson",
+                            line)
+                if _g_jk:
+                    if m == "enableDefaultTyping":
+                        _r3_add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH, "JAST-DESER-004",
+                                "ObjectMapper.enableDefaultTyping() lets JSON choose the Java class — "
+                                "polymorphic deserialization (CWE-502); use a restrictive "
+                                "PolymorphicTypeValidator", line)
+                    elif m == "activateDefaultTyping" and "LaissezFaireSubTypeValidator" in content:
+                        _r3_add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH, "JAST-DESER-004",
+                                "activateDefaultTyping() with LaissezFaireSubTypeValidator permits any "
+                                "class — polymorphic deserialization (CWE-502); use "
+                                "BasicPolymorphicTypeValidator with an allowlist", line)
+                if _g_xs and m == "fromXML" and args and _is_tainted(args[0], et):
+                    _r3_add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH, "JAST-DESER-006",
+                            "XStream.fromXML() on request data without a security framework "
+                            "(allowTypes/permissions) — unsafe deserialization (CWE-502)", line)
+
+            if _g_hdr or _g_jsonp or _g_fj or _g_jk or _g_xs:
+                for _, node in tree.filter(jt.MethodInvocation):
+                    _ln = _node_line(node)
+                    if _ln and _ln in dead_lines:
+                        continue
+                    if _ln:
+                        _r3_invocation(node, _ln, _eff_tainted(_ln))
+                for _r3p, node in tree.filter(jt.ClassCreator):
+                    _cl = _creator_line(_r3p, node)
+                    if not _cl or _cl in dead_lines:
+                        continue
+                    _ct = _type_name(node.type)
+                    _cargs = node.arguments or []
+                    _et = _eff_tainted(_cl)
+                    if _g_hdr and _ct == "Cookie" and len(_cargs) >= 2 and (
+                            _r3_taint(_cargs[1], _et) or _r3_taint(_cargs[0], _et)):
+                        _r3_add(node, VulnType.HEADER_INJECTION, Severity.MEDIUM, "JAST-HEADER-001",
+                                "new Cookie() with a request-controlled name/value — header (CRLF) "
+                                "injection in Set-Cookie (CWE-113); encode the value", _cl)
+                    if _g_jsonp and _ct == "JSONPObject" and _cargs and _is_tainted(_cargs[0], _et):
+                        _r3_add(node, VulnType.XSS, Severity.HIGH, "JAST-JSONP-001",
+                                "new JSONPObject(callback) with a request-supplied function name — "
+                                "script injection (CWE-79); allowlist the callback", _cl)
+                    # `new XStream().fromXML(tainted)` selector form
+                    if _g_xs and _ct == "XStream":
+                        for _sel in (node.selectors or []):
+                            if isinstance(_sel, jt.MethodInvocation) and _sel.member == "fromXML":
+                                _sa = _sel.arguments or []
+                                if _sa and _is_tainted(_sa[0], _et):
+                                    _r3_add(node, VulnType.INSECURE_DESERIALIZATION, Severity.HIGH,
+                                            "JAST-DESER-006",
+                                            "XStream.fromXML() on request data without a security "
+                                            "framework — unsafe deserialization (CWE-502)", _cl)
+            # callback + "(" + json + ")" : tainted value in function-name position
+            if _g_cat and ("callback" in _lc or "cb" in _lc or "func" in _lc or "fn" in _lc):
+                for _bp, node in tree.filter(jt.BinaryOperation):
+                    if node.operator != "+":
+                        continue
+                    _ln = _creator_line(_bp, node)
+                    if not _ln or _ln in dead_lines:
+                        continue
+                    _ops = _flatten_plus(node)
+                    if len(_ops) < 3 or not isinstance(_ops[1], jt.Literal):
+                        continue
+                    _lit = str(_ops[1].value).strip('"')
+                    _o0 = _ops[0]
+                    _o0n = ""
+                    if isinstance(_o0, jt.MemberReference):
+                        _o0n = _o0.member
+                    elif isinstance(_o0, jt.MethodInvocation):
+                        _o0a = (_o0.arguments or [None])[0]
+                        _o0n = str(_o0a.value) if isinstance(_o0a, jt.Literal) else ""
+                    if _lit.startswith("(") and _JSONP_NAME_RE.search(_o0n) \
+                            and _is_tainted(_o0, _eff_tainted(_ln)):
+                        _r3_add(node, VulnType.XSS, Severity.HIGH, "JAST-JSONP-001",
+                                "request value concatenated as a JavaScript function name "
+                                "(callback + \"(\" ...) — JSONP script injection (CWE-79); "
+                                "allowlist the callback to [A-Za-z0-9_.]+", _ln)
+            if _g_jsonp and "AbstractJsonpResponseBodyAdvice" in content:
+                _mm = re.search(r'extends\s+AbstractJsonpResponseBodyAdvice', content)
+                if _mm:
+                    _al = content.count("\n", 0, _mm.start()) + 1
+                    findings.append(Finding(
+                        vuln_type=VulnType.XSS, severity=Severity.MEDIUM, file_path=file_path,
+                        line_number=_al, line_content=lines[_al - 1].strip() if 0 < _al <= len(lines) else "",
+                        description="AbstractJsonpResponseBodyAdvice enables JSONP for every @ResponseBody "
+                                    "endpoint (removed in Spring 6; CWE-79/CWE-346) — verify the callback "
+                                    "parameters are needed and responses carry no sensitive data",
+                        rule_id="JAST-JSONP-002", repo_url=repo_url,
+                        snippet=self._extract_snippet(lines, _al)))
+            if "JsonTypeInfo" in content:
+                for _mm in _JSON_TYPE_INFO_RE.finditer(content):
+                    _al = content.count("\n", 0, _mm.start()) + 1
+                    if _al in dead_lines:
+                        continue
+                    _r3_add(None, VulnType.INSECURE_DESERIALIZATION, Severity.MEDIUM, "JAST-DESER-005",
+                            "@JsonTypeInfo(use = Id.CLASS) lets the JSON payload name the Java class — "
+                            "polymorphic deserialization (CWE-502); use Id.NAME with @JsonSubTypes", _al)
         except Exception:
             pass
 

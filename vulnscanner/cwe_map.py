@@ -47,6 +47,8 @@ _PREFIX: dict[str, int] = {
     "JWT":      347,   # CWE-347:  Improper Verification of Cryptographic Signature
     "CORS":     346,   # CWE-346:  Origin Validation Error
     "MASS":     915,   # CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes
+    "HEADER":   113,   # CWE-113:  HTTP Response Splitting / header injection
+    "JSONP":    79,    # CWE-79:   JSONP callback reflected as script
     "UPLOAD":   434,   # CWE-434:  Unrestricted Upload of File with Dangerous Type
 }
 
