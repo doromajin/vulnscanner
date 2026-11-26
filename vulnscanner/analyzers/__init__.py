@@ -38,6 +38,7 @@ from vulnscanner.analyzers.xss import XSSAnalyzer
 from vulnscanner.analyzers.blade_xss import BladeXSSAnalyzer
 from vulnscanner.analyzers.ejs_xss import EjsXSSAnalyzer
 from vulnscanner.analyzers.cshtml_xss import CshtmlXSSAnalyzer
+from vulnscanner.analyzers.jsp_analyzer import JspAnalyzer
 from vulnscanner.analyzers.mybatis import MyBatisAnalyzer
 
 ALL_ANALYZERS: list[BaseAnalyzer] = [
@@ -52,6 +53,8 @@ ALL_ANALYZERS: list[BaseAnalyzer] = [
     EjsXSSAnalyzer(),
     # ASP.NET Razor: Html.Raw / HtmlString output
     CshtmlXSSAnalyzer(),
+    # JSP/JSPX: scriptlets via the Java AST analyzer + JSP XSS / include rules
+    JspAnalyzer(),
     # MyBatis ${} substitution in mapper XML and @Select/@Update annotations
     MyBatisAnalyzer(),
     # PHP: AST-based multi-hop XSS taint (2-hop, null-coalescing, function propagation)

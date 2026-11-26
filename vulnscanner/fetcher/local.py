@@ -10,6 +10,7 @@ _SCAN_EXTENSIONS = {
     ".php", ".java", ".rb", ".go", ".cs", ".rs",
     ".mjs", ".cjs",
     ".html", ".htm", ".ejs", ".sh", ".cshtml", ".razor", ".xml",
+    ".jsp", ".jspx", ".jspf", ".tag",
     ".env", ".yml", ".yaml", ".json", ".config", ".tf",
     ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx",
 }

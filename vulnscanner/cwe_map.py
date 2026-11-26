@@ -14,6 +14,10 @@ _SPECIFIC: dict[str, int] = {
     "WCRYPTO-016": 338,
     "WCRYPTO-017": 327,
     "WCRYPTO-018": 328,
+    "JSP-XSS-001": 79,
+    "JSP-XSS-002": 79,
+    "JSP-XSS-003": 79,
+    "JSP-INCLUDE-001": 98,
     "SEC-005": 312,       # Cleartext Storage of Sensitive Information (private keys)
 }
 
