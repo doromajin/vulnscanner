@@ -820,11 +820,11 @@ def _dal_param_sql(first_arg) -> bool:
     return _sql_string_built_from_param(expr, params)
 
 
-def _sql_extra_method_plausible(prop: str, obj_node, has_sqlite_lib: bool) -> bool:
+def _sql_extra_method_plausible(prop: str, obj_node, has_sqlite_lib: bool, is_ts: bool = False) -> bool:
     """Method names beyond query/execute/run that are SQL only on a specific driver: sqlite3 `get`/`each`/`exec`,
     better-sqlite3 `exec`, Prisma `$queryRawUnsafe`/`$executeRawUnsafe`."""
     if prop in ("$queryRawUnsafe", "$executeRawUnsafe"):
-        return True
+        return not is_ts  # TypeScript files: the TS analyzer already reports Prisma raw-unsafe calls
     text = obj_node.text.decode("utf-8", errors="replace")
     if prop == "exec":
         return (has_sqlite_lib or receiver_looks_like_db(text)) and not _re.search(r"child_process|\bcp\b|\bshell\b", text)
@@ -1089,6 +1089,7 @@ def _check_sinks(
     seen: set[tuple] = set()
     has_db_lib = file_loads_db_library(lines)
     uses_sequelize = any(_SEQUELIZE_IMPORT_RE.search(ln) for ln in lines)
+    is_ts = file_path.endswith((".ts", ".tsx", ".mts", ".cts"))
     has_sqlite_lib = any(_SQLITE_IMPORT_RE.search(ln) for ln in lines)
     has_mathjs = any(_MATHJS_IMPORT_RE.search(ln) for ln in lines)
     has_vm = any(_VM_IMPORT_RE.search(ln) for ln in lines)
@@ -1232,7 +1233,7 @@ def _check_sinks(
 
             # SQL injection
             if ((prop in _SQL_METHOD_SINKS and _sql_receiver_plausible(obj_node, has_db_lib))
-                    or (prop in _SQL_EXTRA_METHOD_SINKS and _sql_extra_method_plausible(prop, obj_node, has_sqlite_lib))):
+                    or (prop in _SQL_EXTRA_METHOD_SINKS and _sql_extra_method_plausible(prop, obj_node, has_sqlite_lib, is_ts))):
                 named = list(args_node.named_children)
                 t_args = tainted_args(args_node)
                 has_tainted = bool(t_args)
