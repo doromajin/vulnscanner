@@ -143,3 +143,39 @@ def test_mybatis_fp_bound_params_comments_conditions():
 def test_mybatis_fn_other_annotation_mixed():
     src = ('public interface M {\n  @Update({"update t set a = #{a}", "where id = ${id}"})\n  int u(String a, String id);\n}\n')
     assert [x.rule_id for x in _mb("M.java", src)] == ["MYBATIS-002"]
+
+
+# ── 4. Reflected XSS from @RestController / @ResponseBody String handlers ────
+_XH = ("import org.springframework.web.bind.annotation.*;\nimport org.springframework.web.util.HtmlUtils;\n"
+       "import org.jsoup.Jsoup;\nimport java.util.*;\n")
+
+
+def _x(src: str) -> set:
+    return {f.rule_id for f in JavaASTAnalyzer().analyze("A.java", _XH + src)}
+
+
+def _rest(body: str, ann: str = "@GetMapping(\"/x\")", cls: str = "@RestController") -> str:
+    return f"{cls}\npublic class C {{\n  {ann}\n{body}\n}}\n"
+
+
+def test_rest_xss_tp():
+    assert "JAST-XSS-REST" in _x(_rest('  public String h(@RequestParam String name) {\n    return "<p>" + name + "</p>";\n  }'))
+    assert "JAST-XSS-REST" in _x(_rest('  public String h(String xss) {\n    return xss;\n  }'))
+    assert "JAST-XSS-REST" in _x(_rest('  @ResponseBody public String h(@RequestParam String n) {\n    String s = n;\n    return s;\n  }',
+                                        cls="@Controller"))
+
+
+def test_rest_xss_fp_dto_json_sanitized_literal():
+    assert "JAST-XSS-REST" not in _x(_rest('  public Map<String,String> h(@RequestParam String n) {\n    Map<String,String> m = new HashMap<>();\n    m.put("a", n);\n    return m;\n  }'))
+    assert "JAST-XSS-REST" not in _x(_rest('  public String h(@RequestParam String n) {\n    return HtmlUtils.htmlEscape(n);\n  }'))
+    assert "JAST-XSS-REST" not in _x(_rest('  public String h(@RequestParam String n) {\n    return Jsoup.clean(n, org.jsoup.safety.Safelist.basic());\n  }'))
+    assert "JAST-XSS-REST" not in _x(_rest('  public String h(@RequestParam String n) {\n    return "ok";\n  }'))
+    assert "JAST-XSS-REST" not in _x(_rest('  public String h(@RequestParam String n) {\n    return com.alibaba.fastjson.JSON.toJSONString(n);\n  }'))
+    # JSON content type declared
+    assert "JAST-XSS-REST" not in _x(_rest('  public String h(@RequestParam String n) {\n    return n;\n  }',
+                                           ann='@GetMapping(value = "/x", produces = "application/json")'))
+
+
+def test_rest_xss_fn_plain_controller_view_name_not_flagged():
+    # @Controller without @ResponseBody returns a view name, not a body
+    assert "JAST-XSS-REST" not in _x(_rest('  public String h(@RequestParam String n) {\n    return n;\n  }', cls="@Controller"))

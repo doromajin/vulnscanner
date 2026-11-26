@@ -1039,6 +1039,29 @@ _HTTP_CLIENT_URL_CTORS = frozenset({
     "URI",
 })
 
+_SPRING_MAPPING_ANNS = frozenset({
+    "RequestMapping", "GetMapping", "PostMapping", "PutMapping", "DeleteMapping", "PatchMapping",
+})
+_JSON_PRODUCERS = frozenset({
+    "toJSONString", "toJSON", "writeValueAsString", "toJson", "serialize", "toString_json",
+})
+
+
+
+def _rest_xss_json_or_sanitized(expr) -> bool:
+    """The returned expression is built by a JSON serializer or passes through an HTML sanitizer."""
+    for _, n in expr.filter(jt.MethodInvocation):
+        if n.member in _JSON_PRODUCERS or n.member in _XSS_SANITIZER_METHODS:
+            return True
+    return False
+
+
+def _rest_xss_has_markup(expr) -> bool:
+    for _, n in expr.filter(jt.Literal):
+        if isinstance(n.value, str) and "<" in n.value:
+            return True
+    return False
+
 # ── XSS writer sinks and sanitizers ───────────────────────────────────────────
 
 _RESPONSE_OBJECTS = frozenset({
@@ -1054,6 +1077,7 @@ _XSS_SANITIZER_METHODS = frozenset({
     "htmlEscape", "escapeHtml", "escapeHtml4", "escapeHtml3",
     "encodeForHTML", "encodeForHTMLAttribute",
     "htmlEncode", "escapeXml", "escapeXml10", "escapeXml11",
+    "forHtml", "forHtmlContent", "forHtmlAttribute", "clean",
     "encode",  # URLEncoder.encode() — sanitizes for URL/redirect (but tracked in tainted_raw)
 })
 
@@ -4849,6 +4873,41 @@ class JavaASTAnalyzer(BaseAnalyzer):
                 for sel in (node.selectors or ()):
                     if isinstance(sel, jt.MethodInvocation):
                         _ssrf_check(sel, "", sel.member, sel.arguments, _l)
+        except Exception:
+            pass
+
+        # Reflected XSS: @RestController / @ResponseBody String handler returning request data (text/html body).
+        try:
+            for _, cls in tree.filter(jt.ClassDeclaration):
+                _cls_ann = {a.name for a in (cls.annotations or ())}
+                _cls_rest = "RestController" in _cls_ann
+                if not (_cls_rest or "Controller" in _cls_ann):
+                    continue
+                for meth in (cls.methods or ()):
+                    _man = {a.name: a for a in (meth.annotations or ())}
+                    if not (_man.keys() & _SPRING_MAPPING_ANNS):
+                        continue
+                    if not (_cls_rest or "ResponseBody" in _man):
+                        continue
+                    if _type_name(meth.return_type) != "String" or getattr(meth.return_type, "dimensions", None):
+                        continue
+                    if any("json" in str(a.element).lower() for a in _man.values()
+                           if a.name in _SPRING_MAPPING_ANNS):
+                        continue
+                    for _, ret in meth.filter(jt.ReturnStatement):
+                        expr = ret.expression
+                        if expr is None or isinstance(expr, jt.Literal):
+                            continue
+                        _rl = _node_line(ret) or _node_line(meth)
+                        if _rl in dead_lines or not _is_tainted(expr, _eff_tainted(_rl)):
+                            continue
+                        if _rest_xss_json_or_sanitized(expr):
+                            continue
+                        _html = _rest_xss_has_markup(expr)
+                        _add(ret, VulnType.XSS, Severity.HIGH if _html else Severity.MEDIUM, "JAST-XSS-REST",
+                             "Handler returns request data as the response body (HTML content type) — reflected XSS; "
+                             "HTML-encode it (HtmlUtils.htmlEscape) or return a JSON object",
+                             line_override=_rl)
         except Exception:
             pass
 
