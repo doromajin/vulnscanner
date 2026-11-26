@@ -5193,9 +5193,15 @@ class JavaASTAnalyzer(BaseAnalyzer):
             if _em is not None:
                 ctx.append(_em[2].name)
             if _vm:
-                _scope = lines[_em[0] - 1:_em[1]] if _em is not None else lines
                 _vre = re.compile(r"\b" + re.escape(_vm.group(1)) + r"\b")
-                ctx.extend(_l for _l in _scope if _vre.search(_l))
+                _lo, _hi = (_em[0], _em[1]) if _em is not None else (1, len(lines))
+                for _ui in range(_lo, _hi + 1):
+                    if _vre.search(lines[_ui - 1]):
+                        ctx.append(lines[_ui - 1])
+                        _um = _enclosing_method(_ui)
+                        if _um is not None:
+                            ctx.append(_um[2].name)
+            ctx.append(Path(file_path).stem)  # class / file name (PasswordResetService ...)
             return Severity.HIGH if _RAND_SENSITIVE_RE.search("\n".join(ctx)) else Severity.LOW
 
         try:
