@@ -59,6 +59,7 @@ from vulnscanner.analyzers.file_context import (
     INCLUDE_TEST_FILES,
     INCLUDE_VENDOR_FILES,
     classify_file_context,
+    is_minified_file,
     is_minified_line,
 )
 from vulnscanner.fetcher.github import GitHubFetcher
@@ -537,10 +538,11 @@ class VulnScanner:
         #     Decided per line so hand-written code in the same bundle stays reportable; MALWARE
         #     findings are never dropped.
         if not INCLUDE_VENDOR_FILES:
+            file_minified = is_minified_file(file_path, lines)
             minified = [
                 f for f in raw
                 if f.vuln_type != VulnType.MALWARE and 0 < f.line_number <= len(lines)
-                and is_minified_line(file_path, lines[f.line_number - 1])
+                and (file_minified or is_minified_line(file_path, lines[f.line_number - 1]))
             ]
             if minified:
                 partial.suppression_breakdown["vendor_path"] = (
