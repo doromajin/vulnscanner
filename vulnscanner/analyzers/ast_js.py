@@ -628,6 +628,7 @@ def _build_taint_state(root) -> _JSTaintState:
 # ── Sink definitions ──────────────────────────────────────────────────────────
 
 _SQL_METHOD_SINKS = frozenset({"query", "execute", "raw", "all", "run", "prepare"})
+_SQL_EXTRA_METHOD_SINKS = frozenset({"exec", "get", "each", "$queryRawUnsafe", "$executeRawUnsafe"})
 _CMD_GLOBAL_SINKS = frozenset({
     "exec", "execSync", "execFile", "execFileSync", "spawnSync", "spawn",
 })
@@ -707,6 +708,129 @@ def _is_regex_receiver(obj_node) -> bool:
     """`/x/.exec(s)`, `new RegExp(p).exec(s)`, `regex.exec(s)`: RegExp.prototype.exec matches a
     string, it does not run a command."""
     return bool(_REGEX_RECEIVER_RE.match(obj_node.text.decode(errors="replace").strip()))
+
+
+_SQLITE_IMPORT_RE = _re.compile(r"""(?:require\(\s*|from\s+|import\s+)['"](?:sqlite3?|better-sqlite3)['"]""")
+_MATHJS_IMPORT_RE = _re.compile(r"""(?:require\(\s*|from\s+|import\s+)['"]mathjs(?:/[^'"]*)?['"]""")
+_VM_IMPORT_RE = _re.compile(r"""(?:require\(\s*|from\s+|import\s+)['"](?:node:)?vm2?['"]""")
+_SAFE_EVAL_IMPORT_RE = _re.compile(r"""(?:require\(\s*|from\s+|import\s+)['"](?:safe-eval|static-eval)['"]""")
+_LIBXML_IMPORT_RE = _re.compile(r"""(?:require\(\s*|from\s+|import\s+)['"]libxmljs2?['"]""")
+_NOENT_TRUE_RE = _re.compile(r"""\bnoent['"]?\s*:\s*true\b""")
+_SQL_WORD_RE = _re.compile(r"\b(?:select|insert|update|delete|where|from|values|set|order\s+by)\b", _re.IGNORECASE)
+_VM_RUN_METHODS = frozenset({"runInNewContext", "runInThisContext", "runInContext", "compileFunction"})
+_SAFE_EVAL_NAMES = frozenset({"safeEval", "staticEval", "evaluate"})
+_JS_FUNCTION_TYPES = frozenset({
+    "function_declaration", "function_expression", "function", "arrow_function",
+    "method_definition", "generator_function_declaration", "generator_function",
+})
+
+
+def _enclosing_function(node):
+    cur = node.parent
+    while cur is not None and cur.type not in _JS_FUNCTION_TYPES:
+        cur = cur.parent
+    return cur
+
+
+def _function_param_names(fn) -> set[str]:
+    params = fn.child_by_field_name("parameters") or fn.child_by_field_name("parameter")
+    if params is None:
+        return set()
+    if params.type == "identifier":
+        return {params.text.decode("utf-8", errors="replace")}
+    out: set[str] = set()
+    for p in params.named_children:
+        cur = p
+        if cur.type in ("required_parameter", "optional_parameter"):
+            cur = cur.child_by_field_name("pattern") or (cur.named_children[0] if cur.named_children else cur)
+        if cur.type == "assignment_pattern":
+            cur = cur.child_by_field_name("left") or cur
+        if cur.type == "identifier":
+            out.add(cur.text.decode("utf-8", errors="replace"))
+    return out
+
+
+def _local_declared_value(fn, name: str):
+    """The initialiser of `const/let/var <name> = <value>` declared inside function *fn* (or None)."""
+    for n in _walk(fn):
+        if n.type == "variable_declarator":
+            nm = n.child_by_field_name("name")
+            if nm is not None and nm.type == "identifier" and nm.text.decode("utf-8", errors="replace") == name:
+                return n.child_by_field_name("value")
+    return None
+
+
+def _operand_uses_param(node, params: set[str]) -> bool:
+    node = _unwrap(node)
+    if node.type == "identifier":
+        return node.text.decode("utf-8", errors="replace") in params
+    if node.type == "member_expression":
+        chain = _member_chain(node)
+        return bool(chain) and chain[0] in params
+    return False
+
+
+def _sql_string_built_from_param(expr, params: set[str]) -> bool:
+    """`"SELECT ... '" + username + "'"` or a template literal with `${param}`, where the literal text reads
+    as SQL and a bare function parameter (or a property of one) is spliced into it."""
+    expr = _unwrap(expr)
+    literal_text: list[str] = []
+    spliced: list = []
+    if expr.type == "template_string":
+        for c in expr.named_children:
+            if c.type == "template_substitution":
+                spliced.extend(c.named_children)
+            else:
+                literal_text.append(c.text.decode("utf-8", errors="replace"))
+    elif expr.type == "binary_expression":
+        stack = [expr]
+        while stack:
+            n = _unwrap(stack.pop())
+            if n.type == "binary_expression":
+                op = n.child_by_field_name("operator")
+                if op is None or op.text != b"+":
+                    return False
+                stack.append(n.child_by_field_name("left"))
+                stack.append(n.child_by_field_name("right"))
+            elif n.type == "string":
+                literal_text.append(n.text.decode("utf-8", errors="replace"))
+            elif n.type == "template_string":
+                literal_text.append(n.text.decode("utf-8", errors="replace"))
+            else:
+                spliced.append(n)
+    else:
+        return False
+    if not _SQL_WORD_RE.search(" ".join(literal_text)):
+        return False
+    return any(_operand_uses_param(x, params) for x in spliced)
+
+
+def _dal_param_sql(first_arg) -> bool:
+    fn = _enclosing_function(first_arg)
+    if fn is None:
+        return False
+    params = _function_param_names(fn)
+    if not params:
+        return False
+    expr = _unwrap(first_arg)
+    if expr.type == "identifier":
+        expr = _local_declared_value(fn, expr.text.decode("utf-8", errors="replace"))
+        if expr is None:
+            return False
+    return _sql_string_built_from_param(expr, params)
+
+
+def _sql_extra_method_plausible(prop: str, obj_node, has_sqlite_lib: bool) -> bool:
+    """Method names beyond query/execute/run that are SQL only on a specific driver: sqlite3 `get`/`each`/`exec`,
+    better-sqlite3 `exec`, Prisma `$queryRawUnsafe`/`$executeRawUnsafe`."""
+    if prop in ("$queryRawUnsafe", "$executeRawUnsafe"):
+        return True
+    text = obj_node.text.decode("utf-8", errors="replace")
+    if prop == "exec":
+        return (has_sqlite_lib or receiver_looks_like_db(text)) and not _re.search(r"child_process|\bcp\b|\bshell\b", text)
+    if prop in ("get", "each"):
+        return has_sqlite_lib and receiver_looks_like_db(text)
+    return False
 
 
 _SEQUELIZE_IMPORT_RE = _re.compile(r"""(?:require\(\s*|from\s+|import\s+)['"]sequelize(?:-typescript)?['"]|\bsequelize\.define\(""")
@@ -965,6 +1089,11 @@ def _check_sinks(
     seen: set[tuple] = set()
     has_db_lib = file_loads_db_library(lines)
     uses_sequelize = any(_SEQUELIZE_IMPORT_RE.search(ln) for ln in lines)
+    has_sqlite_lib = any(_SQLITE_IMPORT_RE.search(ln) for ln in lines)
+    has_mathjs = any(_MATHJS_IMPORT_RE.search(ln) for ln in lines)
+    has_vm = any(_VM_IMPORT_RE.search(ln) for ln in lines)
+    has_safe_eval = any(_SAFE_EVAL_IMPORT_RE.search(ln) for ln in lines)
+    has_libxml = any(_LIBXML_IMPORT_RE.search(ln) for ln in lines)
 
     def tainted_args(args_node) -> list:
         return [c for c in args_node.named_children if state.is_tainted_node(c)]
@@ -1015,6 +1144,14 @@ def _check_sinks(
                       VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                       "JSAST-EVAL-001",
                       "User-controlled data flows into new Function() — arbitrary code execution")
+            elif (
+                has_vm and ctor is not None and args is not None and tainted_args(args)
+                and (_member_chain(ctor) == ["vm", "Script"] or (ctor.type == "identifier" and ctor.text == b"Script"))
+            ):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.COMMAND_INJECTION, Severity.CRITICAL,
+                      "JSAST-EVAL-001",
+                      "User-controlled data flows into new vm.Script() — arbitrary code execution")
             continue
 
         if node.type != "call_expression":
@@ -1034,6 +1171,12 @@ def _check_sinks(
                       VulnType.COMMAND_INJECTION, Severity.CRITICAL,
                       "JSAST-EVAL-001",
                       "User-controlled data flows into eval() — arbitrary code execution")
+
+            elif fname in _SAFE_EVAL_NAMES and (has_safe_eval or (has_mathjs and fname == "evaluate")) and tainted_args(args_node):
+                _emit(findings, seen, file_path, line, lines, repo_url,
+                      VulnType.COMMAND_INJECTION, Severity.CRITICAL,
+                      "JSAST-EVAL-001",
+                      f"User-controlled data flows into {fname}() — arbitrary expression evaluation")
 
             elif fname in _CMD_GLOBAL_SINKS and tainted_args(args_node):
                 _emit(findings, seen, file_path, line, lines, repo_url,
@@ -1066,8 +1209,30 @@ def _check_sinks(
             obj_chain = _member_chain(obj_node)
             obj_root = obj_chain[0] if obj_chain else ""
 
+            # Code injection: mathjs.eval / math.evaluate, vm.runIn*Context, safe-eval style evaluators
+            if ((has_mathjs and prop in ("eval", "evaluate"))
+                    or (has_vm and obj_root == "vm" and prop in _VM_RUN_METHODS)):
+                if tainted_args(args_node):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.COMMAND_INJECTION, Severity.CRITICAL,
+                          "JSAST-EVAL-001",
+                          f"User-controlled data flows into {obj_root}.{prop}() — arbitrary code execution")
+                continue
+
+            # XXE: libxmljs.parseXml / parseXmlString with entity substitution (noent: true)
+            if has_libxml and prop in ("parseXml", "parseXmlString", "parseXmlAsync"):
+                _xargs = list(args_node.named_children)
+                if (len(_xargs) >= 2 and _NOENT_TRUE_RE.search(_xargs[1].text.decode("utf-8", errors="replace"))
+                        and state.is_tainted_node(_xargs[0])):
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.XXE, Severity.HIGH,
+                          "JSAST-XXE-001",
+                          f"User-controlled XML parsed by libxmljs .{prop}() with noent: true — XXE (external entity expansion)")
+                continue
+
             # SQL injection
-            if prop in _SQL_METHOD_SINKS and _sql_receiver_plausible(obj_node, has_db_lib):
+            if ((prop in _SQL_METHOD_SINKS and _sql_receiver_plausible(obj_node, has_db_lib))
+                    or (prop in _SQL_EXTRA_METHOD_SINKS and _sql_extra_method_plausible(prop, obj_node, has_sqlite_lib))):
                 named = list(args_node.named_children)
                 t_args = tainted_args(args_node)
                 has_tainted = bool(t_args)
@@ -1087,6 +1252,15 @@ def _check_sinks(
                               VulnType.SQL_INJECTION, Severity.HIGH,
                               "JSAST-SQL-001",
                               f"User-controlled data flows into .{prop}() — SQL injection risk")
+                elif (named and not (len(named) >= 2 and named[1].type == "array")
+                      and prop in _SQL_METHOD_SINKS and _dal_param_sql(named[0])):
+                    # data-access helper: the SQL text is built from the helper's own parameter, which callers
+                    # fill from request data (cross-file); weaker evidence than a direct request source.
+                    _emit(findings, seen, file_path, line, lines, repo_url,
+                          VulnType.SQL_INJECTION, Severity.MEDIUM,
+                          "JSAST-SQL-002",
+                          f"SQL text for .{prop}() is built by concatenation from a function parameter — "
+                          "SQL injection if callers pass request data; use placeholders with a values array")
 
             # fs operations
             elif obj_root in ("fs", "fsPromises", "fsp") and prop in _FS_SINKS:
@@ -1464,7 +1638,8 @@ def _analyze_with_parser(
                     break
 
     if (not state.tainted and not state.tainted_funcs and not state.tainted_attrs
-            and not _SOURCE_HINT_RE.search(content)):
+            and not _SOURCE_HINT_RE.search(content)
+            and not file_loads_db_library(lines)):  # data-access helpers take the request value as a parameter
         return results
     results += _check_sinks(tree.root_node, state, file_path, lines, repo_url)
     return results
