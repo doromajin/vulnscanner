@@ -456,6 +456,29 @@ _DB: dict[VulnType, dict] = {
         ),
     },
 
+    VulnType.MASS_ASSIGNMENT: {
+        "cwe": 915,
+        "text": (
+            "Never pass the whole request hash to a model constructor or updater. Whitelist the "
+            "attributes: in Rails use params.require(:user).permit(:name, :email) (never permit!), "
+            "in other frameworks use an explicit attribute list or a form/DTO class."
+        ),
+        "markdown": (
+            "## Fix: Mass Assignment (CWE-915)\n\n"
+            "Permit only the attributes a user may set.\n\n"
+            "```ruby\n"
+            "# BAD: User.new(params[:user])\n"
+            "# OK:\n"
+            "def user_params\n"
+            "  params.require(:user).permit(:name, :email)\n"
+            "end\n"
+            "User.new(user_params)\n"
+            "```\n\n"
+            "**References:** "
+            "[OWASP Mass Assignment Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html)"
+        ),
+    },
+
     VulnType.FRAMEWORK_MISCONFIGURATION: {
         "cwe": 16,
         "text": (

@@ -45,6 +45,7 @@ class VulnType(str, Enum):
     EXPOSED_ENDPOINT = "Exposed API Endpoint"
     FILE_UPLOAD = "Unrestricted File Upload"
     FRAMEWORK_MISCONFIGURATION = "Framework Misconfiguration"
+    MASS_ASSIGNMENT = "Mass Assignment"
 
 
 @dataclass

@@ -128,6 +128,26 @@ def _call_receiver_method(node) -> tuple[str, str]:
     return r, m
 
 
+def _is_local_name(node, name: str) -> bool:
+    """True when `name` is a parameter or assigned local of the method enclosing node."""
+    scope = node.parent
+    while scope is not None and scope.type not in _SCOPE_TYPES:
+        scope = scope.parent
+    if scope is None:
+        return False
+    params = scope.child_by_field_name("parameters")
+    if params is not None:
+        for p in _walk(params):
+            if p.type == "identifier" and p.text.decode("utf-8", errors="replace") == name:
+                return True
+    for n in _walk(scope):
+        if n.type in ("assignment", "operator_assignment"):
+            left = n.child_by_field_name("left")
+            if left is not None and left.type == "identifier"                     and left.text.decode("utf-8", errors="replace") == name:
+                return True
+    return False
+
+
 def _is_request_source(node) -> bool:
     """True when node directly produces user-controlled data."""
     if node is None:
@@ -153,6 +173,9 @@ def _is_request_source(node) -> bool:
     # request.path, request.url, request.query_string, request.body
     if node.type == "call":
         recv_text, meth_text = _call_receiver_method(node)
+        # params.permit! / params.to_unsafe_h: the whole request hash, unfiltered
+        if meth_text in ("permit!", "to_unsafe_h", "to_unsafe_hash") and recv_text.split(".")[0] == "params":
+            return True
         if recv_text in ("request", "req") and meth_text in _REQUEST_METHODS:
             return True
 
@@ -219,7 +242,12 @@ def _is_tainted(node, tainted: set[str], tainted_methods: set[str],
         return False
 
     if node.type == "identifier":
-        return node.text.decode("utf-8", errors="replace") in tainted
+        name = node.text.decode("utf-8", errors="replace")
+        if name in tainted:
+            return True
+        # Receiver-less, argument-less call of a helper whose body returns request data
+        # (`User.new(user_params)`): tree-sitter parses it as a bare identifier.
+        return name in tainted_methods and not _is_local_name(node, name)
 
     # @instance_variable taint — Rails controllers use @var = params[:x]
     if node.type == "instance_variable":
@@ -364,8 +392,9 @@ def _collect_method_taint(root, tainted: set[str], tainted_methods: set[str],
                 break
 
         # Check implicit return: last named child of body_statement
-        if not found and body.named_children:
-            last_stmt = body.named_children[-1]
+        stmts = [c for c in body.named_children if c.type != "comment"]
+        if not found and stmts:
+            last_stmt = stmts[-1]
             if _is_tainted(last_stmt, tainted, tainted_methods, tainted_ivars):
                 found = True
 
@@ -505,7 +534,7 @@ _SCALAR_PARAM_RE = re.compile(
 )
 
 _MASS_ASSIGN_METHODS = frozenset({
-    "create", "create!", "update", "update!", "update_all",
+    "create", "create!", "update", "update!", "update_all", "update_attributes", "update_attributes!",
     "new", "build", "assign_attributes", "attributes=",
 })
 
@@ -861,7 +890,7 @@ def _check_sinks(
               and not (meth_text in ("new", "build")
                        and _SCALAR_PARAM_RE.fullmatch(arg_nodes[0].text.decode("utf-8", errors="replace").strip()))):
             _emit(findings, seen, file_path, line, lines, repo_url,
-                  VulnType.SQL_INJECTION, Severity.MEDIUM,
+                  VulnType.MASS_ASSIGNMENT, Severity.MEDIUM,
                   "RBAST-MASS-001",
                   f"User-controlled hash flows into .{meth_text}() — mass assignment risk")
 
