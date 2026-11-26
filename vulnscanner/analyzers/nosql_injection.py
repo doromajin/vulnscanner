@@ -72,12 +72,17 @@ _GUARD = re.compile(
 )
 
 
+_SEQUELIZE_RE = re.compile(r"""(?:require\(\s*|from\s+|import\s+)['"]sequelize(?:-typescript)?['"]|\bsequelize\.define\(""")
+
+
 class NoSQLInjectionAnalyzer(BaseAnalyzer):
     supported_extensions = (".js", ".ts", ".jsx", ".tsx", ".py", ".php")
 
     def analyze(self, file_path: str, content: str, repo_url: str = "") -> list[Finding]:
         if not _GUARD.search(content):
             return []
+        if file_path.endswith((".js", ".ts", ".jsx", ".tsx")) and _SEQUELIZE_RE.search(content):
+            return []  # Sequelize binds `where` values; its query options are not MongoDB operator documents
 
         lines = content.splitlines()
         findings: list[Finding] = []
